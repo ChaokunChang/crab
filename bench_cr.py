@@ -8,30 +8,53 @@ import subprocess
 import time
 from pathlib import Path
 
-def sh(cmd, check=True, capture=True, text=True, sudo=False, cwd=None):
+def sh(cmd, check=True, capture=True, text=True, sudo=False, cwd=None, timeout=None, null_stdio=False):
     if sudo and os.geteuid() != 0:
         cmd = ["sudo"] + cmd
+    if null_stdio:
+        # For detached workloads, avoid inheriting caller TTY fds.
+        stdin = subprocess.DEVNULL
+        stdout = subprocess.PIPE if capture else subprocess.DEVNULL
+        stderr = subprocess.PIPE if capture else subprocess.DEVNULL
+    else:
+        stdin = None
+        stdout = subprocess.PIPE if capture else None
+        stderr = subprocess.PIPE if capture else None
     try:
         p = subprocess.run(
             cmd,
             check=check,
-            stdout=subprocess.PIPE if capture else None,
-            stderr=subprocess.PIPE if capture else None,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
             text=text,
             cwd=cwd,
+            timeout=timeout,
         )
         return p
     except UnicodeDecodeError:
         # Retry in binary mode if decoding fails
+        print("decoding fails, retry in binary mode...")
         p = subprocess.run(
             cmd,
             check=check,
-            stdout=subprocess.PIPE if capture else None,
-            stderr=subprocess.PIPE if capture else None,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
             text=False,
             cwd=cwd,
+            timeout=timeout,
         )
         return p
+    except subprocess.TimeoutExpired as e:
+        print("\n[command timed out]")
+        print("cmd:", " ".join(e.cmd) if isinstance(e.cmd, list) else e.cmd)
+        print("timeout_s:", e.timeout)
+        if e.stdout:
+            print("\n--- stdout ---\n", e.stdout)
+        if e.stderr:
+            print("\n--- stderr ---\n", e.stderr)
+        raise
     except subprocess.CalledProcessError as e:
         # Print useful diagnostics
         print("\n[command failed]")
@@ -67,6 +90,21 @@ def ensure_clean(path: Path):
         shutil.rmtree(path)
     path.mkdir(parents=True, exist_ok=True)
 
+def pick_python_in_rootfs(rootfs: Path) -> str:
+    candidates = [
+        "usr/bin/python3",
+        "usr/local/bin/python3",
+        "bin/python3",
+        "usr/bin/python",
+        "usr/local/bin/python",
+        "bin/python",
+    ]
+    for rel in candidates:
+        if (rootfs / rel).exists():
+            return "/" + rel
+    # Best-effort fallback if image layout is unusual.
+    return "python3"
+
 def benchmark_docker_checkpoint(args, out_rows):
     """
     Uses:
@@ -75,64 +113,72 @@ def benchmark_docker_checkpoint(args, out_rows):
       docker start --checkpoint <ckpt> <ctr>
     """
     method = "docker-checkpoint"
+    run_id = int(time.time() * 1000)
     for i in range(args.iters):
-        ctr = f"{args.name}-docker-{i}"
-        ckpt = f"ckpt{i}"
+        ctr = f"{args.name}-docker-{run_id}-{i}"
+        ckpt = f"ckpt-{run_id}-{i}"
         workdir = Path(args.work_root) / f"work-docker-{i}"
         ensure_clean(workdir)
 
-        # run container
-        sh([
-            "docker", "run", "-d", "--rm=false", "--name", ctr, 
-            "--network", "host", 
-            "--security-opt", "seccomp=unconfined",
-            "--security-opt", "apparmor=unconfined",
-            "--cap-add=SYS_PTRACE",
-            "--cap-add=CHECKPOINT_RESTORE",
-            "-e", f"MEM_MB={args.mem_mb}",
-            "-v", f"{workdir.absolute()}:/work",
-            args.image
-        ])
-
-        time.sleep(args.warmup_s)
-
-        c_before = docker_inspect_counter(workdir)
-
-        # checkpoint
-        t0 = now_ns()
-        sh(["docker", "checkpoint", "create", "--leave-running=false", ctr, ckpt])
-        t1 = now_ns()
-
-        # checkpoint files location (Docker-managed)
-        # typically: /var/lib/docker/containers/<id>/checkpoints/<ckpt>/
-        # we can locate via docker inspect
-        insp = sh(["docker", "inspect", ctr]).stdout
-        j = json.loads(insp)[0]
-        cid = j["Id"]
-        ckpt_path = Path(args.docker_root) / "containers" / cid / "checkpoints" / ckpt
-        ckpt_size = dir_size_bytes(ckpt_path) if ckpt_path.exists() else None
-
-        # restore
-        t2 = now_ns()
-        sh(["docker", "start", "--checkpoint", ckpt, ctr])
-        t3 = now_ns()
-
-        time.sleep(args.post_restore_s)
-        c_after = docker_inspect_counter(workdir)
-
-        # cleanup
+        # Make reruns robust if prior execution crashed mid-iteration.
         sh(["docker", "rm", "-f", ctr], check=False)
 
-        out_rows.append({
-            "iter": i,
-            "method": method,
-            "checkpoint_ms": (t1 - t0) / 1e6,
-            "restore_ms": (t3 - t2) / 1e6,
-            "ckpt_size_bytes": ckpt_size,
-            "counter_before": c_before,
-            "counter_after": c_after,
-            "counter_continues": (c_before is not None and c_after is not None and c_after > c_before),
-        })
+        try:
+            # run container
+            sh([
+                "docker", "run", "-d", "--rm=false", "--name", ctr, 
+                "--network", "host", 
+                "--security-opt", "seccomp=unconfined",
+                "--security-opt", "apparmor=unconfined",
+                "--cap-add=SYS_PTRACE",
+                "--cap-add=CHECKPOINT_RESTORE",
+                "-e", f"MEM_MB={args.mem_mb}",
+                "-v", f"{workdir.absolute()}:/work",
+                args.image
+            ])
+
+            time.sleep(args.warmup_s)
+            c_before = docker_inspect_counter(workdir)
+
+            # checkpoint
+            t0 = now_ns()
+            sh([
+                "docker", "checkpoint", "create",
+                "--leave-running=false", ctr, ckpt
+            ])
+            t1 = now_ns()
+
+            # Docker-managed checkpoint path (daemon storage)
+            insp = sh(["docker", "inspect", ctr]).stdout
+            j = json.loads(insp)[0]
+            cid = j["Id"]
+            ckpt_path = Path(args.docker_root) / "containers" / cid / "checkpoints" / ckpt
+            ckpt_size = dir_size_bytes(ckpt_path) if ckpt_path.exists() else None
+
+            # restore
+            t2 = now_ns()
+            sh([
+                "docker", "start",
+                "--checkpoint", ckpt, ctr
+            ])
+            t3 = now_ns()
+
+            time.sleep(args.post_restore_s)
+            c_after = docker_inspect_counter(workdir)
+
+            out_rows.append({
+                "iter": i,
+                "method": method,
+                "checkpoint_ms": (t1 - t0) / 1e6,
+                "restore_ms": (t3 - t2) / 1e6,
+                "ckpt_size_bytes": ckpt_size,
+                "counter_before": c_before,
+                "counter_after": c_after,
+                "counter_continues": (c_before is not None and c_after is not None and c_after > c_before),
+            })
+        finally:
+            # cleanup
+            sh(["docker", "rm", "-f", ctr], check=False)
 
 def benchmark_runc_criu(args, out_rows):
     """
@@ -186,7 +232,10 @@ def benchmark_runc_criu(args, out_rows):
     cfg = json.loads(config_path.read_text())
 
     # Set process args for workload
-    cfg["process"]["args"] = ["python", "/app/agent_workload.py"]
+    py_bin = pick_python_in_rootfs(rootfs)
+    cfg["process"]["args"] = [py_bin, "/app/agent_workload.py"]
+    # Detached runc run/restore requires no TTY.
+    cfg["process"]["terminal"] = False
     cfg["process"]["env"] = cfg["process"].get("env", [])
     # ensure OUT_DIR and MEM_MB
     cfg["process"]["env"] = [e for e in cfg["process"]["env"] if not e.startswith("OUT_DIR=") and not e.startswith("MEM_MB=")]
@@ -209,6 +258,7 @@ def benchmark_runc_criu(args, out_rows):
     config_path.write_text(json.dumps(cfg, indent=2))
 
     for i in range(args.iters):
+        print(f"[runc {i+1}/{args.iters}] preparing bundle", flush=True)
         cid = f"{args.name}-runc-{i}"
         workdir = Path(args.work_root) / f"work-runc-{i}"
         ensure_clean(workdir)
@@ -220,34 +270,84 @@ def benchmark_runc_criu(args, out_rows):
                 m["source"] = str(workdir.absolute())
         (base / "config.json").write_text(json.dumps(cfg_i, indent=2))
 
+        # Previous failed/aborted runs can leave the same ID behind.
+        # Make reruns idempotent by deleting any stale container first.
+        sh(
+            ["runc", "delete", "-f", cid],
+            sudo=True,
+            check=False,
+            capture=True,
+            cwd=base,
+            timeout=args.cmd_timeout_s,
+        )
+
         # run detached
-        sh(["runc", "run", "-d", cid], sudo=True, check=True, capture=True, cwd=base)
+        print(f"[runc {i+1}/{args.iters}] run -d ({py_bin})", flush=True)
+        sh(
+            ["runc", "run", "-d", cid],
+            sudo=True,
+            check=True,
+            # In detached mode, capturing can block in communicate()
+            # if descendants keep inherited stdio open.
+            capture=False,
+            null_stdio=True,
+            cwd=base,
+            timeout=args.cmd_timeout_s,
+        )
         time.sleep(args.warmup_s)
+        state_j = json.loads(sh(
+            ["runc", "state", cid],
+            sudo=True,
+            check=True,
+            capture=True,
+            cwd=base,
+            timeout=args.cmd_timeout_s,
+        ).stdout)
+        if state_j.get("status") != "running":
+            sh(["runc", "delete", "-f", cid], sudo=True, check=False, capture=True, cwd=base)
+            raise RuntimeError(
+                f"runc container {cid} is '{state_j.get('status')}' right after launch; "
+                f"workload exited early (command was {py_bin} /app/agent_workload.py)."
+            )
 
         c_before = docker_inspect_counter(workdir)
 
-        ckpt_dir = Path(args.work_root) / f"ckpt-runc-{i}"
-        work_path = Path(args.work_root) / f"ckpt-work-{i}"
+        ckpt_dir = (Path(args.work_root) / f"ckpt-runc-{i}").absolute()
+        work_path = (Path(args.work_root) / f"ckpt-work-{i}").absolute()
         ensure_clean(ckpt_dir)
         ensure_clean(work_path)
 
         # checkpoint
+        print(f"[runc {i+1}/{args.iters}] checkpoint", flush=True)
         t0 = now_ns()
         sh([
             "runc", "checkpoint", cid,
             "--image-path", str(ckpt_dir),
             "--work-path", str(work_path),
-        ], sudo=True, check=True, capture=True, cwd=base)
+        ], sudo=True, check=True, capture=True, cwd=base, timeout=args.cmd_timeout_s)
         t1 = now_ns()
         ckpt_size = dir_size_bytes(ckpt_dir)
 
+        # After checkpoint, container metadata with this ID still exists
+        # (usually as "stopped"). Remove it before restore.
+        sh(
+            ["runc", "delete", "-f", cid],
+            sudo=True,
+            check=False,
+            capture=True,
+            cwd=base,
+            timeout=args.cmd_timeout_s,
+        )
+
         # restore (same id)
+        print(f"[runc {i+1}/{args.iters}] restore", flush=True)
         t2 = now_ns()
         sh([
-            "runc", "restore", "-d", cid,
+            "runc", "restore", "-d",
             "--image-path", str(ckpt_dir),
             "--work-path", str(work_path),
-        ], sudo=True, check=True, capture=True, cwd=base)
+            cid,
+        ], sudo=True, check=True, capture=True, null_stdio=True, cwd=base, timeout=args.cmd_timeout_s)
         t3 = now_ns()
 
         time.sleep(args.post_restore_s)
@@ -275,6 +375,7 @@ def main():
     ap.add_argument("--mem-mb", type=int, default=128)
     ap.add_argument("--warmup-s", type=float, default=2.0)
     ap.add_argument("--post-restore-s", type=float, default=1.0)
+    ap.add_argument("--cmd-timeout-s", type=float, default=120.0)
     ap.add_argument("--out", default="results.csv")
 
     # adjust if your docker root differs
