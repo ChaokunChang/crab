@@ -7,6 +7,8 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import urlopen
 
 
 def sh(cmd, check=True, capture=True, text=True, sudo=False, cwd=None, timeout=None, null_stdio=False):
@@ -82,6 +84,21 @@ def docker_inspect_counter(workdir):
         return None
 
 
+def probe_http(port, timeout_s=1.0, retries=10, retry_delay_s=0.2):
+    url = f"http://127.0.0.1:{port}/healthz"
+    for attempt in range(retries):
+        try:
+            with urlopen(url, timeout=timeout_s) as r:
+                if r.status != 200:
+                    raise RuntimeError(f"unexpected status {r.status}")
+                return json.loads(r.read().decode("utf-8"))
+        except (URLError, HTTPError, TimeoutError, OSError, ValueError, RuntimeError):
+            if attempt < retries - 1:
+                time.sleep(retry_delay_s)
+                continue
+            return None
+
+
 def dir_size_bytes(path: Path) -> int:
     total = 0
     for p in path.rglob("*"):
@@ -154,6 +171,7 @@ def benchmark_docker_checkpoint(args, out_rows):
             ctr = f"{args.name}-docker-{run_id}-{i}"
             ckpt = f"ckpt-docker-{run_id}-{i}"
             workdir = Path(args.work_root) / f"work-docker-{i}"
+            http_port = args.http_port_base + i
             ckpt_dir = (Path(args.work_root) / ckpt).absolute()
             ensure_clean(workdir)
             if use_custom_checkpoint_dir:
@@ -178,12 +196,19 @@ def benchmark_docker_checkpoint(args, out_rows):
                     "--cap-add=SYS_PTRACE",
                     "--cap-add=CHECKPOINT_RESTORE",
                     "-e", f"MEM_MB={args.mem_mb}",
+                    "-e", f"HTTP_PORT={http_port}",
                     "-v", f"{workdir.absolute()}:/work",
                     args.image
                 ])
 
                 time.sleep(args.warmup_s)
                 c_before = docker_inspect_counter(workdir)
+                http_before = probe_http(
+                    http_port,
+                    timeout_s=args.http_timeout_s,
+                    retries=args.http_probe_retries,
+                    retry_delay_s=args.http_probe_delay_s,
+                )
 
                 # checkpoint
                 t0 = now_ns()
@@ -335,6 +360,12 @@ def benchmark_docker_checkpoint(args, out_rows):
 
                 time.sleep(args.post_restore_s)
                 c_after = docker_inspect_counter(workdir)
+                http_after = probe_http(
+                    http_port,
+                    timeout_s=args.http_timeout_s,
+                    retries=args.http_probe_retries,
+                    retry_delay_s=args.http_probe_delay_s,
+                )
 
                 out_rows.append({
                     "iter": i,
@@ -347,6 +378,23 @@ def benchmark_docker_checkpoint(args, out_rows):
                     "counter_before": c_before,
                     "counter_after": c_after,
                     "counter_continues": (c_before is not None and c_after is not None and c_after > c_before),
+                    "http_port": http_port,
+                    "http_before_ok": http_before is not None,
+                    "http_after_ok": http_after is not None,
+                    "http_runtime_same": (
+                        http_before is not None
+                        and http_after is not None
+                        and http_before.get("runtime_id") == http_after.get("runtime_id")
+                    ),
+                    "http_seq_before": None if http_before is None else http_before.get("http_seq"),
+                    "http_seq_after": None if http_after is None else http_after.get("http_seq"),
+                    "http_seq_continues": (
+                        http_before is not None
+                        and http_after is not None
+                        and isinstance(http_before.get("http_seq"), int)
+                        and isinstance(http_after.get("http_seq"), int)
+                        and http_after["http_seq"] > http_before["http_seq"]
+                    ),
                 })
             finally:
                 # cleanup
@@ -432,8 +480,14 @@ def benchmark_runc_criu(args, out_rows):
     cfg["process"]["env"] = cfg["process"].get("env", [])
     # ensure OUT_DIR and MEM_MB
     cfg["process"]["env"] = [e for e in cfg["process"]["env"]
-                             if not e.startswith("OUT_DIR=") and not e.startswith("MEM_MB=")]
+                             if not e.startswith("OUT_DIR=") and not e.startswith("MEM_MB=") and not e.startswith("HTTP_PORT=")]
     cfg["process"]["env"] += [f"OUT_DIR=/work", f"MEM_MB={args.mem_mb}"]
+
+    # Expose HTTP port to host for runc runs.
+    linux_cfg = cfg.get("linux", {})
+    ns = linux_cfg.get("namespaces", [])
+    linux_cfg["namespaces"] = [n for n in ns if n.get("type") != "network"]
+    cfg["linux"] = linux_cfg
 
     # Bind mount a host workdir into /work
     # We'll create per-iter workdir and update mount source each time.
@@ -455,6 +509,7 @@ def benchmark_runc_criu(args, out_rows):
         print(f"[runc {i+1}/{args.iters}] preparing bundle", flush=True)
         cid = f"{args.name}-runc-{i}"
         workdir = Path(args.work_root) / f"work-runc-{i}"
+        http_port = args.runc_http_port_base + i
         ensure_clean(workdir)
 
         # patch config.json mount source for this iter
@@ -462,6 +517,11 @@ def benchmark_runc_criu(args, out_rows):
         for m in cfg_i["mounts"]:
             if m.get("destination") == "/work":
                 m["source"] = str(workdir.absolute())
+        cfg_i["process"]["env"] = [
+            e for e in cfg_i["process"].get("env", [])
+            if not e.startswith("HTTP_PORT=")
+        ]
+        cfg_i["process"]["env"] += [f"HTTP_PORT={http_port}"]
         (base / "config.json").write_text(json.dumps(cfg_i, indent=2))
 
         # Previous failed/aborted runs can leave the same ID behind.
@@ -506,6 +566,12 @@ def benchmark_runc_criu(args, out_rows):
             )
 
         c_before = docker_inspect_counter(workdir)
+        http_before = probe_http(
+            http_port,
+            timeout_s=args.http_timeout_s,
+            retries=args.http_probe_retries,
+            retry_delay_s=args.http_probe_delay_s,
+        )
 
         ckpt_dir = (Path(args.work_root) / f"ckpt-runc-{i}").absolute()
         work_path = (Path(args.work_root) / f"ckpt-work-{i}").absolute()
@@ -547,6 +613,12 @@ def benchmark_runc_criu(args, out_rows):
 
         time.sleep(args.post_restore_s)
         c_after = docker_inspect_counter(workdir)
+        http_after = probe_http(
+            http_port,
+            timeout_s=args.http_timeout_s,
+            retries=args.http_probe_retries,
+            retry_delay_s=args.http_probe_delay_s,
+        )
 
         # cleanup
         sh(["runc", "delete", "-f", cid], sudo=True,
@@ -563,6 +635,23 @@ def benchmark_runc_criu(args, out_rows):
             "counter_before": c_before,
             "counter_after": c_after,
             "counter_continues": (c_before is not None and c_after is not None and c_after > c_before),
+            "http_port": http_port,
+            "http_before_ok": http_before is not None,
+            "http_after_ok": http_after is not None,
+            "http_runtime_same": (
+                http_before is not None
+                and http_after is not None
+                and http_before.get("runtime_id") == http_after.get("runtime_id")
+            ),
+            "http_seq_before": None if http_before is None else http_before.get("http_seq"),
+            "http_seq_after": None if http_after is None else http_after.get("http_seq"),
+            "http_seq_continues": (
+                http_before is not None
+                and http_after is not None
+                and isinstance(http_before.get("http_seq"), int)
+                and isinstance(http_after.get("http_seq"), int)
+                and http_after["http_seq"] > http_before["http_seq"]
+            ),
         })
 
 
@@ -578,6 +667,11 @@ def main():
     ap.add_argument("--docker-start-retries", type=int, default=2)
     ap.add_argument("--docker-retry-delay-s", type=float, default=1.0)
     ap.add_argument("--docker-iter-settle-s", type=float, default=0.0)
+    ap.add_argument("--http-port-base", type=int, default=18080)
+    ap.add_argument("--runc-http-port-base", type=int, default=19080)
+    ap.add_argument("--http-timeout-s", type=float, default=1.0)
+    ap.add_argument("--http-probe-retries", type=int, default=20)
+    ap.add_argument("--http-probe-delay-s", type=float, default=0.2)
     ap.add_argument("--out", default="results.csv")
     ap.add_argument("--use-custom-checkpoint-dir", action="store_true")
     ap.add_argument(
@@ -627,7 +721,9 @@ def main():
     with open(args.out, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=[
             "iter", "method", "checkpoint_ms", "restore_ms", "restore_ms_success_only", "restore_retries", "ckpt_size_bytes",
-            "counter_before", "counter_after", "counter_continues"
+            "counter_before", "counter_after", "counter_continues",
+            "http_port", "http_before_ok", "http_after_ok", "http_runtime_same",
+            "http_seq_before", "http_seq_after", "http_seq_continues"
         ])
         w.writeheader()
         for r in rows:
@@ -639,12 +735,21 @@ def main():
               == method and r[key] is not None]
         return sum(xs)/len(xs) if xs else None
 
+    def ratio_true(key, method):
+        xs = [bool(r[key]) for r in rows if r["method"] == method and r.get(key) is not None]
+        if not xs:
+            return None
+        return sum(1 for x in xs if x) / len(xs)
+
     for m in sorted(set(r["method"] for r in rows)):
         print(f"\n== {m} ==")
         print(f"checkpoint_ms_avg: {avg('checkpoint_ms', m)}")
         print(f"restore_ms_avg:    {avg('restore_ms', m)}")
         print(
             f"restore_ms_success_only_avg: {avg('restore_ms_success_only', m)}")
+        print(f"http_after_ok_ratio: {ratio_true('http_after_ok', m)}")
+        print(f"http_runtime_same_ratio: {ratio_true('http_runtime_same', m)}")
+        print(f"http_seq_continues_ratio: {ratio_true('http_seq_continues', m)}")
 
     print(f"\nWrote {args.out}")
 

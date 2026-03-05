@@ -5,7 +5,13 @@ This repository benchmarks checkpoint/restore latency for a stateful Python work
 - Docker checkpoint/restore
 - `runc` + CRIU checkpoint/restore
 
-The workload (`agent_workload.py`) increments a counter, mutates an in-memory buffer, and persists progress to `/work/state.json` so restore continuity can be verified.
+The workload (`agent_workload.py`) now does all of the following:
+
+- Increments a counter and writes `/work/state.json`
+- Mutates an in-memory buffer (to emulate agent runtime memory)
+- Runs an HTTP server (`/healthz`) with in-memory request sequence + runtime ID
+
+This lets the benchmark verify both disk-backed state continuity and in-memory HTTP runtime continuity across restore.
 
 ## Files
 
@@ -53,6 +59,8 @@ python3 bench_cr.py --run-runc --iters 3 --out results.csv
 - `runc` benchmark artifacts are written under `./bench_out`.
 - The runner uses `sudo` for `runc run/checkpoint/restore/delete`.
 - Docker checkpoint size is read from `--docker-root` (default `/var/lib/docker`).
+- Docker HTTP workload port is `--http-port-base + iter` (default base `18080`).
+- `runc` HTTP workload port is `--runc-http-port-base + iter` (default base `19080`).
 - Some Docker runtimes can create checkpoints in `--checkpoint-dir` but cannot restore from it.
   Use `--docker-custom-ckpt-restore daemon` to bridge custom checkpoint files into daemon-managed storage before restore.
   Use `--docker-custom-ckpt-bridge copy|symlink|hardlink` to pick bridge behavior (default `copy`).
@@ -83,5 +91,13 @@ python3 bench_cr.py \
 - `counter_before`
 - `counter_after`
 - `counter_continues`
+- `http_port`
+- `http_before_ok`
+- `http_after_ok`
+- `http_runtime_same`
+- `http_seq_before`
+- `http_seq_after`
+- `http_seq_continues`
 
 `counter_continues=True` indicates the workload state advanced across restore.
+`http_runtime_same=True` + `http_seq_continues=True` indicates the restored process kept serving with the same in-memory runtime identity and continued HTTP request sequence.
