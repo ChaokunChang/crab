@@ -63,6 +63,7 @@ def parse_args() -> argparse.Namespace:
         default=sys.executable,
         help="Python executable used to invoke bench_cr.py.",
     )
+    p.add_argument("--warmup-s", type=float, default=2.0)
     return p.parse_args()
 
 
@@ -87,6 +88,7 @@ def run_one(
     iters: int,
     out_csv: Path,
     runc_http_port_base: int,
+    warmup_s: int = 2,
 ) -> None:
     cmd = [
         python_exe,
@@ -104,6 +106,8 @@ def run_one(
         str(runc_http_port_base),
         "--out",
         str(out_csv),
+        "--warmup-s",
+        str(warmup_s),
     ]
     print(f"\\n### mem={mem_mb}MB: {' '.join(cmd)}", flush=True)
     subprocess.run(cmd, check=True)
@@ -237,6 +241,7 @@ def main() -> None:
             iters=args.iters,
             out_csv=run_csv,
             runc_http_port_base=args.runc_http_port_base + idx * args.http_port_stride,
+            warmup_s=args.warmup_s
         )
         all_rows.extend(load_rows(run_csv, mem_mb=mem))
 
