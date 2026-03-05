@@ -33,7 +33,7 @@ docker build -t agent-sandbox-bench:latest .
 Run both benchmark modes (default):
 
 ```bash
-python3 bench_cr.py --iters 5 --out results.csv
+python3 bench_cr.py --iters 3 --out results.csv
 ```
 
 Run Docker-only mode:
@@ -53,6 +53,23 @@ python3 bench_cr.py --run-runc --iters 3 --out results.csv
 - `runc` benchmark artifacts are written under `./bench_out`.
 - The runner uses `sudo` for `runc run/checkpoint/restore/delete`.
 - Docker checkpoint size is read from `--docker-root` (default `/var/lib/docker`).
+- Some Docker runtimes can create checkpoints in `--checkpoint-dir` but cannot restore from it.
+  Use `--docker-custom-ckpt-restore daemon` to bridge custom checkpoint files into daemon-managed storage before restore.
+  Use `--docker-custom-ckpt-bridge copy|symlink|hardlink` to pick bridge behavior (default `copy`).
+
+Example for tmpfs-backed checkpoint writes with daemon restore:
+
+```bash
+python3 bench_cr.py \
+  --run-docker \
+  --iters 3 \
+  --out results_tmpfs_1G.csv \
+  --mem-mb 1024 \
+  --work-root /mnt/mytmpfs/bench_out \
+  --use-custom-checkpoint-dir \
+  --docker-custom-ckpt-restore daemon \
+  --docker-custom-ckpt-bridge symlink
+```
 
 ## Output
 

@@ -11,6 +11,7 @@ venv/
 # Benchmark artifacts
 bench_out/
 results.csv
+results_*.csv
 
 # OS/editor noise
 .DS_Store
