@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import concurrent.futures
 import csv
 import json
 import os
@@ -169,6 +170,19 @@ def ensure_removed(path: Path):
         shutil.rmtree(path)
 
 
+def clone_tree_with_hardlinks(src: Path, dst: Path):
+    """
+    Clone src tree to dst, preferring hardlinks for speed/space.
+    Falls back to a regular copy if hardlinking is unsupported.
+    """
+    ensure_removed(dst)
+    try:
+        shutil.copytree(src, dst, symlinks=True, copy_function=os.link)
+    except OSError:
+        ensure_removed(dst)
+        shutil.copytree(src, dst, symlinks=True)
+
+
 def bridge_checkpoint_to_daemon(src_ckpt_dir: Path, dst_ckpt_dir: Path, mode: str):
     if not src_ckpt_dir.exists():
         raise RuntimeError(
@@ -203,6 +217,59 @@ def pick_python_in_rootfs(rootfs: Path) -> str:
     return "python3"
 
 
+def run_jobs_concurrently(jobs):
+    """
+    Run shell jobs concurrently.
+    Each job supports keys: cmd, sudo, cwd, timeout, null_stdio.
+    Returns (results, batch_elapsed_ms), where each result has:
+      returncode, stdout, stderr, elapsed_ms, cmd
+    """
+    if not jobs:
+        return [], 0.0
+
+    def _run_one(job):
+        t0 = now_ns()
+        p = sh(
+            job["cmd"],
+            check=False,
+            capture=True,
+            text=True,
+            sudo=job.get("sudo", False),
+            cwd=job.get("cwd"),
+            timeout=job.get("timeout"),
+            null_stdio=job.get("null_stdio", False),
+        )
+        t1 = now_ns()
+        return {
+            "returncode": p.returncode,
+            "stdout": p.stdout,
+            "stderr": p.stderr,
+            "elapsed_ms": (t1 - t0) / 1e6,
+            "cmd": job["cmd"],
+        }
+
+    t_batch0 = now_ns()
+    results = [None] * len(jobs)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as ex:
+        fut_to_idx = {
+            ex.submit(_run_one, job): idx for idx, job in enumerate(jobs)
+        }
+        for fut in concurrent.futures.as_completed(fut_to_idx):
+            idx = fut_to_idx[fut]
+            try:
+                results[idx] = fut.result()
+            except Exception as e:
+                results[idx] = {
+                    "returncode": -1,
+                    "stdout": "",
+                    "stderr": str(e),
+                    "elapsed_ms": None,
+                    "cmd": jobs[idx]["cmd"],
+                }
+    t_batch1 = now_ns()
+    return results, (t_batch1 - t_batch0) / 1e6
+
+
 def benchmark_docker_checkpoint(args, out_rows):
     """
     Uses:
@@ -213,6 +280,307 @@ def benchmark_docker_checkpoint(args, out_rows):
     method = "docker-checkpoint"
     run_id = int(time.time() * 1000)
     use_custom_checkpoint_dir = args.use_custom_checkpoint_dir
+    if args.concurrency > 1:
+        if use_custom_checkpoint_dir:
+            raise ValueError(
+                "--use-custom-checkpoint-dir is not supported with --concurrency > 1"
+            )
+        for i in range(args.iters):
+            specs = []
+            for c in range(args.concurrency):
+                ctr = f"{args.name}-docker-{run_id}-{i}-{c}"
+                ckpt = f"ckpt-docker-{run_id}-{i}-{c}"
+                workdir = Path(args.work_root) / f"work-docker-{i}-{c}"
+                http_port = args.http_port_base + i * args.concurrency + c
+                specs.append(
+                    {
+                        "ctr": ctr,
+                        "ckpt": ckpt,
+                        "workdir": workdir,
+                        "http_port": http_port,
+                    }
+                )
+
+            for s in specs:
+                ensure_clean(s["workdir"])
+                sh(["docker", "rm", "-f", s["ctr"]], check=False)
+
+            try:
+                for s in specs:
+                    sh([
+                        "docker", "run", "-d", "--rm=false", "--name", s["ctr"],
+                        "--network", "host",
+                        "--security-opt", "seccomp=unconfined",
+                        "--security-opt", "apparmor=unconfined",
+                        "--cap-add=SYS_PTRACE",
+                        "--cap-add=CHECKPOINT_RESTORE",
+                        "-e", f"MEM_MB={args.mem_mb}",
+                        "-e", f"HTTP_PORT={s['http_port']}",
+                        "-v", f"{s['workdir'].absolute()}:/work",
+                        args.image
+                    ])
+
+                time.sleep(args.warmup_s)
+                for s in specs:
+                    http_before = probe_http(
+                        s["http_port"],
+                        timeout_s=args.http_timeout_s,
+                        retries=args.http_probe_retries,
+                        retry_delay_s=args.http_probe_delay_s,
+                    )
+                    c_before = best_effort_counter(s["workdir"], http_before)
+                    if c_before is None:
+                        c_before = wait_for_counter(
+                            s["workdir"],
+                            s["http_port"],
+                            target_gt=None,
+                            timeout_s=args.counter_wait_timeout_s,
+                            interval_s=args.counter_wait_interval_s,
+                            http_timeout_s=args.http_timeout_s,
+                        )
+                    s["http_before"] = http_before
+                    s["counter_before"] = c_before
+
+                ckpt_jobs = [
+                    {
+                        "cmd": [
+                            "docker", "checkpoint", "create",
+                            "--leave-running=false",
+                            s["ctr"],
+                            s["ckpt"],
+                        ],
+                    }
+                    for s in specs
+                ]
+                ckpt_results, checkpoint_batch_ms = run_jobs_concurrently(ckpt_jobs)
+                for slot, (s, r) in enumerate(zip(specs, ckpt_results)):
+                    s["slot"] = slot
+                    s["checkpoint_ms"] = r["elapsed_ms"]
+                    if r["returncode"] != 0:
+                        print("\n[command failed]")
+                        print("cmd:", " ".join(r["cmd"]))
+                        print("returncode:", r["returncode"])
+                        if r["stdout"]:
+                            print("\n--- stdout ---\n", r["stdout"])
+                        if r["stderr"]:
+                            print("\n--- stderr ---\n", r["stderr"])
+                        raise RuntimeError(
+                            f"docker checkpoint failed for {s['ctr']} (checkpoint {s['ckpt']})"
+                        )
+
+                ckpt_size_total = 0
+                for s in specs:
+                    insp = sh(["docker", "inspect", s["ctr"]]).stdout
+                    cid = json.loads(insp)[0]["Id"]
+                    ckpt_path_daemon = Path(args.docker_root) / \
+                        "containers" / cid / "checkpoints" / s["ckpt"]
+                    s["ckpt_path_daemon"] = ckpt_path_daemon
+                    if ckpt_path_daemon.exists():
+                        s["ckpt_size_bytes"] = dir_size_bytes(ckpt_path_daemon)
+                        ckpt_size_total += s["ckpt_size_bytes"]
+                    else:
+                        s["ckpt_size_bytes"] = None
+
+                pending = list(range(len(specs)))
+                retries_by_container = [0] * len(specs)
+                restore_success_ms = [None] * len(specs)
+                t_restore0 = now_ns()
+                for attempt in range(args.docker_start_retries + 1):
+                    restore_jobs = [
+                        {
+                            "cmd": [
+                                "docker", "start",
+                                "--checkpoint", specs[idx]["ckpt"],
+                                specs[idx]["ctr"],
+                            ],
+                        }
+                        for idx in pending
+                    ]
+                    restore_results, _ = run_jobs_concurrently(restore_jobs)
+                    next_pending = []
+                    for idx, r in zip(pending, restore_results):
+                        if r["returncode"] == 0:
+                            retries_by_container[idx] = attempt
+                            restore_success_ms[idx] = r["elapsed_ms"]
+                            specs[idx]["restore_ms"] = r["elapsed_ms"]
+                            continue
+                        stderr = r["stderr"] or ""
+                        transient = (
+                            "failed to upload checkpoint to containerd" in stderr
+                            and "already exists" in stderr
+                        )
+                        if transient and attempt < args.docker_start_retries:
+                            next_pending.append(idx)
+                            continue
+                        print("\n[command failed]")
+                        print("cmd:", " ".join(r["cmd"]))
+                        print("returncode:", r["returncode"])
+                        if r["stdout"]:
+                            print("\n--- stdout ---\n", r["stdout"])
+                        if r["stderr"]:
+                            print("\n--- stderr ---\n", r["stderr"])
+                        raise RuntimeError(
+                            f"docker restore failed for {specs[idx]['ctr']} (checkpoint {specs[idx]['ckpt']})"
+                        )
+                    pending = next_pending
+                    if not pending:
+                        break
+                    wait_s = args.docker_retry_delay_s * (attempt + 1)
+                    print(
+                        f"[docker restore retry {attempt + 1}/{args.docker_start_retries}] "
+                        f"{len(pending)} container(s) had transient containerd conflicts; retrying in {wait_s:.1f}s",
+                        flush=True,
+                    )
+                    time.sleep(wait_s)
+                t_restore1 = now_ns()
+                if pending:
+                    raise RuntimeError(
+                        f"docker restore did not complete for {len(pending)} container(s)"
+                    )
+
+                time.sleep(args.post_restore_s)
+                containers_ok = 0
+                all_http_before_ok = True
+                all_http_after_ok = True
+                all_counter_continues = True
+                all_runtime_same = True
+                all_http_seq_continues = True
+                min_before = None
+                min_after = None
+                for s in specs:
+                    http_after = probe_http(
+                        s["http_port"],
+                        timeout_s=args.http_timeout_s,
+                        retries=args.http_probe_retries,
+                        retry_delay_s=args.http_probe_delay_s,
+                    )
+                    c_after = best_effort_counter(s["workdir"], http_after)
+                    c_before = s["counter_before"]
+                    if c_before is not None and (c_after is None or c_after <= c_before):
+                        c_after = wait_for_counter(
+                            s["workdir"],
+                            s["http_port"],
+                            target_gt=c_before,
+                            timeout_s=args.counter_wait_timeout_s,
+                            interval_s=args.counter_wait_interval_s,
+                            http_timeout_s=args.http_timeout_s,
+                        )
+                    s["http_after"] = http_after
+                    s["counter_after"] = c_after
+
+                    before_ok = s["http_before"] is not None
+                    after_ok = http_after is not None
+                    all_http_before_ok = all_http_before_ok and before_ok
+                    all_http_after_ok = all_http_after_ok and after_ok
+
+                    counter_continues = (
+                        c_before is not None and c_after is not None and c_after > c_before
+                    )
+                    all_counter_continues = all_counter_continues and counter_continues
+
+                    runtime_same = (
+                        s["http_before"] is not None
+                        and http_after is not None
+                        and s["http_before"].get("runtime_id") == http_after.get("runtime_id")
+                    )
+                    all_runtime_same = all_runtime_same and runtime_same
+
+                    seq_continues = (
+                        s["http_before"] is not None
+                        and http_after is not None
+                        and isinstance(s["http_before"].get("http_seq"), int)
+                        and isinstance(http_after.get("http_seq"), int)
+                        and http_after["http_seq"] > s["http_before"]["http_seq"]
+                    )
+                    all_http_seq_continues = all_http_seq_continues and seq_continues
+
+                    if before_ok and after_ok:
+                        containers_ok += 1
+                    if c_before is not None:
+                        min_before = c_before if min_before is None else min(min_before, c_before)
+                    if c_after is not None:
+                        min_after = c_after if min_after is None else min(min_after, c_after)
+
+                success_only = [x for x in restore_success_ms if x is not None]
+                out_rows.append({
+                    "iter": i,
+                    "method": method,
+                    "checkpoint_ms": checkpoint_batch_ms,
+                    "restore_ms": (t_restore1 - t_restore0) / 1e6,
+                    "restore_ms_success_only": max(success_only) if success_only else None,
+                    "restore_retries": max(retries_by_container) if retries_by_container else 0,
+                    "ckpt_size_bytes": ckpt_size_total if ckpt_size_total > 0 else None,
+                    "counter_before": min_before,
+                    "counter_after": min_after,
+                    "counter_continues": all_counter_continues,
+                    "http_port": specs[0]["http_port"],
+                    "http_before_ok": all_http_before_ok,
+                    "http_after_ok": all_http_after_ok,
+                    "http_runtime_same": all_runtime_same,
+                    "http_seq_before": None,
+                    "http_seq_after": None,
+                    "http_seq_continues": all_http_seq_continues,
+                    "concurrency": args.concurrency,
+                    "containers_total": args.concurrency,
+                    "containers_ok": containers_ok,
+                    "row_kind": "aggregate",
+                    "container_slot": None,
+                    "container_name": None,
+                })
+
+                if args.per_container_rows:
+                    for idx, s in enumerate(specs):
+                        http_before = s["http_before"]
+                        http_after = s["http_after"]
+                        c_before = s["counter_before"]
+                        c_after = s["counter_after"]
+                        out_rows.append({
+                            "iter": i,
+                            "method": method,
+                            "checkpoint_ms": s.get("checkpoint_ms"),
+                            "restore_ms": s.get("restore_ms"),
+                            "restore_ms_success_only": s.get("restore_ms"),
+                            "restore_retries": retries_by_container[idx],
+                            "ckpt_size_bytes": s.get("ckpt_size_bytes"),
+                            "counter_before": c_before,
+                            "counter_after": c_after,
+                            "counter_continues": (c_before is not None and c_after is not None and c_after > c_before),
+                            "http_port": s["http_port"],
+                            "http_before_ok": http_before is not None,
+                            "http_after_ok": http_after is not None,
+                            "http_runtime_same": (
+                                http_before is not None
+                                and http_after is not None
+                                and http_before.get("runtime_id") == http_after.get("runtime_id")
+                            ),
+                            "http_seq_before": None if http_before is None else http_before.get("http_seq"),
+                            "http_seq_after": None if http_after is None else http_after.get("http_seq"),
+                            "http_seq_continues": (
+                                http_before is not None
+                                and http_after is not None
+                                and isinstance(http_before.get("http_seq"), int)
+                                and isinstance(http_after.get("http_seq"), int)
+                                and http_after["http_seq"] > http_before["http_seq"]
+                            ),
+                            "concurrency": args.concurrency,
+                            "containers_total": args.concurrency,
+                            "containers_ok": 1 if (http_before is not None and http_after is not None) else 0,
+                            "row_kind": "container",
+                            "container_slot": s.get("slot"),
+                            "container_name": s["ctr"],
+                        })
+            finally:
+                for s in specs:
+                    sh(["docker", "rm", "-f", s["ctr"]], check=False)
+
+            if args.docker_iter_settle_s > 0 and i < args.iters - 1:
+                print(
+                    f"[docker settle] sleeping {args.docker_iter_settle_s:.1f}s before next iteration",
+                    flush=True,
+                )
+                time.sleep(args.docker_iter_settle_s)
+        return
+
     for i in range(args.iters):
         while True:
             ctr = f"{args.name}-docker-{run_id}-{i}"
@@ -460,7 +828,49 @@ def benchmark_docker_checkpoint(args, out_rows):
                         and isinstance(http_after.get("http_seq"), int)
                         and http_after["http_seq"] > http_before["http_seq"]
                     ),
+                    "concurrency": 1,
+                    "containers_total": 1,
+                    "containers_ok": 1 if (http_before is not None and http_after is not None) else 0,
+                    "row_kind": "aggregate",
+                    "container_slot": None,
+                    "container_name": None,
                 })
+                if args.per_container_rows:
+                    out_rows.append({
+                        "iter": i,
+                        "method": method,
+                        "checkpoint_ms": (t1 - t0) / 1e6,
+                        "restore_ms": (t3 - t2) / 1e6,
+                        "restore_ms_success_only": restore_ms_success_only,
+                        "restore_retries": restore_retries,
+                        "ckpt_size_bytes": ckpt_size,
+                        "counter_before": c_before,
+                        "counter_after": c_after,
+                        "counter_continues": (c_before is not None and c_after is not None and c_after > c_before),
+                        "http_port": http_port,
+                        "http_before_ok": http_before is not None,
+                        "http_after_ok": http_after is not None,
+                        "http_runtime_same": (
+                            http_before is not None
+                            and http_after is not None
+                            and http_before.get("runtime_id") == http_after.get("runtime_id")
+                        ),
+                        "http_seq_before": None if http_before is None else http_before.get("http_seq"),
+                        "http_seq_after": None if http_after is None else http_after.get("http_seq"),
+                        "http_seq_continues": (
+                            http_before is not None
+                            and http_after is not None
+                            and isinstance(http_before.get("http_seq"), int)
+                            and isinstance(http_after.get("http_seq"), int)
+                            and http_after["http_seq"] > http_before["http_seq"]
+                        ),
+                        "concurrency": 1,
+                        "containers_total": 1,
+                        "containers_ok": 1 if (http_before is not None and http_after is not None) else 0,
+                        "row_kind": "container",
+                        "container_slot": 0,
+                        "container_name": ctr,
+                    })
             finally:
                 # cleanup
                 sh(["docker", "rm", "-f", ctr], check=False)
@@ -569,6 +979,326 @@ def benchmark_runc_criu(args, out_rows):
 
     # Ensure python exists in rootfs (it does, from image)
     config_path.write_text(json.dumps(cfg, indent=2))
+
+    if args.concurrency > 1:
+        cfg_base = json.loads(config_path.read_text())
+        # Concurrent restore/checkpoint against a shared rootfs can race in
+        # mountpoint handling. Give each slot its own rootfs clone.
+        slot_bundles = []
+        for c in range(args.concurrency):
+            bundle_dir = base / f"bundle-slot-{c}"
+            ensure_clean(bundle_dir)
+            clone_tree_with_hardlinks(rootfs, bundle_dir / "rootfs")
+            slot_bundles.append(bundle_dir)
+
+        for i in range(args.iters):
+            print(
+                f"[runc {i+1}/{args.iters}] preparing {args.concurrency} bundles",
+                flush=True,
+            )
+            specs = []
+            for c in range(args.concurrency):
+                cid = f"{args.name}-runc-{i}-{c}"
+                workdir = Path(args.work_root) / f"work-runc-{i}-{c}"
+                http_port = args.runc_http_port_base + i * args.concurrency + c
+                ckpt_dir = (Path(args.work_root) / f"ckpt-runc-{i}-{c}").absolute()
+                work_path = (Path(args.work_root) / f"ckpt-work-{i}-{c}").absolute()
+                bundle_dir = slot_bundles[c]
+                specs.append(
+                    {
+                        "cid": cid,
+                        "workdir": workdir,
+                        "http_port": http_port,
+                        "ckpt_dir": ckpt_dir,
+                        "work_path": work_path,
+                        "bundle_dir": bundle_dir,
+                    }
+                )
+
+            for s in specs:
+                ensure_clean(s["workdir"])
+                ensure_clean(s["ckpt_dir"])
+                ensure_clean(s["work_path"])
+
+                cfg_i = json.loads(json.dumps(cfg_base))
+                for m in cfg_i["mounts"]:
+                    if m.get("destination") == "/work":
+                        m["source"] = str(s["workdir"].absolute())
+                cfg_i["process"]["env"] = [
+                    e for e in cfg_i["process"].get("env", [])
+                    if not e.startswith("HTTP_PORT=")
+                ]
+                cfg_i["process"]["env"] += [f"HTTP_PORT={s['http_port']}"]
+                (s["bundle_dir"] / "config.json").write_text(
+                    json.dumps(cfg_i, indent=2)
+                )
+
+                sh(
+                    ["runc", "delete", "-f", s["cid"]],
+                    sudo=True,
+                    check=False,
+                    capture=True,
+                    cwd=s["bundle_dir"],
+                    timeout=args.cmd_timeout_s,
+                )
+
+            try:
+                for s in specs:
+                    sh(
+                        ["runc", "run", "-d", s["cid"]],
+                        sudo=True,
+                        check=True,
+                        capture=False,
+                        null_stdio=True,
+                        cwd=s["bundle_dir"],
+                        timeout=args.cmd_timeout_s,
+                    )
+
+                time.sleep(args.warmup_s)
+
+                for s in specs:
+                    state_j = json.loads(sh(
+                        ["runc", "state", s["cid"]],
+                        sudo=True,
+                        check=True,
+                        capture=True,
+                        cwd=s["bundle_dir"],
+                        timeout=args.cmd_timeout_s,
+                    ).stdout)
+                    if state_j.get("status") != "running":
+                        raise RuntimeError(
+                            f"runc container {s['cid']} is '{state_j.get('status')}' right after launch"
+                        )
+
+                    http_before = probe_http(
+                        s["http_port"],
+                        timeout_s=args.http_timeout_s,
+                        retries=args.http_probe_retries,
+                        retry_delay_s=args.http_probe_delay_s,
+                    )
+                    c_before = best_effort_counter(s["workdir"], http_before)
+                    if c_before is None:
+                        c_before = wait_for_counter(
+                            s["workdir"],
+                            s["http_port"],
+                            target_gt=None,
+                            timeout_s=args.counter_wait_timeout_s,
+                            interval_s=args.counter_wait_interval_s,
+                            http_timeout_s=args.http_timeout_s,
+                        )
+                    s["http_before"] = http_before
+                    s["counter_before"] = c_before
+
+                ckpt_jobs = [
+                    {
+                        "cmd": [
+                            "runc", "checkpoint", s["cid"],
+                            "--image-path", str(s["ckpt_dir"]),
+                            "--work-path", str(s["work_path"]),
+                        ],
+                        "sudo": True,
+                        "cwd": s["bundle_dir"],
+                        "timeout": args.cmd_timeout_s,
+                    }
+                    for s in specs
+                ]
+                ckpt_results, checkpoint_batch_ms = run_jobs_concurrently(ckpt_jobs)
+                for slot, (s, r) in enumerate(zip(specs, ckpt_results)):
+                    s["slot"] = slot
+                    s["checkpoint_ms"] = r["elapsed_ms"]
+                    if r["returncode"] != 0:
+                        print("\n[command failed]")
+                        print("cmd:", " ".join(r["cmd"]))
+                        print("returncode:", r["returncode"])
+                        if r["stdout"]:
+                            print("\n--- stdout ---\n", r["stdout"])
+                        if r["stderr"]:
+                            print("\n--- stderr ---\n", r["stderr"])
+                        raise RuntimeError(f"runc checkpoint failed for {s['cid']}")
+
+                ckpt_size_total = 0
+                for s in specs:
+                    s["ckpt_size_bytes"] = dir_size_bytes(s["ckpt_dir"])
+                    ckpt_size_total += s["ckpt_size_bytes"]
+
+                for s in specs:
+                    # Defensive: restore bind source must exist on host.
+                    s["workdir"].mkdir(parents=True, exist_ok=True)
+                    sh(
+                        ["runc", "delete", "-f", s["cid"]],
+                        sudo=True,
+                        check=False,
+                        capture=True,
+                        cwd=s["bundle_dir"],
+                        timeout=args.cmd_timeout_s,
+                    )
+
+                restore_jobs = [
+                    {
+                        "cmd": [
+                            "runc", "restore", "-d",
+                            "--image-path", str(s["ckpt_dir"]),
+                            "--work-path", str(s["work_path"]),
+                            s["cid"],
+                        ],
+                        "sudo": True,
+                        "cwd": s["bundle_dir"],
+                        "timeout": args.cmd_timeout_s,
+                        "null_stdio": True,
+                    }
+                    for s in specs
+                ]
+                t_restore0 = now_ns()
+                restore_results, _ = run_jobs_concurrently(restore_jobs)
+                t_restore1 = now_ns()
+                for s, r in zip(specs, restore_results):
+                    s["restore_ms"] = r["elapsed_ms"]
+                    if r["returncode"] != 0:
+                        print("\n[command failed]")
+                        print("cmd:", " ".join(r["cmd"]))
+                        print("returncode:", r["returncode"])
+                        if r["stdout"]:
+                            print("\n--- stdout ---\n", r["stdout"])
+                        if r["stderr"]:
+                            print("\n--- stderr ---\n", r["stderr"])
+                        raise RuntimeError(f"runc restore failed for {s['cid']}")
+
+                time.sleep(args.post_restore_s)
+
+                containers_ok = 0
+                all_http_before_ok = True
+                all_http_after_ok = True
+                all_counter_continues = True
+                all_runtime_same = True
+                all_http_seq_continues = True
+                min_before = None
+                min_after = None
+                for s in specs:
+                    http_after = probe_http(
+                        s["http_port"],
+                        timeout_s=args.http_timeout_s,
+                        retries=args.http_probe_retries,
+                        retry_delay_s=args.http_probe_delay_s,
+                    )
+                    c_after = best_effort_counter(s["workdir"], http_after)
+                    c_before = s["counter_before"]
+                    if c_before is not None and (c_after is None or c_after <= c_before):
+                        c_after = wait_for_counter(
+                            s["workdir"],
+                            s["http_port"],
+                            target_gt=c_before,
+                            timeout_s=args.counter_wait_timeout_s,
+                            interval_s=args.counter_wait_interval_s,
+                            http_timeout_s=args.http_timeout_s,
+                        )
+                    s["http_after"] = http_after
+                    s["counter_after"] = c_after
+
+                    before_ok = s["http_before"] is not None
+                    after_ok = http_after is not None
+                    all_http_before_ok = all_http_before_ok and before_ok
+                    all_http_after_ok = all_http_after_ok and after_ok
+                    all_counter_continues = all_counter_continues and (
+                        c_before is not None and c_after is not None and c_after > c_before
+                    )
+                    all_runtime_same = all_runtime_same and (
+                        s["http_before"] is not None
+                        and http_after is not None
+                        and s["http_before"].get("runtime_id") == http_after.get("runtime_id")
+                    )
+                    all_http_seq_continues = all_http_seq_continues and (
+                        s["http_before"] is not None
+                        and http_after is not None
+                        and isinstance(s["http_before"].get("http_seq"), int)
+                        and isinstance(http_after.get("http_seq"), int)
+                        and http_after["http_seq"] > s["http_before"]["http_seq"]
+                    )
+                    if before_ok and after_ok:
+                        containers_ok += 1
+                    if c_before is not None:
+                        min_before = c_before if min_before is None else min(min_before, c_before)
+                    if c_after is not None:
+                        min_after = c_after if min_after is None else min(min_after, c_after)
+
+                success_only = [r["elapsed_ms"] for r in restore_results if r["elapsed_ms"] is not None]
+                out_rows.append({
+                    "iter": i,
+                    "method": method,
+                    "checkpoint_ms": checkpoint_batch_ms,
+                    "restore_ms": (t_restore1 - t_restore0) / 1e6,
+                    "restore_ms_success_only": max(success_only) if success_only else None,
+                    "restore_retries": 0,
+                    "ckpt_size_bytes": ckpt_size_total if ckpt_size_total > 0 else None,
+                    "counter_before": min_before,
+                    "counter_after": min_after,
+                    "counter_continues": all_counter_continues,
+                    "http_port": specs[0]["http_port"],
+                    "http_before_ok": all_http_before_ok,
+                    "http_after_ok": all_http_after_ok,
+                    "http_runtime_same": all_runtime_same,
+                    "http_seq_before": None,
+                    "http_seq_after": None,
+                    "http_seq_continues": all_http_seq_continues,
+                    "concurrency": args.concurrency,
+                    "containers_total": args.concurrency,
+                    "containers_ok": containers_ok,
+                    "row_kind": "aggregate",
+                    "container_slot": None,
+                    "container_name": None,
+                })
+
+                if args.per_container_rows:
+                    for s in specs:
+                        http_before = s["http_before"]
+                        http_after = s["http_after"]
+                        c_before = s["counter_before"]
+                        c_after = s["counter_after"]
+                        out_rows.append({
+                            "iter": i,
+                            "method": method,
+                            "checkpoint_ms": s.get("checkpoint_ms"),
+                            "restore_ms": s.get("restore_ms"),
+                            "restore_ms_success_only": s.get("restore_ms"),
+                            "restore_retries": 0,
+                            "ckpt_size_bytes": s.get("ckpt_size_bytes"),
+                            "counter_before": c_before,
+                            "counter_after": c_after,
+                            "counter_continues": (c_before is not None and c_after is not None and c_after > c_before),
+                            "http_port": s["http_port"],
+                            "http_before_ok": http_before is not None,
+                            "http_after_ok": http_after is not None,
+                            "http_runtime_same": (
+                                http_before is not None
+                                and http_after is not None
+                                and http_before.get("runtime_id") == http_after.get("runtime_id")
+                            ),
+                            "http_seq_before": None if http_before is None else http_before.get("http_seq"),
+                            "http_seq_after": None if http_after is None else http_after.get("http_seq"),
+                            "http_seq_continues": (
+                                http_before is not None
+                                and http_after is not None
+                                and isinstance(http_before.get("http_seq"), int)
+                                and isinstance(http_after.get("http_seq"), int)
+                                and http_after["http_seq"] > http_before["http_seq"]
+                            ),
+                            "concurrency": args.concurrency,
+                            "containers_total": args.concurrency,
+                            "containers_ok": 1 if (http_before is not None and http_after is not None) else 0,
+                            "row_kind": "container",
+                            "container_slot": s.get("slot"),
+                            "container_name": s["cid"],
+                        })
+            finally:
+                for s in specs:
+                    sh(
+                        ["runc", "delete", "-f", s["cid"]],
+                        sudo=True,
+                        check=False,
+                        capture=True,
+                        cwd=s["bundle_dir"],
+                        timeout=args.cmd_timeout_s,
+                    )
+        return
 
     for i in range(args.iters):
         print(f"[runc {i+1}/{args.iters}] preparing bundle", flush=True)
@@ -735,7 +1465,49 @@ def benchmark_runc_criu(args, out_rows):
                 and isinstance(http_after.get("http_seq"), int)
                 and http_after["http_seq"] > http_before["http_seq"]
             ),
+            "concurrency": 1,
+            "containers_total": 1,
+            "containers_ok": 1 if (http_before is not None and http_after is not None) else 0,
+            "row_kind": "aggregate",
+            "container_slot": None,
+            "container_name": None,
         })
+        if args.per_container_rows:
+            out_rows.append({
+                "iter": i,
+                "method": method,
+                "checkpoint_ms": (t1 - t0) / 1e6,
+                "restore_ms": (t3 - t2) / 1e6,
+                "restore_ms_success_only": (t3 - t2) / 1e6,
+                "restore_retries": 0,
+                "ckpt_size_bytes": ckpt_size,
+                "counter_before": c_before,
+                "counter_after": c_after,
+                "counter_continues": (c_before is not None and c_after is not None and c_after > c_before),
+                "http_port": http_port,
+                "http_before_ok": http_before is not None,
+                "http_after_ok": http_after is not None,
+                "http_runtime_same": (
+                    http_before is not None
+                    and http_after is not None
+                    and http_before.get("runtime_id") == http_after.get("runtime_id")
+                ),
+                "http_seq_before": None if http_before is None else http_before.get("http_seq"),
+                "http_seq_after": None if http_after is None else http_after.get("http_seq"),
+                "http_seq_continues": (
+                    http_before is not None
+                    and http_after is not None
+                    and isinstance(http_before.get("http_seq"), int)
+                    and isinstance(http_after.get("http_seq"), int)
+                    and http_after["http_seq"] > http_before["http_seq"]
+                ),
+                "concurrency": 1,
+                "containers_total": 1,
+                "containers_ok": 1 if (http_before is not None and http_after is not None) else 0,
+                "row_kind": "container",
+                "container_slot": 0,
+                "container_name": cid,
+            })
 
 
 def main():
@@ -743,6 +1515,13 @@ def main():
     ap.add_argument("--image", default="agent-sandbox-bench:latest")
     ap.add_argument("--name", default="asb")
     ap.add_argument("--iters", type=int, default=5)
+    ap.add_argument("--concurrency", type=int, default=1,
+                    help="Number of containers checkpointed/restored concurrently per iteration.")
+    ap.add_argument(
+        "--per-container-rows",
+        action="store_true",
+        help="Also emit one CSV row per container (in addition to per-iteration aggregate rows).",
+    )
     ap.add_argument("--mem-mb", type=int, default=128)
     ap.add_argument("--warmup-s", type=float, default=2.0)
     ap.add_argument("--post-restore-s", type=float, default=1.0)
@@ -787,6 +1566,8 @@ def main():
     ap.add_argument("--run-runc", action="store_true")
 
     args = ap.parse_args()
+    if args.concurrency < 1:
+        raise ValueError("--concurrency must be >= 1")
     Path(args.work_root).mkdir(parents=True, exist_ok=True)
 
     rows = []
@@ -808,7 +1589,9 @@ def main():
             "iter", "method", "checkpoint_ms", "restore_ms", "restore_ms_success_only", "restore_retries", "ckpt_size_bytes",
             "counter_before", "counter_after", "counter_continues",
             "http_port", "http_before_ok", "http_after_ok", "http_runtime_same",
-            "http_seq_before", "http_seq_after", "http_seq_continues"
+            "http_seq_before", "http_seq_after", "http_seq_continues",
+            "concurrency", "containers_total", "containers_ok",
+            "row_kind", "container_slot", "container_name"
         ])
         w.writeheader()
         for r in rows:
@@ -817,11 +1600,14 @@ def main():
     # print a tiny summary
     def avg(key, method):
         xs = [float(r[key]) for r in rows if r["method"]
-              == method and r[key] is not None]
+              == method and r.get("row_kind") == "aggregate" and r[key] is not None]
         return sum(xs)/len(xs) if xs else None
 
     def ratio_true(key, method):
-        xs = [bool(r[key]) for r in rows if r["method"] == method and r.get(key) is not None]
+        xs = [
+            bool(r[key]) for r in rows
+            if r["method"] == method and r.get("row_kind") == "aggregate" and r.get(key) is not None
+        ]
         if not xs:
             return None
         return sum(1 for x in xs if x) / len(xs)
