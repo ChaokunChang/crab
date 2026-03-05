@@ -84,6 +84,53 @@ def docker_inspect_counter(workdir):
         return None
 
 
+def payload_counter(payload):
+    if payload is None:
+        return None
+    v = payload.get("counter")
+    return v if isinstance(v, int) else None
+
+
+def best_effort_counter(workdir, http_payload=None):
+    # Prefer persisted state.json, but fall back to in-memory HTTP counter
+    # when state write lags behind process readiness.
+    file_counter = docker_inspect_counter(workdir)
+    if isinstance(file_counter, int):
+        return file_counter
+    return payload_counter(http_payload)
+
+
+def wait_for_counter(
+    workdir,
+    http_port,
+    target_gt=None,
+    timeout_s=10.0,
+    interval_s=0.2,
+    http_timeout_s=1.0,
+):
+    """
+    Poll counter from state.json (preferred) with HTTP fallback until:
+      - counter is available (target_gt is None), or
+      - counter > target_gt.
+    Returns best observed counter (may still be None / <= target on timeout).
+    """
+    deadline = time.time() + timeout_s
+    last = None
+    while True:
+        http = probe_http(
+            http_port,
+            timeout_s=http_timeout_s,
+            retries=1,
+            retry_delay_s=0.0,
+        )
+        last = best_effort_counter(workdir, http)
+        if last is not None and (target_gt is None or last > target_gt):
+            return last
+        if time.time() >= deadline:
+            return last
+        time.sleep(interval_s)
+
+
 def probe_http(port, timeout_s=1.0, retries=10, retry_delay_s=0.2):
     url = f"http://127.0.0.1:{port}/healthz"
     for attempt in range(retries):
@@ -202,13 +249,22 @@ def benchmark_docker_checkpoint(args, out_rows):
                 ])
 
                 time.sleep(args.warmup_s)
-                c_before = docker_inspect_counter(workdir)
                 http_before = probe_http(
                     http_port,
                     timeout_s=args.http_timeout_s,
                     retries=args.http_probe_retries,
                     retry_delay_s=args.http_probe_delay_s,
                 )
+                c_before = best_effort_counter(workdir, http_before)
+                if c_before is None:
+                    c_before = wait_for_counter(
+                        workdir,
+                        http_port,
+                        target_gt=None,
+                        timeout_s=args.counter_wait_timeout_s,
+                        interval_s=args.counter_wait_interval_s,
+                        http_timeout_s=args.http_timeout_s,
+                    )
 
                 # checkpoint
                 t0 = now_ns()
@@ -359,13 +415,22 @@ def benchmark_docker_checkpoint(args, out_rows):
                         f"docker restore succeeded but no success timing recorded for {ctr}")
 
                 time.sleep(args.post_restore_s)
-                c_after = docker_inspect_counter(workdir)
                 http_after = probe_http(
                     http_port,
                     timeout_s=args.http_timeout_s,
                     retries=args.http_probe_retries,
                     retry_delay_s=args.http_probe_delay_s,
                 )
+                c_after = best_effort_counter(workdir, http_after)
+                if c_before is not None and (c_after is None or c_after <= c_before):
+                    c_after = wait_for_counter(
+                        workdir,
+                        http_port,
+                        target_gt=c_before,
+                        timeout_s=args.counter_wait_timeout_s,
+                        interval_s=args.counter_wait_interval_s,
+                        http_timeout_s=args.http_timeout_s,
+                    )
 
                 out_rows.append({
                     "iter": i,
@@ -565,13 +630,22 @@ def benchmark_runc_criu(args, out_rows):
                 f"workload exited early (command was {py_bin} /app/agent_workload.py)."
             )
 
-        c_before = docker_inspect_counter(workdir)
         http_before = probe_http(
             http_port,
             timeout_s=args.http_timeout_s,
             retries=args.http_probe_retries,
             retry_delay_s=args.http_probe_delay_s,
         )
+        c_before = best_effort_counter(workdir, http_before)
+        if c_before is None:
+            c_before = wait_for_counter(
+                workdir,
+                http_port,
+                target_gt=None,
+                timeout_s=args.counter_wait_timeout_s,
+                interval_s=args.counter_wait_interval_s,
+                http_timeout_s=args.http_timeout_s,
+            )
 
         ckpt_dir = (Path(args.work_root) / f"ckpt-runc-{i}").absolute()
         work_path = (Path(args.work_root) / f"ckpt-work-{i}").absolute()
@@ -612,13 +686,22 @@ def benchmark_runc_criu(args, out_rows):
         t3 = now_ns()
 
         time.sleep(args.post_restore_s)
-        c_after = docker_inspect_counter(workdir)
         http_after = probe_http(
             http_port,
             timeout_s=args.http_timeout_s,
             retries=args.http_probe_retries,
             retry_delay_s=args.http_probe_delay_s,
         )
+        c_after = best_effort_counter(workdir, http_after)
+        if c_before is not None and (c_after is None or c_after <= c_before):
+            c_after = wait_for_counter(
+                workdir,
+                http_port,
+                target_gt=c_before,
+                timeout_s=args.counter_wait_timeout_s,
+                interval_s=args.counter_wait_interval_s,
+                http_timeout_s=args.http_timeout_s,
+            )
 
         # cleanup
         sh(["runc", "delete", "-f", cid], sudo=True,
@@ -672,6 +755,8 @@ def main():
     ap.add_argument("--http-timeout-s", type=float, default=1.0)
     ap.add_argument("--http-probe-retries", type=int, default=20)
     ap.add_argument("--http-probe-delay-s", type=float, default=0.2)
+    ap.add_argument("--counter-wait-timeout-s", type=float, default=20.0)
+    ap.add_argument("--counter-wait-interval-s", type=float, default=0.2)
     ap.add_argument("--out", default="results.csv")
     ap.add_argument("--use-custom-checkpoint-dir", action="store_true")
     ap.add_argument(
