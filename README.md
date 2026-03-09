@@ -1,130 +1,45 @@
-# Container Checkpoint/Restore Benchmark
+# Agent-CR (Interface-First v1)
 
-This repository benchmarks checkpoint/restore latency for a stateful Python workload using:
+This repository now contains a new `agent_cr/` package that implements an interface-first C/R architecture for agent sandboxes.
 
-- Docker checkpoint/restore
-- `runc` + CRIU checkpoint/restore
+Legacy benchmark scripts remain in `legacy/` and are unchanged.
 
-The workload (`agent_workload.py`) now does all of the following:
+## What Is Implemented
 
-- Increments a counter and writes `/work/state.json`
-- Mutates an in-memory buffer (to emulate agent runtime memory)
-- Runs an HTTP server (`/healthz`) with in-memory request sequence + runtime ID
+- Modular contracts for:
+  - Scheduler, executor, policies
+  - Runtime adapters (generic + docker/runc dry-run stubs)
+  - Process/filesystem workers (checkpoint + restore)
+  - Checkpoint manager (local filesystem implementation)
+  - Sandbox inspector, interceptor hooks, sandbox lifecycle manager
+  - Telemetry event/metric sink
+- Versioned checkpoint manifest (`v1`) with integrity hash validation.
+- Deterministic dry-run behavior for runtime operations (`executed=False`) so orchestration can be tested end-to-end.
+- Sync executor API backed by thread pool for concurrent jobs.
 
-This lets the benchmark verify both disk-backed state continuity and in-memory HTTP runtime continuity across restore.
+## Quickstart
 
-## Files
-
-- `bench_cr.py`: Benchmark runner for Docker and `runc`+CRIU paths.
-- `bench_runc_mem_sweep.py`: Sweep/plot runc latency vs `mem_mb`.
-- `bench_runc_concurrency_sweep.py`: Sweep/plot runc latency vs `concurrency`.
-- `bench_runc_mem_concurrency_sweep.py`: Sweep/plot runc latency vs (`mem_mb`, `concurrency`).
-- `agent_workload.py`: Stateful test workload executed inside the container.
-- `Dockerfile`: Image definition for the workload container.
-- `results.csv`: Example output.
-
-## Prerequisites
-
-- Linux host with checkpoint/restore support
-- Python 3.11+
-- Docker with checkpoint support enabled
-- `runc` and CRIU installed on host (`runc --version`, `criu --version`)
-- Privileges for `runc` checkpoint/restore (typically root/sudo)
-
-## Quick Start
-
-Build benchmark image:
+Run tests:
 
 ```bash
-docker build -t agent-sandbox-bench:latest .
+python3 -m unittest discover -s tests -v
 ```
 
-Run both benchmark modes (default):
+Run microbench:
 
 ```bash
-python3 bench_cr.py --iters 3 --out results.csv
-
-# concurrent checkpoint/restore of 4 containers per iteration
-python3 bench_cr.py --iters 3 --concurrency 4 --out results_conc4.csv
+python3 benchmarks/bench_agent_cr_micro.py --iters 1000 --storage-iters 200 --executor-jobs 64
 ```
 
-Run Docker-only mode:
+Run simulated E2E benchmark:
 
 ```bash
-python3 bench_cr.py --run-docker --iters 3 --out results.csv
+python3 benchmarks/bench_agent_cr_e2e.py --sandboxes 8 --iters 20
 ```
 
-Run `runc`+CRIU-only mode:
+## Package Layout
 
-```bash
-python3 bench_cr.py --run-runc --iters 3 --out results.csv
-```
-
-Run `runc` latency sweep vs `concurrency`:
-
-```bash
-python3 bench_runc_concurrency_sweep.py --iters 3 --concurrency-values 1,2,4,8
-```
-
-Run `runc` latency sweep vs (`mem_mb`, `concurrency`):
-
-```bash
-python3 bench_runc_mem_concurrency_sweep.py --iters 3 --mem-values 128,512,1024 --concurrency-values 1,2,4
-```
-
-## Important Notes
-
-- `runc` benchmark artifacts are written under `./bench_out`.
-- The runner uses `sudo` for `runc run/checkpoint/restore/delete`.
-- Docker checkpoint size is read from `--docker-root` (default `/var/lib/docker`).
-- Docker HTTP workload port is `--http-port-base + (iter * concurrency + slot)` (default base `18080`).
-- `runc` HTTP workload port is `--runc-http-port-base + (iter * concurrency + slot)` (default base `19080`).
-- Some Docker runtimes can create checkpoints in `--checkpoint-dir` but cannot restore from it.
-  Use `--docker-custom-ckpt-restore daemon` to bridge custom checkpoint files into daemon-managed storage before restore.
-  Use `--docker-custom-ckpt-bridge copy|symlink|hardlink` to pick bridge behavior (default `copy`).
-- `--concurrency` defaults to `1`. With `--concurrency > 1`, checkpoint/restore is executed in parallel batches per iteration.
-- Use `--per-container-rows` to emit one row per container in addition to aggregate per-iteration rows.
-- `--use-custom-checkpoint-dir` currently only supports `--concurrency 1`.
-
-Example for tmpfs-backed checkpoint writes with daemon restore:
-
-```bash
-python3 bench_cr.py \
-  --run-docker \
-  --iters 3 \
-  --out results_tmpfs_1G.csv \
-  --mem-mb 1024 \
-  --work-root /mnt/mytmpfs/bench_out \
-  --use-custom-checkpoint-dir \
-  --docker-custom-ckpt-restore daemon \
-  --docker-custom-ckpt-bridge symlink
-```
-
-## Output
-
-`results.csv` contains:
-
-- `iter`
-- `method`
-- `checkpoint_ms`
-- `restore_ms`
-- `ckpt_size_bytes`
-- `counter_before`
-- `counter_after`
-- `counter_continues`
-- `http_port`
-- `http_before_ok`
-- `http_after_ok`
-- `http_runtime_same`
-- `http_seq_before`
-- `http_seq_after`
-- `http_seq_continues`
-- `concurrency`
-- `containers_total`
-- `containers_ok`
-- `row_kind` (`aggregate` or `container`)
-- `container_slot`
-- `container_name`
-
-`counter_continues=True` indicates the workload state advanced across restore.
-`http_runtime_same=True` + `http_seq_continues=True` indicates the restored process kept serving with the same in-memory runtime identity and continued HTTP request sequence.
+- `agent_cr/` - core package
+- `benchmarks/` - new v1 interface/simulated benchmarks
+- `tests/` - unit + contract + simulated e2e tests
+- `legacy/` - prior runtime benchmark scripts
