@@ -3,12 +3,15 @@ from __future__ import annotations
 import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 from typing import Any
 
 from ..contracts import SandboxRuntimeAdapter
 from ..ids import CheckpointId, SandboxId
 from ..models import RuntimeCapabilities, RuntimeOperationStatus
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -35,6 +38,7 @@ class SubprocessCommandRunner(CommandRunner):
             command,
             cwd=None if cwd is None else str(cwd),
             check=False,
+            stdin=(subprocess.DEVNULL if detached else None),
             stdout=(subprocess.DEVNULL if detached else subprocess.PIPE),
             stderr=(subprocess.DEVNULL if detached else subprocess.PIPE),
             text=True,
@@ -133,8 +137,23 @@ class CommandRuntimeAdapter(SandboxRuntimeAdapter):
         return self._filesystem_metadata(sandbox_id, checkpoint_id, phase="filesystem_checkpoint")
 
     def _execute(self, command: list[str], *, metadata: dict[str, Any]) -> RuntimeOperationStatus:
+        logger.debug(
+            "Executing runtime command phase=%s sandbox=%s checkpoint=%s command=%s",
+            metadata.get("phase"),
+            metadata.get("sandbox_id"),
+            metadata.get("checkpoint_id"),
+            " ".join(command),
+        )
         result = self._runner.run(command)
         if result.returncode != 0:
+            logger.error(
+                "Runtime command failed rc=%d phase=%s sandbox=%s checkpoint=%s stderr=%s",
+                result.returncode,
+                metadata.get("phase"),
+                metadata.get("sandbox_id"),
+                metadata.get("checkpoint_id"),
+                result.stderr.strip(),
+            )
             raise RuntimeError(
                 f"command failed ({result.returncode}): {' '.join(command)}"
                 f"\nstderr: {result.stderr.strip()}"
@@ -142,6 +161,12 @@ class CommandRuntimeAdapter(SandboxRuntimeAdapter):
         merged = dict(metadata)
         merged["stdout"] = result.stdout.strip()
         merged["stderr"] = result.stderr.strip()
+        logger.debug(
+            "Runtime command completed phase=%s sandbox=%s checkpoint=%s",
+            metadata.get("phase"),
+            metadata.get("sandbox_id"),
+            metadata.get("checkpoint_id"),
+        )
         return RuntimeOperationStatus(
             executed=True,
             reason="command_executed",

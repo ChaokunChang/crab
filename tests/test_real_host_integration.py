@@ -97,7 +97,7 @@ class RealHostIntegrationTests(unittest.TestCase):
         image_tag = f"agent-cr-simulated-agent:{int(time.time())}"
         executor: CRExecutor | None = None
 
-        llm_server = serve(host="127.0.0.1", port=0, response_delay_ms=350)
+        llm_server = serve(host="127.0.0.1", port=0, response_delay_ms=500)
         llm_thread = threading.Thread(target=llm_server.serve_forever, daemon=True)
         llm_thread.start()
         self.addCleanup(llm_server.shutdown)

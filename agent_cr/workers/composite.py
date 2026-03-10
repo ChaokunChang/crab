@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import logging
 
 from ..contracts import (
     CheckpointManager,
@@ -25,6 +26,8 @@ from ..models import (
     utc_now,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class DefaultCWorker(CompositeCheckpointWorker):
     def __init__(
@@ -42,9 +45,22 @@ class DefaultCWorker(CompositeCheckpointWorker):
     def checkpoint(self, job: CheckpointJob) -> CheckpointResult:
         started = utc_now()
         checkpoint_id = CheckpointId(str(job.metadata.get("checkpoint_id", CheckpointId.new())))
+        logger.info(
+            "Starting composite checkpoint for job %s sandbox=%s checkpoint=%s",
+            job.job_id,
+            job.sandbox_id,
+            checkpoint_id,
+        )
 
         process_step = self._process_worker.checkpoint(job, checkpoint_id)
         if not process_step.success:
+            logger.warning(
+                "Process checkpoint step failed for job %s sandbox=%s code=%s message=%s",
+                job.job_id,
+                job.sandbox_id,
+                process_step.failure_code.value,
+                process_step.message,
+            )
             return CheckpointResult(
                 job_id=job.job_id,
                 sandbox_id=job.sandbox_id,
@@ -60,6 +76,13 @@ class DefaultCWorker(CompositeCheckpointWorker):
 
         fs_step = self._filesystem_worker.checkpoint(job, checkpoint_id)
         if not fs_step.success:
+            logger.warning(
+                "Filesystem checkpoint step failed for job %s sandbox=%s code=%s message=%s",
+                job.job_id,
+                job.sandbox_id,
+                fs_step.failure_code.value,
+                fs_step.message,
+            )
             return CheckpointResult(
                 job_id=job.job_id,
                 sandbox_id=job.sandbox_id,
@@ -82,6 +105,13 @@ class DefaultCWorker(CompositeCheckpointWorker):
                     artifact=artifact,
                 )
             )
+        logger.debug(
+            "Stored %d artifacts for job %s sandbox=%s checkpoint=%s",
+            len(refs),
+            job.job_id,
+            job.sandbox_id,
+            checkpoint_id,
+        )
 
         process_refs = [x for x in refs if x.kind == ArtifactKind.PROCESS]
         fs_refs = [x for x in refs if x.kind == ArtifactKind.FILESYSTEM]
@@ -103,6 +133,12 @@ class DefaultCWorker(CompositeCheckpointWorker):
         try:
             self._checkpoint_manager.put_manifest(manifest)
         except Exception as exc:
+            logger.exception(
+                "Failed to persist manifest for job %s sandbox=%s checkpoint=%s",
+                job.job_id,
+                job.sandbox_id,
+                checkpoint_id,
+            )
             return CheckpointResult(
                 job_id=job.job_id,
                 sandbox_id=job.sandbox_id,
@@ -116,6 +152,12 @@ class DefaultCWorker(CompositeCheckpointWorker):
                 operation_statuses=(process_step.operation_status, fs_step.operation_status),
             )
 
+        logger.info(
+            "Composite checkpoint succeeded for job %s sandbox=%s checkpoint=%s",
+            job.job_id,
+            job.sandbox_id,
+            checkpoint_id,
+        )
         return CheckpointResult(
             job_id=job.job_id,
             sandbox_id=job.sandbox_id,
@@ -141,12 +183,24 @@ class DefaultRWorker(CompositeRestoreWorker):
 
     def restore(self, job: RestoreJob) -> RestoreResult:
         started = utc_now()
+        logger.info(
+            "Starting composite restore for job %s sandbox=%s checkpoint=%s",
+            job.job_id,
+            job.sandbox_id,
+            job.checkpoint_id,
+        )
         try:
             manifest = self._checkpoint_manager.get_manifest(
                 sandbox_id=job.sandbox_id,
                 checkpoint_id=job.checkpoint_id,
             )
         except Exception as exc:
+            logger.exception(
+                "Failed to load manifest for restore job %s sandbox=%s checkpoint=%s",
+                job.job_id,
+                job.sandbox_id,
+                job.checkpoint_id,
+            )
             return RestoreResult(
                 job_id=job.job_id,
                 sandbox_id=job.sandbox_id,
@@ -171,6 +225,12 @@ class DefaultRWorker(CompositeRestoreWorker):
                     reference=process_state_ref,
                 )
             except Exception as exc:
+                logger.exception(
+                    "Failed to load process artifact for restore job %s sandbox=%s checkpoint=%s",
+                    job.job_id,
+                    job.sandbox_id,
+                    job.checkpoint_id,
+                )
                 return RestoreResult(
                     job_id=job.job_id,
                     sandbox_id=job.sandbox_id,
@@ -182,9 +242,22 @@ class DefaultRWorker(CompositeRestoreWorker):
                     message=str(exc),
                 )
             restore_job = replace(job, metadata={**job.metadata, "process_state_payload": payload})
+            logger.debug(
+                "Loaded process state payload for restore job %s sandbox=%s checkpoint=%s",
+                job.job_id,
+                job.sandbox_id,
+                job.checkpoint_id,
+            )
 
         fs_step = self._filesystem_worker.restore(restore_job, manifest)
         if not fs_step.success:
+            logger.warning(
+                "Filesystem restore step failed for job %s sandbox=%s code=%s message=%s",
+                job.job_id,
+                job.sandbox_id,
+                fs_step.failure_code.value,
+                fs_step.message,
+            )
             return RestoreResult(
                 job_id=job.job_id,
                 sandbox_id=job.sandbox_id,
@@ -199,6 +272,13 @@ class DefaultRWorker(CompositeRestoreWorker):
 
         process_step = self._process_worker.restore(restore_job, manifest)
         if not process_step.success:
+            logger.warning(
+                "Process restore step failed for job %s sandbox=%s code=%s message=%s",
+                job.job_id,
+                job.sandbox_id,
+                process_step.failure_code.value,
+                process_step.message,
+            )
             return RestoreResult(
                 job_id=job.job_id,
                 sandbox_id=job.sandbox_id,
@@ -211,6 +291,12 @@ class DefaultRWorker(CompositeRestoreWorker):
                 operation_statuses=(fs_step.operation_status, process_step.operation_status),
             )
 
+        logger.info(
+            "Composite restore succeeded for job %s sandbox=%s checkpoint=%s",
+            job.job_id,
+            job.sandbox_id,
+            job.checkpoint_id,
+        )
         return RestoreResult(
             job_id=job.job_id,
             sandbox_id=job.sandbox_id,

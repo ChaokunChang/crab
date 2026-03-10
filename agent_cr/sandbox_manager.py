@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -10,6 +11,8 @@ from .contracts import SandboxManager
 from .ids import SandboxId
 from .models import SandboxDescription
 from .runtime.base import CommandRunner, SubprocessCommandRunner
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -34,16 +37,19 @@ class InMemorySandboxManager(SandboxManager):
                 status="running",
                 metadata=dict(metadata or {}),
             )
-            return sandbox_id
+        logger.info("Launched in-memory sandbox %s with runtime=%s", sandbox_id, runtime_name)
+        return sandbox_id
 
     def stop(self, sandbox_id: SandboxId) -> None:
         with self._lock:
             cur = self._items[sandbox_id]
             self._items[sandbox_id] = replace(cur, status="stopped")
+        logger.info("Stopped in-memory sandbox %s", sandbox_id)
 
     def delete(self, sandbox_id: SandboxId) -> None:
         with self._lock:
             self._items.pop(sandbox_id)
+        logger.info("Deleted in-memory sandbox %s", sandbox_id)
 
     def describe(self, sandbox_id: SandboxId) -> SandboxDescription:
         with self._lock:
@@ -76,6 +82,12 @@ class RuncSandboxManager(SandboxManager):
         bundle_path = Path(str(md["bundle_path"])) if "bundle_path" in md else self._paths.bundle_root / str(sandbox_id)
         rootfs_path = bundle_path / "rootfs"
         dataset = str(md.get("zfs_dataset", f"{self._paths.zfs_dataset_prefix}/{sandbox_id}"))
+        logger.info(
+            "Launching runc sandbox %s with bundle=%s dataset=%s",
+            sandbox_id,
+            bundle_path,
+            dataset,
+        )
 
         bundle_path.mkdir(parents=True, exist_ok=True)
         rootfs_path.mkdir(parents=True, exist_ok=True)
@@ -101,18 +113,22 @@ class RuncSandboxManager(SandboxManager):
         with self._lock:
             self._items[sandbox_id] = description
         self._persist(description)
+        logger.info("Sandbox %s is running with rootfs=%s", sandbox_id, rootfs_path)
         return sandbox_id
 
     def stop(self, sandbox_id: SandboxId) -> None:
         description = self.describe(sandbox_id)
+        logger.info("Stopping sandbox %s", sandbox_id)
         self._run([self._runtime_bin, "--root", str(self._paths.state_root), "kill", str(sandbox_id), "TERM"])
         updated = replace(description, status="stopped")
         with self._lock:
             self._items[sandbox_id] = updated
         self._persist(updated)
+        logger.info("Sandbox %s stopped", sandbox_id)
 
     def delete(self, sandbox_id: SandboxId) -> None:
         description = self.describe(sandbox_id)
+        logger.info("Deleting sandbox %s", sandbox_id)
         self._run([self._runtime_bin, "--root", str(self._paths.state_root), "delete", "-f", str(sandbox_id)])
         dataset = str(description.metadata.get("zfs_dataset", ""))
         if dataset:
@@ -122,6 +138,7 @@ class RuncSandboxManager(SandboxManager):
             metadata_path.unlink()
         with self._lock:
             self._items.pop(sandbox_id, None)
+        logger.info("Sandbox %s deleted", sandbox_id)
 
     def describe(self, sandbox_id: SandboxId) -> SandboxDescription:
         with self._lock:
@@ -140,6 +157,7 @@ class RuncSandboxManager(SandboxManager):
         )
         with self._lock:
             self._items[sandbox_id] = description
+        logger.debug("Loaded sandbox %s description from %s", sandbox_id, path)
         return description
 
     def _persist(self, description: SandboxDescription) -> None:
@@ -159,14 +177,23 @@ class RuncSandboxManager(SandboxManager):
             )
         )
         tmp.replace(path)
+        logger.debug("Persisted sandbox %s metadata to %s", description.sandbox_id, path)
 
     def _metadata_path(self, sandbox_id: SandboxId) -> Path:
         return self._paths.metadata_root / f"{sandbox_id}.json"
 
     def _run(self, command: list[str]) -> None:
+        logger.debug("Running sandbox manager command: %s", " ".join(command))
         result = self._runner.run(command)
         if result.returncode != 0:
+            logger.error(
+                "Sandbox manager command failed rc=%d command=%s stderr=%s",
+                result.returncode,
+                " ".join(command),
+                result.stderr.strip(),
+            )
             raise RuntimeError(
                 f"command failed ({result.returncode}): {' '.join(command)}"
                 f"\nstderr: {result.stderr.strip()}"
             )
+        logger.debug("Sandbox manager command completed: %s", " ".join(command))

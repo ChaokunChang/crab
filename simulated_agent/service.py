@@ -164,7 +164,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, required=True)
-    parser.add_argument("--response-delay-ms", type=int, default=0)
+    parser.add_argument("--response-delay-ms", type=int, default=500)
     args = parser.parse_args()
 
     server = serve(host=args.host, port=args.port, response_delay_ms=args.response_delay_ms)

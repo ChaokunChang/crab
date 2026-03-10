@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import tarfile
 from pathlib import Path
 
 from ..contracts import ProcessCWorker, ProcessRWorker, SandboxRuntimeAdapter
 from ..ids import CheckpointId
 from ..models import ArtifactKind, ArtifactPayload, CheckpointJob, CheckpointManifest, RestoreJob, WorkerStepResult
+
+logger = logging.getLogger(__name__)
 
 
 def _metadata_artifact(name: str, payload: dict[str, object], *, adapter_name: str) -> ArtifactPayload:
@@ -40,6 +43,12 @@ class AdapterProcessCWorker(ProcessCWorker):
         self._adapter = adapter
 
     def checkpoint(self, job: CheckpointJob, checkpoint_id: CheckpointId) -> WorkerStepResult:
+        logger.debug(
+            "Running process checkpoint worker for sandbox=%s checkpoint=%s adapter=%s",
+            job.sandbox_id,
+            checkpoint_id,
+            self._adapter.name,
+        )
         status = self._adapter.checkpoint_process(job.sandbox_id, checkpoint_id)
         payload = {
             "sandbox_id": str(job.sandbox_id),
@@ -62,6 +71,13 @@ class AdapterProcessCWorker(ProcessCWorker):
                     metadata={"adapter": self._adapter.name, "source_path": image_path},
                 )
             )
+        logger.debug(
+            "Process checkpoint worker finished for sandbox=%s checkpoint=%s executed=%s artifacts=%d",
+            job.sandbox_id,
+            checkpoint_id,
+            status.executed,
+            len(artifacts),
+        )
         return WorkerStepResult(success=True, artifacts=artifacts, operation_status=status)
 
 
@@ -82,5 +98,17 @@ class AdapterProcessRWorker(ProcessRWorker):
             if image_path is None:
                 raise ValueError("runtime adapter did not provide image_path for restore")
             _extract_tarball(bytes(payload), Path(str(image_path)))
+            logger.debug(
+                "Extracted process checkpoint payload for sandbox=%s checkpoint=%s into %s",
+                job.sandbox_id,
+                job.checkpoint_id,
+                image_path,
+            )
         status = self._adapter.restore_process(job.sandbox_id, job.checkpoint_id)
+        logger.debug(
+            "Process restore worker finished for sandbox=%s checkpoint=%s executed=%s",
+            job.sandbox_id,
+            job.checkpoint_id,
+            status.executed,
+        )
         return WorkerStepResult(success=True, artifacts=[], operation_status=status)

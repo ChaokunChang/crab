@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import tempfile
-import threading
 import unittest
 from pathlib import Path
 
@@ -74,16 +73,13 @@ class InterceptorTests(unittest.TestCase):
         self.assertEqual(event_names.count("request.start"), 1)
         self.assertEqual(event_names.count("request.end"), 1)
 
-    def test_interceptor_notifies_system_scheduler_asynchronously(self) -> None:
+    def test_interceptor_notifies_system_scheduler(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_interceptor_") as tmp:
             system = build_default_system(
                 storage_root=tmp,
                 runtime="docker",
                 storage_config=StorageConfig(root_dir=Path(tmp)),
             )
-            seen: list[str] = []
-            seen_event = threading.Event()
-            system.checkpoint_if_due = lambda sandbox_id: seen.append(str(sandbox_id)) or seen_event.set() or None  # type: ignore[method-assign]
 
             interceptor = AgentCRRequestInterceptor(
                 upstream_transport=lambda path, headers, body: (
@@ -121,8 +117,9 @@ class InterceptorTests(unittest.TestCase):
                 ).encode("utf-8"),
             )
 
-            self.assertTrue(seen_event.wait(5.0))
-            self.assertIn("sbx-2", seen)
+            self.assertTrue(system.has_pending_interceptor_signal(SandboxId("sbx-2")))
+            event_names = [name for name, _ in system.telemetry.events]
+            self.assertIn("interceptor.state_changed", event_names)
 
 
 if __name__ == "__main__":

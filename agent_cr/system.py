@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Lock
 
 from .config import ExecutorConfig, PolicyConfig, SchedulerConfig, StorageConfig
 from .contracts import SandboxInspector
@@ -26,6 +27,8 @@ from .workers import (
     DefaultRWorker,
 )
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class AgentCRSystem:
@@ -44,6 +47,7 @@ class AgentCRSystem:
         self._interceptor_pending = set()
 
     def checkpoint_once(self, sandbox_id: SandboxId) -> CheckpointResult:
+        logger.info("Running manual checkpoint for sandbox %s", sandbox_id)
         job = CheckpointJob(
             job_id=JobId.new(),
             sandbox_id=sandbox_id,
@@ -53,16 +57,24 @@ class AgentCRSystem:
         result = self.executor.run_checkpoint(job)
         if result.status.value == "succeeded":
             self.scheduler.mark_checkpoint_complete(sandbox_id, result.finished_at)
+        logger.info("Manual checkpoint for sandbox %s finished with status=%s", sandbox_id, result.status.value)
         return result
 
     def checkpoint_if_due(self, sandbox_id: SandboxId) -> CheckpointResult | None:
-        job = self.scheduler.poll_and_schedule(sandbox_id)
-        if job is None:
-            return None
-        result = self.executor.run_checkpoint(job)
-        if result.status.value == "succeeded":
-            self.scheduler.mark_checkpoint_complete(sandbox_id, result.finished_at)
-        return result
+        try:
+            logger.debug("Checking whether sandbox %s is due for checkpoint", sandbox_id)
+            job = self.scheduler.poll_and_schedule(sandbox_id)
+            if job is None:
+                logger.debug("Sandbox %s is not due for checkpoint", sandbox_id)
+                return None
+            result = self.executor.run_checkpoint(job)
+            if result.status.value == "succeeded":
+                self.scheduler.mark_checkpoint_complete(sandbox_id, result.finished_at)
+            logger.info("Checkpoint-if-due for sandbox %s finished with status=%s", sandbox_id, result.status.value)
+            return result
+        finally:
+            with self._interceptor_lock:
+                self._interceptor_pending.discard(sandbox_id)
 
     def checkpoint_due_sandboxes(self, sandbox_ids: list[SandboxId]) -> list[CheckpointResult]:
         results: list[CheckpointResult] = []
@@ -73,6 +85,7 @@ class AgentCRSystem:
         return results
 
     def restore_once(self, sandbox_id: SandboxId, checkpoint_id) -> RestoreResult:
+        logger.info("Running manual restore for sandbox %s checkpoint=%s", sandbox_id, checkpoint_id)
         job = RestoreJob(
             job_id=JobId.new(),
             sandbox_id=sandbox_id,
@@ -80,37 +93,31 @@ class AgentCRSystem:
             requested_at=utc_now(),
             reason="manual",
         )
-        return self.executor.run_restore(job)
+        result = self.executor.run_restore(job)
+        logger.info(
+            "Manual restore for sandbox %s checkpoint=%s finished with status=%s",
+            sandbox_id,
+            checkpoint_id,
+            result.status.value,
+        )
+        return result
 
     def notify_interceptor_state_change(self, sandbox_id: SandboxId) -> None:
         with self._interceptor_lock:
-            if sandbox_id in self._interceptor_pending:
-                return
             self._interceptor_pending.add(sandbox_id)
-        Thread(target=self._checkpoint_from_interceptor, args=(sandbox_id,), daemon=True).start()
+            pending = sandbox_id in self._interceptor_pending
+        logger.debug("Recorded interceptor state change for sandbox %s pending=%s", sandbox_id, pending)
+        self.telemetry.emit_event(
+            "interceptor.state_changed",
+            {
+                "sandbox_id": str(sandbox_id),
+                "pending": pending,
+            },
+        )
 
-    def _checkpoint_from_interceptor(self, sandbox_id: SandboxId) -> None:
-        try:
-            result = self.checkpoint_if_due(sandbox_id)
-            self.telemetry.emit_event(
-                "interceptor.scheduler_notified",
-                {
-                    "sandbox_id": str(sandbox_id),
-                    "scheduled": result is not None,
-                    "status": "" if result is None else result.status.value,
-                },
-            )
-        except Exception as exc:
-            self.telemetry.emit_event(
-                "interceptor.scheduler_error",
-                {
-                    "sandbox_id": str(sandbox_id),
-                    "error": str(exc),
-                },
-            )
-        finally:
-            with self._interceptor_lock:
-                self._interceptor_pending.discard(sandbox_id)
+    def has_pending_interceptor_signal(self, sandbox_id: SandboxId) -> bool:
+        with self._interceptor_lock:
+            return sandbox_id in self._interceptor_pending
 
 
 def build_default_system(
@@ -124,6 +131,7 @@ def build_default_system(
     use_in_memory_telemetry: bool = True,
     request_state_store: InMemoryRequestStateStore | None = None,
 ) -> AgentCRSystem:
+    logger.info("Building default agent-cr system with runtime=%s storage_root=%s", runtime, storage_root)
     scheduler_cfg = scheduler_config or SchedulerConfig()
     executor_cfg = executor_config or ExecutorConfig()
     store_cfg = storage_config or StorageConfig(root_dir=Path(storage_root))
@@ -159,6 +167,11 @@ def build_default_system(
     )
     sandbox_manager = InMemorySandboxManager() if runtime == "docker" else RuncSandboxManager()
 
+    logger.debug(
+        "Constructed agent-cr components runtime=%s telemetry=%s",
+        runtime,
+        type(telemetry).__name__,
+    )
     return AgentCRSystem(
         scheduler=scheduler,
         executor=executor,

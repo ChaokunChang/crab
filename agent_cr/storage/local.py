@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from pathlib import Path
 
 from ..config import StorageConfig
 from ..contracts import CheckpointManager
 from ..ids import CheckpointId, SandboxId
 from ..models import ArtifactPayload, ArtifactReference, CheckpointManifest
+
+logger = logging.getLogger(__name__)
 
 
 def _safe_name(value: str) -> str:
@@ -51,6 +54,12 @@ class LocalCheckpointManager(CheckpointManager):
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(manifest.to_dict(), sort_keys=True, indent=2))
         tmp.replace(path)
+        logger.debug(
+            "Stored manifest for sandbox=%s checkpoint=%s at %s",
+            manifest.sandbox_id,
+            manifest.checkpoint_id,
+            path,
+        )
 
     def get_manifest(
         self,
@@ -61,6 +70,7 @@ class LocalCheckpointManager(CheckpointManager):
         if not path.exists():
             raise FileNotFoundError(f"manifest not found: {path}")
         raw = json.loads(path.read_text())
+        logger.debug("Loaded manifest for sandbox=%s checkpoint=%s from %s", sandbox_id, checkpoint_id, path)
         return CheckpointManifest.from_dict(raw)
 
     def put_artifact(
@@ -83,7 +93,7 @@ class LocalCheckpointManager(CheckpointManager):
         digest = hashlib.sha256(artifact.data).hexdigest()
         size = len(artifact.data)
         rel = str(path.relative_to(self._root))
-        return ArtifactReference(
+        reference = ArtifactReference(
             kind=artifact.kind,
             name=artifact.name,
             relative_path=rel,
@@ -91,6 +101,15 @@ class LocalCheckpointManager(CheckpointManager):
             sha256=digest,
             metadata=dict(artifact.metadata),
         )
+        logger.debug(
+            "Stored artifact %s for sandbox=%s checkpoint=%s at %s (%d bytes)",
+            artifact.name,
+            sandbox_id,
+            checkpoint_id,
+            path,
+            size,
+        )
+        return reference
 
     def get_artifact(
         self,
@@ -110,6 +129,13 @@ class LocalCheckpointManager(CheckpointManager):
             raise ValueError(f"artifact digest mismatch for {reference.name}")
         if len(payload) != reference.size_bytes:
             raise ValueError(f"artifact size mismatch for {reference.name}")
+        logger.debug(
+            "Loaded artifact %s for sandbox=%s checkpoint=%s from %s",
+            reference.name,
+            sandbox_id,
+            checkpoint_id,
+            path,
+        )
         return payload
 
     def list_checkpoints(self, sandbox_id: SandboxId) -> list[CheckpointId]:
@@ -124,4 +150,5 @@ class LocalCheckpointManager(CheckpointManager):
             ckpt = CheckpointId(str(raw["checkpoint_id"]))
             manifests.append((created_at, ckpt))
         manifests.sort(key=lambda x: x[0])
+        logger.debug("Listed %d checkpoints for sandbox=%s", len(manifests), sandbox_id)
         return [x[1] for x in manifests]

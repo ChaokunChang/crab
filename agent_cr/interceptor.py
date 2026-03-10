@@ -253,7 +253,10 @@ class AgentCRRequestInterceptorServer:
                             continue
                         self.send_header(key, value)
                     self.end_headers()
-                    self.wfile.write(body)
+                    try:
+                        self.wfile.write(body)
+                    except BrokenPipeError:
+                        return
                 except ValueError as exc:
                     self.send_error(400, str(exc))
                 except urllib.error.HTTPError as exc:
@@ -264,7 +267,10 @@ class AgentCRRequestInterceptorServer:
                             continue
                         self.send_header(key, value)
                     self.end_headers()
-                    self.wfile.write(body)
+                    try:
+                        self.wfile.write(body)
+                    except BrokenPipeError:
+                        return
 
             def log_message(self, format: str, *args) -> None:
                 _ = (format, args)

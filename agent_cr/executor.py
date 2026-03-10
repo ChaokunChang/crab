@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+import logging
 from threading import Lock
 
 from .config import ExecutorConfig
@@ -19,6 +20,8 @@ from .models import (
     utc_now,
 )
 from .telemetry import NoopTelemetrySink
+
+logger = logging.getLogger(__name__)
 
 
 class CRExecutor:
@@ -38,6 +41,7 @@ class CRExecutor:
         self._records: dict[JobId, JobRecord] = {}
 
     def shutdown(self) -> None:
+        logger.info("Shutting down executor worker pool")
         self._pool.shutdown(wait=True)
 
     def run_checkpoint(self, job: CheckpointJob) -> CheckpointResult:
@@ -79,6 +83,7 @@ class CRExecutor:
                 "sandbox_id": str(job.sandbox_id),
             },
         )
+        logger.info("Queued checkpoint job %s for sandbox %s", job.job_id, job.sandbox_id)
         return self._pool.submit(self._execute_checkpoint, job)
 
     def _submit_restore(self, job: RestoreJob) -> Future[RestoreResult]:
@@ -100,6 +105,12 @@ class CRExecutor:
                 "sandbox_id": str(job.sandbox_id),
                 "checkpoint_id": str(job.checkpoint_id),
             },
+        )
+        logger.info(
+            "Queued restore job %s for sandbox %s checkpoint=%s",
+            job.job_id,
+            job.sandbox_id,
+            job.checkpoint_id,
         )
         return self._pool.submit(self._execute_restore, job)
 
@@ -125,14 +136,25 @@ class CRExecutor:
                 "sandbox_id": str(job.sandbox_id),
             },
         )
+        logger.info("Starting checkpoint job %s for sandbox %s", job.job_id, job.sandbox_id)
 
         last_result: CheckpointResult | None = None
         for attempt in range(self._config.max_retries + 1):
             try:
+                logger.debug(
+                    "Running checkpoint job %s attempt=%d",
+                    job.job_id,
+                    attempt + 1,
+                )
                 last_result = self._checkpoint_worker.checkpoint(job)
                 if last_result.status == JobStatus.SUCCEEDED:
                     break
             except Exception as exc:
+                logger.exception(
+                    "Checkpoint job %s failed with an unhandled exception on attempt %d",
+                    job.job_id,
+                    attempt + 1,
+                )
                 finished = utc_now()
                 last_result = CheckpointResult(
                     job_id=job.job_id,
@@ -144,6 +166,13 @@ class CRExecutor:
                     manifest=None,
                     failure_code=FailureCode.RUNTIME_ERROR,
                     message=str(exc),
+                )
+            if last_result.status != JobStatus.SUCCEEDED and attempt < self._config.max_retries:
+                logger.warning(
+                    "Checkpoint job %s failed on attempt %d with status=%s; retrying",
+                    job.job_id,
+                    attempt + 1,
+                    last_result.status.value,
                 )
             if attempt < self._config.max_retries:
                 time.sleep(self._config.retry_backoff_seconds * (attempt + 1))
@@ -183,6 +212,14 @@ class CRExecutor:
                 "checkpoint_id": str(last_result.checkpoint_id),
             },
         )
+        log_fn = logger.info if last_result.status == JobStatus.SUCCEEDED else logger.error
+        log_fn(
+            "Finished checkpoint job %s for sandbox %s with status=%s checkpoint=%s",
+            job.job_id,
+            job.sandbox_id,
+            last_result.status.value,
+            last_result.checkpoint_id,
+        )
         return last_result
 
     def _execute_restore(self, job: RestoreJob) -> RestoreResult:
@@ -208,14 +245,30 @@ class CRExecutor:
                 "checkpoint_id": str(job.checkpoint_id),
             },
         )
+        logger.info(
+            "Starting restore job %s for sandbox %s checkpoint=%s",
+            job.job_id,
+            job.sandbox_id,
+            job.checkpoint_id,
+        )
 
         last_result: RestoreResult | None = None
         for attempt in range(self._config.max_retries + 1):
             try:
+                logger.debug(
+                    "Running restore job %s attempt=%d",
+                    job.job_id,
+                    attempt + 1,
+                )
                 last_result = self._restore_worker.restore(job)
                 if last_result.status == JobStatus.SUCCEEDED:
                     break
             except Exception as exc:
+                logger.exception(
+                    "Restore job %s failed with an unhandled exception on attempt %d",
+                    job.job_id,
+                    attempt + 1,
+                )
                 last_result = RestoreResult(
                     job_id=job.job_id,
                     sandbox_id=job.sandbox_id,
@@ -225,6 +278,13 @@ class CRExecutor:
                     finished_at=utc_now(),
                     failure_code=FailureCode.RUNTIME_ERROR,
                     message=str(exc),
+                )
+            if last_result.status != JobStatus.SUCCEEDED and attempt < self._config.max_retries:
+                logger.warning(
+                    "Restore job %s failed on attempt %d with status=%s; retrying",
+                    job.job_id,
+                    attempt + 1,
+                    last_result.status.value,
                 )
             if attempt < self._config.max_retries:
                 time.sleep(self._config.retry_backoff_seconds * (attempt + 1))
@@ -264,8 +324,22 @@ class CRExecutor:
                 "checkpoint_id": str(job.checkpoint_id),
             },
         )
+        log_fn = logger.info if last_result.status == JobStatus.SUCCEEDED else logger.error
+        log_fn(
+            "Finished restore job %s for sandbox %s checkpoint=%s with status=%s",
+            job.job_id,
+            job.sandbox_id,
+            job.checkpoint_id,
+            last_result.status.value,
+        )
         return last_result
 
     def _set_record(self, record: JobRecord) -> None:
         with self._lock:
             self._records[record.job_id] = record
+        logger.debug(
+            "Updated job record job_id=%s type=%s status=%s",
+            record.job_id,
+            record.job_type.value,
+            record.status.value,
+        )

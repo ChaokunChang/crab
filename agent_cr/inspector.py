@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime
+import logging
 from threading import Lock
 
 from .contracts import EBPFEventCollector, SandboxInspector
@@ -10,6 +11,7 @@ from .models import EBPFEvent, EBPFEventKind, SandboxSnapshot, utc_now
 
 _PROCESS_EVENT_KINDS = {EBPFEventKind.PROCESS_EXEC, EBPFEventKind.PROCESS_EXIT}
 _FILESYSTEM_EVENT_KINDS = {EBPFEventKind.FILE_WRITE, EBPFEventKind.FILE_DELETE}
+logger = logging.getLogger(__name__)
 
 
 class InMemoryEBPFEventCollector(EBPFEventCollector):
@@ -20,6 +22,7 @@ class InMemoryEBPFEventCollector(EBPFEventCollector):
     def record(self, event: EBPFEvent) -> None:
         with self._lock:
             self._events.append(event)
+        logger.debug("Recorded eBPF event %s for sandbox %s", event.kind.value, event.sandbox_id)
 
     def poll(self, sandbox_id: SandboxId, since: datetime | None = None) -> list[EBPFEvent]:
         with self._lock:
@@ -41,6 +44,13 @@ class EBPFSandboxInspector(SandboxInspector):
         with self._lock:
             self._snapshots[snapshot.sandbox_id] = snapshot
             self._last_cursor.setdefault(snapshot.sandbox_id, snapshot.observed_at)
+        logger.debug(
+            "Upserted snapshot for sandbox %s running=%s process_changed=%s filesystem_changed=%s",
+            snapshot.sandbox_id,
+            snapshot.is_running,
+            snapshot.process_changed,
+            snapshot.filesystem_changed,
+        )
 
     def mark_changed(
         self,
@@ -57,6 +67,12 @@ class EBPFSandboxInspector(SandboxInspector):
                 filesystem_changed=filesystem_changed,
                 observed_at=utc_now(),
             )
+        logger.debug(
+            "Marked sandbox %s changed process_changed=%s filesystem_changed=%s",
+            sandbox_id,
+            process_changed,
+            filesystem_changed,
+        )
 
     def inspect(self, sandbox_id: SandboxId) -> SandboxSnapshot:
         with self._lock:
@@ -91,6 +107,14 @@ class EBPFSandboxInspector(SandboxInspector):
             self._snapshots[sandbox_id] = updated
             if events:
                 self._last_cursor[sandbox_id] = events[-1].observed_at
+        logger.debug(
+            "Inspected sandbox %s events=%d process_changed=%s filesystem_changed=%s network_events=%d",
+            sandbox_id,
+            len(events),
+            updated.process_changed,
+            updated.filesystem_changed,
+            network_event_count,
+        )
         return updated
 
 

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 
 from ..contracts import FileSystemCWorker, FileSystemRWorker, SandboxRuntimeAdapter
 from ..ids import CheckpointId
 from ..models import ArtifactKind, ArtifactPayload, CheckpointJob, CheckpointManifest, RestoreJob, WorkerStepResult
+
+logger = logging.getLogger(__name__)
 
 
 class AdapterFileSystemCWorker(FileSystemCWorker):
@@ -12,6 +15,12 @@ class AdapterFileSystemCWorker(FileSystemCWorker):
         self._adapter = adapter
 
     def checkpoint(self, job: CheckpointJob, checkpoint_id: CheckpointId) -> WorkerStepResult:
+        logger.debug(
+            "Running filesystem checkpoint worker for sandbox=%s checkpoint=%s adapter=%s",
+            job.sandbox_id,
+            checkpoint_id,
+            self._adapter.name,
+        )
         status = self._adapter.checkpoint_filesystem(job.sandbox_id, checkpoint_id)
         metadata = self._adapter.filesystem_checkpoint_metadata(job.sandbox_id, checkpoint_id)
         payload = {
@@ -31,6 +40,12 @@ class AdapterFileSystemCWorker(FileSystemCWorker):
             data=json.dumps(payload, sort_keys=True, indent=2).encode("utf-8"),
             metadata={"adapter": self._adapter.name},
         )
+        logger.debug(
+            "Filesystem checkpoint worker finished for sandbox=%s checkpoint=%s executed=%s",
+            job.sandbox_id,
+            checkpoint_id,
+            status.executed,
+        )
         return WorkerStepResult(success=True, artifacts=[artifact], operation_status=status)
 
 
@@ -41,4 +56,10 @@ class AdapterFileSystemRWorker(FileSystemRWorker):
     def restore(self, job: RestoreJob, manifest: CheckpointManifest) -> WorkerStepResult:
         _ = manifest
         status = self._adapter.restore_filesystem(job.sandbox_id, job.checkpoint_id)
+        logger.debug(
+            "Filesystem restore worker finished for sandbox=%s checkpoint=%s executed=%s",
+            job.sandbox_id,
+            job.checkpoint_id,
+            status.executed,
+        )
         return WorkerStepResult(success=True, artifacts=[], operation_status=status)
