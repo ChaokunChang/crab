@@ -55,7 +55,7 @@ class DefaultCWorker(CompositeCheckpointWorker):
                 manifest=None,
                 failure_code=process_step.failure_code,
                 message=process_step.message,
-                dry_run_statuses=(process_step.dry_run_status,),
+                operation_statuses=(process_step.operation_status,),
             )
 
         fs_step = self._filesystem_worker.checkpoint(job, checkpoint_id)
@@ -70,7 +70,7 @@ class DefaultCWorker(CompositeCheckpointWorker):
                 manifest=None,
                 failure_code=fs_step.failure_code,
                 message=fs_step.message,
-                dry_run_statuses=(process_step.dry_run_status, fs_step.dry_run_status),
+                operation_statuses=(process_step.operation_status, fs_step.operation_status),
             )
 
         refs = []
@@ -113,7 +113,7 @@ class DefaultCWorker(CompositeCheckpointWorker):
                 manifest=None,
                 failure_code=FailureCode.STORAGE_ERROR,
                 message=str(exc),
-                dry_run_statuses=(process_step.dry_run_status, fs_step.dry_run_status),
+                operation_statuses=(process_step.operation_status, fs_step.operation_status),
             )
 
         return CheckpointResult(
@@ -124,7 +124,7 @@ class DefaultCWorker(CompositeCheckpointWorker):
             started_at=started,
             finished_at=utc_now(),
             manifest=manifest,
-            dry_run_statuses=(process_step.dry_run_status, fs_step.dry_run_status),
+            operation_statuses=(process_step.operation_status, fs_step.operation_status),
         )
 
 
@@ -158,21 +158,32 @@ class DefaultRWorker(CompositeRestoreWorker):
                 message=str(exc),
             )
 
-        process_step = self._process_worker.restore(job, manifest)
-        if not process_step.success:
-            return RestoreResult(
-                job_id=job.job_id,
-                sandbox_id=job.sandbox_id,
-                checkpoint_id=job.checkpoint_id,
-                status=JobStatus.FAILED,
-                started_at=started,
-                finished_at=utc_now(),
-                failure_code=process_step.failure_code,
-                message=process_step.message,
-                dry_run_statuses=(process_step.dry_run_status,),
-            )
+        restore_job = job
+        process_state_ref = next(
+            (x for x in manifest.process_artifacts if x.name == "process_state.tar.gz"),
+            None,
+        )
+        if process_state_ref is not None:
+            try:
+                payload = self._checkpoint_manager.get_artifact(
+                    sandbox_id=job.sandbox_id,
+                    checkpoint_id=job.checkpoint_id,
+                    reference=process_state_ref,
+                )
+            except Exception as exc:
+                return RestoreResult(
+                    job_id=job.job_id,
+                    sandbox_id=job.sandbox_id,
+                    checkpoint_id=job.checkpoint_id,
+                    status=JobStatus.FAILED,
+                    started_at=started,
+                    finished_at=utc_now(),
+                    failure_code=FailureCode.STORAGE_ERROR,
+                    message=str(exc),
+                )
+            restore_job = replace(job, metadata={**job.metadata, "process_state_payload": payload})
 
-        fs_step = self._filesystem_worker.restore(job, manifest)
+        fs_step = self._filesystem_worker.restore(restore_job, manifest)
         if not fs_step.success:
             return RestoreResult(
                 job_id=job.job_id,
@@ -183,7 +194,21 @@ class DefaultRWorker(CompositeRestoreWorker):
                 finished_at=utc_now(),
                 failure_code=fs_step.failure_code,
                 message=fs_step.message,
-                dry_run_statuses=(process_step.dry_run_status, fs_step.dry_run_status),
+                operation_statuses=(fs_step.operation_status,),
+            )
+
+        process_step = self._process_worker.restore(restore_job, manifest)
+        if not process_step.success:
+            return RestoreResult(
+                job_id=job.job_id,
+                sandbox_id=job.sandbox_id,
+                checkpoint_id=job.checkpoint_id,
+                status=JobStatus.FAILED,
+                started_at=started,
+                finished_at=utc_now(),
+                failure_code=process_step.failure_code,
+                message=process_step.message,
+                operation_statuses=(fs_step.operation_status, process_step.operation_status),
             )
 
         return RestoreResult(
@@ -193,5 +218,5 @@ class DefaultRWorker(CompositeRestoreWorker):
             status=JobStatus.SUCCEEDED,
             started_at=started,
             finished_at=utc_now(),
-            dry_run_statuses=(process_step.dry_run_status, fs_step.dry_run_status),
+            operation_statuses=(fs_step.operation_status, process_step.operation_status),
         )

@@ -11,10 +11,11 @@ from .models import (
     CheckpointJob,
     CheckpointManifest,
     CheckpointResult,
-    DryRunStatus,
     RequestContext,
     RestoreJob,
     RestoreResult,
+    EBPFEvent,
+    RuntimeOperationStatus,
     RuntimeCapabilities,
     SandboxDescription,
     SandboxSnapshot,
@@ -38,35 +39,51 @@ class SandboxRuntimeAdapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def plan_process_checkpoint(
+    def checkpoint_process(
         self,
         sandbox_id: SandboxId,
         checkpoint_id: CheckpointId,
-    ) -> DryRunStatus:
+    ) -> RuntimeOperationStatus:
         raise NotImplementedError
 
     @abstractmethod
-    def plan_process_restore(
+    def restore_process(
         self,
         sandbox_id: SandboxId,
         checkpoint_id: CheckpointId,
-    ) -> DryRunStatus:
+    ) -> RuntimeOperationStatus:
         raise NotImplementedError
 
     @abstractmethod
-    def plan_filesystem_checkpoint(
+    def process_checkpoint_location(
         self,
         sandbox_id: SandboxId,
         checkpoint_id: CheckpointId,
-    ) -> DryRunStatus:
+    ) -> str | None:
         raise NotImplementedError
 
     @abstractmethod
-    def plan_filesystem_restore(
+    def checkpoint_filesystem(
         self,
         sandbox_id: SandboxId,
         checkpoint_id: CheckpointId,
-    ) -> DryRunStatus:
+    ) -> RuntimeOperationStatus:
+        raise NotImplementedError
+
+    @abstractmethod
+    def restore_filesystem(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> RuntimeOperationStatus:
+        raise NotImplementedError
+
+    @abstractmethod
+    def filesystem_checkpoint_metadata(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> dict[str, object]:
         raise NotImplementedError
 
 
@@ -193,6 +210,12 @@ class CRPolicy(ABC):
 class SandboxInspector(ABC):
     @abstractmethod
     def inspect(self, sandbox_id: SandboxId) -> SandboxSnapshot:
+        raise NotImplementedError
+
+
+class EBPFEventCollector(ABC):
+    @abstractmethod
+    def poll(self, sandbox_id: SandboxId, since: datetime | None = None) -> list[EBPFEvent]:
         raise NotImplementedError
 
 

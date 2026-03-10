@@ -2,6 +2,7 @@ from .config import ExecutorConfig, PolicyConfig, SchedulerConfig, StorageConfig
 from .contracts import (
     CRPolicy,
     CheckpointManager,
+    EBPFEventCollector,
     FileSystemCWorker,
     FileSystemRWorker,
     ProcessCWorker,
@@ -14,7 +15,7 @@ from .contracts import (
 )
 from .executor import CRExecutor
 from .ids import CheckpointId, JobId, SandboxId
-from .inspector import InMemorySandboxInspector
+from .inspector import EBPFSandboxInspector, InMemoryEBPFEventCollector, InMemorySandboxInspector
 from .interceptor import CompositeRequestInterceptorHook, TelemetryRequestInterceptorHook
 from .models import (
     ArtifactKind,
@@ -23,7 +24,8 @@ from .models import (
     CheckpointJob,
     CheckpointManifest,
     CheckpointResult,
-    DryRunStatus,
+    EBPFEvent,
+    EBPFEventKind,
     FailureCode,
     JobRecord,
     JobStatus,
@@ -31,14 +33,15 @@ from .models import (
     RequestContext,
     RestoreJob,
     RestoreResult,
+    RuntimeOperationStatus,
     RuntimeCapabilities,
     SandboxDescription,
     SandboxSnapshot,
     ScheduleDecision,
 )
 from .policy import DefaultHeuristicPolicy
-from .runtime import DockerRuntimeAdapter, RuncRuntimeAdapter
-from .sandbox_manager import InMemorySandboxManager
+from .runtime import CommandRunner, DockerRuntimeAdapter, RuncRuntimeAdapter, RuncRuntimePaths, SubprocessCommandRunner
+from .sandbox_manager import InMemorySandboxManager, RuncSandboxManager, RuncSandboxManagerPaths
 from .scheduler import CRScheduler, InMemorySchedulerStateStore
 from .storage import LocalCheckpointManager
 from .system import AgentCRSystem, build_default_system
@@ -65,16 +68,20 @@ __all__ = [
     "CRExecutor",
     "CRPolicy",
     "CRScheduler",
+    "EBPFEvent",
+    "EBPFEventCollector",
+    "EBPFEventKind",
+    "EBPFSandboxInspector",
     "DefaultCWorker",
     "DefaultHeuristicPolicy",
     "DefaultRWorker",
     "DockerRuntimeAdapter",
-    "DryRunStatus",
     "ExecutorConfig",
     "FailureCode",
     "FileSystemCWorker",
     "FileSystemRWorker",
     "InMemorySandboxInspector",
+    "InMemoryEBPFEventCollector",
     "InMemorySandboxManager",
     "InMemorySchedulerStateStore",
     "InMemoryTelemetrySink",
@@ -92,7 +99,11 @@ __all__ = [
     "RestoreJob",
     "RestoreResult",
     "RuncRuntimeAdapter",
+    "RuncRuntimePaths",
+    "RuncSandboxManager",
+    "RuncSandboxManagerPaths",
     "RuntimeCapabilities",
+    "RuntimeOperationStatus",
     "SandboxDescription",
     "SandboxId",
     "SandboxInspector",
@@ -102,8 +113,10 @@ __all__ = [
     "ScheduleDecision",
     "SchedulerConfig",
     "StorageConfig",
+    "SubprocessCommandRunner",
     "TelemetryConfig",
     "TelemetrySink",
+    "CommandRunner",
     "build_default_system",
     "AdapterProcessCWorker",
     "AdapterProcessRWorker",

@@ -1,6 +1,6 @@
 # Agent-CR Current Architecture
 
-This document describes the architecture of the current `agent_cr` implementation (interface-first v1, dry-run runtime behavior).
+This document describes the current `agent_cr` implementation with a real runtime path for `runc`/CRIU, ZFS-backed filesystem state, and an eBPF-centered inspector.
 
 ## High-Level Component Diagram
 
@@ -11,8 +11,8 @@ flowchart TD
     System --> Scheduler[CRScheduler]
     System --> Executor[CRExecutor]
     System --> Storage[LocalCheckpointManager]
-    System --> Inspector[InMemorySandboxInspector]
-    System --> SandboxMgr[InMemorySandboxManager]
+    System --> Inspector[EBPFSandboxInspector]
+    System --> SandboxMgr[RuncSandboxManager / InMemory fallback]
     System --> Telemetry[InMemoryTelemetrySink / NoopTelemetrySink]
 
     Scheduler --> Policy[DefaultHeuristicPolicy]
@@ -37,8 +37,8 @@ flowchart TD
     ProcessR --> Runtime
     FsR --> Runtime
 
-    Runtime --> Docker[DockerRuntimeAdapter]
-    Runtime --> Runc[RuncRuntimeAdapter]
+    Runtime --> Docker[DockerRuntimeAdapter stub]
+    Runtime --> Runc[RuncRuntimeAdapter + CRIU/ZFS]
 ```
 
 ## Checkpoint and Restore Flow
@@ -50,20 +50,17 @@ flowchart TD
 3. If `should_checkpoint=True`, a `CheckpointJob` is queued in `InMemorySchedulerStateStore`.
 4. `CRExecutor.run_checkpoint(...)` dispatches to `DefaultCWorker` using thread-pool workers.
 5. `DefaultCWorker` calls:
-   - `AdapterProcessCWorker` (process checkpoint planning)
-   - `AdapterFileSystemCWorker` (filesystem checkpoint planning)
-6. Workers call runtime adapter dry-run methods (`executed=False`) and produce artifacts.
-7. `LocalCheckpointManager` stores artifacts and the `CheckpointManifest` (`v1` + integrity hash).
+   - `AdapterProcessCWorker`, which runs `runc checkpoint` and archives the CRIU image directory.
+   - `AdapterFileSystemCWorker`, which runs `zfs snapshot` and stores the snapshot metadata artifact.
+6. `LocalCheckpointManager` stores artifacts and the `CheckpointManifest` (`v1` + integrity hash).
 8. `CheckpointResult` is returned; scheduler can mark checkpoint complete.
 
 ### Restore
 
 1. `CRExecutor.run_restore(...)` dispatches to `DefaultRWorker`.
 2. `DefaultRWorker` loads manifest from `LocalCheckpointManager`.
-3. It calls:
-   - `AdapterProcessRWorker`
-   - `AdapterFileSystemRWorker`
-4. Both execute runtime dry-run restore planning (`executed=False`).
+3. It restores filesystem state first through `AdapterFileSystemRWorker` using `zfs rollback`.
+4. It then restores process state through `AdapterProcessRWorker` by extracting the CRIU artifact and running `runc restore`.
 5. `RestoreResult` is returned with standardized status and telemetry.
 
 ## Data and Contracts
@@ -77,12 +74,14 @@ flowchart TD
   - integrity (`manifest_sha256`)
 - Contracts are defined in `agent_cr/contracts.py` for all extension points.
 
-## Runtime Behavior in v1
+## Runtime Behavior
 
-- Runtime adapters (`docker`, `runc`) are deterministic dry-run stubs.
-- They return planned commands and metadata but do not execute real checkpoint/restore operations.
+- `RuncRuntimeAdapter` executes real commands for process and filesystem state.
+- `DockerRuntimeAdapter` remains a compatibility stub and returns planned commands only.
 - Local storage (`LocalCheckpointManager`) is fully implemented.
-- Scheduler/executor/inspector/sandbox manager default implementations are in-memory.
+- Scheduler/executor remain in-process.
+- The default sandbox manager for `runc` is `RuncSandboxManager`, which drives `runc run|kill|delete` and ZFS dataset lifecycle.
+- Inspector state is derived from eBPF events via `EBPFSandboxInspector`.
 
 ## Module Map
 

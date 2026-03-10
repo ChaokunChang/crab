@@ -55,6 +55,15 @@ class FailureCode(str, Enum):
     UNKNOWN = "unknown"
 
 
+class EBPFEventKind(str, Enum):
+    PROCESS_EXEC = "process_exec"
+    PROCESS_EXIT = "process_exit"
+    FILE_WRITE = "file_write"
+    FILE_DELETE = "file_delete"
+    NETWORK_INGRESS = "network_ingress"
+    NETWORK_EGRESS = "network_egress"
+
+
 @dataclass(frozen=True)
 class RuntimeCapabilities:
     supports_process_checkpoint: bool
@@ -64,10 +73,18 @@ class RuntimeCapabilities:
 
 
 @dataclass(frozen=True)
-class DryRunStatus:
+class RuntimeOperationStatus:
     executed: bool
     reason: str
-    planned_command: tuple[str, ...] = ()
+    command: tuple[str, ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class EBPFEvent:
+    sandbox_id: SandboxId
+    kind: EBPFEventKind
+    observed_at: datetime
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -114,8 +131,8 @@ class ArtifactReference:
 class WorkerStepResult:
     success: bool
     artifacts: list[ArtifactPayload] = field(default_factory=list)
-    dry_run_status: DryRunStatus = field(
-        default_factory=lambda: DryRunStatus(executed=False, reason="unknown")
+    operation_status: RuntimeOperationStatus = field(
+        default_factory=lambda: RuntimeOperationStatus(executed=False, reason="unknown")
     )
     failure_code: FailureCode = FailureCode.NONE
     message: str | None = None
@@ -238,7 +255,7 @@ class CheckpointResult:
     manifest: CheckpointManifest | None
     failure_code: FailureCode = FailureCode.NONE
     message: str | None = None
-    dry_run_statuses: tuple[DryRunStatus, ...] = ()
+    operation_statuses: tuple[RuntimeOperationStatus, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -251,7 +268,7 @@ class RestoreResult:
     finished_at: datetime
     failure_code: FailureCode = FailureCode.NONE
     message: str | None = None
-    dry_run_statuses: tuple[DryRunStatus, ...] = ()
+    operation_statuses: tuple[RuntimeOperationStatus, ...] = ()
 
 
 @dataclass(frozen=True)

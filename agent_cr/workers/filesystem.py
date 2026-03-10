@@ -12,24 +12,26 @@ class AdapterFileSystemCWorker(FileSystemCWorker):
         self._adapter = adapter
 
     def checkpoint(self, job: CheckpointJob, checkpoint_id: CheckpointId) -> WorkerStepResult:
-        dry = self._adapter.plan_filesystem_checkpoint(job.sandbox_id, checkpoint_id)
+        status = self._adapter.checkpoint_filesystem(job.sandbox_id, checkpoint_id)
+        metadata = self._adapter.filesystem_checkpoint_metadata(job.sandbox_id, checkpoint_id)
         payload = {
             "sandbox_id": str(job.sandbox_id),
             "checkpoint_id": str(checkpoint_id),
-            "dry_run": {
-                "executed": dry.executed,
-                "reason": dry.reason,
-                "planned_command": list(dry.planned_command),
-                "metadata": dry.metadata,
+            "status": {
+                "executed": status.executed,
+                "reason": status.reason,
+                "command": list(status.command),
+                "metadata": status.metadata,
             },
+            "filesystem": metadata,
         }
         artifact = ArtifactPayload(
             kind=ArtifactKind.FILESYSTEM,
-            name="filesystem_plan.json",
-            data=json.dumps(payload, sort_keys=True).encode("utf-8"),
+            name="filesystem_checkpoint.json",
+            data=json.dumps(payload, sort_keys=True, indent=2).encode("utf-8"),
             metadata={"adapter": self._adapter.name},
         )
-        return WorkerStepResult(success=True, artifacts=[artifact], dry_run_status=dry)
+        return WorkerStepResult(success=True, artifacts=[artifact], operation_status=status)
 
 
 class AdapterFileSystemRWorker(FileSystemRWorker):
@@ -38,5 +40,5 @@ class AdapterFileSystemRWorker(FileSystemRWorker):
 
     def restore(self, job: RestoreJob, manifest: CheckpointManifest) -> WorkerStepResult:
         _ = manifest
-        dry = self._adapter.plan_filesystem_restore(job.sandbox_id, job.checkpoint_id)
-        return WorkerStepResult(success=True, artifacts=[], dry_run_status=dry)
+        status = self._adapter.restore_filesystem(job.sandbox_id, job.checkpoint_id)
+        return WorkerStepResult(success=True, artifacts=[], operation_status=status)

@@ -34,14 +34,11 @@ class SimulatedE2ETests(unittest.TestCase):
                 )
             )
 
-            job = system.scheduler.poll_and_schedule(sandbox_id)
-            self.assertIsNotNone(job)
-            assert job is not None
-
-            ckpt_result = system.executor.run_checkpoint(job)
+            ckpt_result = system.checkpoint_if_due(sandbox_id)
+            self.assertIsNotNone(ckpt_result)
+            assert ckpt_result is not None
             self.assertEqual(ckpt_result.status, JobStatus.SUCCEEDED)
             self.assertIsNotNone(ckpt_result.manifest)
-            system.scheduler.mark_checkpoint_complete(sandbox_id, ckpt_result.finished_at)
 
             restore_job = RestoreJob(
                 job_id=JobId.new(prefix="restore"),
