@@ -68,6 +68,77 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(decision.should_checkpoint)
         self.assertEqual(decision.reason, "force_interval_elapsed")
 
+    def test_prefers_checkpoint_during_llm_request_window(self) -> None:
+        policy = DefaultHeuristicPolicy(
+            PolicyConfig(
+                min_checkpoint_interval_seconds=0.0,
+                force_checkpoint_after_seconds=1000.0,
+                require_change_signal=True,
+                prefer_checkpoint_during_llm_request=True,
+            )
+        )
+        now = utc_now()
+        snapshot = SandboxSnapshot(
+            sandbox_id=SandboxId("sbx-1"),
+            runtime_name="docker",
+            is_running=True,
+            process_changed=True,
+            filesystem_changed=False,
+            observed_at=now,
+            last_checkpoint_at=now - timedelta(seconds=12),
+            metadata={"llm_request_in_flight": True},
+        )
+        decision = policy.evaluate(snapshot)
+        self.assertTrue(decision.should_checkpoint)
+        self.assertEqual(decision.reason, "llm_request_window_available")
+
+    def test_prefers_llm_request_window_for_first_checkpoint(self) -> None:
+        policy = DefaultHeuristicPolicy(
+            PolicyConfig(
+                min_checkpoint_interval_seconds=0.0,
+                force_checkpoint_after_seconds=1000.0,
+                require_change_signal=True,
+                prefer_checkpoint_during_llm_request=True,
+            )
+        )
+        snapshot = SandboxSnapshot(
+            sandbox_id=SandboxId("sbx-1"),
+            runtime_name="docker",
+            is_running=True,
+            process_changed=True,
+            filesystem_changed=False,
+            observed_at=utc_now(),
+            last_checkpoint_at=None,
+            metadata={"llm_request_in_flight": True},
+        )
+        decision = policy.evaluate(snapshot)
+        self.assertTrue(decision.should_checkpoint)
+        self.assertEqual(decision.reason, "llm_request_window_available")
+
+    def test_requires_llm_request_when_configured(self) -> None:
+        policy = DefaultHeuristicPolicy(
+            PolicyConfig(
+                min_checkpoint_interval_seconds=0.0,
+                force_checkpoint_after_seconds=1000.0,
+                require_change_signal=True,
+                require_llm_request_for_checkpoint=True,
+            )
+        )
+        now = utc_now()
+        snapshot = SandboxSnapshot(
+            sandbox_id=SandboxId("sbx-1"),
+            runtime_name="docker",
+            is_running=True,
+            process_changed=True,
+            filesystem_changed=False,
+            observed_at=now,
+            last_checkpoint_at=now - timedelta(seconds=12),
+            metadata={"llm_request_in_flight": False},
+        )
+        decision = policy.evaluate(snapshot)
+        self.assertFalse(decision.should_checkpoint)
+        self.assertEqual(decision.reason, "llm_request_required")
+
 
 if __name__ == "__main__":
     unittest.main()

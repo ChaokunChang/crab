@@ -39,9 +39,16 @@ Run simulated E2E benchmark:
 python3 benchmarks/bench_agent_cr_e2e.py --sandboxes 8 --iters 20
 ```
 
+Run sandboxed simulated-agent benchmark:
+
+```bash
+python3 benchmarks/bench_agent_cr_sandbox_e2e.py --sandboxes 2 --iters 5 --provider openai
+```
+
 ## Package Layout
 
 - `agent_cr/` - core package
 - `benchmarks/` - benchmarks
+- `simulated_agent/` - simulated LLM service, agent CLI, and sandbox image assets
 - `tests/` - unit + contract + simulated e2e tests
 - `legacy/` - prior runtime benchmark scripts

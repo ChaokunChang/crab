@@ -46,6 +46,8 @@ class PolicyConfig:
     min_checkpoint_interval_seconds: float = 30.0
     force_checkpoint_after_seconds: float = 600.0
     require_change_signal: bool = True
+    prefer_checkpoint_during_llm_request: bool = True
+    require_llm_request_for_checkpoint: bool = False
 
     def __post_init__(self) -> None:
         if self.min_checkpoint_interval_seconds < 0:

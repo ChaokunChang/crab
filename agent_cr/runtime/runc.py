@@ -122,6 +122,7 @@ class RuncRuntimeAdapter(CommandRuntimeAdapter):
             str(image_path),
             "--work-path",
             str(work_path),
+            "--tcp-established",
             str(sandbox_id),
         ]
 

@@ -16,7 +16,14 @@ from .contracts import (
 from .executor import CRExecutor
 from .ids import CheckpointId, JobId, SandboxId
 from .inspector import EBPFSandboxInspector, InMemoryEBPFEventCollector, InMemorySandboxInspector
-from .interceptor import CompositeRequestInterceptorHook, TelemetryRequestInterceptorHook
+from .interceptor import (
+    AgentCRRequestInterceptor,
+    AgentCRRequestInterceptorServer,
+    CompositeRequestInterceptorHook,
+    InMemoryRequestStateStore,
+    RequestAwareSandboxInspector,
+    TelemetryRequestInterceptorHook,
+)
 from .models import (
     ArtifactKind,
     ArtifactPayload,
@@ -31,6 +38,7 @@ from .models import (
     JobStatus,
     JobType,
     RequestContext,
+    RequestState,
     RestoreJob,
     RestoreResult,
     RuntimeOperationStatus,
@@ -95,6 +103,7 @@ __all__ = [
     "ProcessCWorker",
     "ProcessRWorker",
     "RequestContext",
+    "RequestState",
     "RequestInterceptorHook",
     "RestoreJob",
     "RestoreResult",
@@ -123,5 +132,9 @@ __all__ = [
     "AdapterFileSystemCWorker",
     "AdapterFileSystemRWorker",
     "CompositeRequestInterceptorHook",
+    "AgentCRRequestInterceptor",
+    "InMemoryRequestStateStore",
+    "RequestAwareSandboxInspector",
     "TelemetryRequestInterceptorHook",
+    "AgentCRRequestInterceptorServer",
 ]

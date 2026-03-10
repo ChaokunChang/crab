@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Lock, Thread
 
 from .config import ExecutorConfig, PolicyConfig, SchedulerConfig, StorageConfig
 from .contracts import SandboxInspector
 from .executor import CRExecutor
 from .ids import JobId
 from .inspector import EBPFSandboxInspector
+from .interceptor import InMemoryRequestStateStore, RequestAwareSandboxInspector
 from .models import CheckpointJob, CheckpointResult, RestoreJob, RestoreResult, SandboxId, utc_now
 from .policy import DefaultHeuristicPolicy
 from .runtime import DockerRuntimeAdapter, RuncRuntimeAdapter
@@ -33,6 +35,13 @@ class AgentCRSystem:
     inspector: SandboxInspector
     sandbox_manager: InMemorySandboxManager | RuncSandboxManager
     telemetry: InMemoryTelemetrySink | NoopTelemetrySink
+    request_state_store: InMemoryRequestStateStore | None = None
+    _interceptor_lock: Lock = field(init=False, repr=False)
+    _interceptor_pending: set[SandboxId] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._interceptor_lock = Lock()
+        self._interceptor_pending = set()
 
     def checkpoint_once(self, sandbox_id: SandboxId) -> CheckpointResult:
         job = CheckpointJob(
@@ -73,6 +82,36 @@ class AgentCRSystem:
         )
         return self.executor.run_restore(job)
 
+    def notify_interceptor_state_change(self, sandbox_id: SandboxId) -> None:
+        with self._interceptor_lock:
+            if sandbox_id in self._interceptor_pending:
+                return
+            self._interceptor_pending.add(sandbox_id)
+        Thread(target=self._checkpoint_from_interceptor, args=(sandbox_id,), daemon=True).start()
+
+    def _checkpoint_from_interceptor(self, sandbox_id: SandboxId) -> None:
+        try:
+            result = self.checkpoint_if_due(sandbox_id)
+            self.telemetry.emit_event(
+                "interceptor.scheduler_notified",
+                {
+                    "sandbox_id": str(sandbox_id),
+                    "scheduled": result is not None,
+                    "status": "" if result is None else result.status.value,
+                },
+            )
+        except Exception as exc:
+            self.telemetry.emit_event(
+                "interceptor.scheduler_error",
+                {
+                    "sandbox_id": str(sandbox_id),
+                    "error": str(exc),
+                },
+            )
+        finally:
+            with self._interceptor_lock:
+                self._interceptor_pending.discard(sandbox_id)
+
 
 def build_default_system(
     *,
@@ -83,6 +122,7 @@ def build_default_system(
     storage_config: StorageConfig | None = None,
     policy_config: PolicyConfig | None = None,
     use_in_memory_telemetry: bool = True,
+    request_state_store: InMemoryRequestStateStore | None = None,
 ) -> AgentCRSystem:
     scheduler_cfg = scheduler_config or SchedulerConfig()
     executor_cfg = executor_config or ExecutorConfig()
@@ -108,7 +148,8 @@ def build_default_system(
     r_worker = DefaultRWorker(process_r, fs_r, storage)
 
     executor = CRExecutor(executor_cfg, c_worker, r_worker, telemetry)
-    inspector = EBPFSandboxInspector()
+    request_store = request_state_store or InMemoryRequestStateStore()
+    inspector = RequestAwareSandboxInspector(EBPFSandboxInspector(), request_store)
     scheduler = CRScheduler(
         scheduler_cfg,
         DefaultHeuristicPolicy(policy_cfg),
@@ -125,4 +166,5 @@ def build_default_system(
         inspector=inspector,
         sandbox_manager=sandbox_manager,
         telemetry=telemetry,
+        request_state_store=request_store,
     )

@@ -315,6 +315,42 @@ class RequestContext:
 
 
 @dataclass(frozen=True)
+class RequestState:
+    sandbox_id: SandboxId
+    active_llm_requests: int = 0
+    total_llm_requests: int = 0
+    completed_llm_requests: int = 0
+    last_request_id: str | None = None
+    last_llm_provider: str | None = None
+    last_llm_request_started_at: datetime | None = None
+    last_llm_request_ended_at: datetime | None = None
+
+    @property
+    def llm_request_in_flight(self) -> bool:
+        return self.active_llm_requests > 0
+
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            "llm_request_in_flight": self.llm_request_in_flight,
+            "active_llm_requests": self.active_llm_requests,
+            "total_llm_requests": self.total_llm_requests,
+            "completed_llm_requests": self.completed_llm_requests,
+            "last_llm_provider": self.last_llm_provider,
+            "last_request_id": self.last_request_id,
+            "last_llm_request_started_at": (
+                None
+                if self.last_llm_request_started_at is None
+                else _isoformat(self.last_llm_request_started_at)
+            ),
+            "last_llm_request_ended_at": (
+                None
+                if self.last_llm_request_ended_at is None
+                else _isoformat(self.last_llm_request_ended_at)
+            ),
+        }
+
+
+@dataclass(frozen=True)
 class SandboxDescription:
     sandbox_id: SandboxId
     runtime_name: str
