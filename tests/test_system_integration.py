@@ -74,7 +74,8 @@ class SystemIntegrationTests(unittest.TestCase):
             )
 
             runtime = RuncRuntimeAdapter(command_runner=runner, paths=runtime_paths)
-            storage = LocalCheckpointManager(StorageConfig(root_dir=root / "storage"))
+            storage_root = root / "storage"
+            storage = LocalCheckpointManager(StorageConfig(root_dir=storage_root))
             checkpoint_worker = DefaultCWorker(
                 AdapterProcessCWorker(runtime),
                 AdapterFileSystemCWorker(runtime),
@@ -143,8 +144,20 @@ class SystemIntegrationTests(unittest.TestCase):
             assert checkpoint_result is not None
             self.assertEqual(checkpoint_result.status, JobStatus.SUCCEEDED)
             self.assertIsNotNone(checkpoint_result.manifest)
-            self.assertTrue(len(checkpoint_result.manifest.process_artifacts) >= 1)
+            self.assertEqual(len(checkpoint_result.manifest.process_artifacts), 1)
+            self.assertEqual(checkpoint_result.manifest.process_artifacts[0].name, "process_checkpoint.json")
             self.assertTrue(len(checkpoint_result.manifest.filesystem_artifacts) >= 1)
+            process_artifact_dir = (
+                storage_root
+                / "artifacts"
+                / str(sandbox_id)
+                / str(checkpoint_result.checkpoint_id)
+                / "process"
+            )
+            self.assertEqual(
+                sorted(path.name for path in process_artifact_dir.iterdir()),
+                ["process_checkpoint.json"],
+            )
 
             restore_result = system.restore_once(sandbox_id, checkpoint_result.checkpoint_id)
             self.assertEqual(restore_result.status, JobStatus.SUCCEEDED)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +13,7 @@ from agent_cr import (
     CheckpointId,
     CheckpointJob,
     CheckpointManager,
+    DefaultRWorker,
     DockerRuntimeAdapter,
     EBPFSandboxInspector,
     EBPFEvent,
@@ -27,7 +29,7 @@ from agent_cr import (
     StorageConfig,
 )
 from agent_cr.contracts import SandboxRuntimeAdapter
-from agent_cr.models import CheckpointManifest, utc_now
+from agent_cr.models import CheckpointManifest, RuntimeOperationStatus, WorkerStepResult, utc_now
 from agent_cr.runtime import CommandRunner
 
 
@@ -43,6 +45,32 @@ class FakeCommandRunner(CommandRunner):
             (),
             {"command": tuple(command), "returncode": 0, "stdout": "", "stderr": ""},
         )()
+
+
+class RecordingRestoreWorker:
+    def __init__(self) -> None:
+        self.jobs = []
+
+    def restore(self, job: RestoreJob, manifest: CheckpointManifest) -> WorkerStepResult:
+        _ = manifest
+        self.jobs.append(job)
+        return WorkerStepResult(
+            success=True,
+            operation_status=RuntimeOperationStatus(executed=False, reason="recorded"),
+        )
+
+
+class NoArtifactCheckpointManager:
+    def __init__(self, manifest: CheckpointManifest) -> None:
+        self.manifest = manifest
+
+    def get_manifest(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> CheckpointManifest:
+        _ = (sandbox_id, checkpoint_id)
+        return self.manifest
+
+    def get_artifact(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId, reference) -> bytes:
+        _ = (sandbox_id, checkpoint_id, reference)
+        raise AssertionError("process restore should not fetch process artifacts from checkpoint storage")
 
 
 class ContractTests(unittest.TestCase):
@@ -110,6 +138,116 @@ class ContractTests(unittest.TestCase):
         self.assertTrue(r_fs_result.success)
         self.assertFalse(r_process_result.operation_status.executed)
         self.assertFalse(r_fs_result.operation_status.executed)
+
+    def test_runc_process_checkpoint_emits_only_metadata_artifact(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_process_contract_") as tmp:
+            base = Path(tmp)
+            adapter = RuncRuntimeAdapter(
+                command_runner=FakeCommandRunner(),
+                paths=RuncRuntimePaths(
+                    state_root=base / "state",
+                    bundle_root=base / "bundles",
+                    checkpoint_root=base / "checkpoints",
+                    zfs_dataset_prefix="pool/agent-cr",
+                ),
+            )
+            process_c = AdapterProcessCWorker(adapter)
+            sandbox_id = SandboxId("sbx-1")
+            checkpoint_id = CheckpointId("ckpt-1")
+
+            result = process_c.checkpoint(
+                CheckpointJob(
+                    job_id=JobId("job-1"),
+                    sandbox_id=sandbox_id,
+                    requested_at=utc_now(),
+                ),
+                checkpoint_id,
+            )
+
+            self.assertTrue(result.success)
+            self.assertEqual(len(result.artifacts), 1)
+            self.assertEqual(result.artifacts[0].name, "process_checkpoint.json")
+            payload = json.loads(result.artifacts[0].data.decode("utf-8"))
+            self.assertEqual(payload["process_storage_mode"], "runtime_reference")
+            self.assertEqual(
+                payload["process_checkpoint_location"],
+                str(base / "checkpoints" / str(sandbox_id) / str(checkpoint_id) / "process"),
+            )
+
+    def test_runc_process_restore_requires_existing_checkpoint_directory(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_process_restore_") as tmp:
+            base = Path(tmp)
+            adapter = RuncRuntimeAdapter(
+                command_runner=FakeCommandRunner(),
+                paths=RuncRuntimePaths(
+                    state_root=base / "state",
+                    bundle_root=base / "bundles",
+                    checkpoint_root=base / "checkpoints",
+                    zfs_dataset_prefix="pool/agent-cr",
+                ),
+            )
+            process_r = AdapterProcessRWorker(adapter)
+            sandbox_id = SandboxId("sbx-1")
+            checkpoint_id = CheckpointId("ckpt-1")
+            manifest = CheckpointManifest(
+                schema_version="v1",
+                checkpoint_id=checkpoint_id,
+                sandbox_id=sandbox_id,
+                created_at=utc_now(),
+                runtime_name="runc",
+                runtime_version=None,
+                process_artifacts=[],
+                filesystem_artifacts=[],
+                metadata={},
+            ).with_integrity()
+            job = RestoreJob(
+                job_id=JobId("job-2"),
+                sandbox_id=sandbox_id,
+                checkpoint_id=checkpoint_id,
+                requested_at=utc_now(),
+            )
+
+            with self.assertRaisesRegex(FileNotFoundError, "process checkpoint directory not found"):
+                process_r.restore(job, manifest)
+
+            checkpoint_dir = base / "checkpoints" / str(sandbox_id) / str(checkpoint_id) / "process"
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            result = process_r.restore(job, manifest)
+            self.assertTrue(result.success)
+            self.assertTrue(result.operation_status.executed)
+
+    def test_default_restore_worker_skips_process_artifact_downloads(self) -> None:
+        manifest = CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=CheckpointId("ckpt-1"),
+            sandbox_id=SandboxId("sbx-1"),
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version=None,
+            process_artifacts=[],
+            filesystem_artifacts=[],
+            metadata={},
+        ).with_integrity()
+        fs_worker = RecordingRestoreWorker()
+        process_worker = RecordingRestoreWorker()
+        restore_worker = DefaultRWorker(
+            process_worker=process_worker,
+            filesystem_worker=fs_worker,
+            checkpoint_manager=NoArtifactCheckpointManager(manifest),
+        )
+        job = RestoreJob(
+            job_id=JobId("job-restore"),
+            sandbox_id=SandboxId("sbx-1"),
+            checkpoint_id=CheckpointId("ckpt-1"),
+            requested_at=utc_now(),
+            metadata={"keep": "me"},
+        )
+
+        result = restore_worker.restore(job)
+
+        self.assertEqual(result.status.value, "succeeded")
+        self.assertEqual(fs_worker.jobs, [job])
+        self.assertEqual(process_worker.jobs, [job])
 
     def test_runc_runtime_executes_real_commands_via_runner(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_runc_runtime_") as tmp:

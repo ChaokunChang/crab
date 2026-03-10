@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
 import logging
 
 from ..contracts import (
@@ -212,44 +211,7 @@ class DefaultRWorker(CompositeRestoreWorker):
                 message=str(exc),
             )
 
-        restore_job = job
-        process_state_ref = next(
-            (x for x in manifest.process_artifacts if x.name == "process_state.tar.gz"),
-            None,
-        )
-        if process_state_ref is not None:
-            try:
-                payload = self._checkpoint_manager.get_artifact(
-                    sandbox_id=job.sandbox_id,
-                    checkpoint_id=job.checkpoint_id,
-                    reference=process_state_ref,
-                )
-            except Exception as exc:
-                logger.exception(
-                    "Failed to load process artifact for restore job %s sandbox=%s checkpoint=%s",
-                    job.job_id,
-                    job.sandbox_id,
-                    job.checkpoint_id,
-                )
-                return RestoreResult(
-                    job_id=job.job_id,
-                    sandbox_id=job.sandbox_id,
-                    checkpoint_id=job.checkpoint_id,
-                    status=JobStatus.FAILED,
-                    started_at=started,
-                    finished_at=utc_now(),
-                    failure_code=FailureCode.STORAGE_ERROR,
-                    message=str(exc),
-                )
-            restore_job = replace(job, metadata={**job.metadata, "process_state_payload": payload})
-            logger.debug(
-                "Loaded process state payload for restore job %s sandbox=%s checkpoint=%s",
-                job.job_id,
-                job.sandbox_id,
-                job.checkpoint_id,
-            )
-
-        fs_step = self._filesystem_worker.restore(restore_job, manifest)
+        fs_step = self._filesystem_worker.restore(job, manifest)
         if not fs_step.success:
             logger.warning(
                 "Filesystem restore step failed for job %s sandbox=%s code=%s message=%s",
@@ -270,7 +232,7 @@ class DefaultRWorker(CompositeRestoreWorker):
                 operation_statuses=(fs_step.operation_status,),
             )
 
-        process_step = self._process_worker.restore(restore_job, manifest)
+        process_step = self._process_worker.restore(job, manifest)
         if not process_step.success:
             logger.warning(
                 "Process restore step failed for job %s sandbox=%s code=%s message=%s",

@@ -14,6 +14,7 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
+import logging
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -57,6 +58,9 @@ from agent_cr.ids import JobId
 from agent_cr.models import RestoreJob, utc_now
 from simulated_agent.image import build_image, export_image_rootfs
 from simulated_agent.service import serve
+
+
+logger = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
@@ -192,7 +196,7 @@ def main() -> None:
         try:
             build_image(tag=image_tag)
             exported_rootfs = export_image_rootfs(tag=image_tag, output_dir=root / "image")
-            subprocess.run(["truncate", "-s", "1G", str(root / "zpool.img")], check=True)
+            subprocess.run(["truncate", "-s", "10G", str(root / "zpool.img")], check=True)
             subprocess.run(["zpool", "create", "-f", pool_name, str(root / "zpool.img")], check=True)
             subprocess.run(["zfs", "create", f"{pool_name}/agent-cr"], check=True)
 
@@ -343,6 +347,7 @@ def main() -> None:
                     if result is not None:
                         checkpoint_results.append(result)
                 t1 = time.perf_counter()
+                logger.debug("checkpoint results: %s", checkpoint_results)
 
                 restore_jobs = [
                     RestoreJob(
@@ -356,6 +361,7 @@ def main() -> None:
                 ]
                 restore_results = system.executor.run_restores(restore_jobs)
                 t2 = time.perf_counter()
+                logger.debug("restore results: %s", restore_results)
 
                 for sandbox_id in sandboxes:
                     inspector.upsert_snapshot(
