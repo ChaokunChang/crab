@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import shutil
 import socket
 import subprocess
@@ -64,7 +65,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=5)
     parser.add_argument("--provider", choices=["openai", "anthropic"], default="openai")
     parser.add_argument("--out", default="")
+    parser.add_argument(
+        "--log-level",
+        choices=["debug", "info", "warning", "error", "critical"],
+        default="info",
+    )
     return parser.parse_args()
+
+
+def configure_logging(level_name: str) -> None:
+    logging.basicConfig(
+        level=getattr(logging, level_name.upper()),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
 
 def find_free_port() -> int:
@@ -156,6 +169,7 @@ def record_activity_events(
 
 def main() -> None:
     args = parse_args()
+    configure_logging(args.log_level)
     required = ["docker", "runc", "criu", "zfs"]
     missing = [name for name in required if shutil.which(name) is None]
     if missing:
