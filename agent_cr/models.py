@@ -231,7 +231,13 @@ class CheckpointJob:
     sandbox_id: SandboxId
     requested_at: datetime
     reason: str = "manual"
+    checkpoint_process: bool = True
+    checkpoint_filesystem: bool = True
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.checkpoint_process and not self.checkpoint_filesystem:
+            raise ValueError("checkpoint job must include at least one checkpoint scope")
 
 
 @dataclass(frozen=True)
@@ -307,6 +313,17 @@ class ScheduleDecision:
 
 
 @dataclass(frozen=True)
+class SchedulerCheckpointDecision:
+    should_checkpoint: bool
+    checkpoint_process: bool
+    checkpoint_filesystem: bool
+    reason: str
+    policy_name: str
+    next_earliest_checkpoint_at: datetime | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class RequestContext:
     request_id: str
     sandbox_id: SandboxId
@@ -348,6 +365,14 @@ class RequestState:
                 else _isoformat(self.last_llm_request_ended_at)
             ),
         }
+
+
+@dataclass(frozen=True)
+class RequestStateChange:
+    sandbox_id: SandboxId
+    event_type: str
+    request_id: str | None = None
+    observed_at: datetime = field(default_factory=utc_now)
 
 
 @dataclass(frozen=True)

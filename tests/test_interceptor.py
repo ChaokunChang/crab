@@ -11,10 +11,12 @@ from agent_cr import (
     InMemoryRequestStateStore,
     InMemoryTelemetrySink,
     SandboxId,
+    SandboxSnapshot,
     StorageConfig,
     TelemetryRequestInterceptorHook,
     build_default_system,
 )
+from agent_cr.models import utc_now
 from simulated_agent.service import SimulatedLLMState, handle_request
 
 
@@ -120,6 +122,68 @@ class InterceptorTests(unittest.TestCase):
             self.assertTrue(system.has_pending_interceptor_signal(SandboxId("sbx-2")))
             event_names = [name for name, _ in system.telemetry.events]
             self.assertIn("interceptor.state_changed", event_names)
+            system.executor.shutdown()
+
+    def test_interceptor_waits_for_system_checkpoint_flow(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_interceptor_system_") as tmp:
+            system = build_default_system(
+                storage_root=tmp,
+                runtime="docker",
+                storage_config=StorageConfig(root_dir=Path(tmp)),
+            )
+            sandbox_id = system.sandbox_manager.launch("docker")
+            system.inspector.upsert_snapshot(
+                SandboxSnapshot(
+                    sandbox_id=sandbox_id,
+                    runtime_name="docker",
+                    is_running=True,
+                    process_changed=True,
+                    filesystem_changed=False,
+                    observed_at=utc_now(),
+                )
+            )
+            system.start()
+
+            interceptor = AgentCRRequestInterceptor(
+                upstream_transport=lambda path, headers, body: (
+                    200,
+                    [("Content-Type", "application/json")],
+                    json.dumps(
+                        handle_request(
+                            path=path,
+                            headers=headers,
+                            payload=json.loads(body.decode("utf-8")),
+                            state=SimulatedLLMState(),
+                        ),
+                        sort_keys=True,
+                    ).encode("utf-8"),
+                ),
+                request_state_store=system.request_state_store or InMemoryRequestStateStore(),
+                response_gate_registry=system.response_gate_registry,
+            )
+            _, _, body = interceptor.intercept(
+                path="/v1/chat/completions",
+                headers={"Content-Type": "application/json", "X-Agent-Sandbox-Id": str(sandbox_id)},
+                body=json.dumps(
+                    {
+                        "model": "simulated-openai",
+                        "messages": [{"role": "user", "content": "continue"}],
+                    }
+                ).encode("utf-8"),
+            )
+
+            payload = json.loads(body.decode("utf-8"))
+            self.assertIn("choices", payload)
+            state = system.request_state_store.get(sandbox_id) if system.request_state_store is not None else None
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual(state.active_llm_requests, 0)
+            event_names = [name for name, _ in system.telemetry.events]
+            self.assertIn("scheduler.evaluate", event_names)
+            self.assertIn("executor.job_finished", event_names)
+            self.assertEqual(system.sandbox_manager.describe(sandbox_id).status, "running")
+            system.stop()
+            system.executor.shutdown()
 
 
 if __name__ == "__main__":

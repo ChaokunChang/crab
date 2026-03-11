@@ -22,6 +22,7 @@ from .interceptor import (
     CompositeRequestInterceptorHook,
     InMemoryRequestStateStore,
     RequestAwareSandboxInspector,
+    SandboxResponseGateRegistry,
     TelemetryRequestInterceptorHook,
 )
 from .models import (
@@ -39,6 +40,7 @@ from .models import (
     JobType,
     RequestContext,
     RequestState,
+    RequestStateChange,
     RestoreJob,
     RestoreResult,
     RuntimeOperationStatus,
@@ -46,6 +48,7 @@ from .models import (
     SandboxDescription,
     SandboxSnapshot,
     ScheduleDecision,
+    SchedulerCheckpointDecision,
 )
 from .policy import DefaultHeuristicPolicy
 from .runtime import CommandRunner, DockerRuntimeAdapter, RuncRuntimeAdapter, RuncRuntimePaths, SubprocessCommandRunner
@@ -104,6 +107,7 @@ __all__ = [
     "ProcessRWorker",
     "RequestContext",
     "RequestState",
+    "RequestStateChange",
     "RequestInterceptorHook",
     "RestoreJob",
     "RestoreResult",
@@ -120,6 +124,7 @@ __all__ = [
     "SandboxRuntimeAdapter",
     "SandboxSnapshot",
     "ScheduleDecision",
+    "SchedulerCheckpointDecision",
     "SchedulerConfig",
     "StorageConfig",
     "SubprocessCommandRunner",
@@ -135,6 +140,7 @@ __all__ = [
     "AgentCRRequestInterceptor",
     "InMemoryRequestStateStore",
     "RequestAwareSandboxInspector",
+    "SandboxResponseGateRegistry",
     "TelemetryRequestInterceptorHook",
     "AgentCRRequestInterceptorServer",
 ]

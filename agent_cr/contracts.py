@@ -12,6 +12,7 @@ from .models import (
     CheckpointManifest,
     CheckpointResult,
     RequestContext,
+    RequestStateChange,
     RestoreJob,
     RestoreResult,
     EBPFEvent,
@@ -20,6 +21,7 @@ from .models import (
     SandboxDescription,
     SandboxSnapshot,
     ScheduleDecision,
+    SchedulerCheckpointDecision,
     WorkerStepResult,
 )
 
@@ -212,6 +214,17 @@ class SandboxInspector(ABC):
     def inspect(self, sandbox_id: SandboxId) -> SandboxSnapshot:
         raise NotImplementedError
 
+    @abstractmethod
+    def mark_checkpoint_complete(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        process: bool,
+        filesystem: bool,
+        at: datetime,
+    ) -> None:
+        raise NotImplementedError
+
 
 class EBPFEventCollector(ABC):
     @abstractmethod
@@ -254,6 +267,18 @@ class SandboxManager(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def pause(self, sandbox_id: SandboxId) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def resume(self, sandbox_id: SandboxId) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def prepare_for_restore(self, sandbox_id: SandboxId) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
     def delete(self, sandbox_id: SandboxId) -> None:
         raise NotImplementedError
 
@@ -281,16 +306,4 @@ class SchedulerStateStore(ABC):
 
     @abstractmethod
     def get_last_checkpoint(self, sandbox_id: SandboxId) -> datetime | None:
-        raise NotImplementedError
-
-    @abstractmethod
-    def enqueue_checkpoint_job(self, job: CheckpointJob) -> None:
-        raise NotImplementedError
-
-    @abstractmethod
-    def pop_checkpoint_job(self) -> CheckpointJob | None:
-        raise NotImplementedError
-
-    @abstractmethod
-    def pending_jobs(self) -> Iterable[CheckpointJob]:
         raise NotImplementedError

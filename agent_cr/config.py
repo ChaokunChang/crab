@@ -16,12 +16,15 @@ class SchedulerConfig:
 @dataclass(frozen=True)
 class ExecutorConfig:
     max_workers: int = 4
+    max_checkpoint_queue_size: int = 10000
     max_retries: int = 0
     retry_backoff_seconds: float = 0.05
 
     def __post_init__(self) -> None:
         if self.max_workers < 1:
             raise ValueError("max_workers must be >= 1")
+        if self.max_checkpoint_queue_size < 1:
+            raise ValueError("max_checkpoint_queue_size must be >= 1")
         if self.max_retries < 0:
             raise ValueError("max_retries must be >= 0")
         if self.retry_backoff_seconds < 0:

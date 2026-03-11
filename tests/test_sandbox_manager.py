@@ -47,6 +47,12 @@ class SandboxManagerTests(unittest.TestCase):
             self.assertEqual(sandbox_id, SandboxId("sbx-test"))
             self.assertEqual(manager.describe(sandbox_id).status, "running")
 
+            manager.pause(sandbox_id)
+            self.assertEqual(manager.describe(sandbox_id).status, "paused")
+
+            manager.resume(sandbox_id)
+            self.assertEqual(manager.describe(sandbox_id).status, "running")
+
             manager.stop(sandbox_id)
             self.assertEqual(manager.describe(sandbox_id).status, "stopped")
 
@@ -56,6 +62,8 @@ class SandboxManagerTests(unittest.TestCase):
                 [
                     ("zfs", "create", "-o", f"mountpoint={root / 'bundles' / 'sbx-test' / 'rootfs'}", "pool/agent-cr/sbx-test"),
                     ("runc", "--root", str(root / "state"), "run", "-d", "--bundle", str(root / "bundles" / "sbx-test"), "sbx-test"),
+                    ("runc", "--root", str(root / "state"), "pause", "sbx-test"),
+                    ("runc", "--root", str(root / "state"), "resume", "sbx-test"),
                     ("runc", "--root", str(root / "state"), "kill", "sbx-test", "TERM"),
                     ("runc", "--root", str(root / "state"), "delete", "-f", "sbx-test"),
                     ("zfs", "destroy", "-r", "pool/agent-cr/sbx-test"),

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from queue import Full, Queue
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 import logging
-from threading import Lock
+from threading import Lock, Thread
 
 from .config import ExecutorConfig
 from .contracts import CompositeCheckpointWorker, CompositeRestoreWorker, TelemetrySink
@@ -36,16 +37,23 @@ class CRExecutor:
         self._checkpoint_worker = checkpoint_worker
         self._restore_worker = restore_worker
         self._telemetry = telemetry or NoopTelemetrySink()
-        self._pool = ThreadPoolExecutor(max_workers=config.max_workers)
+        self._restore_pool = ThreadPoolExecutor(max_workers=config.max_workers)
+        self._checkpoint_queue: Queue[tuple[CheckpointJob, Future[CheckpointResult]] | None] = Queue(
+            maxsize=config.max_checkpoint_queue_size
+        )
+        self._checkpoint_thread = Thread(target=self._run_checkpoint_loop, name="agent-cr-checkpoint", daemon=True)
         self._lock = Lock()
         self._records: dict[JobId, JobRecord] = {}
+        self._checkpoint_thread.start()
 
     def shutdown(self) -> None:
         logger.info("Shutting down executor worker pool")
-        self._pool.shutdown(wait=True)
+        self._checkpoint_queue.put(None)
+        self._checkpoint_thread.join(timeout=5.0)
+        self._restore_pool.shutdown(wait=True)
 
     def run_checkpoint(self, job: CheckpointJob) -> CheckpointResult:
-        fut = self._submit_checkpoint(job)
+        fut = self.submit_checkpoint(job)
         return fut.result()
 
     def run_restore(self, job: RestoreJob) -> RestoreResult:
@@ -53,7 +61,7 @@ class CRExecutor:
         return fut.result()
 
     def run_checkpoints(self, jobs: list[CheckpointJob]) -> list[CheckpointResult]:
-        futures = [self._submit_checkpoint(job) for job in jobs]
+        futures = [self.submit_checkpoint(job) for job in jobs]
         return [x.result() for x in futures]
 
     def run_restores(self, jobs: list[RestoreJob]) -> list[RestoreResult]:
@@ -64,7 +72,7 @@ class CRExecutor:
         with self._lock:
             return self._records.get(job_id)
 
-    def _submit_checkpoint(self, job: CheckpointJob) -> Future[CheckpointResult]:
+    def submit_checkpoint(self, job: CheckpointJob) -> Future[CheckpointResult]:
         self._set_record(
             JobRecord(
                 job_id=job.job_id,
@@ -84,7 +92,30 @@ class CRExecutor:
             },
         )
         logger.info("Queued checkpoint job %s for sandbox %s", job.job_id, job.sandbox_id)
-        return self._pool.submit(self._execute_checkpoint, job)
+        future: Future[CheckpointResult] = Future()
+        try:
+            self._checkpoint_queue.put_nowait((job, future))
+        except Full as exc:
+            logger.warning(
+                "Checkpoint queue is full; rejecting job %s for sandbox %s",
+                job.job_id,
+                job.sandbox_id,
+            )
+            self._set_record(
+                JobRecord(
+                    job_id=job.job_id,
+                    job_type=JobType.CHECKPOINT,
+                    sandbox_id=job.sandbox_id,
+                    checkpoint_id=None,
+                    status=JobStatus.FAILED,
+                    created_at=utc_now(),
+                    finished_at=utc_now(),
+                    failure_code=FailureCode.RUNTIME_ERROR,
+                    message="checkpoint queue is full",
+                )
+            )
+            raise RuntimeError("checkpoint queue is full") from exc
+        return future
 
     def _submit_restore(self, job: RestoreJob) -> Future[RestoreResult]:
         self._set_record(
@@ -112,7 +143,22 @@ class CRExecutor:
             job.sandbox_id,
             job.checkpoint_id,
         )
-        return self._pool.submit(self._execute_restore, job)
+        return self._restore_pool.submit(self._execute_restore, job)
+
+    def _run_checkpoint_loop(self) -> None:
+        while True:
+            item = self._checkpoint_queue.get()
+            if item is None:
+                return
+            job, future = item
+            if future.cancelled():
+                continue
+            try:
+                result = self._execute_checkpoint(job)
+            except Exception as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
 
     def _execute_checkpoint(self, job: CheckpointJob) -> CheckpointResult:
         started = utc_now()

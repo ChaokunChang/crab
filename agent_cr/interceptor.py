@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 import json
 import threading
 import urllib.error
@@ -11,7 +12,7 @@ from typing import Callable
 
 from .contracts import RequestInterceptorHook, SandboxInspector, TelemetrySink
 from .ids import SandboxId
-from .models import RequestContext, RequestState, SandboxSnapshot, utc_now
+from .models import RequestContext, RequestState, RequestStateChange, SandboxSnapshot, utc_now
 
 
 class CompositeRequestInterceptorHook(RequestInterceptorHook):
@@ -60,7 +61,9 @@ class TelemetryRequestInterceptorHook(RequestInterceptorHook):
 class InMemoryRequestStateStore:
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
         self._states: dict[SandboxId, RequestState] = {}
+        self._changes: deque[RequestStateChange] = deque()
 
     def mark_request_start(self, context: RequestContext) -> RequestState:
         with self._lock:
@@ -75,11 +78,21 @@ class InMemoryRequestStateStore:
                 last_llm_request_started_at=context.started_at,
             )
             self._states[context.sandbox_id] = updated
+            self._changes.append(
+                RequestStateChange(
+                    sandbox_id=context.sandbox_id,
+                    event_type="request_start",
+                    request_id=context.request_id,
+                    observed_at=context.started_at,
+                )
+            )
+            self._condition.notify_all()
             return updated
 
     def mark_request_end(self, context: RequestContext) -> RequestState:
         with self._lock:
             current = self._states.get(context.sandbox_id, RequestState(sandbox_id=context.sandbox_id))
+            ended_at = utc_now()
             provider = None if context.metadata.get("provider") is None else str(context.metadata["provider"])
             updated = replace(
                 current,
@@ -87,14 +100,113 @@ class InMemoryRequestStateStore:
                 completed_llm_requests=current.completed_llm_requests + 1,
                 last_request_id=context.request_id,
                 last_llm_provider=provider,
-                last_llm_request_ended_at=utc_now(),
+                last_llm_request_ended_at=ended_at,
             )
             self._states[context.sandbox_id] = updated
+            self._changes.append(
+                RequestStateChange(
+                    sandbox_id=context.sandbox_id,
+                    event_type="request_end",
+                    request_id=context.request_id,
+                    observed_at=ended_at,
+                )
+            )
+            self._condition.notify_all()
             return updated
 
     def get(self, sandbox_id: SandboxId) -> RequestState:
         with self._lock:
             return self._states.get(sandbox_id, RequestState(sandbox_id=sandbox_id))
+
+    def wait_for_change(self, timeout: float | None = None) -> RequestStateChange | None:
+        with self._condition:
+            if not self._changes:
+                self._condition.wait(timeout=timeout)
+            if not self._changes:
+                return None
+            return self._changes.popleft()
+
+    def notify_waiters(self) -> None:
+        with self._condition:
+            self._condition.notify_all()
+
+
+class SandboxResponseGateRegistry:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._enabled = False
+        self._states: dict[SandboxId, dict[str, int | bool | threading.Condition]] = {}
+
+    def enable(self) -> None:
+        with self._lock:
+            self._enabled = True
+
+    def disable(self) -> None:
+        with self._lock:
+            self._enabled = False
+            conditions = [state["condition"] for state in self._states.values()]
+            for state in self._states.values():
+                state["active"] = False
+                state["released_generation"] = state["generation"]
+        for condition in conditions:
+            assert isinstance(condition, threading.Condition)
+            with condition:
+                condition.notify_all()
+
+    def arm(self, sandbox_id: SandboxId) -> int | None:
+        with self._lock:
+            if not self._enabled:
+                return None
+            state = self._states.get(sandbox_id)
+            if state is None:
+                condition = threading.Condition()
+                state = {
+                    "generation": 0,
+                    "released_generation": 0,
+                    "active": False,
+                    "condition": condition,
+                }
+                self._states[sandbox_id] = state
+            if not bool(state["active"]):
+                state["generation"] = int(state["generation"]) + 1
+                state["active"] = True
+            return int(state["generation"])
+
+    def wait_for_release(self, sandbox_id: SandboxId, generation: int | None, timeout: float | None = None) -> None:
+        if generation is None:
+            return
+        with self._lock:
+            state = self._states.get(sandbox_id)
+            if state is None:
+                return
+            condition = state["condition"]
+            assert isinstance(condition, threading.Condition)
+        with condition:
+            condition.wait_for(
+                lambda: self._is_generation_released(sandbox_id, generation),
+                timeout=timeout,
+            )
+
+    def release(self, sandbox_id: SandboxId) -> None:
+        with self._lock:
+            state = self._states.get(sandbox_id)
+            if state is None:
+                return
+            state["active"] = False
+            state["released_generation"] = int(state["generation"])
+            condition = state["condition"]
+            assert isinstance(condition, threading.Condition)
+        with condition:
+            condition.notify_all()
+
+    def _is_generation_released(self, sandbox_id: SandboxId, generation: int) -> bool:
+        with self._lock:
+            state = self._states.get(sandbox_id)
+            if state is None:
+                return True
+            if not self._enabled:
+                return True
+            return int(state["released_generation"]) >= generation
 
 
 class RequestAwareSandboxInspector(SandboxInspector):
@@ -119,6 +231,21 @@ class RequestAwareSandboxInspector(SandboxInspector):
             metadata={**base_snapshot.metadata, **request_state.to_metadata()},
         )
 
+    def mark_checkpoint_complete(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        process: bool,
+        filesystem: bool,
+        at,
+    ) -> None:
+        self._base.mark_checkpoint_complete(
+            sandbox_id,
+            process=process,
+            filesystem=filesystem,
+            at=at,
+        )
+
 
 class AgentCRRequestInterceptor:
     def __init__(
@@ -128,11 +255,13 @@ class AgentCRRequestInterceptor:
         request_state_store: InMemoryRequestStateStore,
         hook: RequestInterceptorHook | None = None,
         on_state_change: Callable[[SandboxId], None] | None = None,
+        response_gate_registry: SandboxResponseGateRegistry | None = None,
     ) -> None:
         self._upstream_transport = upstream_transport
         self._request_state_store = request_state_store
         self._hook = hook or CompositeRequestInterceptorHook()
         self._on_state_change = on_state_change
+        self._response_gate_registry = response_gate_registry
 
     def intercept(
         self,
@@ -153,9 +282,15 @@ class AgentCRRequestInterceptor:
         )
         self._hook.on_request_start(context)
         self._request_state_store.mark_request_start(context)
+        gate_generation = None
+        if self._response_gate_registry is not None:
+            gate_generation = self._response_gate_registry.arm(context.sandbox_id)
         self._notify(context.sandbox_id)
         try:
-            return self._upstream_transport(path, headers, body)
+            response = self._upstream_transport(path, headers, body)
+            if self._response_gate_registry is not None:
+                self._response_gate_registry.wait_for_release(context.sandbox_id, gate_generation)
+            return response
         finally:
             self._request_state_store.mark_request_end(context)
             self._hook.on_request_end(context)
@@ -177,6 +312,7 @@ class AgentCRRequestInterceptorServer:
         request_state_store: InMemoryRequestStateStore,
         hook: RequestInterceptorHook | None = None,
         on_state_change: Callable[[SandboxId], None] | None = None,
+        response_gate_registry: SandboxResponseGateRegistry | None = None,
         host: str = "127.0.0.1",
         port: int = 0,
     ) -> None:
@@ -186,6 +322,7 @@ class AgentCRRequestInterceptorServer:
             request_state_store=request_state_store,
             hook=hook,
             on_state_change=on_state_change,
+            response_gate_registry=response_gate_registry,
         )
         self._server = ThreadingHTTPServer((host, port), self._build_handler())
         self._thread: threading.Thread | None = None

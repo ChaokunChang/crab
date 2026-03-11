@@ -10,9 +10,12 @@ from agent_cr import (
     AdapterFileSystemRWorker,
     AdapterProcessCWorker,
     AdapterProcessRWorker,
+    ArtifactKind,
+    ArtifactPayload,
     CheckpointId,
     CheckpointJob,
     CheckpointManager,
+    DefaultCWorker,
     DefaultRWorker,
     DockerRuntimeAdapter,
     EBPFSandboxInspector,
@@ -50,10 +53,11 @@ class FakeCommandRunner(CommandRunner):
 class RecordingRestoreWorker:
     def __init__(self) -> None:
         self.jobs = []
+        self.manifests: list[CheckpointManifest] = []
 
     def restore(self, job: RestoreJob, manifest: CheckpointManifest) -> WorkerStepResult:
-        _ = manifest
         self.jobs.append(job)
+        self.manifests.append(manifest)
         return WorkerStepResult(
             success=True,
             operation_status=RuntimeOperationStatus(executed=False, reason="recorded"),
@@ -71,6 +75,79 @@ class NoArtifactCheckpointManager:
     def get_artifact(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId, reference) -> bytes:
         _ = (sandbox_id, checkpoint_id, reference)
         raise AssertionError("process restore should not fetch process artifacts from checkpoint storage")
+
+    def list_checkpoints(self, sandbox_id: SandboxId) -> list[CheckpointId]:
+        _ = sandbox_id
+        return [self.manifest.checkpoint_id]
+
+
+class ManifestCheckpointManager:
+    def __init__(self, manifests: list[CheckpointManifest]) -> None:
+        self._manifests = {(manifest.sandbox_id, manifest.checkpoint_id): manifest for manifest in manifests}
+        self._ordered: dict[SandboxId, list[CheckpointId]] = {}
+        for manifest in manifests:
+            self._ordered.setdefault(manifest.sandbox_id, []).append(manifest.checkpoint_id)
+
+    def get_manifest(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> CheckpointManifest:
+        return self._manifests[(sandbox_id, checkpoint_id)]
+
+    def list_checkpoints(self, sandbox_id: SandboxId) -> list[CheckpointId]:
+        return list(self._ordered.get(sandbox_id, []))
+
+    def put_manifest(self, manifest: CheckpointManifest) -> None:
+        self._manifests[(manifest.sandbox_id, manifest.checkpoint_id)] = manifest
+
+    def put_artifact(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId, artifact):
+        raise NotImplementedError
+
+    def get_artifact(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId, reference) -> bytes:
+        raise NotImplementedError
+
+
+class RecordingCheckpointWorker:
+    def __init__(self, artifact_kind: str) -> None:
+        self.calls: list[tuple[CheckpointJob, CheckpointId]] = []
+        self.artifact_kind = artifact_kind
+
+    def checkpoint(self, job: CheckpointJob, checkpoint_id: CheckpointId) -> WorkerStepResult:
+        self.calls.append((job, checkpoint_id))
+        return WorkerStepResult(
+            success=True,
+            artifacts=[],
+            operation_status=RuntimeOperationStatus(executed=False, reason=self.artifact_kind),
+        )
+
+
+class RecordingCheckpointManager:
+    def __init__(self) -> None:
+        self.manifest: CheckpointManifest | None = None
+
+    def put_manifest(self, manifest: CheckpointManifest) -> None:
+        self.manifest = manifest
+
+    def get_manifest(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> CheckpointManifest:
+        _ = (sandbox_id, checkpoint_id)
+        assert self.manifest is not None
+        return self.manifest
+
+    def put_artifact(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId, artifact):
+        _ = artifact
+        return type(
+            "ArtifactReference",
+            (),
+            {
+                "kind": None,
+                "name": "noop",
+            },
+        )()
+
+    def get_artifact(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId, reference) -> bytes:
+        _ = (sandbox_id, checkpoint_id, reference)
+        return b""
+
+    def list_checkpoints(self, sandbox_id: SandboxId) -> list[CheckpointId]:
+        _ = sandbox_id
+        return []
 
 
 class ContractTests(unittest.TestCase):
@@ -246,8 +323,138 @@ class ContractTests(unittest.TestCase):
         result = restore_worker.restore(job)
 
         self.assertEqual(result.status.value, "succeeded")
-        self.assertEqual(fs_worker.jobs, [job])
-        self.assertEqual(process_worker.jobs, [job])
+        self.assertEqual(fs_worker.jobs, [])
+        self.assertEqual(process_worker.jobs, [])
+
+    def test_default_checkpoint_worker_honors_scoped_checkpoint_flags(self) -> None:
+        manager = RecordingCheckpointManager()
+        process_worker = RecordingCheckpointWorker("process")
+        filesystem_worker = RecordingCheckpointWorker("filesystem")
+        worker = DefaultCWorker(
+            process_worker=process_worker,
+            filesystem_worker=filesystem_worker,
+            checkpoint_manager=manager,
+            runtime_adapter=DockerRuntimeAdapter(),
+        )
+        job = CheckpointJob(
+            job_id=JobId("job-scoped"),
+            sandbox_id=SandboxId("sbx-1"),
+            requested_at=utc_now(),
+            checkpoint_process=True,
+            checkpoint_filesystem=False,
+        )
+
+        result = worker.checkpoint(job)
+
+        self.assertEqual(result.status.value, "succeeded")
+        self.assertEqual(len(process_worker.calls), 1)
+        self.assertEqual(len(filesystem_worker.calls), 0)
+        assert result.manifest is not None
+        self.assertEqual(result.manifest.filesystem_artifacts, [])
+
+    def test_default_restore_worker_backfills_missing_process_from_previous_checkpoint(self) -> None:
+        sid = SandboxId("sbx-1")
+        process_ref = LocalCheckpointManager(StorageConfig(root_dir=Path(tempfile.mkdtemp()))).put_artifact(
+            sid,
+            CheckpointId("ckpt-bootstrap"),
+            ArtifactPayload(kind=ArtifactKind.PROCESS, name="process.json", data=b"{}"),
+        )
+        previous = CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=CheckpointId("ckpt-1"),
+            sandbox_id=sid,
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version=None,
+            process_artifacts=[process_ref],
+            filesystem_artifacts=[],
+            metadata={},
+        ).with_integrity()
+        current = CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=CheckpointId("ckpt-2"),
+            sandbox_id=sid,
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version=None,
+            process_artifacts=[],
+            filesystem_artifacts=[],
+            metadata={},
+        ).with_integrity()
+        fs_worker = RecordingRestoreWorker()
+        process_worker = RecordingRestoreWorker()
+        restore_worker = DefaultRWorker(
+            process_worker=process_worker,
+            filesystem_worker=fs_worker,
+            checkpoint_manager=ManifestCheckpointManager([previous, current]),
+        )
+
+        result = restore_worker.restore(
+            RestoreJob(
+                job_id=JobId("job-restore-process"),
+                sandbox_id=sid,
+                checkpoint_id=CheckpointId("ckpt-2"),
+                requested_at=utc_now(),
+            )
+        )
+
+        self.assertEqual(result.status.value, "succeeded")
+        self.assertEqual(len(process_worker.jobs), 1)
+        self.assertEqual(len(fs_worker.jobs), 0)
+        self.assertEqual(process_worker.manifests[0].metadata["process_restore_checkpoint_id"], "ckpt-1")
+        self.assertEqual(len(process_worker.manifests[0].process_artifacts), 1)
+
+    def test_default_restore_worker_backfills_missing_filesystem_from_previous_checkpoint(self) -> None:
+        sid = SandboxId("sbx-1")
+        fs_ref = LocalCheckpointManager(StorageConfig(root_dir=Path(tempfile.mkdtemp()))).put_artifact(
+            sid,
+            CheckpointId("ckpt-bootstrap"),
+            ArtifactPayload(kind=ArtifactKind.FILESYSTEM, name="filesystem.json", data=b"{}"),
+        )
+        previous = CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=CheckpointId("ckpt-1"),
+            sandbox_id=sid,
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version=None,
+            process_artifacts=[],
+            filesystem_artifacts=[fs_ref],
+            metadata={},
+        ).with_integrity()
+        current = CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=CheckpointId("ckpt-2"),
+            sandbox_id=sid,
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version=None,
+            process_artifacts=[],
+            filesystem_artifacts=[],
+            metadata={},
+        ).with_integrity()
+        fs_worker = RecordingRestoreWorker()
+        process_worker = RecordingRestoreWorker()
+        restore_worker = DefaultRWorker(
+            process_worker=process_worker,
+            filesystem_worker=fs_worker,
+            checkpoint_manager=ManifestCheckpointManager([previous, current]),
+        )
+
+        result = restore_worker.restore(
+            RestoreJob(
+                job_id=JobId("job-restore-fs"),
+                sandbox_id=sid,
+                checkpoint_id=CheckpointId("ckpt-2"),
+                requested_at=utc_now(),
+            )
+        )
+
+        self.assertEqual(result.status.value, "succeeded")
+        self.assertEqual(len(fs_worker.jobs), 1)
+        self.assertEqual(len(process_worker.jobs), 0)
+        self.assertEqual(fs_worker.manifests[0].metadata["filesystem_restore_checkpoint_id"], "ckpt-1")
+        self.assertEqual(len(fs_worker.manifests[0].filesystem_artifacts), 1)
 
     def test_runc_runtime_executes_real_commands_via_runner(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_runc_runtime_") as tmp:
@@ -298,6 +505,38 @@ class ContractTests(unittest.TestCase):
         self.assertFalse(snapshot.process_changed)
         self.assertTrue(snapshot.filesystem_changed)
         self.assertEqual(snapshot.metadata["ebpf_event_count"], 1)
+
+    def test_ebpf_inspector_clears_only_checkpointed_dimension(self) -> None:
+        collector = InMemoryEBPFEventCollector()
+        inspector = EBPFSandboxInspector(collector)
+        sandbox_id = SandboxId("sbx-1")
+        base_time = utc_now()
+        inspector.upsert_snapshot(
+            SandboxSnapshot(
+                sandbox_id=sandbox_id,
+                runtime_name="runc",
+                is_running=True,
+                process_changed=True,
+                filesystem_changed=True,
+                observed_at=base_time,
+            )
+        )
+
+        snapshot = inspector.inspect(sandbox_id)
+        self.assertTrue(snapshot.process_changed)
+        self.assertTrue(snapshot.filesystem_changed)
+
+        checkpoint_time = utc_now()
+        inspector.mark_checkpoint_complete(
+            sandbox_id,
+            process=True,
+            filesystem=False,
+            at=checkpoint_time,
+        )
+
+        updated = inspector.inspect(sandbox_id)
+        self.assertFalse(updated.process_changed)
+        self.assertTrue(updated.filesystem_changed)
 
     def test_local_storage_implements_checkpoint_manager_contract(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_contract_") as tmp:

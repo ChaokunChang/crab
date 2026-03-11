@@ -88,6 +88,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 storage,
             )
             executor = CRExecutor(ExecutorConfig(max_workers=1), checkpoint_worker, restore_worker, telemetry)
+            sandbox_manager = RuncSandboxManager(command_runner=runner, paths=sandbox_paths)
             scheduler = CRScheduler(
                 SchedulerConfig(),
                 DefaultHeuristicPolicy(
@@ -98,10 +99,10 @@ class SystemIntegrationTests(unittest.TestCase):
                     )
                 ),
                 inspector,
+                sandbox_manager,
                 InMemorySchedulerStateStore(),
                 telemetry,
             )
-            sandbox_manager = RuncSandboxManager(command_runner=runner, paths=sandbox_paths)
             system = AgentCRSystem(
                 scheduler=scheduler,
                 executor=executor,
@@ -144,20 +145,8 @@ class SystemIntegrationTests(unittest.TestCase):
             assert checkpoint_result is not None
             self.assertEqual(checkpoint_result.status, JobStatus.SUCCEEDED)
             self.assertIsNotNone(checkpoint_result.manifest)
-            self.assertEqual(len(checkpoint_result.manifest.process_artifacts), 1)
-            self.assertEqual(checkpoint_result.manifest.process_artifacts[0].name, "process_checkpoint.json")
+            self.assertEqual(len(checkpoint_result.manifest.process_artifacts), 0)
             self.assertTrue(len(checkpoint_result.manifest.filesystem_artifacts) >= 1)
-            process_artifact_dir = (
-                storage_root
-                / "artifacts"
-                / str(sandbox_id)
-                / str(checkpoint_result.checkpoint_id)
-                / "process"
-            )
-            self.assertEqual(
-                sorted(path.name for path in process_artifact_dir.iterdir()),
-                ["process_checkpoint.json"],
-            )
 
             restore_result = system.restore_once(sandbox_id, checkpoint_result.checkpoint_id)
             self.assertEqual(restore_result.status, JobStatus.SUCCEEDED)
@@ -172,36 +161,11 @@ class SystemIntegrationTests(unittest.TestCase):
             expected_commands = [
                 ("zfs", "create", "-o", f"mountpoint={root / 'bundles' / 'sbx-int' / 'rootfs'}", "pool/agent-cr/sbx-int"),
                 ("runc", "--root", str(root / "runtime-state"), "run", "-d", "--bundle", str(root / "bundles" / "sbx-int"), "sbx-int"),
-                (
-                    "runc",
-                    "--root",
-                    str(root / "runtime-state"),
-                    "checkpoint",
-                    "sbx-int",
-                    "--image-path",
-                    str(root / "checkpoints" / "sbx-int" / str(checkpoint_result.checkpoint_id) / "process"),
-                    "--work-path",
-                    str(root / "checkpoints" / "sbx-int" / str(checkpoint_result.checkpoint_id) / "work"),
-                    "--leave-running=false",
-                    "--tcp-established",
-                ),
+                ("runc", "--root", str(root / "runtime-state"), "pause", "sbx-int"),
                 ("zfs", "snapshot", f"pool/agent-cr/sbx-int@{checkpoint_result.checkpoint_id}"),
+                ("runc", "--root", str(root / "runtime-state"), "resume", "sbx-int"),
+                ("runc", "--root", str(root / "runtime-state"), "delete", "-f", "sbx-int"),
                 ("zfs", "rollback", "-r", f"pool/agent-cr/sbx-int@{checkpoint_result.checkpoint_id}"),
-                (
-                    "runc",
-                    "--root",
-                    str(root / "runtime-state"),
-                    "restore",
-                    "-d",
-                    "--bundle",
-                    str(root / "bundles" / "sbx-int"),
-                    "--image-path",
-                    str(root / "checkpoints" / "sbx-int" / str(checkpoint_result.checkpoint_id) / "process"),
-                    "--work-path",
-                    str(root / "checkpoints" / "sbx-int" / str(checkpoint_result.checkpoint_id) / "work"),
-                    "--tcp-established",
-                    "sbx-int",
-                ),
                 ("runc", "--root", str(root / "runtime-state"), "kill", "sbx-int", "TERM"),
                 ("runc", "--root", str(root / "runtime-state"), "delete", "-f", "sbx-int"),
                 ("zfs", "destroy", "-r", "pool/agent-cr/sbx-int"),

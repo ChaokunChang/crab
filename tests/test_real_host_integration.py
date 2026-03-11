@@ -97,7 +97,7 @@ class RealHostIntegrationTests(unittest.TestCase):
         image_tag = f"agent-cr-simulated-agent:{int(time.time())}"
         executor: CRExecutor | None = None
 
-        llm_server = serve(host="127.0.0.1", port=0, response_delay_ms=500)
+        llm_server = serve(host="127.0.0.1", port=0, response_delay_ms=250)
         llm_thread = threading.Thread(target=llm_server.serve_forever, daemon=True)
         llm_thread.start()
         self.addCleanup(llm_server.shutdown)
@@ -169,6 +169,14 @@ class RealHostIntegrationTests(unittest.TestCase):
                 ),
                 telemetry,
             )
+            sandbox_manager = RuncSandboxManager(
+                paths=RuncSandboxManagerPaths(
+                    state_root=runtime_state_root,
+                    bundle_root=root / "bundles",
+                    metadata_root=sandbox_metadata_root,
+                    zfs_dataset_prefix=f"{pool_name}/agent-cr",
+                )
+            )
             scheduler = CRScheduler(
                 SchedulerConfig(),
                 DefaultHeuristicPolicy(
@@ -181,16 +189,9 @@ class RealHostIntegrationTests(unittest.TestCase):
                     )
                 ),
                 inspector,
+                sandbox_manager,
                 InMemorySchedulerStateStore(),
                 telemetry,
-            )
-            sandbox_manager = RuncSandboxManager(
-                paths=RuncSandboxManagerPaths(
-                    state_root=runtime_state_root,
-                    bundle_root=root / "bundles",
-                    metadata_root=sandbox_metadata_root,
-                    zfs_dataset_prefix=f"{pool_name}/agent-cr",
-                )
             )
             system = AgentCRSystem(
                 scheduler=scheduler,
@@ -310,6 +311,11 @@ class RealHostIntegrationTests(unittest.TestCase):
             )
             self.assertFalse(tamper_path.exists(), "zfs rollback should remove host-side tamper")
 
+            _wait_for(
+                lambda: int(_wait_for_http_json(f"http://127.0.0.1:{status_port}/status")["total_actions"]) > total_before,
+                timeout_s=20.0,
+                interval_s=0.5,
+            )
             status_after = _wait_for_http_json(f"http://127.0.0.1:{status_port}/status")
             self.assertEqual(str(status_after["runtime_id"]), runtime_id_before)
             self.assertGreater(int(status_after["total_actions"]), total_before)

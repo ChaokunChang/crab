@@ -1,0 +1,149 @@
+from __future__ import annotations
+
+import unittest
+
+from agent_cr import (
+    CRScheduler,
+    DefaultHeuristicPolicy,
+    InMemorySandboxInspector,
+    InMemorySchedulerStateStore,
+    PolicyConfig,
+    SandboxDescription,
+    SandboxId,
+    SandboxSnapshot,
+    SchedulerConfig,
+)
+from agent_cr.models import utc_now
+
+
+class RecordingSandboxManager:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, SandboxId]] = []
+        self._items: dict[SandboxId, SandboxDescription] = {}
+
+    def add(self, sandbox_id: SandboxId) -> None:
+        self._items[sandbox_id] = SandboxDescription(
+            sandbox_id=sandbox_id,
+            runtime_name="runc",
+            status="running",
+        )
+
+    def launch(self, runtime_name: str, metadata: dict[str, object] | None = None) -> SandboxId:
+        _ = (runtime_name, metadata)
+        raise NotImplementedError
+
+    def stop(self, sandbox_id: SandboxId) -> None:
+        self.calls.append(("stop", sandbox_id))
+        self._items[sandbox_id] = SandboxDescription(
+            sandbox_id=sandbox_id,
+            runtime_name="runc",
+            status="stopped",
+        )
+
+    def pause(self, sandbox_id: SandboxId) -> None:
+        self.calls.append(("pause", sandbox_id))
+        current = self._items[sandbox_id]
+        self._items[sandbox_id] = SandboxDescription(
+            sandbox_id=sandbox_id,
+            runtime_name=current.runtime_name,
+            status="paused",
+            metadata=current.metadata,
+        )
+
+    def resume(self, sandbox_id: SandboxId) -> None:
+        self.calls.append(("resume", sandbox_id))
+        current = self._items[sandbox_id]
+        self._items[sandbox_id] = SandboxDescription(
+            sandbox_id=sandbox_id,
+            runtime_name=current.runtime_name,
+            status="running",
+            metadata=current.metadata,
+        )
+
+    def delete(self, sandbox_id: SandboxId) -> None:
+        self.calls.append(("delete", sandbox_id))
+        self._items.pop(sandbox_id, None)
+
+    def describe(self, sandbox_id: SandboxId) -> SandboxDescription:
+        return self._items[sandbox_id]
+
+
+class SchedulerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.inspector = InMemorySandboxInspector()
+        self.sandbox_manager = RecordingSandboxManager()
+        self.sandbox_id = SandboxId("sbx-1")
+        self.sandbox_manager.add(self.sandbox_id)
+        self.scheduler = CRScheduler(
+            SchedulerConfig(),
+            DefaultHeuristicPolicy(
+                PolicyConfig(
+                    min_checkpoint_interval_seconds=0.0,
+                    force_checkpoint_after_seconds=0.0,
+                    require_change_signal=True,
+                )
+            ),
+            self.inspector,
+            self.sandbox_manager,
+            InMemorySchedulerStateStore(),
+        )
+
+    def test_query_resumes_sandbox_when_checkpoint_not_needed(self) -> None:
+        self.inspector.upsert_snapshot(
+            SandboxSnapshot(
+                sandbox_id=self.sandbox_id,
+                runtime_name="runc",
+                is_running=True,
+                process_changed=False,
+                filesystem_changed=False,
+                observed_at=utc_now(),
+            )
+        )
+
+        decision = self.scheduler.query_checkpoint(self.sandbox_id)
+
+        self.assertFalse(decision.should_checkpoint)
+        self.assertEqual(self.sandbox_manager.calls, [("pause", self.sandbox_id), ("resume", self.sandbox_id)])
+        self.assertEqual(self.sandbox_manager.describe(self.sandbox_id).status, "running")
+
+    def test_query_returns_process_only_scope_and_keeps_sandbox_paused(self) -> None:
+        self.inspector.upsert_snapshot(
+            SandboxSnapshot(
+                sandbox_id=self.sandbox_id,
+                runtime_name="runc",
+                is_running=True,
+                process_changed=True,
+                filesystem_changed=False,
+                observed_at=utc_now(),
+            )
+        )
+
+        decision = self.scheduler.query_checkpoint(self.sandbox_id)
+
+        self.assertTrue(decision.should_checkpoint)
+        self.assertTrue(decision.checkpoint_process)
+        self.assertFalse(decision.checkpoint_filesystem)
+        self.assertEqual(self.sandbox_manager.calls, [("pause", self.sandbox_id)])
+        self.assertEqual(self.sandbox_manager.describe(self.sandbox_id).status, "paused")
+
+    def test_query_returns_both_scopes_when_both_dimensions_changed(self) -> None:
+        self.inspector.upsert_snapshot(
+            SandboxSnapshot(
+                sandbox_id=self.sandbox_id,
+                runtime_name="runc",
+                is_running=True,
+                process_changed=True,
+                filesystem_changed=True,
+                observed_at=utc_now(),
+            )
+        )
+
+        decision = self.scheduler.query_checkpoint(self.sandbox_id)
+
+        self.assertTrue(decision.should_checkpoint)
+        self.assertTrue(decision.checkpoint_process)
+        self.assertTrue(decision.checkpoint_filesystem)
+
+
+if __name__ == "__main__":
+    unittest.main()

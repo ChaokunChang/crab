@@ -61,19 +61,36 @@ class AdapterProcessRWorker(ProcessRWorker):
         self._adapter = adapter
 
     def restore(self, job: RestoreJob, manifest: CheckpointManifest) -> WorkerStepResult:
-        _ = manifest
+        restore_checkpoint_id = _restore_checkpoint_id(
+            manifest,
+            metadata_key="process_restore_checkpoint_id",
+            default=job.checkpoint_id,
+        )
         if self._adapter.capabilities().supports_custom_checkpoint_dir:
-            image_path = self._adapter.process_checkpoint_location(job.sandbox_id, job.checkpoint_id)
+            image_path = self._adapter.process_checkpoint_location(job.sandbox_id, restore_checkpoint_id)
             if image_path is None:
                 raise ValueError("runtime adapter did not provide process checkpoint location for restore")
             checkpoint_dir = Path(str(image_path))
             if not checkpoint_dir.exists():
                 raise FileNotFoundError(f"process checkpoint directory not found: {checkpoint_dir}")
-        status = self._adapter.restore_process(job.sandbox_id, job.checkpoint_id)
+        status = self._adapter.restore_process(job.sandbox_id, restore_checkpoint_id)
         logger.debug(
-            "Process restore worker finished for sandbox=%s checkpoint=%s executed=%s",
+            "Process restore worker finished for sandbox=%s checkpoint=%s restore_checkpoint=%s executed=%s",
             job.sandbox_id,
             job.checkpoint_id,
+            restore_checkpoint_id,
             status.executed,
         )
         return WorkerStepResult(success=True, artifacts=[], operation_status=status)
+
+
+def _restore_checkpoint_id(
+    manifest: CheckpointManifest,
+    *,
+    metadata_key: str,
+    default: CheckpointId,
+) -> CheckpointId:
+    raw = manifest.metadata.get(metadata_key)
+    if raw is None:
+        return default
+    return CheckpointId(str(raw))

@@ -229,6 +229,14 @@ def main() -> None:
                 ),
                 telemetry,
             )
+            sandbox_manager = RuncSandboxManager(
+                paths=RuncSandboxManagerPaths(
+                    state_root=runtime_state_root,
+                    bundle_root=root / "bundles",
+                    metadata_root=root / "sandbox-meta",
+                    zfs_dataset_prefix=f"{pool_name}/agent-cr",
+                )
+            )
             scheduler = CRScheduler(
                 SchedulerConfig(),
                 DefaultHeuristicPolicy(
@@ -241,16 +249,9 @@ def main() -> None:
                     )
                 ),
                 inspector,
+                sandbox_manager,
                 InMemorySchedulerStateStore(),
                 telemetry,
-            )
-            sandbox_manager = RuncSandboxManager(
-                paths=RuncSandboxManagerPaths(
-                    state_root=runtime_state_root,
-                    bundle_root=root / "bundles",
-                    metadata_root=root / "sandbox-meta",
-                    zfs_dataset_prefix=f"{pool_name}/agent-cr",
-                )
             )
             system = AgentCRSystem(
                 scheduler=scheduler,
@@ -349,17 +350,10 @@ def main() -> None:
                 t1 = time.perf_counter()
                 logger.debug("checkpoint results: %s", checkpoint_results)
 
-                restore_jobs = [
-                    RestoreJob(
-                        job_id=JobId.new(prefix="restore"),
-                        sandbox_id=result.sandbox_id,
-                        checkpoint_id=result.checkpoint_id,
-                        requested_at=utc_now(),
-                        reason="bench_restore",
-                    )
+                restore_results = [
+                    system.restore_once(result.sandbox_id, result.checkpoint_id)
                     for result in checkpoint_results
                 ]
-                restore_results = system.executor.run_restores(restore_jobs)
                 t2 = time.perf_counter()
                 logger.debug("restore results: %s", restore_results)
 

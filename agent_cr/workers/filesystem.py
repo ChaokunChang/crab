@@ -54,12 +54,29 @@ class AdapterFileSystemRWorker(FileSystemRWorker):
         self._adapter = adapter
 
     def restore(self, job: RestoreJob, manifest: CheckpointManifest) -> WorkerStepResult:
-        _ = manifest
-        status = self._adapter.restore_filesystem(job.sandbox_id, job.checkpoint_id)
+        restore_checkpoint_id = _restore_checkpoint_id(
+            manifest,
+            metadata_key="filesystem_restore_checkpoint_id",
+            default=job.checkpoint_id,
+        )
+        status = self._adapter.restore_filesystem(job.sandbox_id, restore_checkpoint_id)
         logger.debug(
-            "Filesystem restore worker finished for sandbox=%s checkpoint=%s executed=%s",
+            "Filesystem restore worker finished for sandbox=%s checkpoint=%s restore_checkpoint=%s executed=%s",
             job.sandbox_id,
             job.checkpoint_id,
+            restore_checkpoint_id,
             status.executed,
         )
         return WorkerStepResult(success=True, artifacts=[], operation_status=status)
+
+
+def _restore_checkpoint_id(
+    manifest: CheckpointManifest,
+    *,
+    metadata_key: str,
+    default: CheckpointId,
+) -> CheckpointId:
+    raw = manifest.metadata.get(metadata_key)
+    if raw is None:
+        return default
+    return CheckpointId(str(raw))

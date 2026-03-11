@@ -22,7 +22,7 @@ class SimulatedE2ETests(unittest.TestCase):
                 ),
             )
 
-            sandbox_id = SandboxId("sandbox-1")
+            sandbox_id = system.sandbox_manager.launch("docker")
             system.inspector.upsert_snapshot(
                 SandboxSnapshot(
                     sandbox_id=sandbox_id,

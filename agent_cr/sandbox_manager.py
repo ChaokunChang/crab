@@ -46,6 +46,21 @@ class InMemorySandboxManager(SandboxManager):
             self._items[sandbox_id] = replace(cur, status="stopped")
         logger.info("Stopped in-memory sandbox %s", sandbox_id)
 
+    def pause(self, sandbox_id: SandboxId) -> None:
+        with self._lock:
+            cur = self._items[sandbox_id]
+            self._items[sandbox_id] = replace(cur, status="paused")
+        logger.info("Paused in-memory sandbox %s", sandbox_id)
+
+    def resume(self, sandbox_id: SandboxId) -> None:
+        with self._lock:
+            cur = self._items[sandbox_id]
+            self._items[sandbox_id] = replace(cur, status="running")
+        logger.info("Resumed in-memory sandbox %s", sandbox_id)
+
+    def prepare_for_restore(self, sandbox_id: SandboxId) -> None:
+        logger.info("Prepared in-memory sandbox %s for restore", sandbox_id)
+
     def delete(self, sandbox_id: SandboxId) -> None:
         with self._lock:
             self._items.pop(sandbox_id)
@@ -125,6 +140,35 @@ class RuncSandboxManager(SandboxManager):
             self._items[sandbox_id] = updated
         self._persist(updated)
         logger.info("Sandbox %s stopped", sandbox_id)
+
+    def pause(self, sandbox_id: SandboxId) -> None:
+        description = self.describe(sandbox_id)
+        logger.info("Pausing sandbox %s", sandbox_id)
+        self._run([self._runtime_bin, "--root", str(self._paths.state_root), "pause", str(sandbox_id)])
+        updated = replace(description, status="paused")
+        with self._lock:
+            self._items[sandbox_id] = updated
+        self._persist(updated)
+        logger.info("Sandbox %s paused", sandbox_id)
+
+    def resume(self, sandbox_id: SandboxId) -> None:
+        description = self.describe(sandbox_id)
+        logger.info("Resuming sandbox %s", sandbox_id)
+        self._run([self._runtime_bin, "--root", str(self._paths.state_root), "resume", str(sandbox_id)])
+        updated = replace(description, status="running")
+        with self._lock:
+            self._items[sandbox_id] = updated
+        self._persist(updated)
+        logger.info("Sandbox %s resumed", sandbox_id)
+
+    def prepare_for_restore(self, sandbox_id: SandboxId) -> None:
+        logger.info("Preparing sandbox %s for restore", sandbox_id)
+        try:
+            self._run([self._runtime_bin, "--root", str(self._paths.state_root), "delete", "-f", str(sandbox_id)])
+        except RuntimeError as exc:
+            if "does not exist" not in str(exc):
+                raise
+        logger.info("Sandbox %s runtime state cleared for restore", sandbox_id)
 
     def delete(self, sandbox_id: SandboxId) -> None:
         description = self.describe(sandbox_id)

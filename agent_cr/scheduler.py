@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import replace
 from datetime import datetime
 import logging
 from threading import Lock
 
 from .config import SchedulerConfig
-from .contracts import CRPolicy, SandboxInspector, SchedulerStateStore, TelemetrySink
-from .ids import JobId, SandboxId
-from .models import CheckpointJob, SandboxSnapshot, ScheduleDecision, utc_now
+from .contracts import CRPolicy, SandboxInspector, SandboxManager, SchedulerStateStore, TelemetrySink
+from .ids import SandboxId
+from .models import SandboxSnapshot, SchedulerCheckpointDecision, utc_now
 from .telemetry import NoopTelemetrySink
 
 logger = logging.getLogger(__name__)
@@ -19,7 +18,6 @@ class InMemorySchedulerStateStore(SchedulerStateStore):
     def __init__(self) -> None:
         self._lock = Lock()
         self._last_checkpoint: dict[SandboxId, datetime] = {}
-        self._queue: deque[CheckpointJob] = deque()
 
     def set_last_checkpoint(self, sandbox_id: SandboxId, checkpoint_time: datetime) -> None:
         with self._lock:
@@ -34,36 +32,6 @@ class InMemorySchedulerStateStore(SchedulerStateStore):
         with self._lock:
             return self._last_checkpoint.get(sandbox_id)
 
-    def enqueue_checkpoint_job(self, job: CheckpointJob) -> None:
-        with self._lock:
-            self._queue.append(job)
-            queue_size = len(self._queue)
-        logger.debug(
-            "Enqueued checkpoint job %s for sandbox %s; pending_jobs=%d",
-            job.job_id,
-            job.sandbox_id,
-            queue_size,
-        )
-
-    def pop_checkpoint_job(self) -> CheckpointJob | None:
-        with self._lock:
-            if not self._queue:
-                logger.debug("Checkpoint queue is empty")
-                return None
-            job = self._queue.popleft()
-            queue_size = len(self._queue)
-        logger.debug(
-            "Dequeued checkpoint job %s for sandbox %s; pending_jobs=%d",
-            job.job_id,
-            job.sandbox_id,
-            queue_size,
-        )
-        return job
-
-    def pending_jobs(self):
-        with self._lock:
-            return tuple(self._queue)
-
 
 class CRScheduler:
     def __init__(
@@ -71,16 +39,18 @@ class CRScheduler:
         config: SchedulerConfig,
         policy: CRPolicy,
         inspector: SandboxInspector,
+        sandbox_manager: SandboxManager,
         state_store: SchedulerStateStore | None = None,
         telemetry: TelemetrySink | None = None,
     ):
         self._config = config
         self._policy = policy
         self._inspector = inspector
+        self._sandbox_manager = sandbox_manager
         self._state = state_store or InMemorySchedulerStateStore()
         self._telemetry = telemetry or NoopTelemetrySink()
 
-    def evaluate(self, sandbox: SandboxSnapshot) -> ScheduleDecision:
+    def evaluate(self, sandbox: SandboxSnapshot) -> SchedulerCheckpointDecision:
         hydrated = sandbox
         if hydrated.last_checkpoint_at is None:
             last = self._state.get_last_checkpoint(hydrated.sandbox_id)
@@ -91,14 +61,27 @@ class CRScheduler:
                     hydrated.sandbox_id,
                     last.isoformat(),
                 )
-        decision = self._policy.evaluate(hydrated)
+        policy_decision = self._policy.evaluate(hydrated)
+        has_scope = hydrated.process_changed or hydrated.filesystem_changed
+        should_checkpoint = policy_decision.should_checkpoint and has_scope
+        decision = SchedulerCheckpointDecision(
+            should_checkpoint=should_checkpoint,
+            checkpoint_process=should_checkpoint and hydrated.process_changed,
+            checkpoint_filesystem=should_checkpoint and hydrated.filesystem_changed,
+            reason=policy_decision.reason if should_checkpoint or not policy_decision.should_checkpoint else "no_change_signal",
+            policy_name=policy_decision.policy_name,
+            next_earliest_checkpoint_at=policy_decision.next_earliest_checkpoint_at,
+            metadata=dict(policy_decision.metadata),
+        )
         log_fn = logger.info if decision.should_checkpoint else logger.debug
         log_fn(
-            "Scheduler evaluated sandbox %s with policy=%s should_checkpoint=%s reason=%s",
+            "Scheduler evaluated sandbox %s with policy=%s should_checkpoint=%s reason=%s process=%s filesystem=%s",
             hydrated.sandbox_id,
             self._policy.name,
             decision.should_checkpoint,
             decision.reason,
+            decision.checkpoint_process,
+            decision.checkpoint_filesystem,
         )
         self._telemetry.emit_event(
             "scheduler.evaluate",
@@ -107,84 +90,40 @@ class CRScheduler:
                 "policy": self._policy.name,
                 "should_checkpoint": decision.should_checkpoint,
                 "reason": decision.reason,
+                "checkpoint_process": decision.checkpoint_process,
+                "checkpoint_filesystem": decision.checkpoint_filesystem,
             },
         )
         return decision
 
-    def submit_checkpoint(
-        self,
-        sandbox_id: SandboxId,
-        *,
-        reason: str = "manual",
-        metadata: dict[str, object] | None = None,
-    ) -> JobId:
-        pending_count = len(tuple(self._state.pending_jobs()))
-        if pending_count >= self._config.max_pending_jobs:
-            logger.warning(
-                "Rejecting checkpoint submission for sandbox %s because queue is full (%d/%d)",
-                sandbox_id,
-                pending_count,
-                self._config.max_pending_jobs,
-            )
-            raise RuntimeError("scheduler pending queue is full")
-        job_id = JobId.new()
-        job = CheckpointJob(
-            job_id=job_id,
-            sandbox_id=sandbox_id,
-            requested_at=utc_now(),
-            reason=reason,
-            metadata=dict(metadata or {}),
-        )
-        self._state.enqueue_checkpoint_job(job)
-        logger.info(
-            "Submitted checkpoint job %s for sandbox %s with reason=%s",
-            job_id,
-            sandbox_id,
-            reason,
-        )
-        self._telemetry.emit_event(
-            "scheduler.submit_checkpoint",
-            {
-                "sandbox_id": str(sandbox_id),
-                "job_id": str(job_id),
-                "reason": reason,
-            },
-        )
-        return job_id
-
-    def pop_next_checkpoint_job(self) -> CheckpointJob | None:
-        return self._state.pop_checkpoint_job()
-
-    def poll_and_schedule(self, sandbox_id: SandboxId) -> CheckpointJob | None:
-        logger.debug("Polling sandbox %s for checkpoint scheduling", sandbox_id)
-        snapshot = self._inspector.inspect(sandbox_id)
-        decision = self.evaluate(snapshot)
-        if not decision.should_checkpoint:
-            logger.debug(
-                "Sandbox %s is not due for checkpoint; reason=%s",
-                sandbox_id,
-                decision.reason,
-            )
-            return None
-        job_id = self.submit_checkpoint(
-            sandbox_id=sandbox_id,
-            reason=decision.reason,
-            metadata={"policy": decision.policy_name, **decision.metadata},
-        )
-        job = self.pop_next_checkpoint_job()
-        if job is None or job.job_id != job_id:
-            logger.warning(
-                "Checkpoint job %s for sandbox %s was not available when dequeued",
-                job_id,
-                sandbox_id,
-            )
-            return None
-        logger.info(
-            "Scheduled checkpoint job %s for sandbox %s",
-            job.job_id,
-            sandbox_id,
-        )
-        return job
+    def query_checkpoint(self, sandbox_id: SandboxId) -> SchedulerCheckpointDecision:
+        logger.debug("Querying scheduler for sandbox %s", sandbox_id)
+        self._sandbox_manager.pause(sandbox_id)
+        try:
+            snapshot = self._inspector.inspect(sandbox_id)
+            decision = self.evaluate(snapshot)
+            if not decision.should_checkpoint:
+                self._sandbox_manager.resume(sandbox_id)
+                logger.debug(
+                    "Scheduler declined checkpoint for sandbox %s reason=%s",
+                    sandbox_id,
+                    decision.reason,
+                )
+            else:
+                logger.info(
+                    "Scheduler selected checkpoint for sandbox %s reason=%s process=%s filesystem=%s",
+                    sandbox_id,
+                    decision.reason,
+                    decision.checkpoint_process,
+                    decision.checkpoint_filesystem,
+                )
+            return decision
+        except Exception:
+            try:
+                self._sandbox_manager.resume(sandbox_id)
+            except Exception:
+                logger.exception("Failed to resume sandbox %s after scheduler exception", sandbox_id)
+            raise
 
     def mark_checkpoint_complete(self, sandbox_id: SandboxId, at: datetime | None = None) -> None:
         ts = at or utc_now()
