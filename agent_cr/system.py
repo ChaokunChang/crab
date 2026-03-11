@@ -143,6 +143,8 @@ class AgentCRSystem:
             reason="manual",
         )
         result = self.executor.run_restore(job)
+        if result.status.value == "succeeded":
+            self.sandbox_manager.mark_restored(sandbox_id)
         logger.info(
             "Manual restore for sandbox %s checkpoint=%s finished with status=%s",
             sandbox_id,

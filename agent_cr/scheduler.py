@@ -64,9 +64,15 @@ class CRScheduler:
         policy_decision = self._policy.evaluate(hydrated)
         has_scope = hydrated.process_changed or hydrated.filesystem_changed
         should_checkpoint = policy_decision.should_checkpoint and has_scope
+        # A live filesystem checkpoint must also capture process state. Long-lived
+        # agents can mutate memory without emitting exec/exit events, so a
+        # filesystem-only checkpoint can restore an inconsistent runtime.
+        checkpoint_process = should_checkpoint and (
+            hydrated.process_changed or hydrated.filesystem_changed
+        )
         decision = SchedulerCheckpointDecision(
             should_checkpoint=should_checkpoint,
-            checkpoint_process=should_checkpoint and hydrated.process_changed,
+            checkpoint_process=checkpoint_process,
             checkpoint_filesystem=should_checkpoint and hydrated.filesystem_changed,
             reason=policy_decision.reason if should_checkpoint or not policy_decision.should_checkpoint else "no_change_signal",
             policy_name=policy_decision.policy_name,

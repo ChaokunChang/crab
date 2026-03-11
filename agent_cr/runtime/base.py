@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import tempfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 import logging
@@ -33,23 +34,50 @@ class SubprocessCommandRunner(CommandRunner):
         self._timeout_seconds = timeout_seconds
 
     def run(self, command: list[str], *, cwd: Path | None = None) -> CommandResult:
-        detached = "-d" in command
-        completed = subprocess.run(
-            command,
-            cwd=None if cwd is None else str(cwd),
-            check=False,
-            stdin=(subprocess.DEVNULL if detached else None),
-            stdout=(subprocess.DEVNULL if detached else subprocess.PIPE),
-            stderr=(subprocess.DEVNULL if detached else subprocess.PIPE),
-            text=True,
-            timeout=self._timeout_seconds,
-        )
+        detached = self._should_use_file_stdio(command)
+        if detached:
+            with tempfile.TemporaryFile(mode="w+") as stdout_file, tempfile.TemporaryFile(mode="w+") as stderr_file:
+                completed = subprocess.run(
+                    command,
+                    cwd=None if cwd is None else str(cwd),
+                    check=False,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    text=True,
+                    timeout=self._timeout_seconds,
+                )
+                stdout_file.seek(0)
+                stderr_file.seek(0)
+                stdout = stdout_file.read()
+                stderr = stderr_file.read()
+        else:
+            completed = subprocess.run(
+                command,
+                cwd=None if cwd is None else str(cwd),
+                check=False,
+                stdin=None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=self._timeout_seconds,
+            )
+            stdout = "" if completed.stdout is None else completed.stdout
+            stderr = "" if completed.stderr is None else completed.stderr
         return CommandResult(
             command=tuple(command),
             returncode=completed.returncode,
-            stdout="" if completed.stdout is None else completed.stdout,
-            stderr="" if completed.stderr is None else completed.stderr,
+            stdout=stdout,
+            stderr=stderr,
         )
+
+    def _should_use_file_stdio(self, command: list[str]) -> bool:
+        if "-d" in command:
+            return True
+        if not command:
+            return False
+        executable = Path(command[0]).name
+        return executable == "runc" and any(verb in command for verb in ("create", "start"))
 
 
 class CommandRuntimeAdapter(SandboxRuntimeAdapter):

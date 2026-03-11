@@ -14,7 +14,6 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
-import logging
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -103,12 +102,20 @@ def wait_for_http_json(url: str, *, timeout_s: float = 30.0) -> dict[str, object
     raise RuntimeError(f"timed out waiting for {url}: {last_exc}")
 
 
-def wait_for(predicate, *, timeout_s: float = 30.0, interval_s: float = 0.2) -> None:
+def wait_for(
+    predicate,
+    *,
+    timeout_s: float = 30.0,
+    interval_s: float = 0.2,
+    raise_on_timeout: bool = True,
+) -> bool:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         if predicate():
-            return
+            return True
         time.sleep(interval_s)
+    if not raise_on_timeout:
+        return False
     raise RuntimeError("timed out waiting for predicate")
 
 
@@ -122,16 +129,33 @@ def enough_progress(payload: dict[str, object]) -> bool:
     )
 
 
-def write_bundle_config(*, bundle_dir: Path, interceptor_port: int, provider: str, sandbox_name: str, status_port: int) -> None:
+def write_bundle_config(
+    *,
+    bundle_dir: Path,
+    interceptor_port: int,
+    provider: str,
+    sandbox_name: str,
+    status_port: int,
+    cgroup_path: str,
+) -> None:
     config_path = bundle_dir / "config.json"
     cfg = json.loads(config_path.read_text())
     linux_cfg = cfg.get("linux", {})
-    linux_cfg["namespaces"] = [ns for ns in linux_cfg.get("namespaces", []) if ns.get("type") != "network"]
+    linux_cfg["namespaces"] = [
+        ns
+        for ns in linux_cfg.get("namespaces", [])
+        if ns.get("type") not in {"network", "cgroup"}
+    ]
+    linux_cfg["cgroupsPath"] = cgroup_path
     linux_cfg.pop("seccomp", None)
     cfg["linux"] = linux_cfg
     cfg["process"]["terminal"] = False
     cfg["process"]["cwd"] = "/work"
-    cfg["process"]["args"] = ["/usr/local/bin/agent-cli", "run", "--provider", provider]
+    cfg["process"]["args"] = [
+        "/bin/sh",
+        "-lc",
+        f"exec /usr/local/bin/agent-cli run --provider {provider} >/dev/null 2>/dev/null",
+    ]
     cfg["process"]["env"] = [
         "PATH=/usr/local/bin:/usr/bin:/bin",
         "PYTHONUNBUFFERED=1",
@@ -288,6 +312,7 @@ def main() -> None:
                     provider=args.provider,
                     sandbox_name=sandbox_name,
                     status_port=status_port,
+                    cgroup_path=f"agent-cr-bench/{pool_name}/{sandbox_name}",
                 )
                 inspector.upsert_snapshot(
                     SandboxSnapshot(
@@ -332,7 +357,15 @@ def main() -> None:
                         ),
                         timeout_s=45.0,
                     )
-                    wait_for(lambda sid=sandbox_id: request_state_store.get(sid).llm_request_in_flight, timeout_s=20.0)
+                    if not wait_for(
+                        lambda sid=sandbox_id: request_state_store.get(sid).llm_request_in_flight,
+                        timeout_s=20.0,
+                        raise_on_timeout=False,
+                    ):
+                        logger.warning(
+                            "sandbox %s did not enter an in-flight LLM request window before checkpoint; continuing",
+                            sandbox_id,
+                        )
                     current = wait_for_http_json(f"http://127.0.0.1:{status_ports[sandbox_id]}/status")
                     record_activity_events(
                         collector=collector,

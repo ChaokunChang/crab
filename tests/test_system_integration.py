@@ -145,7 +145,7 @@ class SystemIntegrationTests(unittest.TestCase):
             assert checkpoint_result is not None
             self.assertEqual(checkpoint_result.status, JobStatus.SUCCEEDED)
             self.assertIsNotNone(checkpoint_result.manifest)
-            self.assertEqual(len(checkpoint_result.manifest.process_artifacts), 0)
+            self.assertGreaterEqual(len(checkpoint_result.manifest.process_artifacts), 1)
             self.assertTrue(len(checkpoint_result.manifest.filesystem_artifacts) >= 1)
 
             restore_result = system.restore_once(sandbox_id, checkpoint_result.checkpoint_id)
@@ -158,19 +158,84 @@ class SystemIntegrationTests(unittest.TestCase):
             self.assertEqual(system.sandbox_manager.describe(sandbox_id).status, "stopped")
             system.sandbox_manager.delete(sandbox_id)
 
-            expected_commands = [
-                ("zfs", "create", "-o", f"mountpoint={root / 'bundles' / 'sbx-int' / 'rootfs'}", "pool/agent-cr/sbx-int"),
-                ("runc", "--root", str(root / "runtime-state"), "run", "-d", "--bundle", str(root / "bundles" / "sbx-int"), "sbx-int"),
-                ("runc", "--root", str(root / "runtime-state"), "pause", "sbx-int"),
+            self.assertEqual(
+                runner.commands[:4],
+                [
+                    ("zfs", "create", "-o", f"mountpoint={root / 'bundles' / 'sbx-int' / 'rootfs'}", "pool/agent-cr/sbx-int"),
+                    (
+                        "runc",
+                        "--root",
+                        str(root / "runtime-state"),
+                        "create",
+                        "--bundle",
+                        str(root / "bundles" / "sbx-int"),
+                        "sbx-int",
+                    ),
+                    ("runc", "--root", str(root / "runtime-state"), "start", "sbx-int"),
+                    ("runc", "--root", str(root / "runtime-state"), "pause", "sbx-int"),
+                ],
+            )
+            self.assertIn(
+                (
+                    "runc",
+                    "--root",
+                    str(root / "runtime-state"),
+                    "checkpoint",
+                    "sbx-int",
+                    "--image-path",
+                    str(root / "checkpoints" / "sbx-int" / str(checkpoint_result.checkpoint_id) / "process"),
+                    "--work-path",
+                    str(root / "checkpoints" / "sbx-int" / str(checkpoint_result.checkpoint_id) / "work"),
+                    "--leave-running=false",
+                    "--tcp-established",
+                ),
+                runner.commands,
+            )
+            self.assertIn(
                 ("zfs", "snapshot", f"pool/agent-cr/sbx-int@{checkpoint_result.checkpoint_id}"),
-                ("runc", "--root", str(root / "runtime-state"), "resume", "sbx-int"),
+                runner.commands,
+            )
+            self.assertIn(
                 ("runc", "--root", str(root / "runtime-state"), "delete", "-f", "sbx-int"),
+                runner.commands,
+            )
+            self.assertIn(
                 ("zfs", "rollback", "-r", f"pool/agent-cr/sbx-int@{checkpoint_result.checkpoint_id}"),
-                ("runc", "--root", str(root / "runtime-state"), "kill", "sbx-int", "TERM"),
-                ("runc", "--root", str(root / "runtime-state"), "delete", "-f", "sbx-int"),
-                ("zfs", "destroy", "-r", "pool/agent-cr/sbx-int"),
-            ]
-            self.assertEqual(runner.commands, expected_commands)
+                runner.commands,
+            )
+            self.assertIn(
+                (
+                    "runc",
+                    "--root",
+                    str(root / "runtime-state"),
+                    "restore",
+                    "-d",
+                    "--bundle",
+                    str(root / "bundles" / "sbx-int"),
+                    "--image-path",
+                    str(root / "checkpoints" / "sbx-int" / str(checkpoint_result.checkpoint_id) / "process"),
+                    "--work-path",
+                    str(root / "checkpoints" / "sbx-int" / str(checkpoint_result.checkpoint_id) / "work"),
+                    "--tcp-established",
+                    "sbx-int",
+                ),
+                runner.commands,
+            )
+            self.assertEqual(
+                runner.commands[-3:],
+                [
+                    (
+                        "runc",
+                        "--root",
+                        str(root / "runtime-state"),
+                        "kill",
+                        "sbx-int",
+                        "TERM",
+                    ),
+                    ("runc", "--root", str(root / "runtime-state"), "delete", "-f", "sbx-int"),
+                    ("zfs", "destroy", "-r", "pool/agent-cr/sbx-int"),
+                ],
+            )
 
             event_names = [name for name, _ in telemetry.events]
             self.assertIn("scheduler.evaluate", event_names)

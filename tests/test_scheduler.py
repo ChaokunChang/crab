@@ -126,6 +126,26 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(self.sandbox_manager.calls, [("pause", self.sandbox_id)])
         self.assertEqual(self.sandbox_manager.describe(self.sandbox_id).status, "paused")
 
+    def test_query_promotes_filesystem_change_to_full_checkpoint(self) -> None:
+        self.inspector.upsert_snapshot(
+            SandboxSnapshot(
+                sandbox_id=self.sandbox_id,
+                runtime_name="runc",
+                is_running=True,
+                process_changed=False,
+                filesystem_changed=True,
+                observed_at=utc_now(),
+            )
+        )
+
+        decision = self.scheduler.query_checkpoint(self.sandbox_id)
+
+        self.assertTrue(decision.should_checkpoint)
+        self.assertTrue(decision.checkpoint_process)
+        self.assertTrue(decision.checkpoint_filesystem)
+        self.assertEqual(self.sandbox_manager.calls, [("pause", self.sandbox_id)])
+        self.assertEqual(self.sandbox_manager.describe(self.sandbox_id).status, "paused")
+
     def test_query_returns_both_scopes_when_both_dimensions_changed(self) -> None:
         self.inspector.upsert_snapshot(
             SandboxSnapshot(

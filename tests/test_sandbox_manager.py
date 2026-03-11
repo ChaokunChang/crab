@@ -61,7 +61,8 @@ class SandboxManagerTests(unittest.TestCase):
                 runner.commands,
                 [
                     ("zfs", "create", "-o", f"mountpoint={root / 'bundles' / 'sbx-test' / 'rootfs'}", "pool/agent-cr/sbx-test"),
-                    ("runc", "--root", str(root / "state"), "run", "-d", "--bundle", str(root / "bundles" / "sbx-test"), "sbx-test"),
+                    ("runc", "--root", str(root / "state"), "create", "--bundle", str(root / "bundles" / "sbx-test"), "sbx-test"),
+                    ("runc", "--root", str(root / "state"), "start", "sbx-test"),
                     ("runc", "--root", str(root / "state"), "pause", "sbx-test"),
                     ("runc", "--root", str(root / "state"), "resume", "sbx-test"),
                     ("runc", "--root", str(root / "state"), "kill", "sbx-test", "TERM"),

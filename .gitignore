@@ -12,6 +12,8 @@ venv/
 bench_out/
 results.csv
 results_*.csv
+results/
+logs/
 
 # OS/editor noise
 .DS_Store

@@ -279,6 +279,10 @@ class SandboxManager(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def mark_restored(self, sandbox_id: SandboxId) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
     def delete(self, sandbox_id: SandboxId) -> None:
         raise NotImplementedError
 

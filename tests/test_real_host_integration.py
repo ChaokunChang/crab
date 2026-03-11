@@ -220,6 +220,7 @@ class RealHostIntegrationTests(unittest.TestCase):
                 interceptor_port=interceptor.port,
                 provider=provider,
                 status_port=status_port,
+                cgroup_path=f"agent-cr-tests/{pool_name}/sbx-real",
             )
 
             inspector.upsert_snapshot(
@@ -368,16 +369,33 @@ class RealHostIntegrationTests(unittest.TestCase):
                 stderr=subprocess.DEVNULL,
             )
 
-    def _write_bundle_config(self, *, bundle_dir: Path, interceptor_port: int, provider: str, status_port: int) -> None:
+    def _write_bundle_config(
+        self,
+        *,
+        bundle_dir: Path,
+        interceptor_port: int,
+        provider: str,
+        status_port: int,
+        cgroup_path: str,
+    ) -> None:
         config_path = bundle_dir / "config.json"
         cfg = json.loads(config_path.read_text())
         linux_cfg = cfg.get("linux", {})
-        linux_cfg["namespaces"] = [ns for ns in linux_cfg.get("namespaces", []) if ns.get("type") != "network"]
+        linux_cfg["namespaces"] = [
+            ns
+            for ns in linux_cfg.get("namespaces", [])
+            if ns.get("type") not in {"network", "cgroup"}
+        ]
+        linux_cfg["cgroupsPath"] = cgroup_path
         linux_cfg.pop("seccomp", None)
         cfg["linux"] = linux_cfg
         cfg["process"]["terminal"] = False
         cfg["process"]["cwd"] = "/work"
-        cfg["process"]["args"] = ["/usr/local/bin/agent-cli", "run", "--provider", provider]
+        cfg["process"]["args"] = [
+            "/bin/sh",
+            "-lc",
+            f"exec /usr/local/bin/agent-cli run --provider {provider} >/dev/null 2>/dev/null",
+        ]
         cfg["process"]["env"] = [
             "PATH=/usr/local/bin:/usr/bin:/bin",
             "PYTHONUNBUFFERED=1",

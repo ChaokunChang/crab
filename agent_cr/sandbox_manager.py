@@ -61,6 +61,12 @@ class InMemorySandboxManager(SandboxManager):
     def prepare_for_restore(self, sandbox_id: SandboxId) -> None:
         logger.info("Prepared in-memory sandbox %s for restore", sandbox_id)
 
+    def mark_restored(self, sandbox_id: SandboxId) -> None:
+        with self._lock:
+            cur = self._items[sandbox_id]
+            self._items[sandbox_id] = replace(cur, status="running")
+        logger.info("Marked in-memory sandbox %s restored", sandbox_id)
+
     def delete(self, sandbox_id: SandboxId) -> None:
         with self._lock:
             self._items.pop(sandbox_id)
@@ -117,7 +123,16 @@ class RuncSandboxManager(SandboxManager):
             else:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, destination, follow_symlinks=True)
-        self._run([self._runtime_bin, "--root", str(self._paths.state_root), "run", "-d", "--bundle", str(bundle_path), str(sandbox_id)])
+        runtime_root = str(self._paths.state_root)
+        self._run([self._runtime_bin, "--root", runtime_root, "create", "--bundle", str(bundle_path), str(sandbox_id)])
+        try:
+            self._run([self._runtime_bin, "--root", runtime_root, "start", str(sandbox_id)])
+        except Exception:
+            try:
+                self._run([self._runtime_bin, "--root", runtime_root, "delete", "-f", str(sandbox_id)])
+            except Exception:
+                logger.exception("Failed to clean up sandbox %s after start failure", sandbox_id)
+            raise
 
         description = SandboxDescription(
             sandbox_id=sandbox_id,
@@ -169,6 +184,14 @@ class RuncSandboxManager(SandboxManager):
             if "does not exist" not in str(exc):
                 raise
         logger.info("Sandbox %s runtime state cleared for restore", sandbox_id)
+
+    def mark_restored(self, sandbox_id: SandboxId) -> None:
+        description = self.describe(sandbox_id)
+        updated = replace(description, status="running")
+        with self._lock:
+            self._items[sandbox_id] = updated
+        self._persist(updated)
+        logger.info("Sandbox %s marked running after restore", sandbox_id)
 
     def delete(self, sandbox_id: SandboxId) -> None:
         description = self.describe(sandbox_id)
@@ -231,13 +254,15 @@ class RuncSandboxManager(SandboxManager):
         result = self._runner.run(command)
         if result.returncode != 0:
             logger.error(
-                "Sandbox manager command failed rc=%d command=%s stderr=%s",
+                "Sandbox manager command failed rc=%d command=%s stdout=%s stderr=%s",
                 result.returncode,
                 " ".join(command),
+                result.stdout.strip(),
                 result.stderr.strip(),
             )
             raise RuntimeError(
                 f"command failed ({result.returncode}): {' '.join(command)}"
+                f"\nstdout: {result.stdout.strip()}"
                 f"\nstderr: {result.stderr.strip()}"
             )
         logger.debug("Sandbox manager command completed: %s", " ".join(command))

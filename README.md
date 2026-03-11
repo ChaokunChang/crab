@@ -33,12 +33,6 @@ Run microbench:
 python3 benchmarks/bench_agent_cr_micro.py --iters 1000 --storage-iters 200 --executor-jobs 64
 ```
 
-Run simulated E2E benchmark:
-
-```bash
-python3 benchmarks/bench_agent_cr_e2e.py --sandboxes 8 --iters 20
-```
-
 Run sandboxed simulated-agent benchmark:
 
 ```bash
