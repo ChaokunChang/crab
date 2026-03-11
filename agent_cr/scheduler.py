@@ -49,7 +49,7 @@ class CheckpointingPolicy:
 
     def evaluate(self, snapshot: SandboxSnapshot) -> SchedulerCheckpointDecision:
         changed = snapshot.process_changed or snapshot.filesystem_changed
-        checkpoint_process = changed
+        checkpoint_process = changed # Mark: we do this because we can not monitor valid process_changed yet.
         checkpoint_filesystem = snapshot.filesystem_changed
 
         if not snapshot.is_running:
