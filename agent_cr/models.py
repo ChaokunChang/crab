@@ -302,16 +302,6 @@ class SandboxSnapshot:
     last_checkpoint_at: datetime | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
-
-@dataclass(frozen=True)
-class ScheduleDecision:
-    should_checkpoint: bool
-    reason: str
-    policy_name: str
-    next_earliest_checkpoint_at: datetime | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-
 @dataclass(frozen=True)
 class SchedulerCheckpointDecision:
     should_checkpoint: bool
@@ -319,7 +309,6 @@ class SchedulerCheckpointDecision:
     checkpoint_filesystem: bool
     reason: str
     policy_name: str
-    next_earliest_checkpoint_at: datetime | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

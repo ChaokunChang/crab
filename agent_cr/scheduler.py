@@ -2,14 +2,13 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime
-from datetime import timedelta
 import logging
 from threading import Lock
 
 from .config import SchedulerConfig
 from .contracts import SandboxInspector, SandboxManager, SchedulerStateStore, TelemetrySink
 from .ids import SandboxId
-from .models import ScheduleDecision, SandboxSnapshot, SchedulerCheckpointDecision, utc_now
+from .models import SandboxSnapshot, SchedulerCheckpointDecision, utc_now
 from .telemetry import NoopTelemetrySink
 
 logger = logging.getLogger(__name__)
@@ -48,35 +47,46 @@ class CheckpointingPolicy:
     def name(self) -> str:
         return "default-checkpointing"
 
-    def evaluate(self, snapshot: SandboxSnapshot) -> ScheduleDecision:
+    def evaluate(self, snapshot: SandboxSnapshot) -> SchedulerCheckpointDecision:
+        changed = snapshot.process_changed or snapshot.filesystem_changed
+        checkpoint_process = changed
+        checkpoint_filesystem = snapshot.filesystem_changed
+
         if not snapshot.is_running:
-            return ScheduleDecision(
+            return SchedulerCheckpointDecision(
                 should_checkpoint=False,
+                checkpoint_process=False,
+                checkpoint_filesystem=False,
                 reason="sandbox_not_running",
                 policy_name=self.name,
             )
 
-        changed = snapshot.process_changed or snapshot.filesystem_changed
         request_in_flight = bool(snapshot.metadata.get("llm_request_in_flight", False))
         if self._config.require_change_signal and not changed:
-            return ScheduleDecision(
+            return SchedulerCheckpointDecision(
                 should_checkpoint=False,
+                checkpoint_process=False,
+                checkpoint_filesystem=False,
                 reason="no_change_signal",
                 policy_name=self.name,
             )
 
         if snapshot.last_checkpoint_at is None:
             if self._config.require_llm_request_for_checkpoint and not request_in_flight:
-                return ScheduleDecision(
+                return SchedulerCheckpointDecision(
                     should_checkpoint=False,
+                    checkpoint_process=False,
+                    checkpoint_filesystem=False,
                     reason="llm_request_required",
                     policy_name=self.name,
                 )
             reason = "no_previous_checkpoint"
             if self._config.prefer_checkpoint_during_llm_request and request_in_flight:
                 reason = "llm_request_window_available"
-            return ScheduleDecision(
+            return SchedulerCheckpointDecision(
                 should_checkpoint=True,
+                checkpoint_process=checkpoint_process,
+                checkpoint_filesystem=checkpoint_filesystem,
                 reason=reason,
                 policy_name=self.name,
                 metadata={"llm_request_in_flight": request_in_flight},
@@ -87,25 +97,30 @@ class CheckpointingPolicy:
         force_after = self._config.force_checkpoint_after_seconds
 
         if force_after > 0 and elapsed >= force_after:
-            return ScheduleDecision(
+            return SchedulerCheckpointDecision(
                 should_checkpoint=True,
+                checkpoint_process=checkpoint_process,
+                checkpoint_filesystem=checkpoint_filesystem,
                 reason="force_interval_elapsed",
                 policy_name=self.name,
                 metadata={"elapsed_seconds": elapsed, "llm_request_in_flight": request_in_flight},
             )
 
         if elapsed < min_interval:
-            return ScheduleDecision(
+            return SchedulerCheckpointDecision(
                 should_checkpoint=False,
+                checkpoint_process=False,
+                checkpoint_filesystem=False,
                 reason="minimum_interval_not_elapsed",
                 policy_name=self.name,
-                next_earliest_checkpoint_at=snapshot.last_checkpoint_at + timedelta(seconds=min_interval),
                 metadata={"elapsed_seconds": elapsed, "llm_request_in_flight": request_in_flight},
             )
 
         if self._config.require_llm_request_for_checkpoint and not request_in_flight:
-            return ScheduleDecision(
+            return SchedulerCheckpointDecision(
                 should_checkpoint=False,
+                checkpoint_process=False,
+                checkpoint_filesystem=False,
                 reason="llm_request_required",
                 policy_name=self.name,
                 metadata={"elapsed_seconds": elapsed, "llm_request_in_flight": request_in_flight},
@@ -114,8 +129,10 @@ class CheckpointingPolicy:
         reason = "change_signal_and_interval_elapsed"
         if self._config.prefer_checkpoint_during_llm_request and request_in_flight:
             reason = "llm_request_window_available"
-        return ScheduleDecision(
+        return SchedulerCheckpointDecision(
             should_checkpoint=True,
+            checkpoint_process=checkpoint_process,
+            checkpoint_filesystem=checkpoint_filesystem,
             reason=reason,
             policy_name=self.name,
             metadata={"elapsed_seconds": elapsed, "llm_request_in_flight": request_in_flight},
@@ -149,24 +166,7 @@ class CRScheduler:
                     hydrated.sandbox_id,
                     last.isoformat(),
                 )
-        policy_decision = self._policy.evaluate(hydrated)
-        has_scope = hydrated.process_changed or hydrated.filesystem_changed
-        should_checkpoint = policy_decision.should_checkpoint and has_scope
-        # A live filesystem checkpoint must also capture process state. Long-lived
-        # agents can mutate memory without emitting exec/exit events, so a
-        # filesystem-only checkpoint can restore an inconsistent runtime.
-        checkpoint_process = should_checkpoint and (
-            hydrated.process_changed or hydrated.filesystem_changed
-        )
-        decision = SchedulerCheckpointDecision(
-            should_checkpoint=should_checkpoint,
-            checkpoint_process=checkpoint_process,
-            checkpoint_filesystem=should_checkpoint and hydrated.filesystem_changed,
-            reason=policy_decision.reason if should_checkpoint or not policy_decision.should_checkpoint else "no_change_signal",
-            policy_name=policy_decision.policy_name,
-            next_earliest_checkpoint_at=policy_decision.next_earliest_checkpoint_at,
-            metadata=dict(policy_decision.metadata),
-        )
+        decision = self._policy.evaluate(hydrated)
         log_fn = logger.info if decision.should_checkpoint else logger.debug
         log_fn(
             "Scheduler evaluated sandbox %s with policy=%s should_checkpoint=%s reason=%s process=%s filesystem=%s",

@@ -46,7 +46,6 @@ from .models import (
     RuntimeCapabilities,
     SandboxDescription,
     SandboxSnapshot,
-    ScheduleDecision,
     SchedulerCheckpointDecision,
 )
 from .runtime import CommandRunner, DockerRuntimeAdapter, RuncRuntimeAdapter, RuncRuntimePaths, SubprocessCommandRunner
@@ -118,7 +117,6 @@ __all__ = [
     "SandboxManager",
     "SandboxRuntimeAdapter",
     "SandboxSnapshot",
-    "ScheduleDecision",
     "SchedulerCheckpointDecision",
     "SchedulerConfig",
     "StorageConfig",

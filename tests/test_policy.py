@@ -91,10 +91,6 @@ class PolicyTests(unittest.TestCase):
         decision = policy.evaluate(snapshot)
         self.assertFalse(decision.should_checkpoint)
         self.assertEqual(decision.reason, "minimum_interval_not_elapsed")
-        self.assertEqual(
-            decision.next_earliest_checkpoint_at,
-            last_checkpoint_at + timedelta(seconds=60),
-        )
 
     def test_prefers_checkpoint_during_llm_request_window(self) -> None:
         policy = CheckpointingPolicy(
