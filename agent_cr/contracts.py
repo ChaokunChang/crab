@@ -20,7 +20,6 @@ from .models import (
     RuntimeCapabilities,
     SandboxDescription,
     SandboxSnapshot,
-    ScheduleDecision,
     SchedulerCheckpointDecision,
     WorkerStepResult,
 )
@@ -195,17 +194,6 @@ class RemoteCheckpointBackend(ABC):
         checkpoint_id: CheckpointId,
         reference: ArtifactReference,
     ) -> bytes:
-        raise NotImplementedError
-
-
-class CRPolicy(ABC):
-    @property
-    @abstractmethod
-    def name(self) -> str:
-        raise NotImplementedError
-
-    @abstractmethod
-    def evaluate(self, snapshot: SandboxSnapshot) -> ScheduleDecision:
         raise NotImplementedError
 
 

@@ -5,14 +5,13 @@ import logging
 from pathlib import Path
 from threading import Event, Lock, Thread
 
-from .config import ExecutorConfig, PolicyConfig, SchedulerConfig, StorageConfig
+from .config import ExecutorConfig, SchedulerConfig, StorageConfig
 from .contracts import SandboxInspector
 from .executor import CRExecutor
 from .ids import JobId
 from .inspector import EBPFSandboxInspector
 from .interceptor import InMemoryRequestStateStore, RequestAwareSandboxInspector, SandboxResponseGateRegistry
 from .models import CheckpointJob, CheckpointResult, RestoreJob, RestoreResult, SandboxId, utc_now
-from .policy import DefaultHeuristicPolicy
 from .runtime import DockerRuntimeAdapter, RuncRuntimeAdapter
 from .sandbox_manager import InMemorySandboxManager, RuncSandboxManager
 from .scheduler import CRScheduler, InMemorySchedulerStateStore
@@ -280,7 +279,6 @@ def build_default_system(
     scheduler_config: SchedulerConfig | None = None,
     executor_config: ExecutorConfig | None = None,
     storage_config: StorageConfig | None = None,
-    policy_config: PolicyConfig | None = None,
     use_in_memory_telemetry: bool = True,
     request_state_store: InMemoryRequestStateStore | None = None,
 ) -> AgentCRSystem:
@@ -288,7 +286,6 @@ def build_default_system(
     scheduler_cfg = scheduler_config or SchedulerConfig()
     executor_cfg = executor_config or ExecutorConfig()
     store_cfg = storage_config or StorageConfig(root_dir=Path(storage_root))
-    policy_cfg = policy_config or PolicyConfig()
 
     if runtime == "docker":
         adapter = DockerRuntimeAdapter()
@@ -316,7 +313,6 @@ def build_default_system(
     inspector = RequestAwareSandboxInspector(EBPFSandboxInspector(), request_store)
     scheduler = CRScheduler(
         scheduler_cfg,
-        DefaultHeuristicPolicy(policy_cfg),
         inspector,
         sandbox_manager,
         InMemorySchedulerStateStore(),

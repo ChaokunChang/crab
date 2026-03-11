@@ -4,10 +4,8 @@ import unittest
 
 from agent_cr import (
     CRScheduler,
-    DefaultHeuristicPolicy,
     InMemorySandboxInspector,
     InMemorySchedulerStateStore,
-    PolicyConfig,
     SandboxDescription,
     SandboxId,
     SandboxSnapshot,
@@ -75,13 +73,10 @@ class SchedulerTests(unittest.TestCase):
         self.sandbox_id = SandboxId("sbx-1")
         self.sandbox_manager.add(self.sandbox_id)
         self.scheduler = CRScheduler(
-            SchedulerConfig(),
-            DefaultHeuristicPolicy(
-                PolicyConfig(
-                    min_checkpoint_interval_seconds=0.0,
-                    force_checkpoint_after_seconds=0.0,
-                    require_change_signal=True,
-                )
+            SchedulerConfig(
+                min_checkpoint_interval_seconds=0.0,
+                force_checkpoint_after_seconds=0.0,
+                require_change_signal=True,
             ),
             self.inspector,
             self.sandbox_manager,
@@ -145,6 +140,37 @@ class SchedulerTests(unittest.TestCase):
         self.assertTrue(decision.checkpoint_filesystem)
         self.assertEqual(self.sandbox_manager.calls, [("pause", self.sandbox_id)])
         self.assertEqual(self.sandbox_manager.describe(self.sandbox_id).status, "paused")
+
+    def test_evaluate_hydrates_last_checkpoint_from_state_store(self) -> None:
+        observed_at = utc_now()
+        last_checkpoint_at = observed_at.replace(microsecond=0)
+        scheduler = CRScheduler(
+            SchedulerConfig(
+                min_checkpoint_interval_seconds=60.0,
+                force_checkpoint_after_seconds=0.0,
+                require_change_signal=True,
+            ),
+            self.inspector,
+            self.sandbox_manager,
+            InMemorySchedulerStateStore(),
+        )
+        scheduler.mark_checkpoint_complete(self.sandbox_id, last_checkpoint_at)
+
+        decision = scheduler.evaluate(
+            SandboxSnapshot(
+                sandbox_id=self.sandbox_id,
+                runtime_name="runc",
+                is_running=True,
+                process_changed=True,
+                filesystem_changed=False,
+                observed_at=observed_at,
+                last_checkpoint_at=None,
+            )
+        )
+
+        self.assertFalse(decision.should_checkpoint)
+        self.assertEqual(decision.reason, "minimum_interval_not_elapsed")
+        self.assertEqual(decision.policy_name, "default-checkpointing")
 
     def test_query_returns_both_scopes_when_both_dimensions_changed(self) -> None:
         self.inspector.upsert_snapshot(

@@ -13,7 +13,6 @@ from agent_cr import (
     CRExecutor,
     CRScheduler,
     DefaultCWorker,
-    DefaultHeuristicPolicy,
     DefaultRWorker,
     EBPFSandboxInspector,
     EBPFEvent,
@@ -23,7 +22,6 @@ from agent_cr import (
     InMemorySchedulerStateStore,
     InMemoryTelemetrySink,
     LocalCheckpointManager,
-    PolicyConfig,
     RuncRuntimeAdapter,
     RuncRuntimePaths,
     RuncSandboxManager,
@@ -90,13 +88,10 @@ class SystemIntegrationTests(unittest.TestCase):
             executor = CRExecutor(ExecutorConfig(max_workers=1), checkpoint_worker, restore_worker, telemetry)
             sandbox_manager = RuncSandboxManager(command_runner=runner, paths=sandbox_paths)
             scheduler = CRScheduler(
-                SchedulerConfig(),
-                DefaultHeuristicPolicy(
-                    PolicyConfig(
-                        min_checkpoint_interval_seconds=0.0,
-                        force_checkpoint_after_seconds=0.0,
-                        require_change_signal=True,
-                    )
+                SchedulerConfig(
+                    min_checkpoint_interval_seconds=0.0,
+                    force_checkpoint_after_seconds=0.0,
+                    require_change_signal=True,
                 ),
                 inspector,
                 sandbox_manager,

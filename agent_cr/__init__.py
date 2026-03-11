@@ -1,6 +1,5 @@
-from .config import ExecutorConfig, PolicyConfig, SchedulerConfig, StorageConfig, TelemetryConfig
+from .config import ExecutorConfig, SchedulerConfig, StorageConfig, TelemetryConfig
 from .contracts import (
-    CRPolicy,
     CheckpointManager,
     EBPFEventCollector,
     FileSystemCWorker,
@@ -50,7 +49,6 @@ from .models import (
     ScheduleDecision,
     SchedulerCheckpointDecision,
 )
-from .policy import DefaultHeuristicPolicy
 from .runtime import CommandRunner, DockerRuntimeAdapter, RuncRuntimeAdapter, RuncRuntimePaths, SubprocessCommandRunner
 from .sandbox_manager import InMemorySandboxManager, RuncSandboxManager, RuncSandboxManagerPaths
 from .scheduler import CRScheduler, InMemorySchedulerStateStore
@@ -77,14 +75,12 @@ __all__ = [
     "CheckpointManifest",
     "CheckpointResult",
     "CRExecutor",
-    "CRPolicy",
     "CRScheduler",
     "EBPFEvent",
     "EBPFEventCollector",
     "EBPFEventKind",
     "EBPFSandboxInspector",
     "DefaultCWorker",
-    "DefaultHeuristicPolicy",
     "DefaultRWorker",
     "DockerRuntimeAdapter",
     "ExecutorConfig",
@@ -102,7 +98,6 @@ __all__ = [
     "JobType",
     "LocalCheckpointManager",
     "NoopTelemetrySink",
-    "PolicyConfig",
     "ProcessCWorker",
     "ProcessRWorker",
     "RequestContext",

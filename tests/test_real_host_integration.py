@@ -22,7 +22,6 @@ from agent_cr import (
     CRScheduler,
     CompositeRequestInterceptorHook,
     DefaultCWorker,
-    DefaultHeuristicPolicy,
     DefaultRWorker,
     EBPFEvent,
     EBPFEventKind,
@@ -33,7 +32,6 @@ from agent_cr import (
     InMemorySchedulerStateStore,
     InMemoryTelemetrySink,
     LocalCheckpointManager,
-    PolicyConfig,
     RequestAwareSandboxInspector,
     RuncRuntimeAdapter,
     RuncRuntimePaths,
@@ -178,15 +176,12 @@ class RealHostIntegrationTests(unittest.TestCase):
                 )
             )
             scheduler = CRScheduler(
-                SchedulerConfig(),
-                DefaultHeuristicPolicy(
-                    PolicyConfig(
-                        min_checkpoint_interval_seconds=0.0,
-                        force_checkpoint_after_seconds=0.0,
-                        require_change_signal=True,
-                        prefer_checkpoint_during_llm_request=True,
-                        require_llm_request_for_checkpoint=True,
-                    )
+                SchedulerConfig(
+                    min_checkpoint_interval_seconds=0.0,
+                    force_checkpoint_after_seconds=0.0,
+                    require_change_signal=True,
+                    prefer_checkpoint_during_llm_request=True,
+                    require_llm_request_for_checkpoint=True,
                 ),
                 inspector,
                 sandbox_manager,

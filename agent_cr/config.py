@@ -6,11 +6,17 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class SchedulerConfig:
-    max_pending_jobs: int = 10000
+    min_checkpoint_interval_seconds: float = 30.0
+    force_checkpoint_after_seconds: float = 600.0
+    require_change_signal: bool = True
+    prefer_checkpoint_during_llm_request: bool = True
+    require_llm_request_for_checkpoint: bool = False
 
     def __post_init__(self) -> None:
-        if self.max_pending_jobs < 1:
-            raise ValueError("max_pending_jobs must be >= 1")
+        if self.min_checkpoint_interval_seconds < 0:
+            raise ValueError("min_checkpoint_interval_seconds must be >= 0")
+        if self.force_checkpoint_after_seconds < 0:
+            raise ValueError("force_checkpoint_after_seconds must be >= 0")
 
 
 @dataclass(frozen=True)
@@ -42,21 +48,6 @@ class StorageConfig:
             raise ValueError("manifests_dirname must be non-empty")
         if not self.artifacts_dirname:
             raise ValueError("artifacts_dirname must be non-empty")
-
-
-@dataclass(frozen=True)
-class PolicyConfig:
-    min_checkpoint_interval_seconds: float = 30.0
-    force_checkpoint_after_seconds: float = 600.0
-    require_change_signal: bool = True
-    prefer_checkpoint_during_llm_request: bool = True
-    require_llm_request_for_checkpoint: bool = False
-
-    def __post_init__(self) -> None:
-        if self.min_checkpoint_interval_seconds < 0:
-            raise ValueError("min_checkpoint_interval_seconds must be >= 0")
-        if self.force_checkpoint_after_seconds < 0:
-            raise ValueError("force_checkpoint_after_seconds must be >= 0")
 
 
 @dataclass(frozen=True)
