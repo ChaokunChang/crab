@@ -186,7 +186,7 @@ class LocalCheckpointManager(CheckpointManager):
         logger.debug("Deleted checkpoint sandbox=%s checkpoint=%s", sandbox_id, checkpoint_id)
 
     def delete_all_checkpoints(self, sandbox_id: SandboxId) -> None:
-        for checkpoint_id in list(self.list_checkpoints(sandbox_id)):
+        for checkpoint_id in reversed(self.list_checkpoints(sandbox_id)):
             self.delete_checkpoint(sandbox_id, checkpoint_id)
 
     def handle_checkpoint_complete(self, manifest: CheckpointManifest) -> None:

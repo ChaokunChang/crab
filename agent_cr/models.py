@@ -367,6 +367,26 @@ class RequestStateChange:
 
 
 @dataclass(frozen=True)
+class RecoveryEvent:
+    sandbox_id: SandboxId
+    event_type: str
+    observed_at: datetime
+    reason: str = ""
+    grace_remaining_seconds: float | None = None
+
+
+@dataclass(frozen=True)
+class RecoveryRecord:
+    sandbox_id: SandboxId
+    event_type: str
+    started_at: datetime
+    finished_at: datetime
+    status: str
+    checkpoint_id: CheckpointId | None = None
+    message: str | None = None
+
+
+@dataclass(frozen=True)
 class SandboxDescription:
     sandbox_id: SandboxId
     runtime_name: str

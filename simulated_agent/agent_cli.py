@@ -107,9 +107,11 @@ class AgentRuntime:
             os.fsync(fh.fileno())
 
     def build_request(self) -> tuple[str, dict[str, str], bytes]:
+        with self.lock:
+            total_actions = self.state["total_actions"]
         metadata = {
             "sandbox_id": self.sandbox_id,
-            "total_actions": self.state["total_actions"],
+            "total_actions": total_actions,
         }
         if self.provider == "openai":
             path = "/v1/chat/completions"
@@ -146,10 +148,12 @@ class AgentRuntime:
             headers=headers,
             method="POST",
         )
-        self.state["total_requests"] += 1
+        with self.lock:
+            self.state["total_requests"] += 1
         with urllib.request.urlopen(req, timeout=30.0) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
-        self.state["completed_requests"] += 1
+        with self.lock:
+            self.state["completed_requests"] += 1
         if self.provider == "openai":
             return parse_openai_tool_calls(payload)
         return parse_anthropic_tool_calls(payload)
@@ -223,9 +227,9 @@ class AgentRuntime:
 
     def loop_forever(self) -> None:
         while True:
-            with self.lock:
-                calls = self.fetch_tool_calls()
-                for call in calls:
+            calls = self.fetch_tool_calls()
+            for call in calls:
+                with self.lock:
                     self.run_tool(str(call["name"]), dict(call["input"]))
             time.sleep(self.poll_interval_s)
 

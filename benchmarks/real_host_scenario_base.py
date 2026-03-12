@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import logging
+import random
 import shutil
 import socket
 import subprocess
@@ -13,6 +14,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable
@@ -45,6 +47,8 @@ from agent_cr import (
     InMemorySchedulerStateStore,
     InMemoryTelemetrySink,
     LocalCheckpointManager,
+    RequestContext,
+    RequestInterceptorHook,
     RequestAwareSandboxInspector,
     RuncRuntimeAdapter,
     RuncRuntimePaths,
@@ -214,6 +218,71 @@ def compute_summary(rows: list[dict[str, object]], metric_keys: Iterable[str]) -
     return summary
 
 
+def select_injected_indices(
+    population_size: int,
+    *,
+    iteration: int,
+    rate: float,
+    first_forced_iteration: int,
+    rng: random.Random,
+) -> list[int]:
+    if population_size <= 0:
+        return []
+    if first_forced_iteration > 0 and iteration < first_forced_iteration:
+        return []
+    selected = [index for index in range(population_size) if rng.random() < rate]
+    if first_forced_iteration > 0 and iteration == first_forced_iteration and 0 not in selected:
+        selected.insert(0, 0)
+    return sorted(set(selected))
+
+
+def resolve_checkpoint_copy_plan(
+    checkpoint_order: list[CheckpointId],
+    manifests: dict[CheckpointId, CheckpointManifest],
+    checkpoint_id: CheckpointId,
+) -> list[tuple[CheckpointId, bool, bool]]:
+    manifest = manifests[checkpoint_id]
+    plan: list[tuple[CheckpointId, bool, bool]] = [
+        (checkpoint_id, bool(manifest.process_artifacts), bool(manifest.filesystem_artifacts))
+    ]
+    need_process = not bool(manifest.process_artifacts)
+    need_filesystem = not bool(manifest.filesystem_artifacts)
+    if not need_process and not need_filesystem:
+        return plan
+
+    try:
+        current_index = checkpoint_order.index(checkpoint_id)
+        candidates = list(reversed(checkpoint_order[:current_index]))
+    except ValueError:
+        candidates = list(reversed(checkpoint_order))
+
+    for candidate_id in candidates:
+        if not need_process and not need_filesystem:
+            break
+        candidate = manifests[candidate_id]
+        copy_process = need_process and bool(candidate.process_artifacts)
+        copy_filesystem = need_filesystem and bool(candidate.filesystem_artifacts)
+        if not copy_process and not copy_filesystem:
+            continue
+        plan.insert(0, (candidate_id, copy_process, copy_filesystem))
+        if copy_process:
+            need_process = False
+        if copy_filesystem:
+            need_filesystem = False
+
+    if need_process or need_filesystem:
+        raise ValueError(f"unable to resolve restore dependencies for checkpoint {checkpoint_id}")
+    return plan
+
+
+class NoopRequestInterceptorHook(RequestInterceptorHook):
+    def on_request_start(self, context: RequestContext) -> None:
+        _ = context
+
+    def on_request_end(self, context: RequestContext) -> None:
+        _ = context
+
+
 @dataclass
 class SandboxHandle:
     sandbox_id: SandboxId
@@ -236,6 +305,7 @@ class RealHostScenarioHarness:
         scheduler_policy,
         checkpoint_manager_factory,
         max_workers: int,
+        auto_cr: bool = False,
     ) -> None:
         self.provider = provider
         self.transfer_delay_ms = transfer_delay_ms
@@ -243,6 +313,7 @@ class RealHostScenarioHarness:
         self.scheduler_policy = scheduler_policy
         self.checkpoint_manager_factory = checkpoint_manager_factory
         self.max_workers = max_workers
+        self.auto_cr = auto_cr
         self._tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self.root: Path | None = None
         self.pool_name = ""
@@ -259,16 +330,19 @@ class RealHostScenarioHarness:
         self.sandbox_manager: RuncSandboxManager | None = None
         self.system: AgentCRSystem | None = None
         self.interceptor: AgentCRRequestInterceptorServer | None = None
+        self.interceptor_hook = CompositeRequestInterceptorHook()
         self.llm_server = None
         self.llm_thread: threading.Thread | None = None
         self.sandboxes: list[SandboxHandle] = []
+        self._sandbox_by_id: dict[SandboxId, SandboxHandle] = {}
 
     def __enter__(self) -> "RealHostScenarioHarness":
         require_binaries()
         self._tmpdir = tempfile.TemporaryDirectory(prefix="agent_cr_scenario_bench_")
         self.root = Path(self._tmpdir.name)
-        self.pool_name = f"agentcrbench{int(time.time())}"
-        self.image_tag = f"agent-cr-scenario-bench:{int(time.time())}"
+        unique_suffix = uuid.uuid4().hex[:10]
+        self.pool_name = f"agentcrbench{unique_suffix}"
+        self.image_tag = f"agent-cr-scenario-bench:{unique_suffix}"
         self.runtime_state_root = self.root / "runtime-state"
         self.llm_server = serve(host="127.0.0.1", port=0, response_delay_ms=250)
         self.llm_thread = threading.Thread(target=self.llm_server.serve_forever, daemon=True)
@@ -333,21 +407,28 @@ class RealHostScenarioHarness:
             sandbox_manager=self.sandbox_manager,
             telemetry=self.telemetry,
             request_state_store=self.request_state_store,
+            relaunch_handler=self._relaunch_sandbox if self.auto_cr else None,
+            recovery_delay_seconds=self.transfer_delay_ms / 1000.0 if self.auto_cr else 0.0,
         )
+        self.interceptor_hook.add_hook(TelemetryRequestInterceptorHook(self.telemetry))
         self.interceptor = AgentCRRequestInterceptorServer(
             upstream_url=f"http://127.0.0.1:{self.llm_server.server_address[1]}",
             request_state_store=self.request_state_store,
-            hook=CompositeRequestInterceptorHook([TelemetryRequestInterceptorHook(self.telemetry)]),
+            hook=self.interceptor_hook,
             on_state_change=self.system.notify_interceptor_state_change,
             host="127.0.0.1",
             port=0,
         )
         self.interceptor.start()
         wait_for_http_json(f"http://127.0.0.1:{self.interceptor.port}/healthz")
+        if self.auto_cr:
+            self.system.start()
         self.exported_rootfs = exported_rootfs
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        if self.system is not None and self.auto_cr:
+            self.system.stop()
         if self.interceptor is not None:
             self.interceptor.stop()
         if self.executor is not None:
@@ -446,7 +527,19 @@ class RealHostScenarioHarness:
             last_status=payload,
         )
         self.sandboxes.append(handle)
+        self._sandbox_by_id[sandbox_id] = handle
+        logger.info(
+            "Launched benchmark sandbox name=%s sandbox_id=%s status_port=%d auto_cr=%s",
+            sandbox_name,
+            sandbox_id,
+            status_port,
+            self.auto_cr,
+        )
         return handle
+
+    def add_interceptor_hook(self, hook: RequestInterceptorHook) -> None:
+        self.interceptor_hook.add_hook(hook)
+        logger.debug("Registered interceptor hook %s", type(hook).__name__)
 
     def poll_status(self, sandbox: SandboxHandle) -> dict[str, object]:
         return wait_for_http_json(sandbox.status_url)
@@ -475,8 +568,11 @@ class RealHostScenarioHarness:
         sandbox.last_status = current
 
     def set_snapshot_metadata(self, sandbox: SandboxHandle, **metadata: object) -> None:
+        self.set_snapshot_metadata_by_id(sandbox.sandbox_id, **metadata)
+
+    def set_snapshot_metadata_by_id(self, sandbox_id: SandboxId, **metadata: object) -> None:
         assert self.base_inspector is not None
-        snapshot = self.base_inspector.inspect(sandbox.sandbox_id)
+        snapshot = self.base_inspector.inspect(sandbox_id)
         merged = {**snapshot.metadata, **metadata}
         self.base_inspector.upsert_snapshot(
             replace(
@@ -487,8 +583,11 @@ class RealHostScenarioHarness:
         )
 
     def clear_snapshot_metadata(self, sandbox: SandboxHandle, *keys: str) -> None:
+        self.clear_snapshot_metadata_by_id(sandbox.sandbox_id, *keys)
+
+    def clear_snapshot_metadata_by_id(self, sandbox_id: SandboxId, *keys: str) -> None:
         assert self.base_inspector is not None
-        snapshot = self.base_inspector.inspect(sandbox.sandbox_id)
+        snapshot = self.base_inspector.inspect(sandbox_id)
         metadata = dict(snapshot.metadata)
         for key in keys:
             metadata.pop(key, None)
@@ -502,21 +601,132 @@ class RealHostScenarioHarness:
 
     def checkpoint_if_due(self, sandbox: SandboxHandle):
         assert self.system is not None
+        logger.debug("Benchmark requesting checkpoint_if_due for sandbox=%s", sandbox.sandbox_id)
         return self.system.checkpoint_if_due(sandbox.sandbox_id)
 
     def restore_once(self, sandbox: SandboxHandle, checkpoint_id: CheckpointId):
         assert self.system is not None
+        logger.info(
+            "Benchmark requesting restore sandbox=%s checkpoint=%s transfer_delay_ms=%.1f",
+            sandbox.sandbox_id,
+            checkpoint_id,
+            self.transfer_delay_ms,
+        )
         if self.transfer_delay_ms > 0:
             time.sleep(self.transfer_delay_ms / 1000.0)
         return self.system.restore_once(sandbox.sandbox_id, checkpoint_id)
 
+    def notify_fault(self, sandbox: SandboxHandle, *, reason: str = "fault") -> None:
+        assert self.system is not None
+        logger.info("Benchmark notifying fault sandbox=%s reason=%s", sandbox.sandbox_id, reason)
+        self.system.notify_fault(sandbox.sandbox_id, reason=reason)
+
+    def notify_preemption(self, sandbox: SandboxHandle, *, grace_remaining_seconds: float) -> None:
+        assert self.system is not None
+        logger.info(
+            "Benchmark notifying preemption sandbox=%s grace_remaining_seconds=%.3f",
+            sandbox.sandbox_id,
+            grace_remaining_seconds,
+        )
+        self.system.notify_preemption(sandbox.sandbox_id, grace_remaining_seconds=grace_remaining_seconds)
+
+    def wait_for_recovery(
+        self,
+        sandbox: SandboxHandle,
+        *,
+        event_type: str,
+        observed_after,
+        timeout_s: float = 60.0,
+    ):
+        assert self.system is not None
+
+        def _matching_record():
+            record = self.system.get_last_recovery_record(sandbox.sandbox_id)
+            if record is None:
+                return None
+            if record.event_type != event_type:
+                return None
+            if record.started_at < observed_after:
+                return None
+            return record
+
+        wait_for(lambda: _matching_record() is not None, timeout_s=timeout_s)
+        record = _matching_record()
+        logger.info(
+            "Observed recovery record sandbox=%s event_type=%s status=%s checkpoint=%s",
+            sandbox.sandbox_id,
+            event_type,
+            record.status if record is not None else "missing",
+            "" if record is None or record.checkpoint_id is None else record.checkpoint_id,
+        )
+        return record
+
+    def list_checkpoint_manifests(self, sandbox_id: SandboxId) -> list[CheckpointManifest]:
+        assert self.storage is not None
+        return [self.storage.get_manifest(sandbox_id, checkpoint_id) for checkpoint_id in self.storage.list_checkpoints(sandbox_id)]
+
+    def wait_for_checkpoint_count(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        minimum: int,
+        timeout_s: float = 45.0,
+    ) -> int:
+        assert self.storage is not None
+        wait_for(lambda: len(self.storage.list_checkpoints(sandbox_id)) >= minimum, timeout_s=timeout_s)
+        return len(self.storage.list_checkpoints(sandbox_id))
+
+    def wait_for_checkpoint_count_stable(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        stable_period_s: float = 1.0,
+        timeout_s: float = 15.0,
+    ) -> int:
+        assert self.storage is not None
+        logger.debug(
+            "Waiting for checkpoint count to stabilize sandbox=%s stable_period_s=%.1f timeout_s=%.1f",
+            sandbox_id,
+            stable_period_s,
+            timeout_s,
+        )
+        deadline = time.time() + timeout_s
+        stable_since = time.time()
+        last_count = len(self.storage.list_checkpoints(sandbox_id))
+        while time.time() < deadline:
+            current = len(self.storage.list_checkpoints(sandbox_id))
+            if current != last_count:
+                logger.debug(
+                    "Checkpoint count changed sandbox=%s previous=%d current=%d",
+                    sandbox_id,
+                    last_count,
+                    current,
+                )
+                last_count = current
+                stable_since = time.time()
+            elif time.time() - stable_since >= stable_period_s:
+                logger.info("Checkpoint count stabilized sandbox=%s count=%d", sandbox_id, current)
+                return current
+            time.sleep(0.2)
+        raise RuntimeError(f"checkpoint count did not stabilize for sandbox {sandbox_id}")
+
     def inject_fault(self, sandbox: SandboxHandle) -> None:
         assert self.runtime_state_root is not None
+        logger.info("Injecting fault into sandbox=%s", sandbox.sandbox_id)
         subprocess.run(
             ["runc", "--root", str(self.runtime_state_root), "delete", "-f", str(sandbox.sandbox_id)],
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+        )
+        assert self.base_inspector is not None
+        snapshot = self.base_inspector.inspect(sandbox.sandbox_id)
+        self.base_inspector.upsert_snapshot(
+            replace(
+                snapshot,
+                is_running=False,
+                observed_at=utc_now(),
+            )
         )
 
     def destroy_sandbox_dataset(self, sandbox: SandboxHandle) -> None:
@@ -540,6 +750,51 @@ class RealHostScenarioHarness:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+        self._sandbox_by_id.pop(sandbox.sandbox_id, None)
+
+    def _relaunch_sandbox(self, sandbox_id: SandboxId, event_type: str) -> None:
+        _ = event_type
+        handle = self._sandbox_by_id[sandbox_id]
+        self.relaunch_sandbox(handle)
+
+    def relaunch_sandbox(self, sandbox: SandboxHandle) -> dict[str, object]:
+        assert self.base_inspector is not None
+        assert self.sandbox_manager is not None
+        assert self.runtime_state_root is not None
+
+        description = self.sandbox_manager.describe(sandbox.sandbox_id)
+        metadata = dict(description.metadata)
+        logger.info("Relaunching sandbox=%s after recovery fallback", sandbox.sandbox_id)
+        subprocess.run(
+            ["runc", "--root", str(self.runtime_state_root), "delete", "-f", str(sandbox.sandbox_id)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        dataset = str(metadata.get("zfs_dataset", ""))
+        if dataset:
+            subprocess.run(
+                ["zfs", "destroy", "-r", dataset],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        self.sandbox_manager.launch("runc", metadata)
+        payload = wait_for_http_json(sandbox.status_url)
+        self.base_inspector.upsert_snapshot(
+            SandboxSnapshot(
+                sandbox_id=sandbox.sandbox_id,
+                runtime_name="runc",
+                is_running=True,
+                process_changed=False,
+                filesystem_changed=False,
+                observed_at=utc_now(),
+                metadata={},
+            )
+        )
+        sandbox.last_status = payload
+        logger.info("Relaunched sandbox=%s and recovered status endpoint", sandbox.sandbox_id)
+        return payload
 
     def clone_checkpoint_to_fork(
         self,
@@ -565,62 +820,87 @@ class RealHostScenarioHarness:
         target_dataset = f"{self.pool_name}/agent-cr/{target.sandbox_id}"
         rootfs_path = target.bundle_dir / "rootfs"
         subprocess.run(["zfs", "destroy", "-r", target_dataset], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        manifests = {manifest.checkpoint_id: manifest for manifest in self.list_checkpoint_manifests(source.sandbox_id)}
+        checkpoint_order = list(manifests.keys())
+        copy_plan = resolve_checkpoint_copy_plan(checkpoint_order, manifests, checkpoint_id)
+        filesystem_checkpoint_id = next(copy_id for copy_id, _, copy_filesystem in reversed(copy_plan) if copy_filesystem)
+        logger.info(
+            "Cloning checkpoint to fork source=%s target=%s selected_checkpoint=%s filesystem_checkpoint=%s copy_plan=%s",
+            source.sandbox_id,
+            target.sandbox_id,
+            checkpoint_id,
+            filesystem_checkpoint_id,
+            [(str(copy_id), copy_process, copy_filesystem) for copy_id, copy_process, copy_filesystem in copy_plan],
+        )
         subprocess.run(
             [
                 "zfs",
                 "clone",
                 "-o",
                 f"mountpoint={rootfs_path}",
-                f"{source_dataset}@{checkpoint_id}",
+                f"{source_dataset}@{filesystem_checkpoint_id}",
                 target_dataset,
             ],
             check=True,
         )
-        subprocess.run(["zfs", "snapshot", f"{target_dataset}@{checkpoint_id}"], check=True)
+        subprocess.run(["zfs", "snapshot", f"{target_dataset}@{filesystem_checkpoint_id}"], check=True)
 
-        source_manifest = self.storage.get_manifest(source.sandbox_id, checkpoint_id)
-        process_refs = []
-        fs_refs = []
-        for reference in source_manifest.process_artifacts:
-            payload = self.storage.get_artifact(source.sandbox_id, checkpoint_id, reference)
-            process_refs.append(
-                self.storage.put_artifact(
-                    target.sandbox_id,
-                    checkpoint_id,
-                    ArtifactPayload(
-                        kind=reference.kind,
-                        name=reference.name,
-                        data=self._rewrite_process_artifact(payload, source.sandbox_id, target.sandbox_id, checkpoint_id),
-                        metadata=dict(reference.metadata),
-                    ),
-                )
-            )
-        for reference in source_manifest.filesystem_artifacts:
-            payload = self.storage.get_artifact(source.sandbox_id, checkpoint_id, reference)
-            fs_refs.append(
-                self.storage.put_artifact(
-                    target.sandbox_id,
-                    checkpoint_id,
-                    ArtifactPayload(
-                        kind=reference.kind,
-                        name=reference.name,
-                        data=self._rewrite_filesystem_artifact(payload, source.sandbox_id, target.sandbox_id, checkpoint_id),
-                        metadata=dict(reference.metadata),
-                    ),
-                )
-            )
-        manifest = CheckpointManifest(
-            schema_version=source_manifest.schema_version,
-            checkpoint_id=source_manifest.checkpoint_id,
-            sandbox_id=target.sandbox_id,
-            created_at=source_manifest.created_at,
-            runtime_name=source_manifest.runtime_name,
-            runtime_version=source_manifest.runtime_version,
-            process_artifacts=process_refs,
-            filesystem_artifacts=fs_refs,
-            metadata=dict(source_manifest.metadata),
-        ).with_integrity()
-        self.storage.put_manifest(manifest)
+        for copy_id, copy_process, copy_filesystem in copy_plan:
+            source_manifest = manifests[copy_id]
+            process_refs = []
+            filesystem_refs = []
+            if copy_process:
+                for reference in source_manifest.process_artifacts:
+                    payload = self.storage.get_artifact(source.sandbox_id, copy_id, reference)
+                    process_refs.append(
+                        self.storage.put_artifact(
+                            target.sandbox_id,
+                            copy_id,
+                            ArtifactPayload(
+                                kind=reference.kind,
+                                name=reference.name,
+                                data=self._rewrite_process_artifact(
+                                    payload,
+                                    source.sandbox_id,
+                                    target.sandbox_id,
+                                    copy_id,
+                                ),
+                                metadata=dict(reference.metadata),
+                            ),
+                        )
+                    )
+            if copy_filesystem:
+                for reference in source_manifest.filesystem_artifacts:
+                    payload = self.storage.get_artifact(source.sandbox_id, copy_id, reference)
+                    filesystem_refs.append(
+                        self.storage.put_artifact(
+                            target.sandbox_id,
+                            copy_id,
+                            ArtifactPayload(
+                                kind=reference.kind,
+                                name=reference.name,
+                                data=self._rewrite_filesystem_artifact(
+                                    payload,
+                                    source.sandbox_id,
+                                    target.sandbox_id,
+                                    copy_id,
+                                ),
+                                metadata=dict(reference.metadata),
+                            ),
+                        )
+                    )
+            manifest = CheckpointManifest(
+                schema_version=source_manifest.schema_version,
+                checkpoint_id=source_manifest.checkpoint_id,
+                sandbox_id=target.sandbox_id,
+                created_at=source_manifest.created_at,
+                runtime_name=source_manifest.runtime_name,
+                runtime_version=source_manifest.runtime_version,
+                process_artifacts=process_refs,
+                filesystem_artifacts=filesystem_refs,
+                metadata=dict(source_manifest.metadata),
+            ).with_integrity()
+            self.storage.put_manifest(manifest)
 
         description = SandboxDescription(
             sandbox_id=target.sandbox_id,

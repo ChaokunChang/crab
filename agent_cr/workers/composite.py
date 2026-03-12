@@ -139,6 +139,7 @@ class DefaultCWorker(CompositeCheckpointWorker):
             process_artifacts=process_refs,
             filesystem_artifacts=fs_refs,
             metadata={
+                **job.metadata,
                 "job_id": str(job.job_id),
                 "reason": job.reason,
                 "leave_running": job.leave_running,

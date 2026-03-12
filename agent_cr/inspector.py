@@ -44,6 +44,7 @@ class EBPFSandboxInspector(SandboxInspector):
 
     def upsert_snapshot(self, snapshot: SandboxSnapshot) -> None:
         with self._lock:
+            previous = self._snapshots.get(snapshot.sandbox_id)
             self._snapshots[snapshot.sandbox_id] = replace(
                 snapshot,
                 process_changed=False,
@@ -55,6 +56,13 @@ class EBPFSandboxInspector(SandboxInspector):
             )
             self._process_checkpoint_cursor.setdefault(snapshot.sandbox_id, snapshot.last_checkpoint_at)
             self._filesystem_checkpoint_cursor.setdefault(snapshot.sandbox_id, snapshot.last_checkpoint_at)
+        if previous is not None and previous.is_running and not snapshot.is_running:
+            logger.debug(
+                "Inspector observed sandbox %s transition to not-running at %s metadata=%s",
+                snapshot.sandbox_id,
+                snapshot.observed_at.isoformat(),
+                snapshot.metadata,
+            )
         logger.debug(
             "Upserted snapshot for sandbox %s running=%s process_changed=%s filesystem_changed=%s",
             snapshot.sandbox_id,
