@@ -11,6 +11,7 @@ from .executor import CRExecutor
 from .ids import JobId
 from .inspector import EBPFSandboxInspector
 from .interceptor import InMemoryRequestStateStore, RequestAwareSandboxInspector, SandboxResponseGateRegistry
+from .remote_inspector import HostInspectorServiceClient, RemoteSandboxInspector
 from .models import CheckpointJob, CheckpointResult, RestoreJob, RestoreResult, SandboxId, utc_now
 from .runtime import DockerRuntimeAdapter, RuncRuntimeAdapter
 from .sandbox_manager import InMemorySandboxManager, RuncSandboxManager
@@ -281,18 +282,23 @@ def build_default_system(
     storage_config: StorageConfig | None = None,
     use_in_memory_telemetry: bool = True,
     request_state_store: InMemoryRequestStateStore | None = None,
+    host_inspector_url: str | None = None,
 ) -> AgentCRSystem:
     logger.info("Building default agent-cr system with runtime=%s storage_root=%s", runtime, storage_root)
     scheduler_cfg = scheduler_config or SchedulerConfig()
     executor_cfg = executor_config or ExecutorConfig()
     store_cfg = storage_config or StorageConfig(root_dir=Path(storage_root))
 
+    host_inspector_client = (
+        HostInspectorServiceClient(host_inspector_url) if host_inspector_url is not None else None
+    )
+
     if runtime == "docker":
         adapter = DockerRuntimeAdapter()
-        sandbox_manager = InMemorySandboxManager()
+        sandbox_manager = InMemorySandboxManager(host_inspector_client=host_inspector_client)
     elif runtime == "runc":
         adapter = RuncRuntimeAdapter()
-        sandbox_manager = RuncSandboxManager()
+        sandbox_manager = RuncSandboxManager(host_inspector_client=host_inspector_client)
     else:
         raise ValueError(f"unsupported runtime adapter: {runtime}")
 
@@ -310,7 +316,12 @@ def build_default_system(
     executor = CRExecutor(executor_cfg, c_worker, r_worker, telemetry)
     request_store = request_state_store or InMemoryRequestStateStore()
     response_gate_registry = SandboxResponseGateRegistry()
-    inspector = RequestAwareSandboxInspector(EBPFSandboxInspector(), request_store)
+    base_inspector: SandboxInspector
+    if host_inspector_client is not None:
+        base_inspector = RemoteSandboxInspector(host_inspector_client)
+    else:
+        base_inspector = EBPFSandboxInspector()
+    inspector = RequestAwareSandboxInspector(base_inspector, request_store)
     scheduler = CRScheduler(
         scheduler_cfg,
         inspector,

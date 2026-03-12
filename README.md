@@ -39,6 +39,10 @@ Run sandboxed simulated-agent benchmark:
 python3 benchmarks/bench_agent_cr_sandbox_e2e.py --sandboxes 3 --iters 5 --provider openai
 ```
 
+Host inspector manual usage and real Docker validation:
+
+See `agent_cr/host_inspector/README.md`.
+
 ## Package Layout
 
 - `agent_cr/` - core package
