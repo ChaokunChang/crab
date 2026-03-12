@@ -18,6 +18,7 @@ from agent_cr.models import utc_now
 from benchmarks.real_host_scenario_base import (
     RealHostScenarioHarness,
     add_common_args,
+    bounded_probability,
     compute_summary,
     configure_logging,
     select_injected_indices,
@@ -34,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=3)
     parser.add_argument("--grace-period-seconds", type=float, default=60.0)
     parser.add_argument("--auto-cr", action="store_true")
-    parser.add_argument("--preemption-rate", type=float, default=0.5)
+    parser.add_argument("--preemption-rate", type=bounded_probability, default=0.5)
     parser.add_argument("--first-preempt-iteration", type=int, default=0)
     add_common_args(parser)
     return parser.parse_args()

@@ -6,6 +6,7 @@ from agent_cr import ArtifactKind, ArtifactReference, CheckpointId, CheckpointMa
 from agent_cr.models import utc_now
 from benchmarks.bench_tree_search import choose_replay_steps
 from benchmarks.real_host_scenario_base import (
+    bounded_probability,
     compute_summary,
     resolve_checkpoint_copy_plan,
     select_injected_indices,
@@ -108,6 +109,11 @@ class BenchmarkHelperTests(unittest.TestCase):
                 (CheckpointId("ckpt-3"), True, False),
             ],
         )
+
+    def test_bounded_probability_rejects_invalid_values(self) -> None:
+        self.assertEqual(bounded_probability("0.3"), 0.3)
+        with self.assertRaises(Exception):
+            bounded_probability("3.0")
 
 
 if __name__ == "__main__":

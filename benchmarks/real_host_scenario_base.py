@@ -75,6 +75,13 @@ def configure_logging(level_name: str) -> None:
     )
 
 
+def bounded_probability(raw: str) -> float:
+    value = float(raw)
+    if value < 0.0 or value > 1.0:
+        raise argparse.ArgumentTypeError(f"expected probability in [0.0, 1.0], got {raw}")
+    return value
+
+
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--provider", choices=["openai", "anthropic"], default="openai")
     parser.add_argument("--out", default="")

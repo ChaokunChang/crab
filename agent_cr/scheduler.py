@@ -318,7 +318,19 @@ class CRScheduler:
 
     def query_checkpoint(self, sandbox_id: SandboxId) -> SchedulerCheckpointDecision:
         logger.debug("Querying scheduler for sandbox %s", sandbox_id)
-        self._sandbox_manager.pause(sandbox_id)
+        try:
+            self._sandbox_manager.pause(sandbox_id)
+        except Exception:
+            snapshot = self._inspector.inspect(sandbox_id)
+            if not snapshot.is_running:
+                decision = self.evaluate(snapshot)
+                logger.info(
+                    "Skipping pause for sandbox %s because it is already not running; reason=%s",
+                    sandbox_id,
+                    decision.reason,
+                )
+                return decision
+            raise
         try:
             snapshot = self._inspector.inspect(sandbox_id)
             decision = self.evaluate(snapshot)

@@ -19,6 +19,7 @@ class RecordingSandboxManager:
     def __init__(self) -> None:
         self.calls: list[tuple[str, SandboxId]] = []
         self._items: dict[SandboxId, SandboxDescription] = {}
+        self.fail_pause_for: set[SandboxId] = set()
 
     def add(self, sandbox_id: SandboxId) -> None:
         self._items[sandbox_id] = SandboxDescription(
@@ -41,6 +42,8 @@ class RecordingSandboxManager:
 
     def pause(self, sandbox_id: SandboxId) -> None:
         self.calls.append(("pause", sandbox_id))
+        if sandbox_id in self.fail_pause_for:
+            raise RuntimeError("container not running")
         current = self._items[sandbox_id]
         self._items[sandbox_id] = SandboxDescription(
             sandbox_id=sandbox_id,
@@ -223,6 +226,25 @@ class SchedulerTests(unittest.TestCase):
 
         self.assertTrue(decision.should_checkpoint)
         self.assertTrue(decision.leave_running)
+
+    def test_query_handles_pause_failure_when_snapshot_is_not_running(self) -> None:
+        self.sandbox_manager.fail_pause_for.add(self.sandbox_id)
+        self.inspector.upsert_snapshot(
+            SandboxSnapshot(
+                sandbox_id=self.sandbox_id,
+                runtime_name="runc",
+                is_running=False,
+                process_changed=False,
+                filesystem_changed=False,
+                observed_at=utc_now(),
+            )
+        )
+
+        decision = self.scheduler.query_checkpoint(self.sandbox_id)
+
+        self.assertFalse(decision.should_checkpoint)
+        self.assertEqual(decision.reason, "sandbox_not_running")
+        self.assertEqual(self.sandbox_manager.calls, [("pause", self.sandbox_id)])
 
 
 if __name__ == "__main__":
