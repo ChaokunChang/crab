@@ -49,20 +49,15 @@ class HostInspectorDaemon:
         self._process_poll_interval_s = process_poll_interval_s
         self._lock = Lock()
         self._records: dict[str, SandboxRecord] = {}
-        self._stop_event = Event()
-        self._process_thread: Thread | None = None
 
     def start(self) -> None:
         self._fs_monitor.start(self._handle_fs_event)
-        self._stop_event.clear()
-        self._process_thread = Thread(target=self._run_process_loop, name="host-inspector-process", daemon=True)
-        self._process_thread.start()
+        logger.info(
+            "process change detection is on-demand; process_poll_interval=%s is accepted for compatibility only",
+            self._process_poll_interval_s,
+        )
 
     def stop(self) -> None:
-        self._stop_event.set()
-        if self._process_thread is not None:
-            self._process_thread.join(timeout=5.0)
-            self._process_thread = None
         self._fs_monitor.stop()
 
     def register(self, sandbox_id: str, runtime: str, object_id: str) -> dict[str, object]:
@@ -104,7 +99,32 @@ class HostInspectorDaemon:
             record = self._records.get(sandbox_id)
             if record is None:
                 raise KeyError(sandbox_id)
+        if record.last_reset_at is None:
             return self._record_to_response(record)
+
+        resolved = self._resolver.resolve(record.runtime, record.object_id)
+        current_pids = list_cgroup_pids(resolved.cgroup_path)
+        dirty = dirty_pids(current_pids)
+        updated = replace(
+            record,
+            runtime_name=resolved.runtime_name,
+            is_running=resolved.is_running,
+            init_pid=resolved.init_pid,
+            cgroup_path=resolved.cgroup_path,
+            cgroup_id=resolved.cgroup_id,
+            current_pids=current_pids,
+            dirty_pids=dirty,
+            process_changed=(current_pids != record.baseline_pids) or bool(dirty),
+            observed_at=max(record.observed_at or utc_now(), utc_now()),
+            last_error=None,
+        )
+        with self._lock:
+            self._records[sandbox_id] = updated
+        if resolved.cgroup_id != record.cgroup_id:
+            self._fs_monitor.remove_sandbox(sandbox_id)
+            if resolved.cgroup_id is not None:
+                self._fs_monitor.upsert_sandbox(sandbox_id, resolved.cgroup_id)
+        return self._record_to_response(updated)
 
     def reset(self, sandbox_id: str, at: datetime | None = None) -> dict[str, object]:
         when = at or utc_now()
@@ -140,52 +160,6 @@ class HostInspectorDaemon:
         if resolved.cgroup_id is not None:
             self._fs_monitor.upsert_sandbox(sandbox_id, resolved.cgroup_id)
         return self._record_to_response(updated)
-
-    def _run_process_loop(self) -> None:
-        while not self._stop_event.wait(self._process_poll_interval_s):
-            with self._lock:
-                sandbox_ids = list(self._records)
-            for sandbox_id in sandbox_ids:
-                try:
-                    self._refresh_process_state(sandbox_id)
-                except Exception:
-                    logger.exception("Failed to refresh process state for %s", sandbox_id)
-
-    def _refresh_process_state(self, sandbox_id: str) -> None:
-        with self._lock:
-            record = self._records.get(sandbox_id)
-        if record is None:
-            return
-
-        resolved = self._resolver.resolve(record.runtime, record.object_id)
-        current_pids = list_cgroup_pids(resolved.cgroup_path)
-        dirty = dirty_pids(current_pids)
-        process_changed = record.process_changed
-        if record.last_reset_at is not None:
-            if current_pids != record.baseline_pids:
-                process_changed = True
-            if dirty:
-                process_changed = True
-
-        updated = replace(
-            record,
-            runtime_name=resolved.runtime_name,
-            is_running=resolved.is_running,
-            init_pid=resolved.init_pid,
-            cgroup_path=resolved.cgroup_path,
-            cgroup_id=resolved.cgroup_id,
-            current_pids=current_pids,
-            dirty_pids=dirty,
-            process_changed=process_changed,
-            observed_at=max(record.observed_at or utc_now(), utc_now()),
-            last_error=None,
-        )
-        with self._lock:
-            self._records[sandbox_id] = updated
-        if resolved.cgroup_id != record.cgroup_id:
-            self._fs_monitor.remove_sandbox(sandbox_id)
-            if resolved.cgroup_id is not None:
-                self._fs_monitor.upsert_sandbox(sandbox_id, resolved.cgroup_id)
 
     def _handle_fs_event(self, event) -> None:
         if not self._is_countable_fs_event(event):

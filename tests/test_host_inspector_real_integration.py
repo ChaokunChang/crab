@@ -556,6 +556,73 @@ class HostInspectorRealIntegrationTests(unittest.TestCase):
         print(f"idle inspect latency ms: {idle_summary}")
         print(f"active inspect latency ms: {active_summary}")
 
+    def test_real_docker_process_changed_is_evaluated_at_query_time(self) -> None:
+        _, client, _, container_name, sandbox_id = self._start_docker_host_inspector_fixture(
+            name_prefix="agent-cr-proc-now",
+            sandbox_name="proc-now-sbx",
+            process_poll_interval_s=0.1,
+        )
+
+        self._reset_and_wait_clear(client, sandbox_id)
+        subprocess.run(
+            ["docker", "exec", container_name, "sh", "-lc", "sleep 0.5"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        status_after_transient = self._status_for(client, sandbox_id)
+        self.assertFalse(status_after_transient["process_changed"], status_after_transient)
+        self.assertFalse(status_after_transient["filesystem_changed"], status_after_transient)
+
+        self._reset_and_wait_clear(client, sandbox_id)
+        live_proc = subprocess.Popen(
+            ["docker", "exec", container_name, "sh", "-lc", "sleep 2"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            live_status = self._wait_for_status(
+                client,
+                sandbox_id,
+                predicate=lambda payload: bool(payload["process_changed"]),
+                timeout_s=8.0,
+                interval_s=0.1,
+            )
+        finally:
+            stdout, stderr = live_proc.communicate(timeout=10.0)
+            self.assertEqual(live_proc.returncode, 0, f"live sleep failed\nstdout={stdout}\nstderr={stderr}")
+        self.assertTrue(live_status["process_changed"], live_status)
+        self.assertFalse(live_status["filesystem_changed"], live_status)
+
+        status_after_exit = self._wait_for_status(
+            client,
+            sandbox_id,
+            predicate=lambda payload: not bool(payload["process_changed"]),
+            timeout_s=8.0,
+            interval_s=0.1,
+        )
+        self.assertFalse(status_after_exit["filesystem_changed"], status_after_exit)
+
+        self._reset_and_wait_clear(client, sandbox_id)
+        subprocess.run(
+            [
+                "docker",
+                "exec",
+                container_name,
+                "python3",
+                "-B",
+                "-c",
+                "buf=bytearray(8*1024*1024); buf[4096]=1",
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        status_after_transient_dirty = self._status_for(client, sandbox_id)
+        self.assertFalse(status_after_transient_dirty["process_changed"], status_after_transient_dirty)
+        self.assertFalse(status_after_transient_dirty["filesystem_changed"], status_after_transient_dirty)
+
     def test_real_runc_criu_zfs_checkpoint_restore_with_remote_inspector(self) -> None:
         if (
             os.geteuid() != 0

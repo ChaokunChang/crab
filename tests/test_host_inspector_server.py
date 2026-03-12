@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import time
-import unittest
 import os
 import stat as pystat
+import unittest
 from unittest.mock import patch
 
 from agent_cr.host_inspector.protocol import HelperEvent
@@ -77,7 +76,11 @@ class HostInspectorServerTests(unittest.TestCase):
                 timestamp="2026-03-11T12:00:00+00:00",
             )
         )
-        status = {"status": daemon.status("sbx-1")}
+        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111, 222}), patch(
+            "agent_cr.host_inspector.server.dirty_pids",
+            return_value=set(),
+        ):
+            status = {"status": daemon.status("sbx-1")}
         self.assertFalse(status["status"]["process_changed"])
         self.assertTrue(status["status"]["filesystem_changed"])
 
@@ -85,7 +88,7 @@ class HostInspectorServerTests(unittest.TestCase):
         self.assertTrue(unregistered["unregistered"])
         self.assertIn("sbx-1", fs_monitor.removals)
 
-    def test_process_poll_latches_dirty_memory(self) -> None:
+    def test_status_reports_dirty_memory_for_current_live_pid(self) -> None:
         resolver = FakeResolver()
         fs_monitor = FakeFilesystemMonitor()
         daemon = HostInspectorDaemon(resolver=resolver, fs_monitor=fs_monitor, process_poll_interval_s=0.05)
@@ -97,18 +100,53 @@ class HostInspectorServerTests(unittest.TestCase):
             daemon.register("sbx-1", "docker", "container-1")
             daemon.reset("sbx-1")
 
-        daemon.start()
-        self.addCleanup(daemon.stop)
-
         with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
             "agent_cr.host_inspector.server.dirty_pids",
             return_value={111},
         ):
-            time.sleep(0.12)
-
-        status = daemon.status("sbx-1")
+            status = daemon.status("sbx-1")
         self.assertTrue(status["process_changed"])
         self.assertEqual(status["metadata"]["dirty_pids"], [111])
+
+    def test_status_returns_false_after_transient_pid_exits(self) -> None:
+        resolver = FakeResolver()
+        fs_monitor = FakeFilesystemMonitor()
+        daemon = HostInspectorDaemon(resolver=resolver, fs_monitor=fs_monitor, process_poll_interval_s=0.05)
+
+        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+            return_value={111},
+        ):
+            daemon.register("sbx-1", "docker", "container-1")
+            daemon.reset("sbx-1")
+
+        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "agent_cr.host_inspector.server.dirty_pids",
+            return_value=set(),
+        ):
+            status = daemon.status("sbx-1")
+        self.assertFalse(status["process_changed"])
+        self.assertEqual(status["metadata"]["current_pids"], [111])
+
+    def test_status_returns_true_for_live_pid_set_difference(self) -> None:
+        resolver = FakeResolver()
+        fs_monitor = FakeFilesystemMonitor()
+        daemon = HostInspectorDaemon(resolver=resolver, fs_monitor=fs_monitor, process_poll_interval_s=0.05)
+
+        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+            return_value={111},
+        ):
+            daemon.register("sbx-1", "docker", "container-1")
+            daemon.reset("sbx-1")
+
+        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111, 222}), patch(
+            "agent_cr.host_inspector.server.dirty_pids",
+            return_value=set(),
+        ):
+            status = daemon.status("sbx-1")
+        self.assertTrue(status["process_changed"])
+        self.assertEqual(status["metadata"]["current_pids"], [111, 222])
 
     def test_open_with_rdwr_only_does_not_latch_filesystem(self) -> None:
         resolver = FakeResolver()
