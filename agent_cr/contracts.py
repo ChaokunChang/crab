@@ -44,6 +44,8 @@ class SandboxRuntimeAdapter(ABC):
         self,
         sandbox_id: SandboxId,
         checkpoint_id: CheckpointId,
+        *,
+        leave_running: bool,
     ) -> RuntimeOperationStatus:
         raise NotImplementedError
 
@@ -161,6 +163,30 @@ class CheckpointManager(ABC):
 
     @abstractmethod
     def list_checkpoints(self, sandbox_id: SandboxId) -> list[CheckpointId]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def delete_checkpoint(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def delete_all_checkpoints(self, sandbox_id: SandboxId) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def handle_checkpoint_complete(self, manifest: CheckpointManifest) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def handle_restore_complete(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> None:
         raise NotImplementedError
 
 

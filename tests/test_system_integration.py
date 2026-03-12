@@ -18,6 +18,7 @@ from agent_cr import (
     EBPFEvent,
     EBPFEventKind,
     ExecutorConfig,
+    FaultToleranceCheckpointingPolicy,
     InMemoryEBPFEventCollector,
     InMemorySchedulerStateStore,
     InMemoryTelemetrySink,
@@ -235,6 +236,99 @@ class SystemIntegrationTests(unittest.TestCase):
             event_names = [name for name, _ in telemetry.events]
             self.assertIn("scheduler.evaluate", event_names)
             self.assertIn("executor.job_finished", event_names)
+            executor.shutdown()
+
+    def test_fault_tolerance_policy_resumes_sandbox_after_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
+            root = Path(tmp)
+            runner = FakeCommandRunner()
+            telemetry = InMemoryTelemetrySink()
+            collector = InMemoryEBPFEventCollector()
+            inspector = EBPFSandboxInspector(collector)
+
+            runtime = RuncRuntimeAdapter(
+                command_runner=runner,
+                paths=RuncRuntimePaths(
+                    state_root=root / "runtime-state",
+                    bundle_root=root / "bundles",
+                    checkpoint_root=root / "checkpoints",
+                    zfs_dataset_prefix="pool/agent-cr",
+                ),
+            )
+            storage = LocalCheckpointManager(StorageConfig(root_dir=root / "storage"))
+            executor = CRExecutor(
+                ExecutorConfig(max_workers=1),
+                DefaultCWorker(
+                    AdapterProcessCWorker(runtime),
+                    AdapterFileSystemCWorker(runtime),
+                    storage,
+                    runtime,
+                ),
+                DefaultRWorker(
+                    AdapterProcessRWorker(runtime),
+                    AdapterFileSystemRWorker(runtime),
+                    storage,
+                ),
+                telemetry,
+            )
+            sandbox_manager = RuncSandboxManager(
+                command_runner=runner,
+                paths=RuncSandboxManagerPaths(
+                    state_root=root / "runtime-state",
+                    bundle_root=root / "bundles",
+                    metadata_root=root / "sandbox-metadata",
+                    zfs_dataset_prefix="pool/agent-cr",
+                ),
+            )
+            scheduler = CRScheduler(
+                SchedulerConfig(
+                    min_checkpoint_interval_seconds=0.0,
+                    force_checkpoint_after_seconds=0.0,
+                    require_change_signal=True,
+                ),
+                inspector,
+                sandbox_manager,
+                InMemorySchedulerStateStore(),
+                telemetry,
+                FaultToleranceCheckpointingPolicy(
+                    SchedulerConfig(
+                        min_checkpoint_interval_seconds=0.0,
+                        force_checkpoint_after_seconds=0.0,
+                        require_change_signal=True,
+                    )
+                ),
+            )
+            system = AgentCRSystem(
+                scheduler=scheduler,
+                executor=executor,
+                storage=storage,
+                inspector=inspector,
+                sandbox_manager=sandbox_manager,
+                telemetry=telemetry,
+            )
+            sandbox_id = system.sandbox_manager.launch(
+                "runc",
+                {
+                    "sandbox_id": "sbx-ft",
+                    "bundle_path": str(root / "bundles" / "sbx-ft"),
+                },
+            )
+            inspector.upsert_snapshot(
+                SandboxSnapshot(
+                    sandbox_id=sandbox_id,
+                    runtime_name="runc",
+                    is_running=True,
+                    process_changed=True,
+                    filesystem_changed=True,
+                    observed_at=utc_now(),
+                )
+            )
+
+            result = system.checkpoint_if_due(sandbox_id)
+
+            self.assertIsNotNone(result)
+            self.assertEqual(system.sandbox_manager.describe(sandbox_id).status, "running")
+            self.assertTrue(any("--leave-running=true" in command for command in runner.commands))
             executor.shutdown()
 
 

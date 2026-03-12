@@ -6,7 +6,7 @@ from pathlib import Path
 from threading import Event, Lock, Thread
 
 from .config import ExecutorConfig, SchedulerConfig, StorageConfig
-from .contracts import SandboxInspector
+from .contracts import CheckpointManager, SandboxInspector
 from .executor import CRExecutor
 from .ids import JobId
 from .inspector import EBPFSandboxInspector
@@ -14,7 +14,7 @@ from .interceptor import InMemoryRequestStateStore, RequestAwareSandboxInspector
 from .models import CheckpointJob, CheckpointResult, RestoreJob, RestoreResult, SandboxId, utc_now
 from .runtime import DockerRuntimeAdapter, RuncRuntimeAdapter
 from .sandbox_manager import InMemorySandboxManager, RuncSandboxManager
-from .scheduler import CRScheduler, InMemorySchedulerStateStore
+from .scheduler import CRScheduler, InMemorySchedulerStateStore, SchedulerPolicy
 from .storage import LocalCheckpointManager
 from .telemetry import InMemoryTelemetrySink, NoopTelemetrySink
 from .workers import (
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 class AgentCRSystem:
     scheduler: CRScheduler
     executor: CRExecutor
-    storage: LocalCheckpointManager
+    storage: CheckpointManager
     inspector: SandboxInspector
     sandbox_manager: InMemorySandboxManager | RuncSandboxManager
     telemetry: InMemoryTelemetrySink | NoopTelemetrySink
@@ -91,6 +91,7 @@ class AgentCRSystem:
                 sandbox_id=sandbox_id,
                 requested_at=utc_now(),
                 reason="manual",
+                leave_running=False,
             )
             result = self.executor.run_checkpoint(job)
             if result.status.value == "succeeded":
@@ -144,6 +145,7 @@ class AgentCRSystem:
         result = self.executor.run_restore(job)
         if result.status.value == "succeeded":
             self.sandbox_manager.mark_restored(sandbox_id)
+            self.storage.handle_restore_complete(sandbox_id, result.checkpoint_id)
         logger.info(
             "Manual restore for sandbox %s checkpoint=%s finished with status=%s",
             sandbox_id,
@@ -215,6 +217,7 @@ class AgentCRSystem:
             reason=decision.reason,
             checkpoint_process=decision.checkpoint_process,
             checkpoint_filesystem=decision.checkpoint_filesystem,
+            leave_running=decision.leave_running,
             metadata={"policy": decision.policy_name, **decision.metadata},
         )
         result: CheckpointResult | None = None
@@ -262,14 +265,11 @@ class AgentCRSystem:
         job: CheckpointJob | None,
         result: CheckpointResult | None,
     ) -> bool:
-        if job is None or not job.checkpoint_process:
+        if job is None:
             return True
-        if result is None:
+        if result is None or result.status.value != "succeeded":
             return True
-        for status in result.operation_statuses:
-            if status.metadata.get("phase") == "process_checkpoint" and bool(status.executed):
-                return False
-        return True
+        return job.leave_running
 
 
 def build_default_system(
@@ -281,6 +281,8 @@ def build_default_system(
     storage_config: StorageConfig | None = None,
     use_in_memory_telemetry: bool = True,
     request_state_store: InMemoryRequestStateStore | None = None,
+    scheduler_policy: SchedulerPolicy | None = None,
+    checkpoint_manager: CheckpointManager | None = None,
 ) -> AgentCRSystem:
     logger.info("Building default agent-cr system with runtime=%s storage_root=%s", runtime, storage_root)
     scheduler_cfg = scheduler_config or SchedulerConfig()
@@ -297,7 +299,7 @@ def build_default_system(
         raise ValueError(f"unsupported runtime adapter: {runtime}")
 
     telemetry = InMemoryTelemetrySink() if use_in_memory_telemetry else NoopTelemetrySink()
-    storage = LocalCheckpointManager(store_cfg)
+    storage = checkpoint_manager or LocalCheckpointManager(store_cfg)
 
     process_c = AdapterProcessCWorker(adapter)
     process_r = AdapterProcessRWorker(adapter)
@@ -317,6 +319,7 @@ def build_default_system(
         sandbox_manager,
         InMemorySchedulerStateStore(),
         telemetry,
+        scheduler_policy,
     )
 
     logger.debug(

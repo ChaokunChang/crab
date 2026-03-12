@@ -50,8 +50,19 @@ from .models import (
 )
 from .runtime import CommandRunner, DockerRuntimeAdapter, RuncRuntimeAdapter, RuncRuntimePaths, SubprocessCommandRunner
 from .sandbox_manager import InMemorySandboxManager, RuncSandboxManager, RuncSandboxManagerPaths
-from .scheduler import CRScheduler, InMemorySchedulerStateStore
-from .storage import LocalCheckpointManager
+from .scheduler import (
+    CRScheduler,
+    FaultToleranceCheckpointingPolicy,
+    InMemorySchedulerStateStore,
+    SpotPreemptionCheckpointingPolicy,
+    TreeSearchCheckpointingPolicy,
+)
+from .storage import (
+    DeleteAfterRestoreCheckpointManager,
+    KeepAllCheckpointManager,
+    LatestOnlyCheckpointManager,
+    LocalCheckpointManager,
+)
 from .system import AgentCRSystem, build_default_system
 from .telemetry import InMemoryTelemetrySink, NoopTelemetrySink
 from .workers import (
@@ -81,8 +92,10 @@ __all__ = [
     "EBPFSandboxInspector",
     "DefaultCWorker",
     "DefaultRWorker",
+    "DeleteAfterRestoreCheckpointManager",
     "DockerRuntimeAdapter",
     "ExecutorConfig",
+    "FaultToleranceCheckpointingPolicy",
     "FailureCode",
     "FileSystemCWorker",
     "FileSystemRWorker",
@@ -95,6 +108,8 @@ __all__ = [
     "JobRecord",
     "JobStatus",
     "JobType",
+    "KeepAllCheckpointManager",
+    "LatestOnlyCheckpointManager",
     "LocalCheckpointManager",
     "NoopTelemetrySink",
     "ProcessCWorker",
@@ -119,6 +134,7 @@ __all__ = [
     "SandboxSnapshot",
     "SchedulerCheckpointDecision",
     "SchedulerConfig",
+    "SpotPreemptionCheckpointingPolicy",
     "StorageConfig",
     "SubprocessCommandRunner",
     "TelemetryConfig",
@@ -135,5 +151,6 @@ __all__ = [
     "RequestAwareSandboxInspector",
     "SandboxResponseGateRegistry",
     "TelemetryRequestInterceptorHook",
+    "TreeSearchCheckpointingPolicy",
     "AgentCRRequestInterceptorServer",
 ]

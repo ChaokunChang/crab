@@ -80,6 +80,18 @@ class NoArtifactCheckpointManager:
         _ = sandbox_id
         return [self.manifest.checkpoint_id]
 
+    def delete_checkpoint(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> None:
+        _ = (sandbox_id, checkpoint_id)
+
+    def delete_all_checkpoints(self, sandbox_id: SandboxId) -> None:
+        _ = sandbox_id
+
+    def handle_checkpoint_complete(self, manifest: CheckpointManifest) -> None:
+        _ = manifest
+
+    def handle_restore_complete(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> None:
+        _ = (sandbox_id, checkpoint_id)
+
 
 class ManifestCheckpointManager:
     def __init__(self, manifests: list[CheckpointManifest]) -> None:
@@ -103,6 +115,19 @@ class ManifestCheckpointManager:
     def get_artifact(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId, reference) -> bytes:
         raise NotImplementedError
 
+    def delete_checkpoint(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> None:
+        self._manifests.pop((sandbox_id, checkpoint_id), None)
+
+    def delete_all_checkpoints(self, sandbox_id: SandboxId) -> None:
+        for checkpoint_id in list(self._ordered.get(sandbox_id, [])):
+            self.delete_checkpoint(sandbox_id, checkpoint_id)
+
+    def handle_checkpoint_complete(self, manifest: CheckpointManifest) -> None:
+        _ = manifest
+
+    def handle_restore_complete(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> None:
+        _ = (sandbox_id, checkpoint_id)
+
 
 class RecordingCheckpointWorker:
     def __init__(self, artifact_kind: str) -> None:
@@ -121,6 +146,7 @@ class RecordingCheckpointWorker:
 class RecordingCheckpointManager:
     def __init__(self) -> None:
         self.manifest: CheckpointManifest | None = None
+        self.completed: list[CheckpointManifest] = []
 
     def put_manifest(self, manifest: CheckpointManifest) -> None:
         self.manifest = manifest
@@ -149,12 +175,27 @@ class RecordingCheckpointManager:
         _ = sandbox_id
         return []
 
+    def delete_checkpoint(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> None:
+        _ = (sandbox_id, checkpoint_id)
+
+    def delete_all_checkpoints(self, sandbox_id: SandboxId) -> None:
+        _ = sandbox_id
+
+    def handle_checkpoint_complete(self, manifest: CheckpointManifest) -> None:
+        self.completed.append(manifest)
+
+    def handle_restore_complete(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> None:
+        _ = (sandbox_id, checkpoint_id)
+
 
 class ContractTests(unittest.TestCase):
     def test_runtime_adapters_are_contract_compatible(self) -> None:
         docker = DockerRuntimeAdapter()
         self.assertIsInstance(docker, SandboxRuntimeAdapter)
-        self.assertTrue(len(docker.checkpoint_process(SandboxId("sbx-1"), CheckpointId("ckpt-1")).command) > 0)
+        self.assertTrue(
+            len(docker.checkpoint_process(SandboxId("sbx-1"), CheckpointId("ckpt-1"), leave_running=False).command)
+            > 0
+        )
 
         with tempfile.TemporaryDirectory(prefix="agent_cr_runtime_contract_") as tmp:
             adapter = RuncRuntimeAdapter(
@@ -168,7 +209,14 @@ class ContractTests(unittest.TestCase):
             )
             self.assertIsInstance(adapter, SandboxRuntimeAdapter)
             self.assertTrue(
-                len(adapter.checkpoint_process(SandboxId("sbx-1"), CheckpointId("ckpt-1")).command) > 0
+                len(
+                    adapter.checkpoint_process(
+                        SandboxId("sbx-1"),
+                        CheckpointId("ckpt-1"),
+                        leave_running=False,
+                    ).command
+                )
+                > 0
             )
 
     def test_workers_return_typed_dry_run_results(self) -> None:
@@ -349,6 +397,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(result.status.value, "succeeded")
         self.assertEqual(len(process_worker.calls), 1)
         self.assertEqual(len(filesystem_worker.calls), 0)
+        self.assertEqual(len(manager.completed), 1)
         assert result.manifest is not None
         self.assertEqual(result.manifest.filesystem_artifacts, [])
 
@@ -470,12 +519,17 @@ class ContractTests(unittest.TestCase):
                 ),
             )
 
-            process_status = adapter.checkpoint_process(SandboxId("sbx-1"), CheckpointId("ckpt-1"))
+            process_status = adapter.checkpoint_process(
+                SandboxId("sbx-1"),
+                CheckpointId("ckpt-1"),
+                leave_running=True,
+            )
             fs_status = adapter.checkpoint_filesystem(SandboxId("sbx-1"), CheckpointId("ckpt-1"))
 
             self.assertTrue(process_status.executed)
             self.assertTrue(fs_status.executed)
             self.assertEqual(runner.commands[0][0:3], ("runc", "--root", str(base / "state")))
+            self.assertIn("--leave-running=true", runner.commands[0])
             self.assertEqual(runner.commands[1], ("zfs", "snapshot", "pool/agent-cr/sbx-1@ckpt-1"))
 
     def test_ebpf_inspector_uses_recorded_events(self) -> None:

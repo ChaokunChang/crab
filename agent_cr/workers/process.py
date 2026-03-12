@@ -31,11 +31,16 @@ class AdapterProcessCWorker(ProcessCWorker):
             checkpoint_id,
             self._adapter.name,
         )
-        status = self._adapter.checkpoint_process(job.sandbox_id, checkpoint_id)
+        status = self._adapter.checkpoint_process(
+            job.sandbox_id,
+            checkpoint_id,
+            leave_running=job.leave_running,
+        )
         image_path = self._adapter.process_checkpoint_location(job.sandbox_id, checkpoint_id)
         payload = {
             "sandbox_id": str(job.sandbox_id),
             "checkpoint_id": str(checkpoint_id),
+            "leave_running": job.leave_running,
             "process_storage_mode": "runtime_reference" if image_path else "adapter_default",
             "process_checkpoint_location": image_path,
             "status": {

@@ -233,6 +233,7 @@ class CheckpointJob:
     reason: str = "manual"
     checkpoint_process: bool = True
     checkpoint_filesystem: bool = True
+    leave_running: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -307,6 +308,7 @@ class SchedulerCheckpointDecision:
     should_checkpoint: bool
     checkpoint_process: bool
     checkpoint_filesystem: bool
+    leave_running: bool
     reason: str
     policy_name: str
     metadata: dict[str, Any] = field(default_factory=dict)

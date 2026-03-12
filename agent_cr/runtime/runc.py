@@ -34,11 +34,22 @@ class RuncRuntimeAdapter(CommandRuntimeAdapter):
         self,
         sandbox_id: SandboxId,
         checkpoint_id: CheckpointId,
+        *,
+        leave_running: bool,
     ):
-        meta = self._process_metadata(sandbox_id, checkpoint_id, phase="process_checkpoint")
+        meta = self._process_metadata(
+            sandbox_id,
+            checkpoint_id,
+            phase="process_checkpoint",
+            leave_running=leave_running,
+        )
         self._ensure_dir(Path(str(meta["image_path"])))
         self._ensure_dir(Path(str(meta["work_path"])))
-        return super().checkpoint_process(sandbox_id, checkpoint_id)
+        return super().checkpoint_process(
+            sandbox_id,
+            checkpoint_id,
+            leave_running=leave_running,
+        )
 
     def restore_process(
         self,
@@ -56,10 +67,11 @@ class RuncRuntimeAdapter(CommandRuntimeAdapter):
         checkpoint_id: CheckpointId,
         *,
         phase: str,
+        leave_running: bool | None = None,
     ) -> dict[str, object]:
         image_path = self._checkpoint_image_path(sandbox_id, checkpoint_id)
         work_path = self._checkpoint_work_path(sandbox_id, checkpoint_id)
-        return {
+        metadata = {
             "phase": phase,
             "runtime": self.name,
             "sandbox_id": str(sandbox_id),
@@ -69,6 +81,9 @@ class RuncRuntimeAdapter(CommandRuntimeAdapter):
             "work_path": str(work_path),
             "state_root": str(self._paths.state_root),
         }
+        if leave_running is not None:
+            metadata["leave_running"] = leave_running
+        return metadata
 
     def _filesystem_metadata(
         self,
@@ -89,7 +104,13 @@ class RuncRuntimeAdapter(CommandRuntimeAdapter):
             "mountpoint": str(self._bundle_path(sandbox_id) / "rootfs"),
         }
 
-    def _checkpoint_cmd(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> list[str]:
+    def _checkpoint_cmd(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+        *,
+        leave_running: bool,
+    ) -> list[str]:
         image_path = self._checkpoint_image_path(sandbox_id, checkpoint_id)
         work_path = self._checkpoint_work_path(sandbox_id, checkpoint_id)
         return [
@@ -102,7 +123,7 @@ class RuncRuntimeAdapter(CommandRuntimeAdapter):
             str(image_path),
             "--work-path",
             str(work_path),
-            "--leave-running=false",
+            f"--leave-running={'true' if leave_running else 'false'}",
             "--tcp-established",
         ]
 

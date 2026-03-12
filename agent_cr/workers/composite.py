@@ -141,10 +141,12 @@ class DefaultCWorker(CompositeCheckpointWorker):
             metadata={
                 "job_id": str(job.job_id),
                 "reason": job.reason,
+                "leave_running": job.leave_running,
             },
         ).with_integrity()
         try:
             self._checkpoint_manager.put_manifest(manifest)
+            self._checkpoint_manager.handle_checkpoint_complete(manifest)
         except Exception as exc:
             logger.exception(
                 "Failed to persist manifest for job %s sandbox=%s checkpoint=%s",

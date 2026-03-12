@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import datetime
 import logging
 from threading import Lock
+from typing import Protocol
 
 from .config import SchedulerConfig
 from .contracts import SandboxInspector, SandboxManager, SchedulerStateStore, TelemetrySink
@@ -12,6 +13,19 @@ from .models import SandboxSnapshot, SchedulerCheckpointDecision, utc_now
 from .telemetry import NoopTelemetrySink
 
 logger = logging.getLogger(__name__)
+
+_PREEMPTION_NOTICE_KEY = "preemption_notice"
+_PREEMPTION_GRACE_SECONDS_KEY = "preemption_grace_remaining_seconds"
+_TREE_SEARCH_STEP_KEY = "tree_search_step"
+
+
+class SchedulerPolicy(Protocol):
+    @property
+    def name(self) -> str:
+        ...
+
+    def evaluate(self, snapshot: SandboxSnapshot) -> SchedulerCheckpointDecision:
+        ...
 
 
 class InMemorySchedulerStateStore(SchedulerStateStore):
@@ -49,7 +63,7 @@ class CheckpointingPolicy:
 
     def evaluate(self, snapshot: SandboxSnapshot) -> SchedulerCheckpointDecision:
         changed = snapshot.process_changed or snapshot.filesystem_changed
-        checkpoint_process = changed # Mark: we do this because we can not monitor valid process_changed yet.
+        checkpoint_process = changed
         checkpoint_filesystem = snapshot.filesystem_changed
 
         if not snapshot.is_running:
@@ -57,6 +71,7 @@ class CheckpointingPolicy:
                 should_checkpoint=False,
                 checkpoint_process=False,
                 checkpoint_filesystem=False,
+                leave_running=False,
                 reason="sandbox_not_running",
                 policy_name=self.name,
             )
@@ -67,6 +82,7 @@ class CheckpointingPolicy:
                 should_checkpoint=False,
                 checkpoint_process=False,
                 checkpoint_filesystem=False,
+                leave_running=False,
                 reason="no_change_signal",
                 policy_name=self.name,
             )
@@ -77,6 +93,7 @@ class CheckpointingPolicy:
                     should_checkpoint=False,
                     checkpoint_process=False,
                     checkpoint_filesystem=False,
+                    leave_running=False,
                     reason="llm_request_required",
                     policy_name=self.name,
                 )
@@ -87,6 +104,7 @@ class CheckpointingPolicy:
                 should_checkpoint=True,
                 checkpoint_process=checkpoint_process,
                 checkpoint_filesystem=checkpoint_filesystem,
+                leave_running=False,
                 reason=reason,
                 policy_name=self.name,
                 metadata={"llm_request_in_flight": request_in_flight},
@@ -101,6 +119,7 @@ class CheckpointingPolicy:
                 should_checkpoint=True,
                 checkpoint_process=checkpoint_process,
                 checkpoint_filesystem=checkpoint_filesystem,
+                leave_running=False,
                 reason="force_interval_elapsed",
                 policy_name=self.name,
                 metadata={"elapsed_seconds": elapsed, "llm_request_in_flight": request_in_flight},
@@ -111,6 +130,7 @@ class CheckpointingPolicy:
                 should_checkpoint=False,
                 checkpoint_process=False,
                 checkpoint_filesystem=False,
+                leave_running=False,
                 reason="minimum_interval_not_elapsed",
                 policy_name=self.name,
                 metadata={"elapsed_seconds": elapsed, "llm_request_in_flight": request_in_flight},
@@ -121,6 +141,7 @@ class CheckpointingPolicy:
                 should_checkpoint=False,
                 checkpoint_process=False,
                 checkpoint_filesystem=False,
+                leave_running=False,
                 reason="llm_request_required",
                 policy_name=self.name,
                 metadata={"elapsed_seconds": elapsed, "llm_request_in_flight": request_in_flight},
@@ -133,9 +154,111 @@ class CheckpointingPolicy:
             should_checkpoint=True,
             checkpoint_process=checkpoint_process,
             checkpoint_filesystem=checkpoint_filesystem,
+            leave_running=False,
             reason=reason,
             policy_name=self.name,
             metadata={"elapsed_seconds": elapsed, "llm_request_in_flight": request_in_flight},
+        )
+
+
+class FaultToleranceCheckpointingPolicy(CheckpointingPolicy):
+    @property
+    def name(self) -> str:
+        return "fault-tolerance"
+
+    def evaluate(self, snapshot: SandboxSnapshot) -> SchedulerCheckpointDecision:
+        decision = super().evaluate(snapshot)
+        if not decision.should_checkpoint:
+            return decision
+        return replace(decision, leave_running=True, policy_name=self.name)
+
+
+class SpotPreemptionCheckpointingPolicy:
+    def __init__(self, config: SchedulerConfig):
+        self._config = config
+
+    @property
+    def name(self) -> str:
+        return "spot-preemption"
+
+    def evaluate(self, snapshot: SandboxSnapshot) -> SchedulerCheckpointDecision:
+        if not snapshot.is_running:
+            return SchedulerCheckpointDecision(
+                should_checkpoint=False,
+                checkpoint_process=False,
+                checkpoint_filesystem=False,
+                leave_running=False,
+                reason="sandbox_not_running",
+                policy_name=self.name,
+            )
+
+        notice = bool(snapshot.metadata.get(_PREEMPTION_NOTICE_KEY, False))
+        if not notice:
+            return SchedulerCheckpointDecision(
+                should_checkpoint=False,
+                checkpoint_process=False,
+                checkpoint_filesystem=False,
+                leave_running=False,
+                reason="awaiting_preemption_notice",
+                policy_name=self.name,
+            )
+
+        remaining = float(snapshot.metadata.get(_PREEMPTION_GRACE_SECONDS_KEY, 0.0))
+        if remaining <= 0:
+            return SchedulerCheckpointDecision(
+                should_checkpoint=False,
+                checkpoint_process=False,
+                checkpoint_filesystem=False,
+                leave_running=False,
+                reason="preemption_budget_expired",
+                policy_name=self.name,
+                metadata={_PREEMPTION_GRACE_SECONDS_KEY: remaining},
+            )
+
+        return SchedulerCheckpointDecision(
+            should_checkpoint=True,
+            checkpoint_process=True,
+            checkpoint_filesystem=True,
+            leave_running=False,
+            reason="preemption_notice_received",
+            policy_name=self.name,
+            metadata={_PREEMPTION_GRACE_SECONDS_KEY: remaining},
+        )
+
+
+class TreeSearchCheckpointingPolicy:
+    @property
+    def name(self) -> str:
+        return "tree-search"
+
+    def evaluate(self, snapshot: SandboxSnapshot) -> SchedulerCheckpointDecision:
+        if not snapshot.is_running:
+            return SchedulerCheckpointDecision(
+                should_checkpoint=False,
+                checkpoint_process=False,
+                checkpoint_filesystem=False,
+                leave_running=False,
+                reason="sandbox_not_running",
+                policy_name=self.name,
+            )
+        step = snapshot.metadata.get(_TREE_SEARCH_STEP_KEY)
+        if step is None:
+            return SchedulerCheckpointDecision(
+                should_checkpoint=False,
+                checkpoint_process=False,
+                checkpoint_filesystem=False,
+                leave_running=False,
+                reason="tree_search_step_missing",
+                policy_name=self.name,
+            )
+        return SchedulerCheckpointDecision(
+            should_checkpoint=True,
+            checkpoint_process=True,
+            checkpoint_filesystem=True,
+            leave_running=True,
+            reason="tree_search_step",
+            policy_name=self.name,
+            metadata={_TREE_SEARCH_STEP_KEY: step},
         )
 
 
@@ -147,9 +270,10 @@ class CRScheduler:
         sandbox_manager: SandboxManager,
         state_store: SchedulerStateStore | None = None,
         telemetry: TelemetrySink | None = None,
+        policy: SchedulerPolicy | None = None,
     ):
         self._config = config
-        self._policy = CheckpointingPolicy(config)
+        self._policy = policy or CheckpointingPolicy(config)
         self._inspector = inspector
         self._sandbox_manager = sandbox_manager
         self._state = state_store or InMemorySchedulerStateStore()
@@ -169,13 +293,14 @@ class CRScheduler:
         decision = self._policy.evaluate(hydrated)
         log_fn = logger.info if decision.should_checkpoint else logger.debug
         log_fn(
-            "Scheduler evaluated sandbox %s with policy=%s should_checkpoint=%s reason=%s process=%s filesystem=%s",
+            "Scheduler evaluated sandbox %s with policy=%s should_checkpoint=%s reason=%s process=%s filesystem=%s leave_running=%s",
             hydrated.sandbox_id,
             self._policy.name,
             decision.should_checkpoint,
             decision.reason,
             decision.checkpoint_process,
             decision.checkpoint_filesystem,
+            decision.leave_running,
         )
         self._telemetry.emit_event(
             "scheduler.evaluate",
@@ -186,6 +311,7 @@ class CRScheduler:
                 "reason": decision.reason,
                 "checkpoint_process": decision.checkpoint_process,
                 "checkpoint_filesystem": decision.checkpoint_filesystem,
+                "leave_running": decision.leave_running,
             },
         )
         return decision
@@ -205,11 +331,12 @@ class CRScheduler:
                 )
             else:
                 logger.info(
-                    "Scheduler selected checkpoint for sandbox %s reason=%s process=%s filesystem=%s",
+                    "Scheduler selected checkpoint for sandbox %s reason=%s process=%s filesystem=%s leave_running=%s",
                     sandbox_id,
                     decision.reason,
                     decision.checkpoint_process,
                     decision.checkpoint_filesystem,
+                    decision.leave_running,
                 )
             return decision
         except Exception:
