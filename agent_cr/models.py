@@ -55,6 +55,15 @@ class FailureCode(str, Enum):
     UNKNOWN = "unknown"
 
 
+class EBPFEventKind(str, Enum):
+    PROCESS_EXEC = "process_exec"
+    PROCESS_EXIT = "process_exit"
+    FILE_WRITE = "file_write"
+    FILE_DELETE = "file_delete"
+    NETWORK_INGRESS = "network_ingress"
+    NETWORK_EGRESS = "network_egress"
+
+
 @dataclass(frozen=True)
 class RuntimeCapabilities:
     supports_process_checkpoint: bool
@@ -64,10 +73,18 @@ class RuntimeCapabilities:
 
 
 @dataclass(frozen=True)
-class DryRunStatus:
+class RuntimeOperationStatus:
     executed: bool
     reason: str
-    planned_command: tuple[str, ...] = ()
+    command: tuple[str, ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class EBPFEvent:
+    sandbox_id: SandboxId
+    kind: EBPFEventKind
+    observed_at: datetime
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -114,8 +131,8 @@ class ArtifactReference:
 class WorkerStepResult:
     success: bool
     artifacts: list[ArtifactPayload] = field(default_factory=list)
-    dry_run_status: DryRunStatus = field(
-        default_factory=lambda: DryRunStatus(executed=False, reason="unknown")
+    operation_status: RuntimeOperationStatus = field(
+        default_factory=lambda: RuntimeOperationStatus(executed=False, reason="unknown")
     )
     failure_code: FailureCode = FailureCode.NONE
     message: str | None = None
@@ -214,7 +231,14 @@ class CheckpointJob:
     sandbox_id: SandboxId
     requested_at: datetime
     reason: str = "manual"
+    checkpoint_process: bool = True
+    checkpoint_filesystem: bool = True
+    leave_running: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.checkpoint_process and not self.checkpoint_filesystem:
+            raise ValueError("checkpoint job must include at least one checkpoint scope")
 
 
 @dataclass(frozen=True)
@@ -238,7 +262,7 @@ class CheckpointResult:
     manifest: CheckpointManifest | None
     failure_code: FailureCode = FailureCode.NONE
     message: str | None = None
-    dry_run_statuses: tuple[DryRunStatus, ...] = ()
+    operation_statuses: tuple[RuntimeOperationStatus, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -251,7 +275,7 @@ class RestoreResult:
     finished_at: datetime
     failure_code: FailureCode = FailureCode.NONE
     message: str | None = None
-    dry_run_statuses: tuple[DryRunStatus, ...] = ()
+    operation_statuses: tuple[RuntimeOperationStatus, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -279,13 +303,14 @@ class SandboxSnapshot:
     last_checkpoint_at: datetime | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
-
 @dataclass(frozen=True)
-class ScheduleDecision:
+class SchedulerCheckpointDecision:
     should_checkpoint: bool
+    checkpoint_process: bool
+    checkpoint_filesystem: bool
+    leave_running: bool
     reason: str
     policy_name: str
-    next_earliest_checkpoint_at: datetime | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -295,6 +320,70 @@ class RequestContext:
     sandbox_id: SandboxId
     started_at: datetime
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RequestState:
+    sandbox_id: SandboxId
+    active_llm_requests: int = 0
+    total_llm_requests: int = 0
+    completed_llm_requests: int = 0
+    last_request_id: str | None = None
+    last_llm_provider: str | None = None
+    last_llm_request_started_at: datetime | None = None
+    last_llm_request_ended_at: datetime | None = None
+
+    @property
+    def llm_request_in_flight(self) -> bool:
+        return self.active_llm_requests > 0
+
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            "llm_request_in_flight": self.llm_request_in_flight,
+            "active_llm_requests": self.active_llm_requests,
+            "total_llm_requests": self.total_llm_requests,
+            "completed_llm_requests": self.completed_llm_requests,
+            "last_llm_provider": self.last_llm_provider,
+            "last_request_id": self.last_request_id,
+            "last_llm_request_started_at": (
+                None
+                if self.last_llm_request_started_at is None
+                else _isoformat(self.last_llm_request_started_at)
+            ),
+            "last_llm_request_ended_at": (
+                None
+                if self.last_llm_request_ended_at is None
+                else _isoformat(self.last_llm_request_ended_at)
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class RequestStateChange:
+    sandbox_id: SandboxId
+    event_type: str
+    request_id: str | None = None
+    observed_at: datetime = field(default_factory=utc_now)
+
+
+@dataclass(frozen=True)
+class RecoveryEvent:
+    sandbox_id: SandboxId
+    event_type: str
+    observed_at: datetime
+    reason: str = ""
+    grace_remaining_seconds: float | None = None
+
+
+@dataclass(frozen=True)
+class RecoveryRecord:
+    sandbox_id: SandboxId
+    event_type: str
+    started_at: datetime
+    finished_at: datetime
+    status: str
+    checkpoint_id: CheckpointId | None = None
+    message: str | None = None
 
 
 @dataclass(frozen=True)

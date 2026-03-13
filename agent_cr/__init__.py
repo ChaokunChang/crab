@@ -1,7 +1,7 @@
-from .config import ExecutorConfig, PolicyConfig, SchedulerConfig, StorageConfig, TelemetryConfig
+from .config import ExecutorConfig, SchedulerConfig, StorageConfig, TelemetryConfig
 from .contracts import (
-    CRPolicy,
     CheckpointManager,
+    EBPFEventCollector,
     FileSystemCWorker,
     FileSystemRWorker,
     ProcessCWorker,
@@ -14,8 +14,17 @@ from .contracts import (
 )
 from .executor import CRExecutor
 from .ids import CheckpointId, JobId, SandboxId
-from .inspector import InMemorySandboxInspector
-from .interceptor import CompositeRequestInterceptorHook, TelemetryRequestInterceptorHook
+from .inspector import EBPFSandboxInspector, InMemoryEBPFEventCollector, InMemorySandboxInspector
+from .interceptor import (
+    AgentCRRequestInterceptor,
+    AgentCRRequestInterceptorServer,
+    CompositeRequestInterceptorHook,
+    InMemoryRequestStateStore,
+    RequestAwareSandboxInspector,
+    SandboxResponseGateRegistry,
+    TelemetryRequestInterceptorHook,
+)
+from .remote_inspector import HostInspectorServiceClient, RemoteSandboxInspector
 from .models import (
     ArtifactKind,
     ArtifactPayload,
@@ -23,24 +32,47 @@ from .models import (
     CheckpointJob,
     CheckpointManifest,
     CheckpointResult,
-    DryRunStatus,
+    EBPFEvent,
+    EBPFEventKind,
     FailureCode,
     JobRecord,
     JobStatus,
     JobType,
     RequestContext,
+    RequestState,
+    RequestStateChange,
     RestoreJob,
     RestoreResult,
+    RuntimeOperationStatus,
     RuntimeCapabilities,
     SandboxDescription,
     SandboxSnapshot,
-    ScheduleDecision,
+    SchedulerCheckpointDecision,
 )
-from .policy import DefaultHeuristicPolicy
-from .runtime import DockerRuntimeAdapter, RuncRuntimeAdapter
-from .sandbox_manager import InMemorySandboxManager
-from .scheduler import CRScheduler, InMemorySchedulerStateStore
-from .storage import LocalCheckpointManager
+from .runtime import (
+    CommandRunner,
+    DockerRuntimeAdapter,
+    RuncCheckpointOptions,
+    RuncRestoreOptions,
+    RuncRuntimeAdapter,
+    RuncRuntimeOptions,
+    RuncRuntimePaths,
+    SubprocessCommandRunner,
+)
+from .sandbox_manager import InMemorySandboxManager, RuncSandboxManager, RuncSandboxManagerPaths
+from .scheduler import (
+    CRScheduler,
+    FaultToleranceCheckpointingPolicy,
+    InMemorySchedulerStateStore,
+    SpotPreemptionCheckpointingPolicy,
+    TreeSearchCheckpointingPolicy,
+)
+from .storage import (
+    DeleteAfterRestoreCheckpointManager,
+    KeepAllCheckpointManager,
+    LatestOnlyCheckpointManager,
+    LocalCheckpointManager,
+)
 from .system import AgentCRSystem, build_default_system
 from .telemetry import InMemoryTelemetrySink, NoopTelemetrySink
 from .workers import (
@@ -63,18 +95,22 @@ __all__ = [
     "CheckpointManifest",
     "CheckpointResult",
     "CRExecutor",
-    "CRPolicy",
     "CRScheduler",
+    "EBPFEvent",
+    "EBPFEventCollector",
+    "EBPFEventKind",
+    "EBPFSandboxInspector",
     "DefaultCWorker",
-    "DefaultHeuristicPolicy",
     "DefaultRWorker",
+    "DeleteAfterRestoreCheckpointManager",
     "DockerRuntimeAdapter",
-    "DryRunStatus",
     "ExecutorConfig",
+    "FaultToleranceCheckpointingPolicy",
     "FailureCode",
     "FileSystemCWorker",
     "FileSystemRWorker",
     "InMemorySandboxInspector",
+    "InMemoryEBPFEventCollector",
     "InMemorySandboxManager",
     "InMemorySchedulerStateStore",
     "InMemoryTelemetrySink",
@@ -82,33 +118,54 @@ __all__ = [
     "JobRecord",
     "JobStatus",
     "JobType",
+    "KeepAllCheckpointManager",
+    "LatestOnlyCheckpointManager",
     "LocalCheckpointManager",
+    "HostInspectorServiceClient",
     "NoopTelemetrySink",
-    "PolicyConfig",
     "ProcessCWorker",
     "ProcessRWorker",
     "RequestContext",
+    "RequestState",
+    "RequestStateChange",
     "RequestInterceptorHook",
     "RestoreJob",
     "RestoreResult",
+    "RuncCheckpointOptions",
     "RuncRuntimeAdapter",
+    "RuncRestoreOptions",
+    "RuncRuntimeOptions",
+    "RuncRuntimePaths",
+    "RuncSandboxManager",
+    "RuncSandboxManagerPaths",
     "RuntimeCapabilities",
+    "RuntimeOperationStatus",
     "SandboxDescription",
     "SandboxId",
     "SandboxInspector",
     "SandboxManager",
     "SandboxRuntimeAdapter",
     "SandboxSnapshot",
-    "ScheduleDecision",
+    "SchedulerCheckpointDecision",
     "SchedulerConfig",
+    "SpotPreemptionCheckpointingPolicy",
     "StorageConfig",
+    "SubprocessCommandRunner",
     "TelemetryConfig",
     "TelemetrySink",
+    "CommandRunner",
     "build_default_system",
     "AdapterProcessCWorker",
     "AdapterProcessRWorker",
     "AdapterFileSystemCWorker",
     "AdapterFileSystemRWorker",
     "CompositeRequestInterceptorHook",
+    "AgentCRRequestInterceptor",
+    "InMemoryRequestStateStore",
+    "RequestAwareSandboxInspector",
+    "RemoteSandboxInspector",
+    "SandboxResponseGateRegistry",
     "TelemetryRequestInterceptorHook",
+    "TreeSearchCheckpointingPolicy",
+    "AgentCRRequestInterceptorServer",
 ]

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent_cr import JobId, PolicyConfig, RestoreJob, SandboxId, SandboxSnapshot, StorageConfig, build_default_system
+from agent_cr import JobId, RestoreJob, SandboxId, SandboxSnapshot, SchedulerConfig, StorageConfig, build_default_system
 from agent_cr.models import JobStatus, utc_now
 
 
@@ -15,14 +15,14 @@ class SimulatedE2ETests(unittest.TestCase):
                 storage_root=tmp,
                 runtime="docker",
                 storage_config=StorageConfig(root_dir=Path(tmp)),
-                policy_config=PolicyConfig(
+                scheduler_config=SchedulerConfig(
                     min_checkpoint_interval_seconds=0.0,
                     force_checkpoint_after_seconds=0.0,
                     require_change_signal=True,
                 ),
             )
 
-            sandbox_id = SandboxId("sandbox-1")
+            sandbox_id = system.sandbox_manager.launch("docker")
             system.inspector.upsert_snapshot(
                 SandboxSnapshot(
                     sandbox_id=sandbox_id,
@@ -34,14 +34,11 @@ class SimulatedE2ETests(unittest.TestCase):
                 )
             )
 
-            job = system.scheduler.poll_and_schedule(sandbox_id)
-            self.assertIsNotNone(job)
-            assert job is not None
-
-            ckpt_result = system.executor.run_checkpoint(job)
+            ckpt_result = system.checkpoint_if_due(sandbox_id)
+            self.assertIsNotNone(ckpt_result)
+            assert ckpt_result is not None
             self.assertEqual(ckpt_result.status, JobStatus.SUCCEEDED)
             self.assertIsNotNone(ckpt_result.manifest)
-            system.scheduler.mark_checkpoint_complete(sandbox_id, ckpt_result.finished_at)
 
             restore_job = RestoreJob(
                 job_id=JobId.new(prefix="restore"),

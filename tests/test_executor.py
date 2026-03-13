@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import threading
 import unittest
 
 from agent_cr import CRExecutor, ExecutorConfig
@@ -19,11 +20,21 @@ from agent_cr.models import (
 class SlowCheckpointWorker:
     def __init__(self, sleep_s: float = 0.05):
         self.sleep_s = sleep_s
+        self._lock = threading.Lock()
+        self.active = 0
+        self.max_active = 0
+        self.completed_job_ids: list[str] = []
 
     def checkpoint(self, job: CheckpointJob) -> CheckpointResult:
+        with self._lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
         time.sleep(self.sleep_s)
         now = utc_now()
         ckpt_id = CheckpointId(f"ckpt-{job.job_id.value}")
+        with self._lock:
+            self.completed_job_ids.append(job.job_id.value)
+            self.active -= 1
         manifest = CheckpointManifest(
             schema_version="v1",
             checkpoint_id=ckpt_id,
@@ -101,19 +112,20 @@ class PassThroughRestoreWorker:
 
 
 class ExecutorTests(unittest.TestCase):
-    def test_executor_parallel_checkpoint_batches(self) -> None:
+    def test_executor_serializes_checkpoint_queue(self) -> None:
+        worker = SlowCheckpointWorker(sleep_s=0.02)
         executor = CRExecutor(
             ExecutorConfig(max_workers=3, max_retries=0),
-            checkpoint_worker=SlowCheckpointWorker(sleep_s=0.05),
+            checkpoint_worker=worker,
             restore_worker=PassThroughRestoreWorker(),
         )
         jobs = [
             CheckpointJob(
-                job_id=JobId.new(prefix="job"),
+                job_id=JobId(f"job-{index}"),
                 sandbox_id=SandboxId("sbx-1"),
                 requested_at=utc_now(),
             )
-            for _ in range(6)
+            for index in range(4)
         ]
 
         t0 = time.perf_counter()
@@ -121,9 +133,11 @@ class ExecutorTests(unittest.TestCase):
         elapsed = time.perf_counter() - t0
         executor.shutdown()
 
-        self.assertEqual(len(results), 6)
+        self.assertEqual(len(results), 4)
         self.assertTrue(all(r.status == JobStatus.SUCCEEDED for r in results))
-        self.assertLess(elapsed, 0.25)
+        self.assertEqual(worker.max_active, 1)
+        self.assertEqual(worker.completed_job_ids, [job.job_id.value for job in jobs])
+        self.assertGreater(elapsed, 0.06)
 
     def test_executor_retry_on_failed_checkpoint_result(self) -> None:
         worker = FlakyCheckpointWorker()

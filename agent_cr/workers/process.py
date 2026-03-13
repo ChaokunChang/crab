@@ -1,10 +1,23 @@
 from __future__ import annotations
 
 import json
+import logging
+from pathlib import Path
 
 from ..contracts import ProcessCWorker, ProcessRWorker, SandboxRuntimeAdapter
 from ..ids import CheckpointId
 from ..models import ArtifactKind, ArtifactPayload, CheckpointJob, CheckpointManifest, RestoreJob, WorkerStepResult
+
+logger = logging.getLogger(__name__)
+
+
+def _metadata_artifact(name: str, payload: dict[str, object], *, adapter_name: str) -> ArtifactPayload:
+    return ArtifactPayload(
+        kind=ArtifactKind.PROCESS,
+        name=name,
+        data=json.dumps(payload, sort_keys=True, indent=2).encode("utf-8"),
+        metadata={"adapter": adapter_name},
+    )
 
 
 class AdapterProcessCWorker(ProcessCWorker):
@@ -12,24 +25,40 @@ class AdapterProcessCWorker(ProcessCWorker):
         self._adapter = adapter
 
     def checkpoint(self, job: CheckpointJob, checkpoint_id: CheckpointId) -> WorkerStepResult:
-        dry = self._adapter.plan_process_checkpoint(job.sandbox_id, checkpoint_id)
+        logger.debug(
+            "Running process checkpoint worker for sandbox=%s checkpoint=%s adapter=%s",
+            job.sandbox_id,
+            checkpoint_id,
+            self._adapter.name,
+        )
+        status = self._adapter.checkpoint_process(
+            job.sandbox_id,
+            checkpoint_id,
+            leave_running=job.leave_running,
+        )
+        image_path = self._adapter.process_checkpoint_location(job.sandbox_id, checkpoint_id)
         payload = {
             "sandbox_id": str(job.sandbox_id),
             "checkpoint_id": str(checkpoint_id),
-            "dry_run": {
-                "executed": dry.executed,
-                "reason": dry.reason,
-                "planned_command": list(dry.planned_command),
-                "metadata": dry.metadata,
+            "leave_running": job.leave_running,
+            "process_storage_mode": "runtime_reference" if image_path else "adapter_default",
+            "process_checkpoint_location": image_path,
+            "status": {
+                "executed": status.executed,
+                "reason": status.reason,
+                "command": list(status.command),
+                "metadata": status.metadata,
             },
         }
-        artifact = ArtifactPayload(
-            kind=ArtifactKind.PROCESS,
-            name="process_plan.json",
-            data=json.dumps(payload, sort_keys=True).encode("utf-8"),
-            metadata={"adapter": self._adapter.name},
+        artifacts = [_metadata_artifact("process_checkpoint.json", payload, adapter_name=self._adapter.name)]
+        logger.debug(
+            "Process checkpoint worker finished for sandbox=%s checkpoint=%s executed=%s artifacts=%d",
+            job.sandbox_id,
+            checkpoint_id,
+            status.executed,
+            len(artifacts),
         )
-        return WorkerStepResult(success=True, artifacts=[artifact], dry_run_status=dry)
+        return WorkerStepResult(success=True, artifacts=artifacts, operation_status=status)
 
 
 class AdapterProcessRWorker(ProcessRWorker):
@@ -37,6 +66,36 @@ class AdapterProcessRWorker(ProcessRWorker):
         self._adapter = adapter
 
     def restore(self, job: RestoreJob, manifest: CheckpointManifest) -> WorkerStepResult:
-        _ = manifest
-        dry = self._adapter.plan_process_restore(job.sandbox_id, job.checkpoint_id)
-        return WorkerStepResult(success=True, artifacts=[], dry_run_status=dry)
+        restore_checkpoint_id = _restore_checkpoint_id(
+            manifest,
+            metadata_key="process_restore_checkpoint_id",
+            default=job.checkpoint_id,
+        )
+        if self._adapter.capabilities().supports_custom_checkpoint_dir:
+            image_path = self._adapter.process_checkpoint_location(job.sandbox_id, restore_checkpoint_id)
+            if image_path is None:
+                raise ValueError("runtime adapter did not provide process checkpoint location for restore")
+            checkpoint_dir = Path(str(image_path))
+            if not checkpoint_dir.exists():
+                raise FileNotFoundError(f"process checkpoint directory not found: {checkpoint_dir}")
+        status = self._adapter.restore_process(job.sandbox_id, restore_checkpoint_id)
+        logger.debug(
+            "Process restore worker finished for sandbox=%s checkpoint=%s restore_checkpoint=%s executed=%s",
+            job.sandbox_id,
+            job.checkpoint_id,
+            restore_checkpoint_id,
+            status.executed,
+        )
+        return WorkerStepResult(success=True, artifacts=[], operation_status=status)
+
+
+def _restore_checkpoint_id(
+    manifest: CheckpointManifest,
+    *,
+    metadata_key: str,
+    default: CheckpointId,
+) -> CheckpointId:
+    raw = manifest.metadata.get(metadata_key)
+    if raw is None:
+        return default
+    return CheckpointId(str(raw))
