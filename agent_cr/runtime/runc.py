@@ -102,7 +102,7 @@ class RuncRuntimeAdapter(CommandRuntimeAdapter):
             str(image_path),
             "--work-path",
             str(work_path),
-            "--leave-running=false",
+            "--leave-running=true",
             "--tcp-established",
         ]
 
