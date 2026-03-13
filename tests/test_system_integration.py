@@ -14,6 +14,7 @@ from agent_cr import (
     AdapterProcessRWorker,
     CRExecutor,
     CRScheduler,
+    DeleteAfterRestoreCheckpointManager,
     DefaultCWorker,
     DefaultRWorker,
     EBPFSandboxInspector,
@@ -1101,6 +1102,101 @@ class SystemIntegrationTests(unittest.TestCase):
 
             self.assertEqual(record.status, "restored")
             self.assertTrue(any("--leave-running=false" in command for command in runner.commands))
+            self.assertTrue(any(command[3] == "restore" for command in runner.commands if len(command) > 3))
+
+    def test_preemption_notification_restores_with_delete_after_restore_storage_policy(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
+            root = Path(tmp)
+            runner = FakeCommandRunner()
+            telemetry = InMemoryTelemetrySink()
+            collector = InMemoryEBPFEventCollector()
+            inspector = EBPFSandboxInspector(collector)
+
+            runtime = RuncRuntimeAdapter(
+                command_runner=runner,
+                paths=RuncRuntimePaths(
+                    state_root=root / "runtime-state",
+                    bundle_root=root / "bundles",
+                    checkpoint_root=root / "checkpoints",
+                    zfs_dataset_prefix="pool/agent-cr",
+                ),
+            )
+            storage = DeleteAfterRestoreCheckpointManager(
+                LocalCheckpointManager(StorageConfig(root_dir=root / "storage"))
+            )
+            executor = CRExecutor(
+                ExecutorConfig(max_workers=1),
+                DefaultCWorker(
+                    AdapterProcessCWorker(runtime),
+                    AdapterFileSystemCWorker(runtime),
+                    storage,
+                    runtime,
+                ),
+                DefaultRWorker(
+                    AdapterProcessRWorker(runtime),
+                    AdapterFileSystemRWorker(runtime),
+                    storage,
+                ),
+                telemetry,
+            )
+            sandbox_manager = RuncSandboxManager(
+                command_runner=runner,
+                paths=RuncSandboxManagerPaths(
+                    state_root=root / "runtime-state",
+                    bundle_root=root / "bundles",
+                    metadata_root=root / "sandbox-metadata",
+                    zfs_dataset_prefix="pool/agent-cr",
+                ),
+            )
+            scheduler_cfg = SchedulerConfig(
+                min_checkpoint_interval_seconds=0.0,
+                force_checkpoint_after_seconds=0.0,
+                require_change_signal=False,
+            )
+            scheduler = CRScheduler(
+                scheduler_cfg,
+                inspector,
+                sandbox_manager,
+                InMemorySchedulerStateStore(),
+                telemetry,
+                SpotPreemptionCheckpointingPolicy(scheduler_cfg),
+            )
+            system = AgentCRSystem(
+                scheduler=scheduler,
+                executor=executor,
+                storage=storage,
+                inspector=inspector,
+                sandbox_manager=sandbox_manager,
+                telemetry=telemetry,
+            )
+            sandbox_id = system.sandbox_manager.launch(
+                "runc",
+                {
+                    "sandbox_id": "sbx-auto-spot-prune",
+                    "bundle_path": str(root / "bundles" / "sbx-auto-spot-prune"),
+                },
+            )
+            inspector.upsert_snapshot(
+                SandboxSnapshot(
+                    sandbox_id=sandbox_id,
+                    runtime_name="runc",
+                    is_running=True,
+                    process_changed=False,
+                    filesystem_changed=False,
+                    observed_at=utc_now(),
+                )
+            )
+
+            system.start()
+            try:
+                system.notify_preemption(sandbox_id, grace_remaining_seconds=30.0)
+                record = self._wait_for_record(system, sandbox_id, "preemption")
+            finally:
+                system.stop()
+                executor.shutdown()
+
+            self.assertEqual(record.status, "restored")
+            self.assertEqual(storage.list_checkpoints(sandbox_id), [])
             self.assertTrue(any(command[3] == "restore" for command in runner.commands if len(command) > 3))
 
 

@@ -15,6 +15,7 @@ from .ids import CheckpointId, JobId
 from .inspector import EBPFSandboxInspector
 from .interceptor import InMemoryRequestStateStore, RequestAwareSandboxInspector, SandboxResponseGateRegistry
 from .models import (
+    CheckpointManifest,
     CheckpointJob,
     CheckpointResult,
     FailureCode,
@@ -335,6 +336,7 @@ class AgentCRSystem:
             return
         started = utc_now()
         checkpoint_id = None
+        restore_manifest: CheckpointManifest | None = None
         status = "failed"
         message = None
         try:
@@ -405,9 +407,14 @@ class AgentCRSystem:
                     event.sandbox_id,
                     checkpoint_id,
                 )
+                restore_manifest = self._resolve_restore_manifest(event.sandbox_id, checkpoint_id)
                 restore_result = self.restore_once(event.sandbox_id, checkpoint_id)
                 if restore_result.status.value == "succeeded":
-                    self._release_checkpoint_response_gate(event.sandbox_id, checkpoint_id)
+                    self._release_checkpoint_response_gate(
+                        event.sandbox_id,
+                        checkpoint_id,
+                        manifest=restore_manifest,
+                    )
                     status = "restored"
                     logger.info(
                         "Recovery restore succeeded sandbox=%s checkpoint=%s",
@@ -618,10 +625,17 @@ class AgentCRSystem:
         manifest = self.storage.get_manifest(sandbox_id, checkpoint_id)
         return resolve_restore_manifest(self.storage, manifest)
 
-    def _release_checkpoint_response_gate(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> bool:
+    def _release_checkpoint_response_gate(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+        *,
+        manifest: CheckpointManifest | None = None,
+    ) -> bool:
         if self.response_gate_registry is None:
             return False
-        manifest = self._resolve_restore_manifest(sandbox_id, checkpoint_id)
+        if manifest is None:
+            manifest = self._resolve_restore_manifest(sandbox_id, checkpoint_id)
         if not bool(manifest.metadata.get(_CAPTURES_INFLIGHT_LLM, False)):
             return False
         captured_request_id = str(manifest.metadata.get(_CAPTURED_REQUEST_ID, "")).strip()
