@@ -9,9 +9,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+
+#define PATH_LEN 128
 
 struct fs_event {
   uint64_t cgroup_id;
@@ -19,7 +23,11 @@ struct fs_event {
   uint32_t syscall_nr;
   uint32_t pid;
   int32_t fd;
+  int32_t dirfd_primary;
+  int32_t dirfd_secondary;
   uint64_t flags;
+  char path[PATH_LEN];
+  char path_secondary[PATH_LEN];
 };
 
 struct registration {
@@ -309,50 +317,260 @@ static void format_now_iso8601(char *buffer, size_t buffer_len)
   );
 }
 
+static void json_print_string_or_null(const char *value)
+{
+  const unsigned char *cursor = (const unsigned char *)value;
+
+  if (!value || value[0] == '\0') {
+    fputs("null", stdout);
+    return;
+  }
+
+  fputc('"', stdout);
+  while (*cursor) {
+    switch (*cursor) {
+      case '\\':
+        fputs("\\\\", stdout);
+        break;
+      case '"':
+        fputs("\\\"", stdout);
+        break;
+      case '\n':
+        fputs("\\n", stdout);
+        break;
+      case '\r':
+        fputs("\\r", stdout);
+        break;
+      case '\t':
+        fputs("\\t", stdout);
+        break;
+      default:
+        if (*cursor < 0x20)
+          fprintf(stdout, "\\u%04x", (unsigned int)*cursor);
+        else
+          fputc(*cursor, stdout);
+        break;
+    }
+    cursor++;
+  }
+  fputc('"', stdout);
+}
+
+static void strip_deleted_suffix(char *path)
+{
+  static const char suffix[] = " (deleted)";
+  char *found = strstr(path, suffix);
+
+  if (found)
+    *found = '\0';
+}
+
+static int read_proc_link(const char *path, char *output, size_t output_len)
+{
+  ssize_t len = readlink(path, output, output_len - 1);
+  if (len < 0)
+    return -errno;
+  output[len] = '\0';
+  strip_deleted_suffix(output);
+  return 0;
+}
+
+static int resolve_base_path(uint32_t pid, int32_t dirfd, char *output, size_t output_len)
+{
+  char proc_path[128];
+
+  if (pid == 0)
+    return -ENOENT;
+  if (dirfd == AT_FDCWD)
+    snprintf(proc_path, sizeof(proc_path), "/proc/%u/cwd", pid);
+  else if (dirfd >= 0)
+    snprintf(proc_path, sizeof(proc_path), "/proc/%u/fd/%d", pid, dirfd);
+  else
+    return -ENOENT;
+  return read_proc_link(proc_path, output, output_len);
+}
+
+static void join_paths(char *output, size_t output_len, const char *base, const char *suffix)
+{
+  if (!suffix || suffix[0] == '\0') {
+    output[0] = '\0';
+    return;
+  }
+  if (suffix[0] == '/') {
+    snprintf(output, output_len, "%s", suffix);
+    return;
+  }
+  if (!base || base[0] == '\0') {
+    snprintf(output, output_len, "%s", suffix);
+    return;
+  }
+  snprintf(output, output_len, "%s/%s", base, suffix);
+}
+
+static void resolve_event_path(
+  uint32_t pid,
+  int32_t dirfd,
+  const char *raw_path,
+  char *output,
+  size_t output_len
+)
+{
+  char base[PATH_MAX];
+
+  output[0] = '\0';
+  if (!raw_path || raw_path[0] == '\0')
+    return;
+  if (raw_path[0] == '/') {
+    snprintf(output, output_len, "%s", raw_path);
+    return;
+  }
+  if (resolve_base_path(pid, dirfd, base, sizeof(base)) == 0) {
+    join_paths(output, output_len, base, raw_path);
+    return;
+  }
+  snprintf(output, output_len, "%s", raw_path);
+}
+
+static void fd_kind_from_mode(mode_t mode, char *fd_kind, size_t fd_kind_len)
+{
+  if (S_ISREG(mode))
+    snprintf(fd_kind, fd_kind_len, "regular");
+  else if (S_ISDIR(mode))
+    snprintf(fd_kind, fd_kind_len, "directory");
+  else if (S_ISLNK(mode))
+    snprintf(fd_kind, fd_kind_len, "symlink");
+  else if (S_ISCHR(mode))
+    snprintf(fd_kind, fd_kind_len, "char");
+  else if (S_ISBLK(mode))
+    snprintf(fd_kind, fd_kind_len, "block");
+  else if (S_ISFIFO(mode))
+    snprintf(fd_kind, fd_kind_len, "fifo");
+  else if (S_ISSOCK(mode))
+    snprintf(fd_kind, fd_kind_len, "socket");
+}
+
+static int resolve_fd_identity(
+  uint32_t pid,
+  int32_t fd,
+  char *path_output,
+  size_t path_output_len,
+  char *fd_kind,
+  size_t fd_kind_len,
+  struct stat *st
+)
+{
+  char fd_path[128];
+
+  if (pid == 0 || fd < 0)
+    return -ENOENT;
+  snprintf(fd_path, sizeof(fd_path), "/proc/%u/fd/%d", pid, fd);
+  if (read_proc_link(fd_path, path_output, path_output_len) != 0)
+    path_output[0] = '\0';
+  if (stat(fd_path, st) != 0)
+    return -errno;
+  fd_kind_from_mode(st->st_mode, fd_kind, fd_kind_len);
+  return 0;
+}
+
+static int resolve_path_identity(const char *path, struct stat *st)
+{
+  if (!path || path[0] == '\0')
+    return -ENOENT;
+  if (lstat(path, st) != 0)
+    return -errno;
+  return 0;
+}
+
 static int handle_event(void *ctx, void *data, size_t data_sz)
 {
   struct helper_state *state = ctx;
   const struct fs_event *event = data;
   char sandbox_id[128];
-  char fd_kind[16] = "unknown";
-  char fd_path[128];
+  char fd_kind[16] = "";
+  char primary_path[PATH_MAX] = "";
+  char secondary_path[PATH_MAX] = "";
+  char fd_resolved_path[PATH_MAX] = "";
   char ts[64];
-  struct stat st;
+  struct stat st = {};
+  struct stat path_st = {};
+  bool have_identity = false;
+  uint64_t device = 0;
+  uint64_t inode = 0;
 
   (void)data_sz;
   if (find_sandbox_id(state, event->cgroup_id, sandbox_id, sizeof(sandbox_id)) != 0)
     return 0;
 
-  if (event->pid > 0 && event->fd >= 0) {
-    snprintf(fd_path, sizeof(fd_path), "/proc/%u/fd/%d", event->pid, event->fd);
-    if (stat(fd_path, &st) == 0) {
-      if (S_ISREG(st.st_mode))
-        snprintf(fd_kind, sizeof(fd_kind), "regular");
-      else if (S_ISDIR(st.st_mode))
-        snprintf(fd_kind, sizeof(fd_kind), "directory");
-      else if (S_ISCHR(st.st_mode))
-        snprintf(fd_kind, sizeof(fd_kind), "char");
-      else if (S_ISBLK(st.st_mode))
-        snprintf(fd_kind, sizeof(fd_kind), "block");
-      else if (S_ISFIFO(st.st_mode))
-        snprintf(fd_kind, sizeof(fd_kind), "fifo");
-      else if (S_ISSOCK(st.st_mode))
-        snprintf(fd_kind, sizeof(fd_kind), "socket");
-    }
+  resolve_event_path(event->pid, event->dirfd_primary, event->path, primary_path, sizeof(primary_path));
+  resolve_event_path(
+    event->pid,
+    event->dirfd_secondary,
+    event->path_secondary,
+    secondary_path,
+    sizeof(secondary_path)
+  );
+
+  if (resolve_fd_identity(
+        event->pid,
+        event->fd,
+        fd_resolved_path,
+        sizeof(fd_resolved_path),
+        fd_kind,
+        sizeof(fd_kind),
+        &st
+      ) == 0) {
+    device = (uint64_t)st.st_dev;
+    inode = (uint64_t)st.st_ino;
+    have_identity = true;
+  } else if (
+    (event->syscall_nr == __NR_rename || event->syscall_nr == __NR_renameat || event->syscall_nr == __NR_renameat2 ||
+     event->syscall_nr == __NR_link || event->syscall_nr == __NR_linkat || event->syscall_nr == __NR_symlink ||
+     event->syscall_nr == __NR_symlinkat) &&
+    resolve_path_identity(secondary_path, &path_st) == 0
+  ) {
+    device = (uint64_t)path_st.st_dev;
+    inode = (uint64_t)path_st.st_ino;
+    if (fd_kind[0] == '\0')
+      fd_kind_from_mode(path_st.st_mode, fd_kind, sizeof(fd_kind));
+    have_identity = true;
+  } else if (resolve_path_identity(primary_path, &path_st) == 0) {
+    device = (uint64_t)path_st.st_dev;
+    inode = (uint64_t)path_st.st_ino;
+    if (fd_kind[0] == '\0')
+      fd_kind_from_mode(path_st.st_mode, fd_kind, sizeof(fd_kind));
+    have_identity = true;
   }
 
   format_now_iso8601(ts, sizeof(ts));
-  printf(
-    "{\"cgroup_id\":%llu,\"fd\":%d,\"fd_kind\":\"%s\",\"flags\":%llu,\"kind\":\"filesystem_change\",\"pid\":%u,\"sandbox_id\":\"%s\",\"syscall\":\"%s\",\"timestamp\":\"%s\"}\n",
-    (unsigned long long)event->cgroup_id,
-    event->fd,
-    fd_kind,
-    (unsigned long long)event->flags,
-    event->pid,
-    sandbox_id,
-    syscall_name(event->syscall_nr),
-    ts
-  );
+  printf("{\"cgroup_id\":%llu", (unsigned long long)event->cgroup_id);
+  printf(",\"fd\":%d", event->fd);
+  printf(",\"fd_kind\":");
+  json_print_string_or_null(fd_kind[0] == '\0' ? NULL : fd_kind);
+  printf(",\"flags\":%llu", (unsigned long long)event->flags);
+  if (have_identity) {
+    printf(",\"device\":%llu", (unsigned long long)device);
+    printf(",\"inode\":%llu", (unsigned long long)inode);
+  } else {
+    printf(",\"device\":null,\"inode\":null");
+  }
+  printf(",\"kind\":\"filesystem_change\"");
+  printf(",\"path\":");
+  if (primary_path[0] != '\0')
+    json_print_string_or_null(primary_path);
+  else if (fd_resolved_path[0] != '\0')
+    json_print_string_or_null(fd_resolved_path);
+  else
+    json_print_string_or_null(NULL);
+  printf(",\"path_secondary\":");
+  json_print_string_or_null(secondary_path[0] == '\0' ? NULL : secondary_path);
+  printf(",\"pid\":%u", event->pid);
+  printf(",\"sandbox_id\":");
+  json_print_string_or_null(sandbox_id);
+  printf(",\"syscall\":");
+  json_print_string_or_null(syscall_name(event->syscall_nr));
+  printf(",\"timestamp\":");
+  json_print_string_or_null(ts);
+  printf("}\n");
   fflush(stdout);
   return 0;
 }

@@ -91,6 +91,7 @@ Call `/reset` before each command below. Expected result is shown as `process_ch
 - stdout only: `docker exec "$CONTAINER_ID" sh -lc 'echo 123; sleep 1'` -> `True/False`
 - stderr only: `docker exec "$CONTAINER_ID" sh -lc 'echo err 1>&2; sleep 1'` -> `True/False`
 - read only: `docker exec "$CONTAINER_ID" sh -lc 'cat /etc/hostname; sleep 1'` -> `True/False`
+- read only ls: `docker exec "$CONTAINER_ID" sh -lc 'ls -la /tmp >/dev/null; sleep 1'` -> `True/False`
 - memory only: `docker exec "$CONTAINER_ID" python3 -B -c "import time; buf=bytearray(8*1024*1024); buf[4096]=1; time.sleep(2)"` -> `True/False`
 - mkdir in `/tmp`: `docker exec "$CONTAINER_ID" sh -lc 'mkdir -p /tmp/hi-dir; sleep 1'` -> `True/True`
 - file write in `/tmp`: `docker exec "$CONTAINER_ID" sh -lc 'echo 123 >/tmp/hi-out.txt; sleep 1'` -> `True/True`
@@ -99,10 +100,10 @@ Call `/reset` before each command below. Expected result is shown as `process_ch
 - rename: `docker exec "$CONTAINER_ID" sh -lc 'echo abc >/tmp/hi-a.txt && mv /tmp/hi-a.txt /tmp/hi-b.txt; sleep 1'` -> `True/True`
 - hard link: `docker exec "$CONTAINER_ID" sh -lc 'echo abc >/tmp/hi-link-src.txt && ln /tmp/hi-link-src.txt /tmp/hi-link-hard.txt; sleep 1'` -> `True/True`
 - soft link: `docker exec "$CONTAINER_ID" sh -lc 'echo abc >/tmp/hi-symlink-src.txt && ln -s /tmp/hi-symlink-src.txt /tmp/hi-link-soft.txt; sleep 1'` -> `True/True`
-- rm in `/tmp`: `docker exec "$CONTAINER_ID" sh -lc 'echo abc >/tmp/hi-rm.txt && rm /tmp/hi-rm.txt; sleep 1'` -> `True/True`
-- rm in `/workspace`: `docker exec "$CONTAINER_ID" sh -lc 'mkdir -p /workspace && echo abc >/workspace/hi-rm.txt && rm /workspace/hi-rm.txt; sleep 1'` -> `True/True`
-- rmdir in `/tmp`: `docker exec "$CONTAINER_ID" sh -lc 'mkdir -p /tmp/hi-rmdir && rmdir /tmp/hi-rmdir; sleep 1'` -> `True/True`
-- rmdir in `/root`: `docker exec "$CONTAINER_ID" sh -lc 'mkdir -p /root/hi-rmdir && rmdir /root/hi-rmdir; sleep 1'` -> `True/True`
+- rm in `/tmp`: `docker exec "$CONTAINER_ID" sh -lc 'echo abc >/tmp/hi-rm.txt && rm /tmp/hi-rm.txt; sleep 1'` -> `True/False`
+- rm in `/workspace`: `docker exec "$CONTAINER_ID" sh -lc 'mkdir -p /workspace && echo abc >/workspace/hi-rm.txt && rm /workspace/hi-rm.txt; sleep 1'` -> `True/False`
+- rmdir in `/tmp`: `docker exec "$CONTAINER_ID" sh -lc 'mkdir -p /tmp/hi-rmdir && rmdir /tmp/hi-rmdir; sleep 1'` -> `True/False`
+- rmdir in `/root`: `docker exec "$CONTAINER_ID" sh -lc 'mkdir -p /root/hi-rmdir && rmdir /root/hi-rmdir; sleep 1'` -> `True/False`
 
 After each command, query `/get_proc_and_fs_status` or use `watch`.
 

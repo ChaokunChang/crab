@@ -33,11 +33,18 @@ class HostInspectorServiceClient:
         with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
             return json.loads(response.read().decode("utf-8"))
 
-    def register_sandbox(self, sandbox_id: SandboxId, runtime: str, object_id: str) -> dict[str, object]:
-        return self._post(
-            "/register",
-            {"sandbox_id": str(sandbox_id), "runtime": runtime, "object_id": object_id},
-        )
+    def register_sandbox(
+        self,
+        sandbox_id: SandboxId,
+        runtime: str,
+        object_id: str,
+        *,
+        ignore_process_rules: list[dict[str, object]] | None = None,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {"sandbox_id": str(sandbox_id), "runtime": runtime, "object_id": object_id}
+        if ignore_process_rules is not None:
+            payload["ignore_process_rules"] = ignore_process_rules
+        return self._post("/register", payload)
 
     def unregister_sandbox(self, sandbox_id: SandboxId) -> dict[str, object]:
         return self._post("/unregister", {"sandbox_id": str(sandbox_id)})

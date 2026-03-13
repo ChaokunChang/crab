@@ -24,11 +24,18 @@ class FakeCommandRunner(CommandRunner):
 
 class FakeHostInspectorClient:
     def __init__(self) -> None:
-        self.register_calls: list[tuple[SandboxId, str, str]] = []
+        self.register_calls: list[tuple[SandboxId, str, str, object | None]] = []
         self.unregister_calls: list[SandboxId] = []
 
-    def register_sandbox(self, sandbox_id: SandboxId, runtime: str, object_id: str) -> dict[str, object]:
-        self.register_calls.append((sandbox_id, runtime, object_id))
+    def register_sandbox(
+        self,
+        sandbox_id: SandboxId,
+        runtime: str,
+        object_id: str,
+        *,
+        ignore_process_rules=None,
+    ) -> dict[str, object]:
+        self.register_calls.append((sandbox_id, runtime, object_id, ignore_process_rules))
         return {"ok": True}
 
     def unregister_sandbox(self, sandbox_id: SandboxId) -> dict[str, object]:
@@ -75,7 +82,7 @@ class SandboxManagerTests(unittest.TestCase):
             manager.delete(sandbox_id)
             self.assertEqual(
                 host_inspector.register_calls,
-                [(SandboxId("sbx-test"), "runc", "sbx-test")],
+                [(SandboxId("sbx-test"), "runc", "sbx-test", None)],
             )
             self.assertEqual(host_inspector.unregister_calls, [SandboxId("sbx-test")])
             self.assertEqual(

@@ -149,7 +149,13 @@ class RuncSandboxManager(SandboxManager):
         self._persist(description)
         if self._host_inspector_client is not None:
             try:
-                self._host_inspector_client.register_sandbox(sandbox_id, "runc", str(sandbox_id))
+                ignore_process_rules = md.get("host_inspector_ignore_process_rules")
+                self._host_inspector_client.register_sandbox(
+                    sandbox_id,
+                    "runc",
+                    str(sandbox_id),
+                    ignore_process_rules=None if ignore_process_rules is None else list(ignore_process_rules),
+                )
             except Exception:
                 logger.exception("Failed to register sandbox %s with host inspector", sandbox_id)
         logger.info("Sandbox %s is running with rootfs=%s", sandbox_id, rootfs_path)
