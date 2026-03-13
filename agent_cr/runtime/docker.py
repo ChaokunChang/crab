@@ -21,12 +21,19 @@ class DockerRuntimeAdapter(CommandRuntimeAdapter):
         self,
         sandbox_id: SandboxId,
         checkpoint_id: CheckpointId,
+        *,
+        leave_running: bool,
     ) -> RuntimeOperationStatus:
         return RuntimeOperationStatus(
             executed=False,
             reason="docker_runtime_not_implemented",
-            command=tuple(self._checkpoint_cmd(sandbox_id, checkpoint_id)),
-            metadata=self._process_metadata(sandbox_id, checkpoint_id, phase="process_checkpoint"),
+            command=tuple(self._checkpoint_cmd(sandbox_id, checkpoint_id, leave_running=leave_running)),
+            metadata=self._process_metadata(
+                sandbox_id,
+                checkpoint_id,
+                phase="process_checkpoint",
+                leave_running=leave_running,
+            ),
         )
 
     def restore_process(
@@ -71,13 +78,17 @@ class DockerRuntimeAdapter(CommandRuntimeAdapter):
         checkpoint_id: CheckpointId,
         *,
         phase: str,
+        leave_running: bool | None = None,
     ) -> dict[str, object]:
-        return {
+        metadata = {
             "phase": phase,
             "runtime": self.name,
             "sandbox_id": str(sandbox_id),
             "checkpoint_id": str(checkpoint_id),
         }
+        if leave_running is not None:
+            metadata["leave_running"] = leave_running
+        return metadata
 
     def _filesystem_metadata(
         self,
@@ -88,12 +99,18 @@ class DockerRuntimeAdapter(CommandRuntimeAdapter):
     ) -> dict[str, object]:
         return self._process_metadata(sandbox_id, checkpoint_id, phase=phase)
 
-    def _checkpoint_cmd(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> list[str]:
+    def _checkpoint_cmd(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+        *,
+        leave_running: bool,
+    ) -> list[str]:
         return [
             "docker",
             "checkpoint",
             "create",
-            "--leave-running=false",
+            f"--leave-running={'true' if leave_running else 'false'}",
             str(sandbox_id),
             str(checkpoint_id),
         ]

@@ -67,6 +67,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--provider", choices=["openai", "anthropic"], default="openai")
     parser.add_argument("--out", default="")
     parser.add_argument(
+        "--work-dir-host-root",
+        type=Path,
+        default=None,
+        help="Host directory root for per-sandbox /work bind mounts",
+    )
+    parser.add_argument(
         "--log-level",
         choices=["debug", "info", "warning", "error", "critical"],
         default="info",
@@ -135,6 +141,7 @@ def write_bundle_config(
     sandbox_name: str,
     status_port: int,
     cgroup_path: str,
+    work_dir_host_path: Path | None = None,
 ) -> None:
     config_path = bundle_dir / "config.json"
     cfg = json.loads(config_path.read_text())
@@ -147,6 +154,18 @@ def write_bundle_config(
     linux_cfg["cgroupsPath"] = cgroup_path
     linux_cfg.pop("seccomp", None)
     cfg["linux"] = linux_cfg
+    mounts = [mount for mount in cfg.get("mounts", []) if mount.get("destination") != "/work"]
+    if work_dir_host_path is not None:
+        work_dir_host_path.mkdir(parents=True, exist_ok=True)
+        mounts.append(
+            {
+                "destination": "/work",
+                "source": str(work_dir_host_path),
+                "type": "bind",
+                "options": ["rbind", "rw"],
+            }
+        )
+    cfg["mounts"] = mounts
     cfg["process"]["terminal"] = False
     cfg["process"]["cwd"] = "/work"
     cfg["process"]["args"] = [
@@ -286,6 +305,7 @@ def main() -> None:
                 request_state_store=request_state_store,
                 hook=CompositeRequestInterceptorHook([TelemetryRequestInterceptorHook(telemetry)]),
                 on_state_change=system.notify_interceptor_state_change,
+                response_gate_registry=system.response_gate_registry,
                 host="127.0.0.1",
                 port=0,
             )
@@ -299,6 +319,9 @@ def main() -> None:
                 sandboxes.append(sandbox_id)
                 status_ports[sandbox_id] = status_port
                 bundle_dir = root / "bundles" / sandbox_name
+                work_dir_host_path = None
+                if args.work_dir_host_root is not None:
+                    work_dir_host_path = args.work_dir_host_root.expanduser().resolve() / sandbox_name
                 bundle_dir.mkdir(parents=True, exist_ok=True)
                 subprocess.run(["runc", "spec"], cwd=bundle_dir, check=True)
                 write_bundle_config(
@@ -308,6 +331,7 @@ def main() -> None:
                     sandbox_name=sandbox_name,
                     status_port=status_port,
                     cgroup_path=f"agent-cr-bench/{pool_name}/{sandbox_name}",
+                    work_dir_host_path=work_dir_host_path,
                 )
                 inspector.upsert_snapshot(
                     SandboxSnapshot(

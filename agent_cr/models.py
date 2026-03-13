@@ -233,6 +233,7 @@ class CheckpointJob:
     reason: str = "manual"
     checkpoint_process: bool = True
     checkpoint_filesystem: bool = True
+    leave_running: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -307,6 +308,7 @@ class SchedulerCheckpointDecision:
     should_checkpoint: bool
     checkpoint_process: bool
     checkpoint_filesystem: bool
+    leave_running: bool
     reason: str
     policy_name: str
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -362,6 +364,26 @@ class RequestStateChange:
     event_type: str
     request_id: str | None = None
     observed_at: datetime = field(default_factory=utc_now)
+
+
+@dataclass(frozen=True)
+class RecoveryEvent:
+    sandbox_id: SandboxId
+    event_type: str
+    observed_at: datetime
+    reason: str = ""
+    grace_remaining_seconds: float | None = None
+
+
+@dataclass(frozen=True)
+class RecoveryRecord:
+    sandbox_id: SandboxId
+    event_type: str
+    started_at: datetime
+    finished_at: datetime
+    status: str
+    checkpoint_id: CheckpointId | None = None
+    message: str | None = None
 
 
 @dataclass(frozen=True)
