@@ -9,6 +9,8 @@ from agent_cr import ArtifactKind, ArtifactReference, CheckpointId, CheckpointMa
 from agent_cr.models import utc_now
 from benchmarks.bench_tree_search import choose_replay_steps
 from benchmarks.real_host_scenario_base import (
+    TreeSearchCheckpointRecord,
+    build_tree_search_checkpoint_index,
     bounded_probability,
     compute_summary,
     resolve_checkpoint_copy_plan,
@@ -20,9 +22,81 @@ from benchmarks.real_host_scenario_base import (
 
 
 class BenchmarkHelperTests(unittest.TestCase):
+    def _tree_search_manifest(
+        self,
+        checkpoint_id: str,
+        *,
+        step: int | None,
+    ) -> CheckpointManifest:
+        metadata: dict[str, object] = {}
+        if step is not None:
+            metadata["tree_search_step"] = step
+        return CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=CheckpointId(checkpoint_id),
+            sandbox_id=SandboxId("sbx"),
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version=None,
+            process_artifacts=[],
+            filesystem_artifacts=[],
+            metadata=metadata,
+        ).with_integrity()
+
     def test_choose_replay_steps_is_deterministic(self) -> None:
         self.assertEqual(choose_replay_steps(6, 2), [1, 3])
         self.assertEqual(choose_replay_steps(4, 10), [1, 2, 3])
+
+    def test_build_tree_search_checkpoint_index_collects_steps(self) -> None:
+        manifests = [
+            self._tree_search_manifest("ckpt-1", step=1),
+            self._tree_search_manifest("ckpt-2", step=2),
+            self._tree_search_manifest("ckpt-3", step=3),
+        ]
+
+        self.assertEqual(
+            build_tree_search_checkpoint_index(manifests, initial_steps=3, require_complete=True),
+            {
+                1: TreeSearchCheckpointRecord(CheckpointId("ckpt-1"), replay_actions=1),
+                2: TreeSearchCheckpointRecord(CheckpointId("ckpt-2"), replay_actions=2),
+                3: TreeSearchCheckpointRecord(CheckpointId("ckpt-3"), replay_actions=3),
+            },
+        )
+
+    def test_build_tree_search_checkpoint_index_rejects_duplicates(self) -> None:
+        manifests = [
+            self._tree_search_manifest("ckpt-1", step=1),
+            self._tree_search_manifest("ckpt-2", step=1),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "duplicate tree-search checkpoint for step 1"):
+            build_tree_search_checkpoint_index(manifests, initial_steps=2)
+
+    def test_build_tree_search_checkpoint_index_rejects_missing_steps_when_required(self) -> None:
+        manifests = [
+            self._tree_search_manifest("ckpt-1", step=1),
+            self._tree_search_manifest("ckpt-3", step=3),
+        ]
+
+        with self.assertRaisesRegex(ValueError, r"missing tree-search checkpoints for steps \[2\]"):
+            build_tree_search_checkpoint_index(manifests, initial_steps=3, require_complete=True)
+
+    def test_build_tree_search_checkpoint_index_ignores_extra_trailing_steps(self) -> None:
+        manifests = [
+            self._tree_search_manifest("ckpt-1", step=1),
+            self._tree_search_manifest("ckpt-2", step=2),
+            self._tree_search_manifest("ckpt-3", step=3),
+            self._tree_search_manifest("ckpt-4", step=4),
+        ]
+
+        self.assertEqual(
+            build_tree_search_checkpoint_index(manifests, initial_steps=3),
+            {
+                1: TreeSearchCheckpointRecord(CheckpointId("ckpt-1"), replay_actions=1),
+                2: TreeSearchCheckpointRecord(CheckpointId("ckpt-2"), replay_actions=2),
+                3: TreeSearchCheckpointRecord(CheckpointId("ckpt-3"), replay_actions=3),
+            },
+        )
 
     def test_compute_summary_averages_metrics(self) -> None:
         rows = [

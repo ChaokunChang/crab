@@ -307,6 +307,48 @@ def resolve_checkpoint_copy_plan(
     return plan
 
 
+@dataclass(frozen=True)
+class TreeSearchCheckpointRecord:
+    checkpoint_id: CheckpointId
+    replay_actions: int
+    checkpoint_ms: float = 0.0
+
+
+def build_tree_search_checkpoint_index(
+    manifests: Iterable[CheckpointManifest],
+    *,
+    initial_steps: int | None = None,
+    require_complete: bool = False,
+) -> dict[int, TreeSearchCheckpointRecord]:
+    indexed: dict[int, TreeSearchCheckpointRecord] = {}
+    for manifest in manifests:
+        raw_step = manifest.metadata.get("tree_search_step")
+        if raw_step is None:
+            continue
+        try:
+            step = int(raw_step)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"invalid tree_search_step={raw_step!r} for checkpoint {manifest.checkpoint_id}"
+            ) from exc
+        if step <= 0:
+            continue
+        if initial_steps is not None and step > initial_steps:
+            continue
+        if step in indexed:
+            raise ValueError(f"duplicate tree-search checkpoint for step {step}")
+        indexed[step] = TreeSearchCheckpointRecord(
+            checkpoint_id=manifest.checkpoint_id,
+            replay_actions=step,
+        )
+
+    if require_complete and initial_steps is not None:
+        missing = [step for step in range(1, initial_steps + 1) if step not in indexed]
+        if missing:
+            raise ValueError(f"missing tree-search checkpoints for steps {missing}")
+    return dict(sorted(indexed.items()))
+
+
 class NoopRequestInterceptorHook(RequestInterceptorHook):
     def on_request_start(self, context: RequestContext) -> None:
         _ = context
@@ -511,21 +553,8 @@ class RealHostScenarioHarness:
         assert self.system is not None
         assert self.interceptor is not None
 
-        status_port = find_free_port()
-        bundle_dir = self.root / "bundles" / sandbox_name
-        work_dir_host_path = resolve_work_dir_host_path(self.work_dir_host_root, sandbox_name)
-        bundle_dir.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["runc", "spec"], cwd=bundle_dir, check=True)
-        write_bundle_config(
-            bundle_dir=bundle_dir,
-            interceptor_port=self.interceptor.port,
-            provider=self.provider,
-            sandbox_name=sandbox_name,
-            status_port=status_port,
-            cgroup_path=f"agent-cr-bench/{self.pool_name}/{sandbox_name}",
-            work_dir_host_path=work_dir_host_path,
-        )
-        sandbox_id = SandboxId(sandbox_name)
+        handle, work_dir_host_path = self._prepare_sandbox_handle(sandbox_name)
+        sandbox_id = handle.sandbox_id
         self.base_inspector.upsert_snapshot(
             SandboxSnapshot(
                 sandbox_id=sandbox_id,
@@ -540,7 +569,7 @@ class RealHostScenarioHarness:
             "runc",
             {
                 "sandbox_id": sandbox_name,
-                "bundle_path": str(bundle_dir),
+                "bundle_path": str(handle.bundle_dir),
                 "work_dir_host_path": None if work_dir_host_path is None else str(work_dir_host_path),
                 "rootfs_init_dirs": [
                     "work",
@@ -557,20 +586,13 @@ class RealHostScenarioHarness:
                 "rootfs_copy_paths": [{"source": str(self.exported_rootfs), "destination": "/"}],
             },
         )
-        payload = wait_for_http_json(f"http://127.0.0.1:{status_port}/status")
-        handle = SandboxHandle(
-            sandbox_id=sandbox_id,
-            bundle_dir=bundle_dir,
-            status_port=status_port,
-            last_status=payload,
-        )
-        self.sandboxes.append(handle)
-        self._sandbox_by_id[sandbox_id] = handle
+        payload = wait_for_http_json(f"http://127.0.0.1:{handle.status_port}/status")
+        handle.last_status = payload
         logger.info(
             "Launched benchmark sandbox name=%s sandbox_id=%s status_port=%d auto_cr=%s",
             sandbox_name,
             sandbox_id,
-            status_port,
+            handle.status_port,
             self.auto_cr,
         )
         return handle
@@ -578,6 +600,16 @@ class RealHostScenarioHarness:
     def add_interceptor_hook(self, hook: RequestInterceptorHook) -> None:
         self.interceptor_hook.add_hook(hook)
         logger.debug("Registered interceptor hook %s", type(hook).__name__)
+
+    def drain_request_state_changes(self) -> int:
+        if self.request_state_store is None:
+            return 0
+        drained = 0
+        while self.request_state_store.wait_for_change(timeout=0.0) is not None:
+            drained += 1
+        if drained:
+            logger.info("Drained %d queued request-state changes", drained)
+        return drained
 
     def poll_status(self, sandbox: SandboxHandle) -> dict[str, object]:
         return wait_for_http_json(sandbox.status_url)
@@ -709,6 +741,55 @@ class RealHostScenarioHarness:
         assert self.storage is not None
         return [self.storage.get_manifest(sandbox_id, checkpoint_id) for checkpoint_id in self.storage.list_checkpoints(sandbox_id)]
 
+    def collect_tree_search_checkpoints(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        initial_steps: int | None = None,
+        require_complete: bool = False,
+    ) -> dict[int, TreeSearchCheckpointRecord]:
+        return build_tree_search_checkpoint_index(
+            self.list_checkpoint_manifests(sandbox_id),
+            initial_steps=initial_steps,
+            require_complete=require_complete,
+        )
+
+    def wait_for_tree_search_checkpoints(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        initial_steps: int,
+        timeout_s: float = 45.0,
+    ) -> dict[int, TreeSearchCheckpointRecord]:
+        collected: dict[int, TreeSearchCheckpointRecord] = {}
+        last_error = f"missing tree-search checkpoints for steps {list(range(1, initial_steps + 1))}"
+
+        def _ready() -> bool:
+            nonlocal collected
+            nonlocal last_error
+            try:
+                collected = self.collect_tree_search_checkpoints(
+                    sandbox_id,
+                    initial_steps=initial_steps,
+                    require_complete=True,
+                )
+            except ValueError as exc:
+                message = str(exc)
+                if message.startswith("missing tree-search checkpoints"):
+                    last_error = message
+                    return False
+                raise
+            return True
+
+        if not wait_for(_ready, timeout_s=timeout_s, interval_s=0.2, raise_on_timeout=False):
+            raise RuntimeError(f"timed out waiting for tree-search checkpoints for sandbox {sandbox_id}: {last_error}")
+        logger.info(
+            "Collected tree-search checkpoints sandbox=%s steps=%s",
+            sandbox_id,
+            sorted(collected.keys()),
+        )
+        return collected
+
     def wait_for_checkpoint_count(
         self,
         sandbox_id: SandboxId,
@@ -754,6 +835,17 @@ class RealHostScenarioHarness:
             time.sleep(0.2)
         raise RuntimeError(f"checkpoint count did not stabilize for sandbox {sandbox_id}")
 
+    def deactivate_sandbox_runtime(self, sandbox: SandboxHandle) -> None:
+        assert self.runtime_state_root is not None
+        logger.info("Deactivating sandbox runtime sandbox=%s", sandbox.sandbox_id)
+        subprocess.run(
+            ["runc", "--root", str(self.runtime_state_root), "delete", "-f", str(sandbox.sandbox_id)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self._set_sandbox_running_state(sandbox.sandbox_id, is_running=False)
+
     def inject_fault(self, sandbox: SandboxHandle) -> None:
         assert self.runtime_state_root is not None
         logger.info("Injecting fault into sandbox=%s", sandbox.sandbox_id)
@@ -763,15 +855,7 @@ class RealHostScenarioHarness:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        assert self.base_inspector is not None
-        snapshot = self.base_inspector.inspect(sandbox.sandbox_id)
-        self.base_inspector.upsert_snapshot(
-            replace(
-                snapshot,
-                is_running=False,
-                observed_at=utc_now(),
-            )
-        )
+        self._set_sandbox_running_state(sandbox.sandbox_id, is_running=False)
 
     def destroy_sandbox_dataset(self, sandbox: SandboxHandle) -> None:
         assert self.sandbox_manager is not None
@@ -852,23 +936,17 @@ class RealHostScenarioHarness:
         assert self.sandbox_manager is not None
         assert self.base_inspector is not None
 
-        target = self.launch_sandbox(fork_name)
-        subprocess.run(
-            ["runc", "--root", str(self.runtime_state_root), "delete", "-f", fork_name],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        target, work_dir_host_path = self._prepare_sandbox_handle(fork_name)
 
         source_dataset = f"{self.pool_name}/agent-cr/{source.sandbox_id}"
         target_dataset = f"{self.pool_name}/agent-cr/{target.sandbox_id}"
         rootfs_path = target.bundle_dir / "rootfs"
+        rootfs_path.mkdir(parents=True, exist_ok=True)
         subprocess.run(["zfs", "destroy", "-r", target_dataset], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         manifests = {manifest.checkpoint_id: manifest for manifest in self.list_checkpoint_manifests(source.sandbox_id)}
         checkpoint_order = list(manifests.keys())
         copy_plan = resolve_checkpoint_copy_plan(checkpoint_order, manifests, checkpoint_id)
         filesystem_checkpoint_id = next(copy_id for copy_id, _, copy_filesystem in reversed(copy_plan) if copy_filesystem)
-        work_dir_host_path = resolve_work_dir_host_path(self.work_dir_host_root, str(target.sandbox_id))
         logger.info(
             "Cloning checkpoint to fork source=%s target=%s selected_checkpoint=%s filesystem_checkpoint=%s copy_plan=%s",
             source.sandbox_id,
@@ -965,13 +1043,51 @@ class RealHostScenarioHarness:
             SandboxSnapshot(
                 sandbox_id=target.sandbox_id,
                 runtime_name="runc",
-                is_running=True,
+                is_running=False,
                 process_changed=False,
                 filesystem_changed=False,
                 observed_at=utc_now(),
             )
         )
         return target
+
+    def _prepare_sandbox_handle(self, sandbox_name: str) -> tuple[SandboxHandle, Path | None]:
+        assert self.root is not None
+        assert self.interceptor is not None
+        status_port = find_free_port()
+        bundle_dir = self.root / "bundles" / sandbox_name
+        work_dir_host_path = resolve_work_dir_host_path(self.work_dir_host_root, sandbox_name)
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["runc", "spec"], cwd=bundle_dir, check=True)
+        write_bundle_config(
+            bundle_dir=bundle_dir,
+            interceptor_port=self.interceptor.port,
+            provider=self.provider,
+            sandbox_name=sandbox_name,
+            status_port=status_port,
+            cgroup_path=f"agent-cr-bench/{self.pool_name}/{sandbox_name}",
+            work_dir_host_path=work_dir_host_path,
+        )
+        handle = SandboxHandle(
+            sandbox_id=SandboxId(sandbox_name),
+            bundle_dir=bundle_dir,
+            status_port=status_port,
+            last_status={},
+        )
+        self.sandboxes.append(handle)
+        self._sandbox_by_id[handle.sandbox_id] = handle
+        return handle, work_dir_host_path
+
+    def _set_sandbox_running_state(self, sandbox_id: SandboxId, *, is_running: bool) -> None:
+        assert self.base_inspector is not None
+        snapshot = self.base_inspector.inspect(sandbox_id)
+        self.base_inspector.upsert_snapshot(
+            replace(
+                snapshot,
+                is_running=is_running,
+                observed_at=utc_now(),
+            )
+        )
 
     def _rewrite_process_artifact(
         self,
