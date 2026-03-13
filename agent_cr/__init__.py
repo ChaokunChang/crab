@@ -24,6 +24,7 @@ from .interceptor import (
     SandboxResponseGateRegistry,
     TelemetryRequestInterceptorHook,
 )
+from .remote_inspector import HostInspectorServiceClient, RemoteSandboxInspector
 from .models import (
     ArtifactKind,
     ArtifactPayload,
@@ -120,6 +121,7 @@ __all__ = [
     "KeepAllCheckpointManager",
     "LatestOnlyCheckpointManager",
     "LocalCheckpointManager",
+    "HostInspectorServiceClient",
     "NoopTelemetrySink",
     "ProcessCWorker",
     "ProcessRWorker",
@@ -161,6 +163,7 @@ __all__ = [
     "AgentCRRequestInterceptor",
     "InMemoryRequestStateStore",
     "RequestAwareSandboxInspector",
+    "RemoteSandboxInspector",
     "SandboxResponseGateRegistry",
     "TelemetryRequestInterceptorHook",
     "TreeSearchCheckpointingPolicy",

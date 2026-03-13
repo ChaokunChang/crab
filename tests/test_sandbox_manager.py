@@ -22,13 +22,29 @@ class FakeCommandRunner(CommandRunner):
         )()
 
 
+class FakeHostInspectorClient:
+    def __init__(self) -> None:
+        self.register_calls: list[tuple[SandboxId, str, str]] = []
+        self.unregister_calls: list[SandboxId] = []
+
+    def register_sandbox(self, sandbox_id: SandboxId, runtime: str, object_id: str) -> dict[str, object]:
+        self.register_calls.append((sandbox_id, runtime, object_id))
+        return {"ok": True}
+
+    def unregister_sandbox(self, sandbox_id: SandboxId) -> dict[str, object]:
+        self.unregister_calls.append(sandbox_id)
+        return {"ok": True}
+
+
 class SandboxManagerTests(unittest.TestCase):
     def test_runc_sandbox_manager_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_sandbox_mgr_") as tmp:
             root = Path(tmp)
             runner = FakeCommandRunner()
+            host_inspector = FakeHostInspectorClient()
             manager = RuncSandboxManager(
                 command_runner=runner,
+                host_inspector_client=host_inspector,
                 paths=RuncSandboxManagerPaths(
                     state_root=root / "state",
                     bundle_root=root / "bundles",
@@ -57,6 +73,11 @@ class SandboxManagerTests(unittest.TestCase):
             self.assertEqual(manager.describe(sandbox_id).status, "stopped")
 
             manager.delete(sandbox_id)
+            self.assertEqual(
+                host_inspector.register_calls,
+                [(SandboxId("sbx-test"), "runc", "sbx-test")],
+            )
+            self.assertEqual(host_inspector.unregister_calls, [SandboxId("sbx-test")])
             self.assertEqual(
                 runner.commands,
                 [

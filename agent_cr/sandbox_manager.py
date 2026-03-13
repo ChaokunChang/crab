@@ -10,6 +10,7 @@ from threading import Lock
 from .contracts import SandboxManager
 from .ids import SandboxId
 from .models import SandboxDescription
+from .remote_inspector import HostInspectorServiceClient
 from .runtime.base import CommandRunner, SubprocessCommandRunner
 
 logger = logging.getLogger(__name__)
@@ -24,9 +25,10 @@ class RuncSandboxManagerPaths:
 
 
 class InMemorySandboxManager(SandboxManager):
-    def __init__(self) -> None:
+    def __init__(self, host_inspector_client: HostInspectorServiceClient | None = None) -> None:
         self._lock = Lock()
         self._items: dict[SandboxId, SandboxDescription] = {}
+        self._host_inspector_client = host_inspector_client
 
     def launch(self, runtime_name: str, metadata: dict[str, object] | None = None) -> SandboxId:
         with self._lock:
@@ -85,11 +87,13 @@ class RuncSandboxManager(SandboxManager):
         command_runner: CommandRunner | None = None,
         runtime_bin: str = "runc",
         zfs_bin: str = "zfs",
+        host_inspector_client: HostInspectorServiceClient | None = None,
     ) -> None:
         self._paths = paths or RuncSandboxManagerPaths()
         self._runner = command_runner or SubprocessCommandRunner()
         self._runtime_bin = runtime_bin
         self._zfs_bin = zfs_bin
+        self._host_inspector_client = host_inspector_client
         self._lock = Lock()
         self._items: dict[SandboxId, SandboxDescription] = {}
         self._paths.metadata_root.mkdir(parents=True, exist_ok=True)
@@ -143,6 +147,11 @@ class RuncSandboxManager(SandboxManager):
         with self._lock:
             self._items[sandbox_id] = description
         self._persist(description)
+        if self._host_inspector_client is not None:
+            try:
+                self._host_inspector_client.register_sandbox(sandbox_id, "runc", str(sandbox_id))
+            except Exception:
+                logger.exception("Failed to register sandbox %s with host inspector", sandbox_id)
         logger.info("Sandbox %s is running with rootfs=%s", sandbox_id, rootfs_path)
         return sandbox_id
 
@@ -205,6 +214,11 @@ class RuncSandboxManager(SandboxManager):
             metadata_path.unlink()
         with self._lock:
             self._items.pop(sandbox_id, None)
+        if self._host_inspector_client is not None:
+            try:
+                self._host_inspector_client.unregister_sandbox(sandbox_id)
+            except Exception:
+                logger.exception("Failed to unregister sandbox %s from host inspector", sandbox_id)
         logger.info("Sandbox %s deleted", sandbox_id)
 
     def describe(self, sandbox_id: SandboxId) -> SandboxDescription:

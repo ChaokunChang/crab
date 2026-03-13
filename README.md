@@ -36,6 +36,8 @@ The codebase currently supports two practical modes:
   - `RequestAwareSandboxInspector`
   - `InMemoryTelemetrySink`
 
+For Host inspector manual usage and real Docker validation, See `agent_cr/host_inspector/README.md`.
+
 ## Main Entry Point
 
 ```python
