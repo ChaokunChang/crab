@@ -237,7 +237,7 @@ def write_bundle_config(
             "export IFLOW_NON_INTERACTIVE=true; "
             "cd /work && "
             f"exec {RUNTIME_MOUNT_PATH}/node/bin/node {prepared_runtime.mounted_entrypoint} "
-            "-p \"$AGENT_CR_IFLOW_TASK\""
+            f"-p \"$AGENT_CR_IFLOW_TASK\" >/dev/null 2>/dev/null"
         ),
     ]
     cfg["process"]["env"] = [
