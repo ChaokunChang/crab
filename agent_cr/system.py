@@ -380,6 +380,16 @@ class AgentCRSystem:
                         event.sandbox_id,
                         checkpoint_id,
                     )
+                elif self.relaunch_handler is not None:
+                    logger.warning(
+                        "Recovery restore failed; invoking relaunch handler sandbox=%s checkpoint=%s message=%s",
+                        event.sandbox_id,
+                        checkpoint_id,
+                        restore_result.message,
+                    )
+                    self.relaunch_handler(event.sandbox_id, event.event_type)
+                    status = "relaunched"
+                    message = "restore_failed_relaunch_handler_invoked"
                 else:
                     status = "restore_failed"
                     message = restore_result.message

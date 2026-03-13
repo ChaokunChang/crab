@@ -52,6 +52,18 @@ class FakeCommandRunner(CommandRunner):
         )()
 
 
+class FailingRestoreRunner(FakeCommandRunner):
+    def run(self, command: list[str], *, cwd: Path | None = None):
+        result = super().run(command, cwd=cwd)
+        if "restore" in command:
+            return type(
+                "Result",
+                (),
+                {"command": tuple(command), "returncode": 1, "stdout": "", "stderr": "restore failed"},
+            )()
+        return result
+
+
 class SystemIntegrationTests(unittest.TestCase):
     def _wait_for_record(self, system: AgentCRSystem, sandbox_id: SandboxId, expected_event_type: str):
         import time
@@ -197,6 +209,7 @@ class SystemIntegrationTests(unittest.TestCase):
                     str(root / "checkpoints" / "sbx-int" / str(checkpoint_result.checkpoint_id) / "work"),
                     "--leave-running=false",
                     "--tcp-established",
+                    "--tcp-skip-in-flight",
                 ),
                 runner.commands,
             )
@@ -467,6 +480,115 @@ class SystemIntegrationTests(unittest.TestCase):
                 ),
                 runner.commands,
             )
+
+    def test_fault_notification_relaunches_when_restore_fails(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
+            root = Path(tmp)
+            runner = FailingRestoreRunner()
+            telemetry = InMemoryTelemetrySink()
+            collector = InMemoryEBPFEventCollector()
+            inspector = EBPFSandboxInspector(collector)
+            request_store = InMemoryRequestStateStore()
+            relaunched: list[tuple[SandboxId, str]] = []
+
+            runtime = RuncRuntimeAdapter(
+                command_runner=runner,
+                paths=RuncRuntimePaths(
+                    state_root=root / "runtime-state",
+                    bundle_root=root / "bundles",
+                    checkpoint_root=root / "checkpoints",
+                    zfs_dataset_prefix="pool/agent-cr",
+                ),
+            )
+            storage = LocalCheckpointManager(StorageConfig(root_dir=root / "storage"))
+            executor = CRExecutor(
+                ExecutorConfig(max_workers=1),
+                DefaultCWorker(
+                    AdapterProcessCWorker(runtime),
+                    AdapterFileSystemCWorker(runtime),
+                    storage,
+                    runtime,
+                ),
+                DefaultRWorker(
+                    AdapterProcessRWorker(runtime),
+                    AdapterFileSystemRWorker(runtime),
+                    storage,
+                ),
+                telemetry,
+            )
+            sandbox_manager = RuncSandboxManager(
+                command_runner=runner,
+                paths=RuncSandboxManagerPaths(
+                    state_root=root / "runtime-state",
+                    bundle_root=root / "bundles",
+                    metadata_root=root / "sandbox-metadata",
+                    zfs_dataset_prefix="pool/agent-cr",
+                ),
+            )
+            scheduler_cfg = SchedulerConfig(
+                min_checkpoint_interval_seconds=0.0,
+                force_checkpoint_after_seconds=0.0,
+                require_change_signal=True,
+            )
+            scheduler = CRScheduler(
+                scheduler_cfg,
+                inspector,
+                sandbox_manager,
+                InMemorySchedulerStateStore(),
+                telemetry,
+                FaultToleranceCheckpointingPolicy(scheduler_cfg),
+            )
+            system = AgentCRSystem(
+                scheduler=scheduler,
+                executor=executor,
+                storage=storage,
+                inspector=inspector,
+                sandbox_manager=sandbox_manager,
+                telemetry=telemetry,
+                request_state_store=request_store,
+                relaunch_handler=lambda sandbox_id, event_type: relaunched.append((sandbox_id, event_type)),
+            )
+            sandbox_id = system.sandbox_manager.launch(
+                "runc",
+                {
+                    "sandbox_id": "sbx-auto-fallback",
+                    "bundle_path": str(root / "bundles" / "sbx-auto-fallback"),
+                },
+            )
+            inspector.upsert_snapshot(
+                SandboxSnapshot(
+                    sandbox_id=sandbox_id,
+                    runtime_name="runc",
+                    is_running=True,
+                    process_changed=True,
+                    filesystem_changed=True,
+                    observed_at=utc_now(),
+                )
+            )
+            checkpoint_result = system.checkpoint_if_due(sandbox_id)
+            self.assertIsNotNone(checkpoint_result)
+            inspector.upsert_snapshot(
+                SandboxSnapshot(
+                    sandbox_id=sandbox_id,
+                    runtime_name="runc",
+                    is_running=False,
+                    process_changed=True,
+                    filesystem_changed=True,
+                    observed_at=utc_now(),
+                    last_checkpoint_at=utc_now(),
+                )
+            )
+
+            system.start()
+            try:
+                system.notify_fault(sandbox_id)
+                record = self._wait_for_record(system, sandbox_id, "fault")
+            finally:
+                system.stop()
+                executor.shutdown()
+
+            self.assertEqual(record.status, "relaunched")
+            self.assertEqual(relaunched, [(sandbox_id, "fault")])
 
     def test_preemption_notification_checkpoints_then_restores(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:

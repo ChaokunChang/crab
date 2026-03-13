@@ -78,6 +78,7 @@ class AgentRuntime:
             "provider": self.provider,
             "total_requests": 0,
             "completed_requests": 0,
+            "request_errors": 0,
             "total_actions": 0,
             "stateless_actions": 0,
             "stateful_actions": 0,
@@ -89,9 +90,29 @@ class AgentRuntime:
             "last_tool_name": None,
             "last_tool_input": None,
             "last_tool_result": None,
+            "last_error": None,
         }
         self.work_dir.mkdir(parents=True, exist_ok=True)
+        self._load_persisted_state()
         self.persist_state()
+
+    def _load_persisted_state(self) -> None:
+        if not self.state_path.exists():
+            return
+        try:
+            payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        memory_notes = payload.get("memory_notes", [])
+        if isinstance(memory_notes, list):
+            self.memory_notes = [str(note) for note in memory_notes]
+        for key in self.state:
+            if key in {"runtime_id", "started_at", "provider"}:
+                continue
+            if key in payload:
+                self.state[key] = payload[key]
 
     def persist_state(self) -> None:
         payload = dict(self.state)
@@ -157,6 +178,16 @@ class AgentRuntime:
         if self.provider == "openai":
             return parse_openai_tool_calls(payload)
         return parse_anthropic_tool_calls(payload)
+
+    def record_error(self, stage: str, exc: Exception) -> None:
+        self.state["request_errors"] += 1
+        self.state["last_error"] = {
+            "stage": stage,
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "ts": time.time(),
+        }
+        self.persist_state()
 
     def run_tool(self, name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
         tool = get_tool(name)
@@ -225,12 +256,25 @@ class AgentRuntime:
         self.persist_state()
         return result
 
-    def loop_forever(self) -> None:
-        while True:
+    def run_cycle(self) -> None:
+        try:
             calls = self.fetch_tool_calls()
-            for call in calls:
+        except Exception as exc:
+            with self.lock:
+                self.record_error("fetch_tool_calls", exc)
+            return
+        for call in calls:
+            try:
                 with self.lock:
                     self.run_tool(str(call["name"]), dict(call["input"]))
+            except Exception as exc:
+                with self.lock:
+                    self.record_error("run_tool", exc)
+                return
+
+    def loop_forever(self) -> None:
+        while True:
+            self.run_cycle()
             time.sleep(self.poll_interval_s)
 
     def status_payload(self) -> dict[str, Any]:

@@ -98,51 +98,50 @@ def main() -> None:
                                 "retained_checkpoints": len(harness.storage.list_checkpoints(sandbox.sandbox_id)),
                             }
                         )
-                        continue
-                    pre_fault = harness.wait_for_action_delta(sandbox, delta=2)
-                    logger.info(
-                        "FaultTolerance injecting fault iteration=%d sandbox=%s pre_fault_actions=%d",
-                        iteration,
-                        sandbox.sandbox_id,
-                        total_actions(pre_fault),
-                    )
-                    event_started = time.perf_counter()
-                    harness.inject_fault(sandbox)
-                    observed_after = utc_now()
-                    harness.notify_fault(sandbox)
-                    recovery_started = time.perf_counter()
-                    record = harness.wait_for_recovery(
-                        sandbox,
-                        event_type="fault",
-                        observed_after=observed_after,
-                    )
-                    recovery_finished = time.perf_counter()
-                    post_recovery = harness.poll_status(sandbox)
-                    ready_at = time.perf_counter()
-                    sandbox.last_status = post_recovery
-                    logger.info(
-                        "FaultTolerance recovery finished iteration=%d sandbox=%s status=%s recovery_ms=%.3f readiness_ms=%.3f end_to_end_recovery_ms=%.3f",
-                        iteration,
-                        sandbox.sandbox_id,
-                        record.status,
-                        (recovery_finished - recovery_started) * 1000.0,
-                        (ready_at - recovery_finished) * 1000.0,
-                        (ready_at - event_started) * 1000.0,
-                    )
-                    rows.append(
-                        {
-                            "iter": iteration,
-                            "sandbox_id": str(sandbox.sandbox_id),
-                            "event_injected": 1,
-                            "recovery_status": record.status,
-                            "recovery_ms": (recovery_finished - recovery_started) * 1000.0,
-                            "readiness_ms": (ready_at - recovery_finished) * 1000.0,
-                            "end_to_end_recovery_ms": (ready_at - event_started) * 1000.0,
-                            "pre_fault_actions": total_actions(pre_fault),
-                            "post_recovery_actions": total_actions(post_recovery),
-                            "retained_checkpoints": len(harness.storage.list_checkpoints(sandbox.sandbox_id)),
-                        }
-                    )
+                    else:
+                        logger.info(
+                            "FaultTolerance injecting fault iteration=%d sandbox=%s pre_fault_actions=%d",
+                            iteration,
+                            sandbox.sandbox_id,
+                            total_actions(pre_fault),
+                        )
+                        event_started = time.perf_counter()
+                        harness.inject_fault(sandbox)
+                        observed_after = utc_now()
+                        harness.notify_fault(sandbox)
+                        recovery_started = time.perf_counter()
+                        record = harness.wait_for_recovery(
+                            sandbox,
+                            event_type="fault",
+                            observed_after=observed_after,
+                        )
+                        recovery_finished = time.perf_counter()
+                        post_recovery = harness.poll_status(sandbox)
+                        ready_at = time.perf_counter()
+                        sandbox.last_status = post_recovery
+                        logger.info(
+                            "FaultTolerance recovery finished iteration=%d sandbox=%s status=%s recovery_ms=%.3f readiness_ms=%.3f end_to_end_recovery_ms=%.3f",
+                            iteration,
+                            sandbox.sandbox_id,
+                            record.status,
+                            (recovery_finished - recovery_started) * 1000.0,
+                            (ready_at - recovery_finished) * 1000.0,
+                            (ready_at - event_started) * 1000.0,
+                        )
+                        rows.append(
+                            {
+                                "iter": iteration,
+                                "sandbox_id": str(sandbox.sandbox_id),
+                                "event_injected": 1,
+                                "recovery_status": record.status,
+                                "recovery_ms": (recovery_finished - recovery_started) * 1000.0,
+                                "readiness_ms": (ready_at - recovery_finished) * 1000.0,
+                                "end_to_end_recovery_ms": (ready_at - event_started) * 1000.0,
+                                "pre_fault_actions": total_actions(pre_fault),
+                                "post_recovery_actions": total_actions(post_recovery),
+                                "retained_checkpoints": len(harness.storage.list_checkpoints(sandbox.sandbox_id)),
+                            }
+                        )
             else:
                 for sandbox in sandboxes:
                     current = harness.wait_for_progress(sandbox, minimum_actions=6)
