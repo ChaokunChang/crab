@@ -131,6 +131,45 @@ class InterceptorTests(unittest.TestCase):
         self.assertEqual(event_names.count("request.start"), 1)
         self.assertEqual(event_names.count("request.end"), 1)
 
+    def test_interceptor_resolves_sandbox_id_from_client_host_and_overrides_forwarded_header(self) -> None:
+        request_state_store = InMemoryRequestStateStore()
+        forwarded_headers: dict[str, str] = {}
+
+        def _upstream_transport(path, headers, body):
+            forwarded_headers.update(headers)
+            return (
+                200,
+                [("Content-Type", "application/json")],
+                json.dumps(
+                    handle_request(
+                        path=path,
+                        headers=headers,
+                        payload=json.loads(body.decode("utf-8")),
+                        state=SimulatedLLMState(),
+                    ),
+                    sort_keys=True,
+                ).encode("utf-8"),
+            )
+
+        interceptor = AgentCRRequestInterceptor(
+            upstream_transport=_upstream_transport,
+            request_state_store=request_state_store,
+            sandbox_id_resolver=lambda client_host, headers, body: "fork-1" if client_host == "10.250.0.8" else None,
+        )
+
+        interceptor.intercept(
+            path="/v1/chat/completions",
+            headers={"Content-Type": "application/json", "X-Agent-Sandbox-Id": "source-1", "X-Request-Id": "req-1"},
+            body=json.dumps({"model": "simulated-openai", "messages": [{"role": "user", "content": "continue"}]}).encode(
+                "utf-8"
+            ),
+            client_host="10.250.0.8",
+        )
+
+        self.assertEqual(request_state_store.get(SandboxId("fork-1")).total_llm_requests, 1)
+        self.assertEqual(request_state_store.get(SandboxId("source-1")).total_llm_requests, 0)
+        self.assertEqual(forwarded_headers["X-Agent-Sandbox-Id"], "fork-1")
+
     def test_interceptor_notifies_system_scheduler(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_interceptor_") as tmp:
             system = build_default_system(

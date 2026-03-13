@@ -301,12 +301,14 @@ class AgentCRRequestInterceptor:
         hook: RequestInterceptorHook | None = None,
         on_state_change: Callable[[SandboxId], None] | None = None,
         response_gate_registry: SandboxResponseGateRegistry | None = None,
+        sandbox_id_resolver: Callable[[str | None, dict[str, str], bytes], str | None] | None = None,
     ) -> None:
         self._upstream_transport = upstream_transport
         self._request_state_store = request_state_store
         self._hook = hook or CompositeRequestInterceptorHook()
         self._on_state_change = on_state_change
         self._response_gate_registry = response_gate_registry
+        self._sandbox_id_resolver = sandbox_id_resolver
 
     def intercept(
         self,
@@ -314,10 +316,17 @@ class AgentCRRequestInterceptor:
         path: str,
         headers: dict[str, str],
         body: bytes,
+        client_host: str | None = None,
     ) -> tuple[int, list[tuple[str, str]], bytes]:
         sandbox_id_raw = headers.get("X-Agent-Sandbox-Id", "").strip()
+        if self._sandbox_id_resolver is not None:
+            resolved = self._sandbox_id_resolver(client_host, headers, body)
+            if resolved is not None and resolved.strip():
+                sandbox_id_raw = resolved.strip()
         if not sandbox_id_raw:
             raise ValueError("missing X-Agent-Sandbox-Id")
+        upstream_headers = dict(headers)
+        upstream_headers["X-Agent-Sandbox-Id"] = sandbox_id_raw
         provider = "openai" if path == "/v1/chat/completions" else "anthropic"
         context = RequestContext(
             request_id=headers.get("X-Request-Id", "").strip() or str(uuid.uuid4()),
@@ -332,7 +341,7 @@ class AgentCRRequestInterceptor:
             gate_generation = self._response_gate_registry.arm(context.sandbox_id, context.request_id)
         self._notify(context.sandbox_id)
         try:
-            response = self._upstream_transport(path, headers, body)
+            response = self._upstream_transport(path, upstream_headers, body)
             if self._response_gate_registry is not None:
                 self._response_gate_registry.wait_for_release(context.sandbox_id, gate_generation)
             return response
@@ -358,6 +367,7 @@ class AgentCRRequestInterceptorServer:
         hook: RequestInterceptorHook | None = None,
         on_state_change: Callable[[SandboxId], None] | None = None,
         response_gate_registry: SandboxResponseGateRegistry | None = None,
+        sandbox_id_resolver: Callable[[str | None, dict[str, str], bytes], str | None] | None = None,
         host: str = "127.0.0.1",
         port: int = 0,
     ) -> None:
@@ -368,6 +378,7 @@ class AgentCRRequestInterceptorServer:
             hook=hook,
             on_state_change=on_state_change,
             response_gate_registry=response_gate_registry,
+            sandbox_id_resolver=sandbox_id_resolver,
         )
         self._server = ThreadingHTTPServer((host, port), self._build_handler())
         self._thread: threading.Thread | None = None
@@ -428,6 +439,7 @@ class AgentCRRequestInterceptorServer:
                         path=self.path,
                         headers=dict(self.headers.items()),
                         body=body,
+                        client_host=str(self.client_address[0]),
                     )
                     self.send_response(status_code)
                     for key, value in headers:

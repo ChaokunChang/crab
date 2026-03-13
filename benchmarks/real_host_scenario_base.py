@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import ipaddress
 import json
 import logging
 import random
@@ -100,7 +101,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
 
 
 def require_binaries() -> None:
-    required = ["docker", "runc", "criu", "zfs", "zpool"]
+    required = ["docker", "runc", "criu", "zfs", "zpool", "ip"]
     missing = [name for name in required if shutil.which(name) is None]
     if missing:
         raise SystemExit(f"missing required binaries: {', '.join(missing)}")
@@ -156,20 +157,32 @@ def write_bundle_config(
     *,
     bundle_dir: Path,
     interceptor_port: int,
+    interceptor_host: str,
     provider: str,
     sandbox_name: str,
     status_port: int,
     cgroup_path: str,
     work_dir_host_path: Path | None = None,
+    network_namespace_path: Path | None = None,
 ) -> None:
     config_path = bundle_dir / "config.json"
     cfg = json.loads(config_path.read_text())
     linux_cfg = cfg.get("linux", {})
-    linux_cfg["namespaces"] = [
-        ns
-        for ns in linux_cfg.get("namespaces", [])
-        if ns.get("type") not in {"network", "cgroup"}
-    ]
+    namespaces = []
+    network_namespace_found = False
+    for namespace in linux_cfg.get("namespaces", []):
+        ns_type = namespace.get("type")
+        if ns_type == "cgroup":
+            continue
+        if ns_type == "network":
+            network_namespace_found = True
+            if network_namespace_path is None:
+                continue
+            namespace = {**namespace, "path": str(network_namespace_path)}
+        namespaces.append(namespace)
+    if network_namespace_path is not None and not network_namespace_found:
+        namespaces.append({"type": "network", "path": str(network_namespace_path)})
+    linux_cfg["namespaces"] = namespaces
     linux_cfg["cgroupsPath"] = cgroup_path
     linux_cfg.pop("seccomp", None)
     cfg["linux"] = linux_cfg
@@ -195,7 +208,7 @@ def write_bundle_config(
     cfg["process"]["env"] = [
         "PATH=/usr/local/bin:/usr/bin:/bin",
         "PYTHONUNBUFFERED=1",
-        f"INTERCEPTOR_URL=http://127.0.0.1:{interceptor_port}",
+        f"INTERCEPTOR_URL=http://{interceptor_host}:{interceptor_port}",
         f"STATUS_PORT={status_port}",
         "POLL_INTERVAL_S=0.2",
         "AGENT_WORK_DIR=/work",
@@ -363,10 +376,21 @@ class SandboxHandle:
     bundle_dir: Path
     status_port: int
     last_status: dict[str, object]
+    status_host: str = "127.0.0.1"
 
     @property
     def status_url(self) -> str:
-        return f"http://127.0.0.1:{self.status_port}/status"
+        return f"http://{self.status_host}:{self.status_port}/status"
+
+
+@dataclass(frozen=True)
+class TreeSearchNetworkLease:
+    sandbox_id: SandboxId
+    namespace_name: str
+    namespace_path: Path
+    host_veth_name: str
+    guest_veth_name: str
+    guest_ip: str
 
 
 class RealHostScenarioHarness:
@@ -411,6 +435,12 @@ class RealHostScenarioHarness:
         self.llm_thread: threading.Thread | None = None
         self.sandboxes: list[SandboxHandle] = []
         self._sandbox_by_id: dict[SandboxId, SandboxHandle] = {}
+        self._tree_search_bridge_name: str | None = None
+        self._tree_search_bridge_ip = "10.250.0.1"
+        self._tree_search_network_cidr = "10.250.0.0/24"
+        self._tree_search_ip_cursor = 2
+        self._tree_search_network_leases: dict[SandboxId, TreeSearchNetworkLease] = {}
+        self._tree_search_ip_to_sandbox: dict[str, SandboxId] = {}
 
     def __enter__(self) -> "RealHostScenarioHarness":
         require_binaries()
@@ -493,7 +523,8 @@ class RealHostScenarioHarness:
             hook=self.interceptor_hook,
             on_state_change=self.system.notify_interceptor_state_change,
             response_gate_registry=self.system.response_gate_registry,
-            host="127.0.0.1",
+            sandbox_id_resolver=self.resolve_interceptor_sandbox_id,
+            host="0.0.0.0",
             port=0,
         )
         self.interceptor.start()
@@ -518,6 +549,16 @@ class RealHostScenarioHarness:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
+        for sandbox_id in list(self._tree_search_network_leases):
+            self._release_tree_search_network_lease(sandbox_id)
+        if self._tree_search_bridge_name is not None:
+            subprocess.run(
+                ["ip", "link", "delete", self._tree_search_bridge_name],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self._tree_search_bridge_name = None
         if self.image_tag:
             subprocess.run(
                 ["docker", "rmi", "-f", self.image_tag],
@@ -553,7 +594,10 @@ class RealHostScenarioHarness:
         assert self.system is not None
         assert self.interceptor is not None
 
-        handle, work_dir_host_path = self._prepare_sandbox_handle(sandbox_name)
+        handle, work_dir_host_path = self._prepare_sandbox_handle(
+            sandbox_name,
+            interceptor_host="127.0.0.1",
+        )
         sandbox_id = handle.sandbox_id
         self.base_inspector.upsert_snapshot(
             SandboxSnapshot(
@@ -597,9 +641,81 @@ class RealHostScenarioHarness:
         )
         return handle
 
+    def launch_tree_search_sandbox(self, sandbox_name: str) -> SandboxHandle:
+        assert self.root is not None
+        assert self.inspector is not None
+        assert self.base_inspector is not None
+        assert self.system is not None
+        assert self.interceptor is not None
+
+        network_lease = self._allocate_tree_search_network_lease(SandboxId(sandbox_name))
+        handle, work_dir_host_path = self._prepare_sandbox_handle(
+            sandbox_name,
+            interceptor_host=self._tree_search_bridge_ip,
+            network_lease=network_lease,
+        )
+        sandbox_id = handle.sandbox_id
+        self._tree_search_ip_to_sandbox[network_lease.guest_ip] = sandbox_id
+        self.base_inspector.upsert_snapshot(
+            SandboxSnapshot(
+                sandbox_id=sandbox_id,
+                runtime_name="runc",
+                is_running=True,
+                process_changed=False,
+                filesystem_changed=False,
+                observed_at=utc_now(),
+            )
+        )
+        self.system.sandbox_manager.launch(
+            "runc",
+            {
+                "sandbox_id": sandbox_name,
+                "bundle_path": str(handle.bundle_dir),
+                "work_dir_host_path": None if work_dir_host_path is None else str(work_dir_host_path),
+                "rootfs_init_dirs": [
+                    "work",
+                    "tmp",
+                    "proc",
+                    "dev",
+                    "dev/pts",
+                    "dev/shm",
+                    "dev/mqueue",
+                    "sys",
+                    "run",
+                    "var",
+                ],
+                "rootfs_copy_paths": [{"source": str(self.exported_rootfs), "destination": "/"}],
+            },
+        )
+        payload = wait_for_http_json(handle.status_url)
+        handle.last_status = payload
+        logger.info(
+            "Launched tree-search sandbox name=%s sandbox_id=%s guest_ip=%s status_port=%d auto_cr=%s",
+            sandbox_name,
+            sandbox_id,
+            network_lease.guest_ip,
+            handle.status_port,
+            self.auto_cr,
+        )
+        return handle
+
     def add_interceptor_hook(self, hook: RequestInterceptorHook) -> None:
         self.interceptor_hook.add_hook(hook)
         logger.debug("Registered interceptor hook %s", type(hook).__name__)
+
+    def resolve_interceptor_sandbox_id(
+        self,
+        client_host: str | None,
+        headers: dict[str, str],
+        body: bytes,
+    ) -> str | None:
+        _ = (headers, body)
+        if client_host is None:
+            return None
+        sandbox_id = self._tree_search_ip_to_sandbox.get(client_host)
+        if sandbox_id is None:
+            return None
+        return str(sandbox_id)
 
     def drain_request_state_changes(self) -> int:
         if self.request_state_store is None:
@@ -869,6 +985,8 @@ class RealHostScenarioHarness:
         try:
             description = self.sandbox_manager.describe(sandbox.sandbox_id)
         except KeyError:
+            self._release_tree_search_network_lease(sandbox.sandbox_id)
+            self._sandbox_by_id.pop(sandbox.sandbox_id, None)
             return
         dataset = str(description.metadata.get("zfs_dataset", ""))
         if dataset:
@@ -878,6 +996,7 @@ class RealHostScenarioHarness:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+        self._release_tree_search_network_lease(sandbox.sandbox_id)
         self._sandbox_by_id.pop(sandbox.sandbox_id, None)
 
     def _relaunch_sandbox(self, sandbox_id: SandboxId, event_type: str) -> None:
@@ -936,7 +1055,10 @@ class RealHostScenarioHarness:
         assert self.sandbox_manager is not None
         assert self.base_inspector is not None
 
-        target, work_dir_host_path = self._prepare_sandbox_handle(fork_name)
+        target, work_dir_host_path = self._prepare_sandbox_handle(
+            fork_name,
+            interceptor_host="127.0.0.1",
+        )
 
         source_dataset = f"{self.pool_name}/agent-cr/{source.sandbox_id}"
         target_dataset = f"{self.pool_name}/agent-cr/{target.sandbox_id}"
@@ -1051,7 +1173,46 @@ class RealHostScenarioHarness:
         )
         return target
 
-    def _prepare_sandbox_handle(self, sandbox_name: str) -> tuple[SandboxHandle, Path | None]:
+    def clone_tree_search_checkpoint_to_fork(
+        self,
+        source: SandboxHandle,
+        checkpoint_id: CheckpointId,
+        fork_name: str,
+    ) -> SandboxHandle:
+        target = self.clone_checkpoint_to_fork(source, checkpoint_id, fork_name)
+        network_lease = self._allocate_tree_search_network_lease(target.sandbox_id)
+        work_dir_host_path = resolve_work_dir_host_path(self.work_dir_host_root, str(target.sandbox_id))
+        write_bundle_config(
+            bundle_dir=target.bundle_dir,
+            interceptor_port=self.interceptor.port if self.interceptor is not None else 0,
+            interceptor_host=self._tree_search_bridge_ip,
+            provider=self.provider,
+            sandbox_name=str(target.sandbox_id),
+            status_port=source.status_port,
+            cgroup_path=f"agent-cr-bench/{self.pool_name}/{target.sandbox_id}",
+            work_dir_host_path=work_dir_host_path,
+            network_namespace_path=network_lease.namespace_path,
+        )
+        target.status_host = network_lease.guest_ip
+        target.status_port = source.status_port
+        self._tree_search_ip_to_sandbox[network_lease.guest_ip] = target.sandbox_id
+        logger.info(
+            "Prepared tree-search fork sandbox=%s guest_ip=%s status_port=%d source=%s checkpoint=%s",
+            target.sandbox_id,
+            network_lease.guest_ip,
+            target.status_port,
+            source.sandbox_id,
+            checkpoint_id,
+        )
+        return target
+
+    def _prepare_sandbox_handle(
+        self,
+        sandbox_name: str,
+        *,
+        interceptor_host: str,
+        network_lease: TreeSearchNetworkLease | None = None,
+    ) -> tuple[SandboxHandle, Path | None]:
         assert self.root is not None
         assert self.interceptor is not None
         status_port = find_free_port()
@@ -1062,21 +1223,128 @@ class RealHostScenarioHarness:
         write_bundle_config(
             bundle_dir=bundle_dir,
             interceptor_port=self.interceptor.port,
+            interceptor_host=interceptor_host,
             provider=self.provider,
             sandbox_name=sandbox_name,
             status_port=status_port,
             cgroup_path=f"agent-cr-bench/{self.pool_name}/{sandbox_name}",
             work_dir_host_path=work_dir_host_path,
+            network_namespace_path=None if network_lease is None else network_lease.namespace_path,
         )
         handle = SandboxHandle(
             sandbox_id=SandboxId(sandbox_name),
             bundle_dir=bundle_dir,
             status_port=status_port,
             last_status={},
+            status_host="127.0.0.1" if network_lease is None else network_lease.guest_ip,
         )
         self.sandboxes.append(handle)
         self._sandbox_by_id[handle.sandbox_id] = handle
         return handle, work_dir_host_path
+
+    def _ensure_tree_search_bridge(self) -> None:
+        if self._tree_search_bridge_name is not None:
+            return
+        assert self.root is not None
+        bridge_name = f"acb{uuid.uuid4().hex[:8]}"
+        subprocess.run(["ip", "link", "add", bridge_name, "type", "bridge"], check=True)
+        subprocess.run(
+            ["ip", "addr", "add", f"{self._tree_search_bridge_ip}/24", "dev", bridge_name],
+            check=True,
+        )
+        subprocess.run(["ip", "link", "set", bridge_name, "up"], check=True)
+        self._tree_search_bridge_name = bridge_name
+        logger.info(
+            "Created tree-search bridge name=%s bridge_ip=%s",
+            bridge_name,
+            self._tree_search_bridge_ip,
+        )
+
+    def _allocate_tree_search_network_lease(self, sandbox_id: SandboxId) -> TreeSearchNetworkLease:
+        self._ensure_tree_search_bridge()
+        assert self._tree_search_bridge_name is not None
+        network = ipaddress.ip_network(self._tree_search_network_cidr)
+        if self._tree_search_ip_cursor >= network.num_addresses - 1:
+            raise RuntimeError("tree-search network exhausted guest IP capacity")
+        guest_ip = str(network[self._tree_search_ip_cursor])
+        self._tree_search_ip_cursor += 1
+        suffix = uuid.uuid4().hex[:8]
+        namespace_name = f"ts-{suffix}"
+        host_veth_name = f"vh{suffix[:6]}"
+        guest_veth_name = f"vg{suffix[:6]}"
+        subprocess.run(["ip", "netns", "add", namespace_name], check=True)
+        subprocess.run(
+            ["ip", "link", "add", host_veth_name, "type", "veth", "peer", "name", guest_veth_name],
+            check=True,
+        )
+        subprocess.run(["ip", "link", "set", host_veth_name, "master", self._tree_search_bridge_name], check=True)
+        subprocess.run(["ip", "link", "set", host_veth_name, "up"], check=True)
+        subprocess.run(["ip", "link", "set", guest_veth_name, "netns", namespace_name], check=True)
+        subprocess.run(["ip", "netns", "exec", namespace_name, "ip", "link", "set", "lo", "up"], check=True)
+        subprocess.run(
+            ["ip", "netns", "exec", namespace_name, "ip", "link", "set", guest_veth_name, "name", "eth0"],
+            check=True,
+        )
+        subprocess.run(
+            ["ip", "netns", "exec", namespace_name, "ip", "addr", "add", f"{guest_ip}/24", "dev", "eth0"],
+            check=True,
+        )
+        subprocess.run(["ip", "netns", "exec", namespace_name, "ip", "link", "set", "eth0", "up"], check=True)
+        subprocess.run(
+            [
+                "ip",
+                "netns",
+                "exec",
+                namespace_name,
+                "ip",
+                "route",
+                "replace",
+                "default",
+                "via",
+                self._tree_search_bridge_ip,
+            ],
+            check=True,
+        )
+        lease = TreeSearchNetworkLease(
+            sandbox_id=sandbox_id,
+            namespace_name=namespace_name,
+            namespace_path=Path("/var/run/netns") / namespace_name,
+            host_veth_name=host_veth_name,
+            guest_veth_name=guest_veth_name,
+            guest_ip=guest_ip,
+        )
+        self._tree_search_network_leases[sandbox_id] = lease
+        logger.info(
+            "Allocated tree-search network lease sandbox=%s guest_ip=%s namespace=%s",
+            sandbox_id,
+            guest_ip,
+            namespace_name,
+        )
+        return lease
+
+    def _release_tree_search_network_lease(self, sandbox_id: SandboxId) -> None:
+        lease = self._tree_search_network_leases.pop(sandbox_id, None)
+        if lease is None:
+            return
+        self._tree_search_ip_to_sandbox.pop(lease.guest_ip, None)
+        subprocess.run(
+            ["ip", "netns", "del", lease.namespace_name],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["ip", "link", "delete", lease.host_veth_name],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        logger.info(
+            "Released tree-search network lease sandbox=%s guest_ip=%s namespace=%s",
+            sandbox_id,
+            lease.guest_ip,
+            lease.namespace_name,
+        )
 
     def _set_sandbox_running_state(self, sandbox_id: SandboxId, *, is_running: bool) -> None:
         assert self.base_inspector is not None
