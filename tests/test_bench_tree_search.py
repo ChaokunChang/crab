@@ -53,6 +53,10 @@ class _FakeHarness:
         self._restore_lock = threading.Lock()
         self._active_restores = 0
         self.max_concurrent_restores = 0
+        self.source_action_delay_s = 0.0
+        self._source_action_lock = threading.Lock()
+        self._active_source_actions = 0
+        self.max_concurrent_source_actions = 0
 
     def launch_tree_search_sandbox(self, sandbox_name: str) -> SandboxHandle:
         sandbox_id = SandboxId(sandbox_name)
@@ -71,6 +75,18 @@ class _FakeHarness:
 
     def wait_for_action_delta(self, sandbox: SandboxHandle, *, delta: int) -> dict[str, object]:
         sandbox_id = str(sandbox.sandbox_id)
+        if sandbox_id.startswith("tree-source-") and self.source_action_delay_s > 0:
+            with self._source_action_lock:
+                self._active_source_actions += 1
+                self.max_concurrent_source_actions = max(
+                    self.max_concurrent_source_actions,
+                    self._active_source_actions,
+                )
+            try:
+                time.sleep(self.source_action_delay_s)
+            finally:
+                with self._source_action_lock:
+                    self._active_source_actions -= 1
         self.action_delta_calls.append((sandbox_id, delta))
         current = int(self._statuses[sandbox_id]["total_actions"])
         payload = {"total_actions": current + delta}
@@ -188,8 +204,9 @@ class TreeSearchBenchmarkTests(unittest.TestCase):
         values.update(overrides)
         return argparse.Namespace(**values)
 
-    def test_manual_mode_round_robins_sources_and_checkpoints_every_step(self) -> None:
+    def test_manual_mode_runs_sources_independently(self) -> None:
         harness = _FakeHarness()
+        harness.source_action_delay_s = 0.05
 
         rows = run_tree_search_benchmark(self._args(sandboxes=2, initial_steps=3, replay_points=1, fork_steps=1), harness)
 
@@ -197,32 +214,25 @@ class TreeSearchBenchmarkTests(unittest.TestCase):
         self.assertEqual(harness.wait_for_tree_search_calls, [])
         self.assertEqual(harness._snapshot_steps["tree-source-0"], [1, 2, 3])
         self.assertEqual(harness._snapshot_steps["tree-source-1"], [1, 2, 3])
-        self.assertEqual(
-            harness.manual_checkpoint_calls,
-            [
-                ("tree-source-0", True),
-                ("tree-source-1", True),
-                ("tree-source-0", True),
-                ("tree-source-1", True),
-                ("tree-source-0", True),
-                ("tree-source-1", True),
-            ],
-        )
+        self.assertEqual(sorted(harness.manual_checkpoint_calls), [("tree-source-0", True)] * 3 + [("tree-source-1", True)] * 3)
+        self.assertGreaterEqual(harness.max_concurrent_source_actions, 2)
         self.assertEqual(sorted(row["source_index"] for row in rows), [0, 1])
         self.assertEqual([row["replay_actions"] for row in rows], [1, 1])
-        fork_progress_calls = [call for call in harness.action_delta_calls if call[0].startswith("tree-fork-")]
+        fork_progress_calls = sorted(call for call in harness.action_delta_calls if call[0].startswith("tree-fork-"))
         self.assertEqual(fork_progress_calls, [("tree-fork-0-1", 1), ("tree-fork-1-1", 1)])
 
     def test_auto_mode_runs_one_rollout_wave_and_stops_system_once(self) -> None:
         harness = _FakeHarness()
+        harness.source_action_delay_s = 0.05
 
         rows = run_tree_search_benchmark(self._args(sandboxes=2, auto_cr=True, initial_steps=3, replay_points=1, fork_steps=1), harness)
 
         self.assertEqual(harness.manual_checkpoint_calls, [])
         self.assertEqual(harness.system.start_calls, 1)
         self.assertEqual(harness.system.stop_calls, 1)
+        self.assertGreaterEqual(harness.max_concurrent_source_actions, 2)
         self.assertEqual(
-            harness.wait_for_tree_search_calls,
+            sorted(harness.wait_for_tree_search_calls),
             [("tree-source-0", 3), ("tree-source-1", 3)],
         )
         self.assertEqual(sorted(row["source_index"] for row in rows), [0, 1])

@@ -354,22 +354,47 @@ class AgentCRSystem:
                 },
             )
             if event.event_type == "preemption":
-                logger.info("Triggering preemption checkpoint flow for sandbox=%s", event.sandbox_id)
-                checkpoint_result = self._execute_checkpoint_flow(event.sandbox_id)
-                if checkpoint_result is not None and checkpoint_result.status.value == "succeeded":
-                    checkpoint_id = checkpoint_result.checkpoint_id
+                checkpoint_id = self._select_recovery_checkpoint_after(
+                    event.sandbox_id,
+                    observed_after=event.observed_at,
+                )
+                if checkpoint_id is not None:
                     logger.info(
-                        "Preemption checkpoint completed sandbox=%s checkpoint=%s",
+                        "Reusing checkpoint already captured after preemption notice sandbox=%s checkpoint=%s",
                         event.sandbox_id,
                         checkpoint_id,
                     )
-                elif checkpoint_result is not None:
-                    message = checkpoint_result.message
-                    logger.warning(
-                        "Preemption checkpoint failed sandbox=%s message=%s",
-                        event.sandbox_id,
-                        checkpoint_result.message,
-                    )
+                else:
+                    logger.info("Triggering preemption checkpoint flow for sandbox=%s", event.sandbox_id)
+                    try:
+                        checkpoint_result = self._execute_checkpoint_flow(event.sandbox_id)
+                    except Exception:
+                        checkpoint_id = self._select_recovery_checkpoint_after(
+                            event.sandbox_id,
+                            observed_after=event.observed_at,
+                        )
+                        if checkpoint_id is None:
+                            raise
+                        logger.warning(
+                            "Preemption checkpoint flow failed after a recent checkpoint was captured; continuing with recovery sandbox=%s checkpoint=%s",
+                            event.sandbox_id,
+                            checkpoint_id,
+                        )
+                    else:
+                        if checkpoint_result is not None and checkpoint_result.status.value == "succeeded":
+                            checkpoint_id = checkpoint_result.checkpoint_id
+                            logger.info(
+                                "Preemption checkpoint completed sandbox=%s checkpoint=%s",
+                                event.sandbox_id,
+                                checkpoint_id,
+                            )
+                        elif checkpoint_result is not None:
+                            message = checkpoint_result.message
+                            logger.warning(
+                                "Preemption checkpoint failed sandbox=%s message=%s",
+                                event.sandbox_id,
+                                checkpoint_result.message,
+                            )
             if checkpoint_id is None:
                 checkpoint_id = self._select_recovery_checkpoint(event.sandbox_id)
                 logger.info(
@@ -619,6 +644,32 @@ class AgentCRSystem:
             "recovery.no_satisfiable_checkpoint",
             {"sandbox_id": str(sandbox_id)},
         )
+        return None
+
+    def _select_recovery_checkpoint_after(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        observed_after,
+    ) -> CheckpointId | None:
+        checkpoints = list(reversed(self.storage.list_checkpoints(sandbox_id)))
+        for checkpoint_id in checkpoints:
+            manifest = self._resolve_restore_manifest(sandbox_id, checkpoint_id)
+            if manifest.created_at < observed_after:
+                break
+            validation_message = (
+                self._validate_restore_checkpoint(sandbox_id, checkpoint_id)
+                if self.enforce_restore_checkpoint_validation
+                else None
+            )
+            if validation_message is None:
+                return checkpoint_id
+            logger.warning(
+                "Skipping recent checkpoint after validation failure sandbox=%s checkpoint=%s message=%s",
+                sandbox_id,
+                checkpoint_id,
+                validation_message,
+            )
         return None
 
     def _resolve_restore_manifest(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId):

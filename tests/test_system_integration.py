@@ -41,7 +41,7 @@ from agent_cr import (
     SpotPreemptionCheckpointingPolicy,
     StorageConfig,
 )
-from agent_cr.models import JobStatus, utc_now
+from agent_cr.models import JobStatus, RecoveryEvent, utc_now
 from simulated_agent.service import SimulatedLLMState, handle_request
 from agent_cr.runtime import CommandRunner
 
@@ -1103,6 +1103,117 @@ class SystemIntegrationTests(unittest.TestCase):
             self.assertEqual(record.status, "restored")
             self.assertTrue(any("--leave-running=false" in command for command in runner.commands))
             self.assertTrue(any(command[3] == "restore" for command in runner.commands if len(command) > 3))
+
+    def test_preemption_reuses_recent_checkpoint_without_duplicate_pause(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
+            root = Path(tmp)
+            runner = FakeCommandRunner()
+            telemetry = InMemoryTelemetrySink()
+            collector = InMemoryEBPFEventCollector()
+            inspector = EBPFSandboxInspector(collector)
+
+            runtime = RuncRuntimeAdapter(
+                command_runner=runner,
+                paths=RuncRuntimePaths(
+                    state_root=root / "runtime-state",
+                    bundle_root=root / "bundles",
+                    checkpoint_root=root / "checkpoints",
+                    zfs_dataset_prefix="pool/agent-cr",
+                ),
+            )
+            storage = LocalCheckpointManager(StorageConfig(root_dir=root / "storage"))
+            executor = CRExecutor(
+                ExecutorConfig(max_workers=1),
+                DefaultCWorker(
+                    AdapterProcessCWorker(runtime),
+                    AdapterFileSystemCWorker(runtime),
+                    storage,
+                    runtime,
+                ),
+                DefaultRWorker(
+                    AdapterProcessRWorker(runtime),
+                    AdapterFileSystemRWorker(runtime),
+                    storage,
+                ),
+                telemetry,
+            )
+            sandbox_manager = RuncSandboxManager(
+                command_runner=runner,
+                paths=RuncSandboxManagerPaths(
+                    state_root=root / "runtime-state",
+                    bundle_root=root / "bundles",
+                    metadata_root=root / "sandbox-metadata",
+                    zfs_dataset_prefix="pool/agent-cr",
+                ),
+            )
+            scheduler_cfg = SchedulerConfig(
+                min_checkpoint_interval_seconds=0.0,
+                force_checkpoint_after_seconds=0.0,
+                require_change_signal=False,
+            )
+            scheduler = CRScheduler(
+                scheduler_cfg,
+                inspector,
+                sandbox_manager,
+                InMemorySchedulerStateStore(),
+                telemetry,
+                SpotPreemptionCheckpointingPolicy(scheduler_cfg),
+            )
+            system = AgentCRSystem(
+                scheduler=scheduler,
+                executor=executor,
+                storage=storage,
+                inspector=inspector,
+                sandbox_manager=sandbox_manager,
+                telemetry=telemetry,
+            )
+            sandbox_id = system.sandbox_manager.launch(
+                "runc",
+                {
+                    "sandbox_id": "sbx-recent-spot",
+                    "bundle_path": str(root / "bundles" / "sbx-recent-spot"),
+                },
+            )
+            inspector.upsert_snapshot(
+                SandboxSnapshot(
+                    sandbox_id=sandbox_id,
+                    runtime_name="runc",
+                    is_running=True,
+                    process_changed=False,
+                    filesystem_changed=False,
+                    observed_at=utc_now(),
+                    metadata={
+                        "preemption_notice": True,
+                        "preemption_grace_remaining_seconds": 30.0,
+                    },
+                )
+            )
+
+            observed_at = utc_now()
+            checkpoint_result = system.checkpoint_once(sandbox_id, leave_running=False)
+            self.assertEqual(checkpoint_result.status.value, "succeeded")
+
+            try:
+                system._handle_recovery_event(
+                    RecoveryEvent(
+                        sandbox_id=sandbox_id,
+                        event_type="preemption",
+                        observed_at=observed_at,
+                        grace_remaining_seconds=30.0,
+                        reason="preemption",
+                    )
+                )
+            finally:
+                executor.shutdown()
+
+            record = system.get_last_recovery_record(sandbox_id)
+            self.assertIsNotNone(record)
+            assert record is not None
+            self.assertEqual(record.status, "restored")
+            pause_commands = [command for command in runner.commands if len(command) > 3 and command[3] == "pause"]
+            restore_commands = [command for command in runner.commands if len(command) > 3 and command[3] == "restore"]
+            self.assertEqual(len(pause_commands), 1)
+            self.assertEqual(len(restore_commands), 1)
 
     def test_preemption_notification_restores_with_delete_after_restore_storage_policy(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:

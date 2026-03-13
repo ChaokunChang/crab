@@ -93,66 +93,54 @@ class RestoredReplayFork:
 
 def collect_manual_checkpoint_indexes(
     harness: RealHostScenarioHarness,
-    sources: list[SandboxHandle],
     *,
+    source: SandboxHandle,
     initial_steps: int,
-    source_indices: dict[str, int],
-) -> dict[str, dict[int, TreeSearchCheckpointRecord]]:
-    checkpoints_by_source: dict[str, dict[int, TreeSearchCheckpointRecord]] = {
-        str(source.sandbox_id): {} for source in sources
-    }
+    source_index: int,
+) -> dict[int, TreeSearchCheckpointRecord]:
+    checkpoints_by_step: dict[int, TreeSearchCheckpointRecord] = {}
     for step in range(1, initial_steps + 1):
-        for source in sources:
-            harness.wait_for_action_delta(source, delta=1)
-            harness.set_snapshot_metadata(source, tree_search_step=step)
-            checkpoint_started = time.perf_counter()
-            checkpoint_result = harness.checkpoint_manual(source, leave_running=True)
-            checkpoint_finished = time.perf_counter()
-            if checkpoint_result is None:
-                raise RuntimeError("tree-search benchmark expected a checkpoint at each step")
-            checkpoint_ms = (checkpoint_finished - checkpoint_started) * 1000.0
-            checkpoints_by_source[str(source.sandbox_id)][step] = TreeSearchCheckpointRecord(
-                checkpoint_id=checkpoint_result.checkpoint_id,
-                replay_actions=step,
-                checkpoint_ms=checkpoint_ms,
-            )
-            logger.info(
-                "TreeSearch manual checkpoint source_index=%d step=%d checkpoint=%s checkpoint_ms=%.3f",
-                source_indices[str(source.sandbox_id)],
-                step,
-                checkpoint_result.checkpoint_id,
-                checkpoint_ms,
-            )
-    return checkpoints_by_source
+        harness.wait_for_action_delta(source, delta=1)
+        harness.set_snapshot_metadata(source, tree_search_step=step)
+        checkpoint_started = time.perf_counter()
+        checkpoint_result = harness.checkpoint_manual(source, leave_running=True)
+        checkpoint_finished = time.perf_counter()
+        if checkpoint_result is None:
+            raise RuntimeError("tree-search benchmark expected a checkpoint at each step")
+        checkpoint_ms = (checkpoint_finished - checkpoint_started) * 1000.0
+        checkpoints_by_step[step] = TreeSearchCheckpointRecord(
+            checkpoint_id=checkpoint_result.checkpoint_id,
+            replay_actions=step,
+            checkpoint_ms=checkpoint_ms,
+        )
+        logger.info(
+            "TreeSearch manual checkpoint source_index=%d step=%d checkpoint=%s checkpoint_ms=%.3f",
+            source_index,
+            step,
+            checkpoint_result.checkpoint_id,
+            checkpoint_ms,
+        )
+    return checkpoints_by_step
 
 
 def collect_auto_checkpoint_indexes(
     harness: RealHostScenarioHarness,
-    sources: list[SandboxHandle],
     *,
+    source: SandboxHandle,
     initial_steps: int,
-    source_indices: dict[str, int],
-) -> dict[str, dict[int, TreeSearchCheckpointRecord]]:
-    checkpoints_by_source: dict[str, dict[int, TreeSearchCheckpointRecord]] = {}
-    logger.info(
-        "TreeSearch running auto rollout sandboxes=%d initial_steps=%d",
-        len(sources),
-        initial_steps,
+    source_index: int,
+) -> dict[int, TreeSearchCheckpointRecord]:
+    harness.wait_for_action_delta(source, delta=initial_steps)
+    checkpoints_by_step = harness.wait_for_tree_search_checkpoints(
+        source.sandbox_id,
+        initial_steps=initial_steps,
     )
-    for source in sources:
-        harness.wait_for_action_delta(source, delta=initial_steps)
-    for source in sources:
-        checkpoints_by_step = harness.wait_for_tree_search_checkpoints(
-            source.sandbox_id,
-            initial_steps=initial_steps,
-        )
-        checkpoints_by_source[str(source.sandbox_id)] = checkpoints_by_step
-        logger.info(
-            "TreeSearch collected source checkpoints source_index=%d steps=%s",
-            source_indices[str(source.sandbox_id)],
-            sorted(checkpoints_by_step.keys()),
-        )
-    return checkpoints_by_source
+    logger.info(
+        "TreeSearch collected source checkpoints source_index=%d steps=%s",
+        source_index,
+        sorted(checkpoints_by_step.keys()),
+    )
+    return checkpoints_by_step
 
 
 def prepare_replay_fork(
@@ -259,11 +247,152 @@ def cleanup_replay_fork(harness: RealHostScenarioHarness, prepared: PreparedRepl
     harness.destroy_sandbox_dataset(prepared.fork)
 
 
+def run_source_replays(
+    args: argparse.Namespace,
+    harness: RealHostScenarioHarness,
+    *,
+    source: SandboxHandle,
+    source_index: int,
+    checkpoints_by_step: dict[int, TreeSearchCheckpointRecord],
+    replay_steps: list[int],
+) -> list[dict[str, object]]:
+    source_sandbox_id = str(source.sandbox_id)
+    retained_source_checkpoints = len(checkpoints_by_step)
+    rows: list[dict[str, object]] = []
+    prepared_forks: list[PreparedReplayFork] = []
+    harness.deactivate_sandbox_runtime(source)
+    try:
+        if args.replay_mode == "concurrent":
+            prepared_forks = [
+                prepare_replay_fork(
+                    harness,
+                    source,
+                    checkpoints_by_step,
+                    source_index=source_index,
+                    replay_step=replay_step,
+                )
+                for replay_step in replay_steps
+            ]
+            if prepared_forks:
+                with ThreadPoolExecutor(max_workers=len(prepared_forks)) as executor:
+                    restored_forks = list(
+                        executor.map(
+                            lambda prepared: restore_prepared_replay_fork(harness, prepared),
+                            prepared_forks,
+                        )
+                    )
+                with ThreadPoolExecutor(max_workers=len(restored_forks)) as executor:
+                    rows.extend(
+                        executor.map(
+                            lambda restored: run_replay_progress(
+                                harness,
+                                restored,
+                                source_sandbox_id=source_sandbox_id,
+                                retained_source_checkpoints=retained_source_checkpoints,
+                                fork_steps=args.fork_steps,
+                            ),
+                            restored_forks,
+                        )
+                    )
+            return rows
+
+        for replay_step in replay_steps:
+            prepared = prepare_replay_fork(
+                harness,
+                source,
+                checkpoints_by_step,
+                source_index=source_index,
+                replay_step=replay_step,
+            )
+            prepared_forks.append(prepared)
+            restored = restore_prepared_replay_fork(harness, prepared)
+            rows.append(
+                run_replay_progress(
+                    harness,
+                    restored,
+                    source_sandbox_id=source_sandbox_id,
+                    retained_source_checkpoints=retained_source_checkpoints,
+                    fork_steps=args.fork_steps,
+                )
+            )
+            cleanup_replay_fork(harness, prepared)
+            prepared_forks.remove(prepared)
+        return rows
+    finally:
+        for prepared in list(prepared_forks):
+            cleanup_replay_fork(harness, prepared)
+
+
+def run_manual_source_workflow(
+    args: argparse.Namespace,
+    harness: RealHostScenarioHarness,
+    *,
+    source_index: int,
+    source: SandboxHandle,
+    replay_steps: list[int],
+) -> list[dict[str, object]]:
+    try:
+        checkpoints_by_step = collect_manual_checkpoint_indexes(
+            harness,
+            source=source,
+            initial_steps=args.initial_steps,
+            source_index=source_index,
+        )
+        return run_source_replays(
+            args,
+            harness,
+            source=source,
+            source_index=source_index,
+            checkpoints_by_step=checkpoints_by_step,
+            replay_steps=replay_steps,
+        )
+    finally:
+        harness.storage.delete_all_checkpoints(source.sandbox_id)
+        harness.destroy_sandbox_dataset(source)
+
+
+def run_auto_rollout(
+    args: argparse.Namespace,
+    harness: RealHostScenarioHarness,
+    *,
+    source_index: int,
+    source: SandboxHandle,
+) -> dict[int, TreeSearchCheckpointRecord]:
+    return collect_auto_checkpoint_indexes(
+        harness,
+        source=source,
+        initial_steps=args.initial_steps,
+        source_index=source_index,
+    )
+
+
+def run_auto_source_replays(
+    args: argparse.Namespace,
+    harness: RealHostScenarioHarness,
+    *,
+    source_index: int,
+    source: SandboxHandle,
+    checkpoints_by_step: dict[int, TreeSearchCheckpointRecord],
+    replay_steps: list[int],
+) -> list[dict[str, object]]:
+    try:
+        return run_source_replays(
+            args,
+            harness,
+            source=source,
+            source_index=source_index,
+            checkpoints_by_step=checkpoints_by_step,
+            replay_steps=replay_steps,
+        )
+    finally:
+        harness.storage.delete_all_checkpoints(source.sandbox_id)
+        harness.destroy_sandbox_dataset(source)
+
+
 def run_tree_search_benchmark(
     args: argparse.Namespace,
     harness: RealHostScenarioHarness,
 ) -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
     replay_steps = choose_replay_steps(args.initial_steps, args.replay_points)
     logger.info(
         "TreeSearch sandboxes=%d auto_cr=%s replay_mode=%s replay_steps=%s",
@@ -273,7 +402,7 @@ def run_tree_search_benchmark(
         replay_steps,
     )
     sources = [harness.launch_tree_search_sandbox(f"tree-source-{source_index}") for source_index in range(args.sandboxes)]
-    source_indices = {str(source.sandbox_id): index for index, source in enumerate(sources)}
+    indexed_sources = list(enumerate(sources))
 
     if args.auto_cr:
         harness.drain_request_state_changes()
@@ -283,96 +412,74 @@ def run_tree_search_benchmark(
 
     try:
         if args.auto_cr:
-            checkpoints_by_source = collect_auto_checkpoint_indexes(
-                harness,
-                sources,
-                initial_steps=args.initial_steps,
-                source_indices=source_indices,
+            logger.info(
+                "TreeSearch running auto rollout sandboxes=%d initial_steps=%d",
+                len(sources),
+                args.initial_steps,
             )
-            system = getattr(harness, "system", None)
-            if system is not None:
-                system.stop()
-            harness.drain_request_state_changes()
-        else:
-            checkpoints_by_source = collect_manual_checkpoint_indexes(
-                harness,
-                sources,
-                initial_steps=args.initial_steps,
-                source_indices=source_indices,
-            )
-
-        for source in sources:
-            harness.deactivate_sandbox_runtime(source)
-
-        for source in sources:
-            source_sandbox_id = str(source.sandbox_id)
-            source_index = source_indices[source_sandbox_id]
-            checkpoints_by_step = checkpoints_by_source[source_sandbox_id]
-            retained_source_checkpoints = len(checkpoints_by_step)
-            prepared_forks: list[PreparedReplayFork] = []
             try:
-                if args.replay_mode == "concurrent":
-                    prepared_forks = [
-                        prepare_replay_fork(
-                            harness,
-                            source,
-                            checkpoints_by_step,
-                            source_index=source_index,
-                            replay_step=replay_step,
+                with ThreadPoolExecutor(max_workers=max(1, len(indexed_sources))) as executor:
+                    checkpoint_groups = list(
+                        executor.map(
+                            lambda item: (
+                                str(item[1].sandbox_id),
+                                run_auto_rollout(
+                                    args,
+                                    harness,
+                                    source_index=item[0],
+                                    source=item[1],
+                                ),
+                            ),
+                            indexed_sources,
                         )
-                        for replay_step in replay_steps
-                    ]
-                    if prepared_forks:
-                        with ThreadPoolExecutor(max_workers=len(prepared_forks)) as executor:
-                            restored_forks = list(
-                                executor.map(
-                                    lambda prepared: restore_prepared_replay_fork(harness, prepared),
-                                    prepared_forks,
-                                )
-                            )
-                        with ThreadPoolExecutor(max_workers=len(restored_forks)) as executor:
-                            rows.extend(
-                                executor.map(
-                                    lambda restored: run_replay_progress(
-                                        harness,
-                                        restored,
-                                        source_sandbox_id=source_sandbox_id,
-                                        retained_source_checkpoints=retained_source_checkpoints,
-                                        fork_steps=args.fork_steps,
-                                    ),
-                                    restored_forks,
-                                )
-                            )
-                else:
-                    for replay_step in replay_steps:
-                        prepared = prepare_replay_fork(
-                            harness,
-                            source,
-                            checkpoints_by_step,
-                            source_index=source_index,
-                            replay_step=replay_step,
-                        )
-                        prepared_forks.append(prepared)
-                        restored = restore_prepared_replay_fork(harness, prepared)
-                        rows.append(
-                            run_replay_progress(
-                                harness,
-                                restored,
-                                source_sandbox_id=source_sandbox_id,
-                                retained_source_checkpoints=retained_source_checkpoints,
-                                fork_steps=args.fork_steps,
-                            )
-                        )
-                        cleanup_replay_fork(harness, prepared)
-                        prepared_forks.remove(prepared)
+                    )
+                checkpoints_by_source = dict(checkpoint_groups)
             finally:
-                for prepared in list(prepared_forks):
-                    cleanup_replay_fork(harness, prepared)
+                system = getattr(harness, "system", None)
+                if system is not None:
+                    system.stop()
+                harness.drain_request_state_changes()
+            with ThreadPoolExecutor(max_workers=max(1, len(indexed_sources))) as executor:
+                row_groups = list(
+                    executor.map(
+                        lambda item: run_auto_source_replays(
+                            args,
+                            harness,
+                            source_index=item[0],
+                            source=item[1],
+                            checkpoints_by_step=checkpoints_by_source[str(item[1].sandbox_id)],
+                            replay_steps=replay_steps,
+                        ),
+                        indexed_sources,
+                    )
+                )
+        else:
+            with ThreadPoolExecutor(max_workers=max(1, len(indexed_sources))) as executor:
+                row_groups = list(
+                    executor.map(
+                        lambda item: run_manual_source_workflow(
+                            args,
+                            harness,
+                            source_index=item[0],
+                            source=item[1],
+                            replay_steps=replay_steps,
+                        ),
+                        indexed_sources,
+                    )
+                )
     finally:
         for source in sources:
             harness.storage.delete_all_checkpoints(source.sandbox_id)
             harness.destroy_sandbox_dataset(source)
-    return rows
+    rows = [row for group in row_groups for row in group]
+    return sorted(
+        rows,
+        key=lambda row: (
+            int(row["source_index"]),
+            int(row["replay_step"]),
+            str(row["fork_sandbox_id"]),
+        ),
+    )
 
 
 def main() -> None:

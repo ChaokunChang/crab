@@ -150,9 +150,18 @@ python3 benchmarks/bench_agent_cr_sandbox_e2e.py --sandboxes 2 --iters 5 --provi
 Real-host recovery benchmarks:
 
 ```bash
-python3 benchmarks/bench_fault_tolerance.py --sandboxes 1 --iters 3
-python3 benchmarks/bench_spot_agent.py --sandboxes 1 --iters 3
-python3 benchmarks/bench_tree_search.py --iters 1
+python3 benchmarks/bench_fault_tolerance.py --sandboxes 1 --iters 3 --fault-rate 0.0 --first-fault-iteration 2
+python3 benchmarks/bench_fault_tolerance.py --auto-cr --sandboxes 1 --iters 3 --fault-rate 0.0 --first-fault-iteration 2
+python3 benchmarks/bench_fault_tolerance.py --auto-cr --sandboxes 10 --iters 10 --fault-rate 0.3 --first-fault-iteration 2
+
+python3 benchmarks/bench_spot_agent.py --sandboxes 1 --iters 3 --preemption-rate 0.0 --first-preempt-iteration 2
+python3 benchmarks/bench_spot_agent.py --auto-cr --sandboxes 1 --iters 3 --preemption-rate 0.0 --first-preempt-iteration 2
+python3 benchmarks/bench_spot_agent.py --auto-cr --sandboxes 10 --iters 10 --preemption-rate 0.3 --first-preempt-iteration 2
+
+python3 benchmarks/bench_tree_search.py --sandboxes 1 --initial-steps 3 --replay-points 1 --fork-steps 2 --replay-mode sequential
+python3 benchmarks/bench_tree_search.py --sandboxes 1 --initial-steps 3 --replay-points 1 --fork-steps 2 --replay-mode concurrent
+python3 benchmarks/bench_tree_search.py --auto-cr --sandboxes 1 --initial-steps 10 --replay-points 3 --fork-steps 2 --replay-mode concurrent
+python3 benchmarks/bench_tree_search.py --sandboxes 3 --initial-steps 10 --replay-points 3 --fork-steps 2 --replay-mode concurrent
 ```
 
 The real-host benchmarks allocate temporary runtime state, create a ZFS pool, build the simulated agent image, and launch `runc` sandboxes through the shared harness in [benchmarks/real_host_scenario_base.py](/root/workspace/agent-cr/benchmarks/real_host_scenario_base.py).
