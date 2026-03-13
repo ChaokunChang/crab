@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import subprocess
 import threading
@@ -70,6 +71,7 @@ class AgentRuntime:
         self.tool_activity_path = self.work_dir / "tool_activity.log"
         self.tool_artifact_path = self.work_dir / "tool_artifact.txt"
         self.journal_path = self.work_dir / "journal.log"
+        self.log_path = self.work_dir / "agent_cli.log"
         self.lock = threading.Lock()
         self.memory_notes: list[str] = []
         self.state = {
@@ -93,17 +95,42 @@ class AgentRuntime:
             "last_error": None,
         }
         self.work_dir.mkdir(parents=True, exist_ok=True)
+        self.logger = self._build_logger()
         self._load_persisted_state()
         self.persist_state()
+        self.logger.info(
+            "agent runtime started sandbox_id=%s provider=%s work_dir=%s poll_interval_s=%.3f status_port=%d",
+            self.sandbox_id,
+            self.provider,
+            self.work_dir,
+            self.poll_interval_s,
+            self.status_port,
+        )
+
+    def _build_logger(self) -> logging.Logger:
+        logger = logging.getLogger(f"simulated_agent.agent_cli.{self.sandbox_id}.{id(self)}")
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+        for existing in list(logger.handlers):
+            logger.removeHandler(existing)
+            existing.close()
+        handler = logging.FileHandler(self.log_path, encoding="utf-8")
+        handler.setLevel(logging.DEBUG)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logger.addHandler(handler)
+        return logger
 
     def _load_persisted_state(self) -> None:
         if not self.state_path.exists():
+            self.logger.debug("no persisted state found at %s", self.state_path)
             return
         try:
             payload = json.loads(self.state_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
+            self.logger.warning("failed to load persisted state from %s", self.state_path, exc_info=True)
             return
         if not isinstance(payload, dict):
+            self.logger.warning("ignored non-dict persisted state from %s", self.state_path)
             return
         memory_notes = payload.get("memory_notes", [])
         if isinstance(memory_notes, list):
@@ -113,6 +140,12 @@ class AgentRuntime:
                 continue
             if key in payload:
                 self.state[key] = payload[key]
+        self.logger.debug(
+            "reloaded persisted state total_actions=%s completed_requests=%s memory_notes=%d",
+            self.state["total_actions"],
+            self.state["completed_requests"],
+            len(self.memory_notes),
+        )
 
     def persist_state(self) -> None:
         payload = dict(self.state)
@@ -120,6 +153,12 @@ class AgentRuntime:
         tmp = self.state_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
         tmp.replace(self.state_path)
+        self.logger.debug(
+            "persisted state total_requests=%s completed_requests=%s total_actions=%s",
+            self.state["total_requests"],
+            self.state["completed_requests"],
+            self.state["total_actions"],
+        )
 
     def append_jsonl(self, path: Path, payload: dict[str, Any]) -> None:
         with path.open("a", encoding="utf-8") as fh:
@@ -163,6 +202,12 @@ class AgentRuntime:
 
     def fetch_tool_calls(self) -> list[dict[str, Any]]:
         path, headers, body = self.build_request()
+        self.logger.debug(
+            "fetching tool calls path=%s request_id=%s total_actions=%s",
+            path,
+            headers["X-Request-Id"],
+            self.state["total_actions"],
+        )
         req = urllib.request.Request(
             self.interceptor_url + path,
             data=body,
@@ -171,13 +216,21 @@ class AgentRuntime:
         )
         with self.lock:
             self.state["total_requests"] += 1
-        with urllib.request.urlopen(req, timeout=30.0) as resp:
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
         with self.lock:
             self.state["completed_requests"] += 1
         if self.provider == "openai":
-            return parse_openai_tool_calls(payload)
-        return parse_anthropic_tool_calls(payload)
+            calls = parse_openai_tool_calls(payload)
+        else:
+            calls = parse_anthropic_tool_calls(payload)
+        self.logger.info(
+            "received tool calls count=%d provider=%s sandbox_id=%s",
+            len(calls),
+            self.provider,
+            self.sandbox_id,
+        )
+        return calls
 
     def record_error(self, stage: str, exc: Exception) -> None:
         self.state["request_errors"] += 1
@@ -187,10 +240,18 @@ class AgentRuntime:
             "message": str(exc),
             "ts": time.time(),
         }
+        self.logger.warning(
+            "runtime error stage=%s type=%s message=%s",
+            stage,
+            type(exc).__name__,
+            exc,
+        )
         self.persist_state()
 
     def run_tool(self, name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
         tool = get_tool(name)
+        self.logger.info("running tool name=%s", name)
+        self.logger.debug("tool input name=%s payload=%s", name, json.dumps(tool_input, sort_keys=True))
         result: dict[str, Any]
         if name == "read_workdir":
             result = {"entries": sorted(path.name for path in self.work_dir.iterdir())}
@@ -254,15 +315,19 @@ class AgentRuntime:
         self.append_jsonl(self.action_log_path, event)
         self.append_jsonl(self.tool_activity_path, event)
         self.persist_state()
+        self.logger.debug("tool result name=%s payload=%s", name, json.dumps(result, sort_keys=True))
         return result
 
     def run_cycle(self) -> None:
+        self.logger.debug("starting agent cycle sandbox_id=%s", self.sandbox_id)
         try:
             calls = self.fetch_tool_calls()
         except Exception as exc:
             with self.lock:
                 self.record_error("fetch_tool_calls", exc)
             return
+        if not calls:
+            self.logger.debug("no tool calls returned for sandbox_id=%s", self.sandbox_id)
         for call in calls:
             try:
                 with self.lock:
@@ -273,6 +338,7 @@ class AgentRuntime:
                 return
 
     def loop_forever(self) -> None:
+        self.logger.info("entering agent loop sandbox_id=%s", self.sandbox_id)
         while True:
             self.run_cycle()
             time.sleep(self.poll_interval_s)

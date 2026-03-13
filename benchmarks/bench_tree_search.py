@@ -82,6 +82,7 @@ def main() -> None:
         checkpoint_manager_factory=lambda base: KeepAllCheckpointManager(base),
         max_workers=max(1, args.replay_points + 1),
         auto_cr=args.auto_cr,
+        work_dir_host_root=args.work_dir_host_root,
     ) as harness:
         if args.auto_cr:
             harness.add_interceptor_hook(TreeSearchStepHook(harness))

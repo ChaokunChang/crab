@@ -25,8 +25,11 @@ from agent_cr import (
     JobId,
     LocalCheckpointManager,
     RestoreJob,
+    RuncCheckpointOptions,
     RuncRuntimeAdapter,
+    RuncRuntimeOptions,
     RuncRuntimePaths,
+    RuncRestoreOptions,
     SandboxId,
     SandboxSnapshot,
     StorageConfig,
@@ -217,6 +220,126 @@ class ContractTests(unittest.TestCase):
                     ).command
                 )
                 > 0
+            )
+
+    def test_runc_runtime_uses_default_optional_checkpoint_and_restore_args(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_runtime_contract_") as tmp:
+            base = Path(tmp)
+            runner = FakeCommandRunner()
+            adapter = RuncRuntimeAdapter(
+                command_runner=runner,
+                paths=RuncRuntimePaths(
+                    state_root=base / "state",
+                    bundle_root=base / "bundles",
+                    checkpoint_root=base / "checkpoints",
+                    zfs_dataset_prefix="pool/agent-cr",
+                ),
+            )
+
+            adapter.checkpoint_process(SandboxId("sbx-1"), CheckpointId("ckpt-1"), leave_running=False)
+            adapter.restore_process(SandboxId("sbx-1"), CheckpointId("ckpt-1"))
+
+            self.assertEqual(
+                runner.commands[0],
+                (
+                    "runc",
+                    "--root",
+                    str(base / "state"),
+                    "checkpoint",
+                    "--image-path",
+                    str(base / "checkpoints" / "sbx-1" / "ckpt-1" / "process"),
+                    "--work-path",
+                    str(base / "checkpoints" / "sbx-1" / "ckpt-1" / "work"),
+                    "--leave-running=false",
+                    "--tcp-established",
+                    "--shell-job",
+                    "--tcp-skip-in-flight",
+                    "sbx-1",
+                ),
+            )
+            self.assertEqual(
+                runner.commands[1],
+                (
+                    "runc",
+                    "--root",
+                    str(base / "state"),
+                    "restore",
+                    "-d",
+                    "--bundle",
+                    str(base / "bundles" / "sbx-1"),
+                    "--image-path",
+                    str(base / "checkpoints" / "sbx-1" / "ckpt-1" / "process"),
+                    "--work-path",
+                    str(base / "checkpoints" / "sbx-1" / "ckpt-1" / "work"),
+                    "--tcp-established",
+                    "--shell-job",
+                    "sbx-1",
+                ),
+            )
+
+    def test_runc_runtime_options_allow_overriding_optional_args(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_runtime_contract_") as tmp:
+            base = Path(tmp)
+            runner = FakeCommandRunner()
+            adapter = RuncRuntimeAdapter(
+                command_runner=runner,
+                paths=RuncRuntimePaths(
+                    state_root=base / "state",
+                    bundle_root=base / "bundles",
+                    checkpoint_root=base / "checkpoints",
+                    zfs_dataset_prefix="pool/agent-cr",
+                ),
+                options=RuncRuntimeOptions(
+                    checkpoint=RuncCheckpointOptions(
+                        shell_job=False,
+                        tcp_skip_in_flight=False,
+                        extra_args=("--manage-cgroups-mode=soft",),
+                    ),
+                    restore=RuncRestoreOptions(
+                        detach=False,
+                        tcp_established=False,
+                        extra_args=("--manage-cgroups-mode=soft",),
+                    ),
+                ),
+            )
+
+            adapter.checkpoint_process(SandboxId("sbx-1"), CheckpointId("ckpt-1"), leave_running=True)
+            adapter.restore_process(SandboxId("sbx-1"), CheckpointId("ckpt-1"))
+
+            self.assertEqual(
+                runner.commands[0],
+                (
+                    "runc",
+                    "--root",
+                    str(base / "state"),
+                    "checkpoint",
+                    "--image-path",
+                    str(base / "checkpoints" / "sbx-1" / "ckpt-1" / "process"),
+                    "--work-path",
+                    str(base / "checkpoints" / "sbx-1" / "ckpt-1" / "work"),
+                    "--leave-running=true",
+                    "--tcp-established",
+                    "--manage-cgroups-mode=soft",
+                    "sbx-1",
+                ),
+            )
+            self.assertEqual(
+                runner.commands[1],
+                (
+                    "runc",
+                    "--root",
+                    str(base / "state"),
+                    "restore",
+                    "--bundle",
+                    str(base / "bundles" / "sbx-1"),
+                    "--image-path",
+                    str(base / "checkpoints" / "sbx-1" / "ckpt-1" / "process"),
+                    "--work-path",
+                    str(base / "checkpoints" / "sbx-1" / "ckpt-1" / "work"),
+                    "--shell-job",
+                    "--manage-cgroups-mode=soft",
+                    "sbx-1",
+                ),
             )
 
     def test_workers_return_typed_dry_run_results(self) -> None:

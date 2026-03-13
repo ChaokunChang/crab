@@ -87,6 +87,12 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--out", default="")
     parser.add_argument("--transfer-delay-ms", type=float, default=0.0)
     parser.add_argument(
+        "--work-dir-host-root",
+        type=Path,
+        default=None,
+        help="Host directory root for per-sandbox /work bind mounts",
+    )
+    parser.add_argument(
         "--log-level",
         choices=["debug", "info", "warning", "error", "critical"],
         default="info",
@@ -154,6 +160,7 @@ def write_bundle_config(
     sandbox_name: str,
     status_port: int,
     cgroup_path: str,
+    work_dir_host_path: Path | None = None,
 ) -> None:
     config_path = bundle_dir / "config.json"
     cfg = json.loads(config_path.read_text())
@@ -166,6 +173,18 @@ def write_bundle_config(
     linux_cfg["cgroupsPath"] = cgroup_path
     linux_cfg.pop("seccomp", None)
     cfg["linux"] = linux_cfg
+    mounts = [mount for mount in cfg.get("mounts", []) if mount.get("destination") != "/work"]
+    if work_dir_host_path is not None:
+        work_dir_host_path.mkdir(parents=True, exist_ok=True)
+        mounts.append(
+            {
+                "destination": "/work",
+                "source": str(work_dir_host_path),
+                "type": "bind",
+                "options": ["rbind", "rw"],
+            }
+        )
+    cfg["mounts"] = mounts
     cfg["process"]["terminal"] = False
     cfg["process"]["cwd"] = "/work"
     cfg["process"]["args"] = [
@@ -214,6 +233,12 @@ def record_activity_events(
 
 def total_actions(payload: dict[str, object]) -> int:
     return int(payload.get("total_actions", 0))
+
+
+def resolve_work_dir_host_path(work_dir_host_root: Path | None, sandbox_name: str) -> Path | None:
+    if work_dir_host_root is None:
+        return None
+    return work_dir_host_root.expanduser().resolve() / sandbox_name
 
 
 def compute_summary(rows: list[dict[str, object]], metric_keys: Iterable[str]) -> dict[str, float]:
@@ -313,6 +338,7 @@ class RealHostScenarioHarness:
         checkpoint_manager_factory,
         max_workers: int,
         auto_cr: bool = False,
+        work_dir_host_root: Path | None = None,
     ) -> None:
         self.provider = provider
         self.transfer_delay_ms = transfer_delay_ms
@@ -321,6 +347,7 @@ class RealHostScenarioHarness:
         self.checkpoint_manager_factory = checkpoint_manager_factory
         self.max_workers = max_workers
         self.auto_cr = auto_cr
+        self.work_dir_host_root = work_dir_host_root
         self._tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self.root: Path | None = None
         self.pool_name = ""
@@ -423,6 +450,7 @@ class RealHostScenarioHarness:
             request_state_store=self.request_state_store,
             hook=self.interceptor_hook,
             on_state_change=self.system.notify_interceptor_state_change,
+            response_gate_registry=self.system.response_gate_registry,
             host="127.0.0.1",
             port=0,
         )
@@ -485,6 +513,7 @@ class RealHostScenarioHarness:
 
         status_port = find_free_port()
         bundle_dir = self.root / "bundles" / sandbox_name
+        work_dir_host_path = resolve_work_dir_host_path(self.work_dir_host_root, sandbox_name)
         bundle_dir.mkdir(parents=True, exist_ok=True)
         subprocess.run(["runc", "spec"], cwd=bundle_dir, check=True)
         write_bundle_config(
@@ -494,6 +523,7 @@ class RealHostScenarioHarness:
             sandbox_name=sandbox_name,
             status_port=status_port,
             cgroup_path=f"agent-cr-bench/{self.pool_name}/{sandbox_name}",
+            work_dir_host_path=work_dir_host_path,
         )
         sandbox_id = SandboxId(sandbox_name)
         self.base_inspector.upsert_snapshot(
@@ -511,6 +541,7 @@ class RealHostScenarioHarness:
             {
                 "sandbox_id": sandbox_name,
                 "bundle_path": str(bundle_dir),
+                "work_dir_host_path": None if work_dir_host_path is None else str(work_dir_host_path),
                 "rootfs_init_dirs": [
                     "work",
                     "tmp",
@@ -606,6 +637,12 @@ class RealHostScenarioHarness:
             )
         )
 
+    def checkpoint_manual(self, sandbox: SandboxHandle, leave_running: bool=False):
+        assert self.system is not None
+        logger.debug("Benchmark requesting checkpoint_manual for sandbox=%s", sandbox.sandbox_id)
+        return self.system.checkpoint_once(sandbox.sandbox_id, leave_running=leave_running)
+        
+        
     def checkpoint_if_due(self, sandbox: SandboxHandle):
         assert self.system is not None
         logger.debug("Benchmark requesting checkpoint_if_due for sandbox=%s", sandbox.sandbox_id)
@@ -831,6 +868,7 @@ class RealHostScenarioHarness:
         checkpoint_order = list(manifests.keys())
         copy_plan = resolve_checkpoint_copy_plan(checkpoint_order, manifests, checkpoint_id)
         filesystem_checkpoint_id = next(copy_id for copy_id, _, copy_filesystem in reversed(copy_plan) if copy_filesystem)
+        work_dir_host_path = resolve_work_dir_host_path(self.work_dir_host_root, str(target.sandbox_id))
         logger.info(
             "Cloning checkpoint to fork source=%s target=%s selected_checkpoint=%s filesystem_checkpoint=%s copy_plan=%s",
             source.sandbox_id,
@@ -918,6 +956,7 @@ class RealHostScenarioHarness:
                 "bundle_path": str(target.bundle_dir),
                 "rootfs_path": str(rootfs_path),
                 "zfs_dataset": target_dataset,
+                "work_dir_host_path": None if work_dir_host_path is None else str(work_dir_host_path),
             },
         )
         self.sandbox_manager._items[target.sandbox_id] = description

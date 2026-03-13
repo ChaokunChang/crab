@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import threading
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,12 +20,16 @@ from agent_cr import (
     EBPFEvent,
     EBPFEventKind,
     ExecutorConfig,
+    FailureCode,
     FaultToleranceCheckpointingPolicy,
+    CheckpointJob,
+    JobId,
     InMemoryEBPFEventCollector,
     InMemoryRequestStateStore,
     InMemorySchedulerStateStore,
     InMemoryTelemetrySink,
     LocalCheckpointManager,
+    RequestContext,
     RuncRuntimeAdapter,
     RuncRuntimePaths,
     RuncSandboxManager,
@@ -35,6 +41,7 @@ from agent_cr import (
     StorageConfig,
 )
 from agent_cr.models import JobStatus, utc_now
+from simulated_agent.service import SimulatedLLMState, handle_request
 from agent_cr.runtime import CommandRunner
 
 
@@ -75,6 +82,77 @@ class SystemIntegrationTests(unittest.TestCase):
                 return record
             time.sleep(0.05)
         self.fail(f"timed out waiting for recovery record {expected_event_type} for {sandbox_id}")
+
+    def _build_runc_system(
+        self,
+        *,
+        root: Path,
+        runner: CommandRunner,
+        telemetry: InMemoryTelemetrySink,
+        inspector: EBPFSandboxInspector,
+        request_store: InMemoryRequestStateStore | None = None,
+        relaunch_handler=None,
+        enforce_restore_checkpoint_validation: bool = False,
+    ) -> tuple[AgentCRSystem, CRExecutor]:
+        runtime = RuncRuntimeAdapter(
+            command_runner=runner,
+            paths=RuncRuntimePaths(
+                state_root=root / "runtime-state",
+                bundle_root=root / "bundles",
+                checkpoint_root=root / "checkpoints",
+                zfs_dataset_prefix="pool/agent-cr",
+            ),
+        )
+        storage = LocalCheckpointManager(StorageConfig(root_dir=root / "storage"))
+        executor = CRExecutor(
+            ExecutorConfig(max_workers=1),
+            DefaultCWorker(
+                AdapterProcessCWorker(runtime),
+                AdapterFileSystemCWorker(runtime),
+                storage,
+                runtime,
+            ),
+            DefaultRWorker(
+                AdapterProcessRWorker(runtime),
+                AdapterFileSystemRWorker(runtime),
+                storage,
+            ),
+            telemetry,
+        )
+        sandbox_manager = RuncSandboxManager(
+            command_runner=runner,
+            paths=RuncSandboxManagerPaths(
+                state_root=root / "runtime-state",
+                bundle_root=root / "bundles",
+                metadata_root=root / "sandbox-metadata",
+                zfs_dataset_prefix="pool/agent-cr",
+            ),
+        )
+        scheduler_cfg = SchedulerConfig(
+            min_checkpoint_interval_seconds=0.0,
+            force_checkpoint_after_seconds=0.0,
+            require_change_signal=True,
+        )
+        scheduler = CRScheduler(
+            scheduler_cfg,
+            inspector,
+            sandbox_manager,
+            InMemorySchedulerStateStore(),
+            telemetry,
+            FaultToleranceCheckpointingPolicy(scheduler_cfg),
+        )
+        system = AgentCRSystem(
+            scheduler=scheduler,
+            executor=executor,
+            storage=storage,
+            inspector=inspector,
+            sandbox_manager=sandbox_manager,
+            telemetry=telemetry,
+            request_state_store=request_store,
+            relaunch_handler=relaunch_handler,
+            enforce_restore_checkpoint_validation=enforce_restore_checkpoint_validation,
+        )
+        return system, executor
 
     def test_runc_system_checkpoint_restore_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
@@ -202,14 +280,15 @@ class SystemIntegrationTests(unittest.TestCase):
                     "--root",
                     str(root / "runtime-state"),
                     "checkpoint",
-                    "sbx-int",
                     "--image-path",
                     str(root / "checkpoints" / "sbx-int" / str(checkpoint_result.checkpoint_id) / "process"),
                     "--work-path",
                     str(root / "checkpoints" / "sbx-int" / str(checkpoint_result.checkpoint_id) / "work"),
                     "--leave-running=false",
                     "--tcp-established",
+                    "--shell-job",
                     "--tcp-skip-in-flight",
+                    "sbx-int",
                 ),
                 runner.commands,
             )
@@ -239,6 +318,7 @@ class SystemIntegrationTests(unittest.TestCase):
                     "--work-path",
                     str(root / "checkpoints" / "sbx-int" / str(checkpoint_result.checkpoint_id) / "work"),
                     "--tcp-established",
+                    "--shell-job",
                     "sbx-int",
                 ),
                 runner.commands,
@@ -453,6 +533,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 )
             )
 
+            system.request_state_store = None
             system.start()
             try:
                 system.notify_fault(sandbox_id)
@@ -476,10 +557,349 @@ class SystemIntegrationTests(unittest.TestCase):
                     "--work-path",
                     str(root / "checkpoints" / "sbx-auto-fault" / str(checkpoint_result.checkpoint_id) / "work"),
                     "--tcp-established",
+                    "--shell-job",
                     "sbx-auto-fault",
                 ),
                 runner.commands,
             )
+
+    def test_restore_releases_buffered_response_for_matching_live_request_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
+            root = Path(tmp)
+            runner = FakeCommandRunner()
+            telemetry = InMemoryTelemetrySink()
+            collector = InMemoryEBPFEventCollector()
+            inspector = EBPFSandboxInspector(collector)
+            request_store = InMemoryRequestStateStore()
+            system, executor = self._build_runc_system(
+                root=root,
+                runner=runner,
+                telemetry=telemetry,
+                inspector=inspector,
+                request_store=request_store,
+            )
+            sandbox_id = system.sandbox_manager.launch(
+                "runc",
+                {
+                    "sandbox_id": "sbx-live-restore",
+                    "bundle_path": str(root / "bundles" / "sbx-live-restore"),
+                },
+            )
+            inspector.upsert_snapshot(
+                SandboxSnapshot(
+                    sandbox_id=sandbox_id,
+                    runtime_name="runc",
+                    is_running=True,
+                    process_changed=True,
+                    filesystem_changed=True,
+                    observed_at=utc_now(),
+                )
+            )
+            assert system.response_gate_registry is not None
+            system.response_gate_registry.enable()
+
+            response_payload: dict[str, object] = {}
+            request_finished = threading.Event()
+
+            def _run_intercept() -> None:
+                from agent_cr import AgentCRRequestInterceptor
+
+                interceptor = AgentCRRequestInterceptor(
+                    upstream_transport=lambda path, headers, body: (
+                        200,
+                        [("Content-Type", "application/json")],
+                        json.dumps(
+                            handle_request(
+                                path=path,
+                                headers=headers,
+                                payload=json.loads(body.decode("utf-8")),
+                                state=SimulatedLLMState(),
+                            ),
+                            sort_keys=True,
+                        ).encode("utf-8"),
+                    ),
+                    request_state_store=request_store,
+                    response_gate_registry=system.response_gate_registry,
+                )
+                _, _, body = interceptor.intercept(
+                    path="/v1/chat/completions",
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Agent-Sandbox-Id": str(sandbox_id),
+                        "X-Request-Id": "req-live",
+                    },
+                    body=json.dumps({"model": "simulated-openai", "messages": [{"role": "user", "content": "continue"}]}).encode("utf-8"),
+                )
+                response_payload["body"] = json.loads(body.decode("utf-8"))
+                request_finished.set()
+
+            thread = threading.Thread(target=_run_intercept)
+            thread.start()
+            pending = None
+            for _ in range(100):
+                pending = system.response_gate_registry.get_pending(sandbox_id)
+                if pending is not None:
+                    break
+                request_finished.wait(0.01)
+            self.assertIsNotNone(pending)
+            assert pending is not None
+
+            checkpoint_job = CheckpointJob(
+                job_id=JobId.new(),
+                sandbox_id=sandbox_id,
+                requested_at=utc_now(),
+                reason="manual",
+                leave_running=True,
+                metadata=system._build_checkpoint_metadata(sandbox_id),
+            )
+            checkpoint_result = executor.run_checkpoint(checkpoint_job)
+            self.assertEqual(checkpoint_result.status, JobStatus.SUCCEEDED)
+            restore_result = system.restore_once(sandbox_id, checkpoint_result.checkpoint_id)
+            self.assertEqual(restore_result.status, JobStatus.SUCCEEDED)
+            self.assertTrue(system._release_checkpoint_response_gate(sandbox_id, checkpoint_result.checkpoint_id))
+
+            thread.join(timeout=2.0)
+            self.assertTrue(request_finished.is_set())
+            self.assertIn("body", response_payload)
+            self.assertEqual(request_store.get(sandbox_id).completed_llm_requests, 1)
+            executor.shutdown()
+
+    def test_restore_validation_can_reject_invalid_live_request_checkpoint_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
+            root = Path(tmp)
+            runner = FakeCommandRunner()
+            telemetry = InMemoryTelemetrySink()
+            collector = InMemoryEBPFEventCollector()
+            inspector = EBPFSandboxInspector(collector)
+            request_store = InMemoryRequestStateStore()
+            system, executor = self._build_runc_system(
+                root=root,
+                runner=runner,
+                telemetry=telemetry,
+                inspector=inspector,
+                request_store=request_store,
+                enforce_restore_checkpoint_validation=True,
+            )
+            sandbox_id = system.sandbox_manager.launch(
+                "runc",
+                {
+                    "sandbox_id": "sbx-restore-validate",
+                    "bundle_path": str(root / "bundles" / "sbx-restore-validate"),
+                },
+            )
+            inspector.upsert_snapshot(
+                SandboxSnapshot(
+                    sandbox_id=sandbox_id,
+                    runtime_name="runc",
+                    is_running=True,
+                    process_changed=True,
+                    filesystem_changed=True,
+                    observed_at=utc_now(),
+                )
+            )
+
+            checkpoint_job = CheckpointJob(
+                job_id=JobId.new(),
+                sandbox_id=sandbox_id,
+                requested_at=utc_now(),
+                reason="manual",
+                leave_running=True,
+                metadata={
+                    "captures_inflight_llm": True,
+                    "captured_request_id": "req-missing",
+                },
+            )
+            checkpoint_result = executor.run_checkpoint(checkpoint_job)
+            self.assertEqual(checkpoint_result.status, JobStatus.SUCCEEDED)
+
+            restore_result = system.restore_once(sandbox_id, checkpoint_result.checkpoint_id)
+
+            self.assertEqual(restore_result.status, JobStatus.FAILED)
+            self.assertEqual(restore_result.failure_code, FailureCode.VALIDATION_ERROR)
+            self.assertIn("no matching interceptor-held request is pending", restore_result.message)
+            self.assertFalse(
+                any(command[3] == "restore" for command in runner.commands if len(command) > 3),
+            )
+            executor.shutdown()
+
+    def test_fault_notification_skips_stale_live_request_checkpoint_for_older_safe_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
+            root = Path(tmp)
+            runner = FakeCommandRunner()
+            telemetry = InMemoryTelemetrySink()
+            collector = InMemoryEBPFEventCollector()
+            inspector = EBPFSandboxInspector(collector)
+            request_store = InMemoryRequestStateStore()
+            system, executor = self._build_runc_system(
+                root=root,
+                runner=runner,
+                telemetry=telemetry,
+                inspector=inspector,
+                request_store=request_store,
+                enforce_restore_checkpoint_validation=True,
+            )
+            sandbox_id = system.sandbox_manager.launch(
+                "runc",
+                {
+                    "sandbox_id": "sbx-stale-skip",
+                    "bundle_path": str(root / "bundles" / "sbx-stale-skip"),
+                },
+            )
+            inspector.upsert_snapshot(
+                SandboxSnapshot(
+                    sandbox_id=sandbox_id,
+                    runtime_name="runc",
+                    is_running=True,
+                    process_changed=True,
+                    filesystem_changed=True,
+                    observed_at=utc_now(),
+                )
+            )
+            safe_checkpoint = system.checkpoint_if_due(sandbox_id)
+            self.assertIsNotNone(safe_checkpoint)
+            assert safe_checkpoint is not None
+
+            assert system.response_gate_registry is not None
+            system.response_gate_registry.enable()
+            context = RequestContext(
+                request_id="req-stale",
+                sandbox_id=sandbox_id,
+                started_at=utc_now(),
+                metadata={"provider": "openai"},
+            )
+            request_store.mark_request_start(context)
+            generation = system.response_gate_registry.arm(sandbox_id, context.request_id)
+            self.assertIsNotNone(generation)
+            inspector.upsert_snapshot(
+                SandboxSnapshot(
+                    sandbox_id=sandbox_id,
+                    runtime_name="runc",
+                    is_running=True,
+                    process_changed=True,
+                    filesystem_changed=True,
+                    observed_at=utc_now(),
+                )
+            )
+            stale_checkpoint = system.checkpoint_if_due(sandbox_id)
+            self.assertIsNotNone(stale_checkpoint)
+            assert stale_checkpoint is not None
+            self.assertNotEqual(safe_checkpoint.checkpoint_id, stale_checkpoint.checkpoint_id)
+            request_store.mark_request_end(context)
+
+            inspector.upsert_snapshot(
+                SandboxSnapshot(
+                    sandbox_id=sandbox_id,
+                    runtime_name="runc",
+                    is_running=False,
+                    process_changed=True,
+                    filesystem_changed=True,
+                    observed_at=utc_now(),
+                    last_checkpoint_at=utc_now(),
+                )
+            )
+
+            system.request_state_store = None
+            system.start()
+            try:
+                system.notify_fault(sandbox_id)
+                record = self._wait_for_record(system, sandbox_id, "fault")
+            finally:
+                system.stop()
+                executor.shutdown()
+
+            self.assertEqual(record.status, "restored")
+            self.assertEqual(record.checkpoint_id, safe_checkpoint.checkpoint_id)
+            self.assertIn(
+                (
+                    "runc",
+                    "--root",
+                    str(root / "runtime-state"),
+                    "restore",
+                    "-d",
+                    "--bundle",
+                    str(root / "bundles" / "sbx-stale-skip"),
+                    "--image-path",
+                    str(root / "checkpoints" / "sbx-stale-skip" / str(safe_checkpoint.checkpoint_id) / "process"),
+                    "--work-path",
+                    str(root / "checkpoints" / "sbx-stale-skip" / str(safe_checkpoint.checkpoint_id) / "work"),
+                    "--tcp-established",
+                    "--shell-job",
+                    "sbx-stale-skip",
+                ),
+                runner.commands,
+            )
+
+    def test_fault_notification_relaunches_when_no_satisfiable_live_request_checkpoint_exists(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
+            root = Path(tmp)
+            runner = FakeCommandRunner()
+            telemetry = InMemoryTelemetrySink()
+            collector = InMemoryEBPFEventCollector()
+            inspector = EBPFSandboxInspector(collector)
+            request_store = InMemoryRequestStateStore()
+            relaunched: list[tuple[SandboxId, str]] = []
+            system, executor = self._build_runc_system(
+                root=root,
+                runner=runner,
+                telemetry=telemetry,
+                inspector=inspector,
+                request_store=request_store,
+                relaunch_handler=lambda sandbox_id, event_type: relaunched.append((sandbox_id, event_type)),
+                enforce_restore_checkpoint_validation=True,
+            )
+            sandbox_id = system.sandbox_manager.launch(
+                "runc",
+                {
+                    "sandbox_id": "sbx-no-live-match",
+                    "bundle_path": str(root / "bundles" / "sbx-no-live-match"),
+                },
+            )
+            assert system.response_gate_registry is not None
+            system.response_gate_registry.enable()
+            context = RequestContext(
+                request_id="req-stale-only",
+                sandbox_id=sandbox_id,
+                started_at=utc_now(),
+                metadata={"provider": "openai"},
+            )
+            request_store.mark_request_start(context)
+            system.response_gate_registry.arm(sandbox_id, context.request_id)
+            inspector.upsert_snapshot(
+                SandboxSnapshot(
+                    sandbox_id=sandbox_id,
+                    runtime_name="runc",
+                    is_running=True,
+                    process_changed=True,
+                    filesystem_changed=True,
+                    observed_at=utc_now(),
+                )
+            )
+            stale_checkpoint = system.checkpoint_if_due(sandbox_id)
+            self.assertIsNotNone(stale_checkpoint)
+            request_store.mark_request_end(context)
+            inspector.upsert_snapshot(
+                SandboxSnapshot(
+                    sandbox_id=sandbox_id,
+                    runtime_name="runc",
+                    is_running=False,
+                    process_changed=True,
+                    filesystem_changed=True,
+                    observed_at=utc_now(),
+                    last_checkpoint_at=utc_now(),
+                )
+            )
+
+            system.start()
+            try:
+                system.notify_fault(sandbox_id)
+                record = self._wait_for_record(system, sandbox_id, "fault")
+            finally:
+                system.stop()
+                executor.shutdown()
+
+            self.assertEqual(record.status, "relaunched")
+            self.assertEqual(relaunched, [(sandbox_id, "fault")])
+            self.assertFalse(any(command[3] == "restore" for command in runner.commands if len(command) > 3))
 
     def test_fault_notification_relaunches_when_restore_fails(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:

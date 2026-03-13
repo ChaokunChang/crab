@@ -48,7 +48,16 @@ from .models import (
     SandboxSnapshot,
     SchedulerCheckpointDecision,
 )
-from .runtime import CommandRunner, DockerRuntimeAdapter, RuncRuntimeAdapter, RuncRuntimePaths, SubprocessCommandRunner
+from .runtime import (
+    CommandRunner,
+    DockerRuntimeAdapter,
+    RuncCheckpointOptions,
+    RuncRestoreOptions,
+    RuncRuntimeAdapter,
+    RuncRuntimeOptions,
+    RuncRuntimePaths,
+    SubprocessCommandRunner,
+)
 from .sandbox_manager import InMemorySandboxManager, RuncSandboxManager, RuncSandboxManagerPaths
 from .scheduler import (
     CRScheduler,
@@ -120,7 +129,10 @@ __all__ = [
     "RequestInterceptorHook",
     "RestoreJob",
     "RestoreResult",
+    "RuncCheckpointOptions",
     "RuncRuntimeAdapter",
+    "RuncRestoreOptions",
+    "RuncRuntimeOptions",
     "RuncRuntimePaths",
     "RuncSandboxManager",
     "RuncSandboxManagerPaths",

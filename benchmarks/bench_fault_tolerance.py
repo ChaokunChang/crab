@@ -61,6 +61,7 @@ def main() -> None:
         checkpoint_manager_factory=lambda base: LatestOnlyCheckpointManager(base),
         max_workers=args.sandboxes,
         auto_cr=args.auto_cr,
+        work_dir_host_root=args.work_dir_host_root,
     ) as harness:
         sandboxes = [harness.launch_sandbox(f"fault-{index}") for index in range(args.sandboxes)]
         rng = random.Random(0)
@@ -83,6 +84,7 @@ def main() -> None:
                 )
                 for index, sandbox in enumerate(sandboxes):
                     current = harness.wait_for_progress(sandbox, minimum_actions=6)
+                    pre_fault = harness.wait_for_action_delta(sandbox, delta=2)
                     if index not in injected:
                         rows.append(
                             {

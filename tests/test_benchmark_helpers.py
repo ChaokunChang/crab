@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from agent_cr import ArtifactKind, ArtifactReference, CheckpointId, CheckpointManifest, SandboxId
 from agent_cr.models import utc_now
@@ -9,8 +12,10 @@ from benchmarks.real_host_scenario_base import (
     bounded_probability,
     compute_summary,
     resolve_checkpoint_copy_plan,
+    resolve_work_dir_host_path,
     select_injected_indices,
     total_actions,
+    write_bundle_config,
 )
 
 
@@ -114,6 +119,63 @@ class BenchmarkHelperTests(unittest.TestCase):
         self.assertEqual(bounded_probability("0.3"), 0.3)
         with self.assertRaises(Exception):
             bounded_probability("3.0")
+
+    def test_resolve_work_dir_host_path_uses_per_sandbox_subdirectory(self) -> None:
+        root = Path("/tmp/bench-workdirs")
+        self.assertEqual(
+            resolve_work_dir_host_path(root, "sandbox-1"),
+            root / "sandbox-1",
+        )
+        self.assertIsNone(resolve_work_dir_host_path(None, "sandbox-1"))
+
+    def test_resolve_work_dir_host_path_makes_relative_roots_absolute(self) -> None:
+        self.assertEqual(
+            resolve_work_dir_host_path(Path("logs/tmp"), "sandbox-1"),
+            (Path.cwd() / "logs/tmp").resolve() / "sandbox-1",
+        )
+
+    def test_write_bundle_config_adds_work_dir_bind_mount(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = Path(tmp)
+            config_path = bundle_dir / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "linux": {"namespaces": [{"type": "network"}, {"type": "pid"}], "seccomp": {"defaultAction": "SCMP_ACT_ERRNO"}},
+                        "mounts": [{"destination": "/proc", "source": "proc", "type": "proc"}],
+                        "process": {"terminal": True, "cwd": "/", "args": [], "env": []},
+                        "root": {"path": "rootfs", "readonly": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            work_dir_host_path = bundle_dir / "host-work" / "sandbox-1"
+            write_bundle_config(
+                bundle_dir=bundle_dir,
+                interceptor_port=9000,
+                provider="openai",
+                sandbox_name="sandbox-1",
+                status_port=9001,
+                cgroup_path="agent-cr/test/sandbox-1",
+                work_dir_host_path=work_dir_host_path,
+            )
+
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+            work_mounts = [mount for mount in payload["mounts"] if mount["destination"] == "/work"]
+            self.assertEqual(
+                work_mounts,
+                [
+                    {
+                        "destination": "/work",
+                        "source": str(work_dir_host_path),
+                        "type": "bind",
+                        "options": ["rbind", "rw"],
+                    }
+                ],
+            )
+            self.assertTrue(work_dir_host_path.is_dir())
+            self.assertEqual(payload["process"]["cwd"], "/work")
 
 
 if __name__ == "__main__":

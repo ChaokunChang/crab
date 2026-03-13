@@ -58,6 +58,7 @@ def main() -> None:
         checkpoint_manager_factory=lambda base: DeleteAfterRestoreCheckpointManager(base),
         max_workers=args.sandboxes,
         auto_cr=args.auto_cr,
+        work_dir_host_root=args.work_dir_host_root,
     ) as harness:
         sandboxes = [harness.launch_sandbox(f"spot-{index}") for index in range(args.sandboxes)]
         rng = random.Random(0)

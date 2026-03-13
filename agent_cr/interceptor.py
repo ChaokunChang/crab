@@ -6,6 +6,7 @@ import threading
 import urllib.error
 import urllib.request
 import uuid
+from dataclasses import dataclass
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
@@ -131,11 +132,18 @@ class InMemoryRequestStateStore:
             self._condition.notify_all()
 
 
+@dataclass(frozen=True)
+class PendingSandboxResponse:
+    sandbox_id: SandboxId
+    request_id: str
+    generation: int
+
+
 class SandboxResponseGateRegistry:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._enabled = False
-        self._states: dict[SandboxId, dict[str, int | bool | threading.Condition]] = {}
+        self._states: dict[SandboxId, dict[str, int | bool | str | None | threading.Condition]] = {}
 
     def enable(self) -> None:
         with self._lock:
@@ -148,12 +156,13 @@ class SandboxResponseGateRegistry:
             for state in self._states.values():
                 state["active"] = False
                 state["released_generation"] = state["generation"]
+                state["request_id"] = None
         for condition in conditions:
             assert isinstance(condition, threading.Condition)
             with condition:
                 condition.notify_all()
 
-    def arm(self, sandbox_id: SandboxId) -> int | None:
+    def arm(self, sandbox_id: SandboxId, request_id: str) -> int | None:
         with self._lock:
             if not self._enabled:
                 return None
@@ -164,12 +173,13 @@ class SandboxResponseGateRegistry:
                     "generation": 0,
                     "released_generation": 0,
                     "active": False,
+                    "request_id": None,
                     "condition": condition,
                 }
                 self._states[sandbox_id] = state
-            if not bool(state["active"]):
-                state["generation"] = int(state["generation"]) + 1
-                state["active"] = True
+            state["generation"] = int(state["generation"]) + 1
+            state["active"] = True
+            state["request_id"] = request_id
             return int(state["generation"])
 
     def wait_for_release(self, sandbox_id: SandboxId, generation: int | None, timeout: float | None = None) -> None:
@@ -187,6 +197,40 @@ class SandboxResponseGateRegistry:
                 timeout=timeout,
             )
 
+    def get_pending(self, sandbox_id: SandboxId) -> PendingSandboxResponse | None:
+        with self._lock:
+            state = self._states.get(sandbox_id)
+            if state is None or not bool(state["active"]):
+                return None
+            request_id = state.get("request_id")
+            if not isinstance(request_id, str) or not request_id:
+                return None
+            return PendingSandboxResponse(
+                sandbox_id=sandbox_id,
+                request_id=request_id,
+                generation=int(state["generation"]),
+            )
+
+    def release_pending(self, sandbox_id: SandboxId, *, request_id: str, generation: int | None = None) -> bool:
+        with self._lock:
+            state = self._states.get(sandbox_id)
+            if state is None or not bool(state["active"]):
+                return False
+            current_request_id = state.get("request_id")
+            current_generation = int(state["generation"])
+            if current_request_id != request_id:
+                return False
+            if generation is not None and current_generation != generation:
+                return False
+            state["active"] = False
+            state["released_generation"] = current_generation
+            state["request_id"] = None
+            condition = state["condition"]
+            assert isinstance(condition, threading.Condition)
+        with condition:
+            condition.notify_all()
+        return True
+
     def release(self, sandbox_id: SandboxId) -> None:
         with self._lock:
             state = self._states.get(sandbox_id)
@@ -194,6 +238,7 @@ class SandboxResponseGateRegistry:
                 return
             state["active"] = False
             state["released_generation"] = int(state["generation"])
+            state["request_id"] = None
             condition = state["condition"]
             assert isinstance(condition, threading.Condition)
         with condition:
@@ -284,7 +329,7 @@ class AgentCRRequestInterceptor:
         self._request_state_store.mark_request_start(context)
         gate_generation = None
         if self._response_gate_registry is not None:
-            gate_generation = self._response_gate_registry.arm(context.sandbox_id)
+            gate_generation = self._response_gate_registry.arm(context.sandbox_id, context.request_id)
         self._notify(context.sandbox_id)
         try:
             response = self._upstream_transport(path, headers, body)

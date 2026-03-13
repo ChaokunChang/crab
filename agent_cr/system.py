@@ -11,12 +11,14 @@ from typing import Callable
 from .config import ExecutorConfig, SchedulerConfig, StorageConfig
 from .contracts import CheckpointManager, SandboxInspector
 from .executor import CRExecutor
-from .ids import JobId
+from .ids import CheckpointId, JobId
 from .inspector import EBPFSandboxInspector
 from .interceptor import InMemoryRequestStateStore, RequestAwareSandboxInspector, SandboxResponseGateRegistry
 from .models import (
     CheckpointJob,
     CheckpointResult,
+    FailureCode,
+    JobStatus,
     RecoveryEvent,
     RecoveryRecord,
     RestoreJob,
@@ -24,7 +26,7 @@ from .models import (
     SandboxId,
     utc_now,
 )
-from .runtime import DockerRuntimeAdapter, RuncRuntimeAdapter
+from .runtime import DockerRuntimeAdapter, RuncRuntimeAdapter, RuncRuntimeOptions
 from .sandbox_manager import InMemorySandboxManager, RuncSandboxManager
 from .scheduler import CRScheduler, InMemorySchedulerStateStore, SchedulerPolicy
 from .storage import LocalCheckpointManager
@@ -37,8 +39,14 @@ from .workers import (
     DefaultCWorker,
     DefaultRWorker,
 )
+from .workers.composite import resolve_restore_manifest
 
 logger = logging.getLogger(__name__)
+
+_CAPTURES_INFLIGHT_LLM = "captures_inflight_llm"
+_CAPTURED_REQUEST_ID = "captured_request_id"
+_CAPTURED_REQUEST_PROVIDER = "captured_request_provider"
+_CAPTURED_REQUEST_STARTED_AT = "captured_request_started_at"
 
 
 @dataclass
@@ -53,6 +61,7 @@ class AgentCRSystem:
     response_gate_registry: SandboxResponseGateRegistry | None = None
     relaunch_handler: Callable[[SandboxId, str], None] | None = None
     recovery_delay_seconds: float = 0.0
+    enforce_restore_checkpoint_validation: bool = False
     _interceptor_lock: Lock = field(init=False, repr=False)
     _interceptor_pending: set[SandboxId] = field(init=False, repr=False)
     _coordination_lock: Lock = field(init=False, repr=False)
@@ -110,7 +119,7 @@ class AgentCRSystem:
         self._recovery_thread = None
         logger.info("Stopped AgentCRSystem background loops")
 
-    def checkpoint_once(self, sandbox_id: SandboxId) -> CheckpointResult:
+    def checkpoint_once(self, sandbox_id: SandboxId, leave_running: bool=False) -> CheckpointResult:
         logger.info("Running manual checkpoint for sandbox %s", sandbox_id)
         paused = self._pause_for_manual_checkpoint(sandbox_id)
         result: CheckpointResult | None = None
@@ -121,7 +130,7 @@ class AgentCRSystem:
                 sandbox_id=sandbox_id,
                 requested_at=utc_now(),
                 reason="manual",
-                leave_running=False,
+                leave_running=leave_running,
             )
             result = self.executor.run_checkpoint(job)
             if result.status.value == "succeeded":
@@ -164,11 +173,35 @@ class AgentCRSystem:
 
     def restore_once(self, sandbox_id: SandboxId, checkpoint_id) -> RestoreResult:
         logger.info("Running manual restore for sandbox %s checkpoint=%s", sandbox_id, checkpoint_id)
+        started = utc_now()
+        restore_checkpoint_id = CheckpointId(str(checkpoint_id))
+        restore_message = (
+            self._validate_restore_checkpoint(sandbox_id, restore_checkpoint_id)
+            if self.enforce_restore_checkpoint_validation
+            else None
+        )
+        if restore_message is not None:
+            logger.warning(
+                "Skipping restore for sandbox=%s checkpoint=%s message=%s",
+                sandbox_id,
+                restore_checkpoint_id,
+                restore_message,
+            )
+            return RestoreResult(
+                job_id=JobId.new(),
+                sandbox_id=sandbox_id,
+                checkpoint_id=restore_checkpoint_id,
+                status=JobStatus.FAILED,
+                started_at=started,
+                finished_at=utc_now(),
+                failure_code=FailureCode.VALIDATION_ERROR,
+                message=restore_message,
+            )
         self.sandbox_manager.prepare_for_restore(sandbox_id)
         job = RestoreJob(
             job_id=JobId.new(),
             sandbox_id=sandbox_id,
-            checkpoint_id=checkpoint_id,
+            checkpoint_id=restore_checkpoint_id,
             requested_at=utc_now(),
             reason="manual",
         )
@@ -179,7 +212,7 @@ class AgentCRSystem:
         logger.info(
             "Manual restore for sandbox %s checkpoint=%s finished with status=%s",
             sandbox_id,
-            checkpoint_id,
+            restore_checkpoint_id,
             result.status.value,
         )
         return result
@@ -336,7 +369,7 @@ class AgentCRSystem:
                         checkpoint_result.message,
                     )
             if checkpoint_id is None:
-                checkpoint_id = self._latest_checkpoint_id(event.sandbox_id)
+                checkpoint_id = self._select_recovery_checkpoint(event.sandbox_id)
                 logger.info(
                     "Resolved latest checkpoint for recovery sandbox=%s checkpoint=%s",
                     event.sandbox_id,
@@ -374,6 +407,7 @@ class AgentCRSystem:
                 )
                 restore_result = self.restore_once(event.sandbox_id, checkpoint_id)
                 if restore_result.status.value == "succeeded":
+                    self._release_checkpoint_response_gate(event.sandbox_id, checkpoint_id)
                     status = "restored"
                     logger.info(
                         "Recovery restore succeeded sandbox=%s checkpoint=%s",
@@ -448,12 +482,15 @@ class AgentCRSystem:
                     "checkpoint_id": "" if checkpoint_id is None else str(checkpoint_id),
                 },
             )
+            with self._interceptor_lock:
+                self._interceptor_pending.discard(event.sandbox_id)
             self._release_coordination(event.sandbox_id)
 
     def _execute_checkpoint_flow(self, sandbox_id: SandboxId) -> CheckpointResult | None:
         decision = self.scheduler.query_checkpoint(sandbox_id)
         if not decision.should_checkpoint:
             return None
+        checkpoint_metadata = self._build_checkpoint_metadata(sandbox_id)
 
         job = CheckpointJob(
             job_id=JobId.new(),
@@ -463,7 +500,7 @@ class AgentCRSystem:
             checkpoint_process=decision.checkpoint_process,
             checkpoint_filesystem=decision.checkpoint_filesystem,
             leave_running=decision.leave_running,
-            metadata={"policy": decision.policy_name, **decision.metadata},
+            metadata={"policy": decision.policy_name, **decision.metadata, **checkpoint_metadata},
         )
         result: CheckpointResult | None = None
         try:
@@ -486,6 +523,134 @@ class AgentCRSystem:
         if not checkpoints:
             return None
         return checkpoints[-1]
+
+    def _build_checkpoint_metadata(self, sandbox_id: SandboxId) -> dict[str, object]:
+        metadata: dict[str, object] = {_CAPTURES_INFLIGHT_LLM: False}
+        if self.request_state_store is None or self.response_gate_registry is None:
+            return metadata
+        request_state = self.request_state_store.get(sandbox_id)
+        pending = self.response_gate_registry.get_pending(sandbox_id)
+        if not request_state.llm_request_in_flight or pending is None:
+            return metadata
+        if request_state.last_request_id != pending.request_id:
+            return metadata
+        metadata[_CAPTURES_INFLIGHT_LLM] = True
+        metadata[_CAPTURED_REQUEST_ID] = pending.request_id
+        if request_state.last_llm_provider is not None:
+            metadata[_CAPTURED_REQUEST_PROVIDER] = request_state.last_llm_provider
+        if request_state.last_llm_request_started_at is not None:
+            metadata[_CAPTURED_REQUEST_STARTED_AT] = request_state.last_llm_request_started_at.isoformat()
+        logger.info(
+            "Checkpoint captured live request sandbox=%s request_id=%s",
+            sandbox_id,
+            pending.request_id,
+        )
+        self.telemetry.emit_event(
+            "checkpoint.captured_live_request",
+            {
+                "sandbox_id": str(sandbox_id),
+                "request_id": pending.request_id,
+            },
+        )
+        return metadata
+
+    def _validate_restore_checkpoint(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> str | None:
+        manifest = self._resolve_restore_manifest(sandbox_id, checkpoint_id)
+        if not bool(manifest.metadata.get(_CAPTURES_INFLIGHT_LLM, False)):
+            return None
+        captured_request_id = str(manifest.metadata.get(_CAPTURED_REQUEST_ID, "")).strip()
+        if not captured_request_id:
+            return f"checkpoint {checkpoint_id} advertises live-request restore without captured_request_id"
+        pending = None if self.response_gate_registry is None else self.response_gate_registry.get_pending(sandbox_id)
+        if pending is None:
+            return (
+                f"checkpoint {checkpoint_id} captured live request {captured_request_id} "
+                "but no matching interceptor-held request is pending"
+            )
+        if pending.request_id != captured_request_id:
+            return (
+                f"checkpoint {checkpoint_id} captured live request {captured_request_id} "
+                f"but current pending request is {pending.request_id}"
+            )
+        return None
+
+    def _select_recovery_checkpoint(self, sandbox_id: SandboxId) -> CheckpointId | None:
+        checkpoints = list(reversed(self.storage.list_checkpoints(sandbox_id)))
+        for checkpoint_id in checkpoints:
+            validation_message = (
+                self._validate_restore_checkpoint(sandbox_id, checkpoint_id)
+                if self.enforce_restore_checkpoint_validation
+                else None
+            )
+            if validation_message is None:
+                return checkpoint_id
+            manifest = self._resolve_restore_manifest(sandbox_id, checkpoint_id)
+            if not bool(manifest.metadata.get(_CAPTURES_INFLIGHT_LLM, False)):
+                logger.warning(
+                    "Skipping checkpoint after validation failure sandbox=%s checkpoint=%s message=%s",
+                    sandbox_id,
+                    checkpoint_id,
+                    validation_message,
+                )
+                continue
+            logger.warning(
+                "Skipping stale live-request checkpoint sandbox=%s checkpoint=%s message=%s",
+                sandbox_id,
+                checkpoint_id,
+                validation_message,
+            )
+            self.telemetry.emit_event(
+                "recovery.checkpoint_skipped_stale_request",
+                {
+                    "sandbox_id": str(sandbox_id),
+                    "checkpoint_id": str(checkpoint_id),
+                    "message": validation_message,
+                },
+            )
+        logger.warning("No restorable checkpoint available for sandbox=%s", sandbox_id)
+        self.telemetry.emit_event(
+            "recovery.no_satisfiable_checkpoint",
+            {"sandbox_id": str(sandbox_id)},
+        )
+        return None
+
+    def _resolve_restore_manifest(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId):
+        manifest = self.storage.get_manifest(sandbox_id, checkpoint_id)
+        return resolve_restore_manifest(self.storage, manifest)
+
+    def _release_checkpoint_response_gate(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> bool:
+        if self.response_gate_registry is None:
+            return False
+        manifest = self._resolve_restore_manifest(sandbox_id, checkpoint_id)
+        if not bool(manifest.metadata.get(_CAPTURES_INFLIGHT_LLM, False)):
+            return False
+        captured_request_id = str(manifest.metadata.get(_CAPTURED_REQUEST_ID, "")).strip()
+        if not captured_request_id:
+            return False
+        pending = self.response_gate_registry.get_pending(sandbox_id)
+        if pending is None or pending.request_id != captured_request_id:
+            return False
+        released = self.response_gate_registry.release_pending(
+            sandbox_id,
+            request_id=captured_request_id,
+            generation=pending.generation,
+        )
+        if released:
+            logger.info(
+                "Released buffered response to restored sandbox=%s request_id=%s checkpoint=%s",
+                sandbox_id,
+                captured_request_id,
+                checkpoint_id,
+            )
+            self.telemetry.emit_event(
+                "recovery.response_released",
+                {
+                    "sandbox_id": str(sandbox_id),
+                    "request_id": captured_request_id,
+                    "checkpoint_id": str(checkpoint_id),
+                },
+            )
+        return released
 
     def _merge_snapshot_metadata(self, sandbox_id: SandboxId, **metadata: object) -> None:
         upsert = getattr(self.inspector, "upsert_snapshot", None)
@@ -584,11 +749,13 @@ def build_default_system(
     scheduler_config: SchedulerConfig | None = None,
     executor_config: ExecutorConfig | None = None,
     storage_config: StorageConfig | None = None,
+    runc_runtime_options: RuncRuntimeOptions | None = None,
     use_in_memory_telemetry: bool = True,
     request_state_store: InMemoryRequestStateStore | None = None,
     scheduler_policy: SchedulerPolicy | None = None,
     checkpoint_manager: CheckpointManager | None = None,
     relaunch_handler: Callable[[SandboxId, str], None] | None = None,
+    enforce_restore_checkpoint_validation: bool = False,
 ) -> AgentCRSystem:
     logger.info("Building default agent-cr system with runtime=%s storage_root=%s", runtime, storage_root)
     scheduler_cfg = scheduler_config or SchedulerConfig()
@@ -599,7 +766,7 @@ def build_default_system(
         adapter = DockerRuntimeAdapter()
         sandbox_manager = InMemorySandboxManager()
     elif runtime == "runc":
-        adapter = RuncRuntimeAdapter()
+        adapter = RuncRuntimeAdapter(options=runc_runtime_options)
         sandbox_manager = RuncSandboxManager()
     else:
         raise ValueError(f"unsupported runtime adapter: {runtime}")
@@ -644,4 +811,5 @@ def build_default_system(
         response_gate_registry=response_gate_registry,
         relaunch_handler=relaunch_handler,
         recovery_delay_seconds=0.0,
+        enforce_restore_checkpoint_validation=enforce_restore_checkpoint_validation,
     )

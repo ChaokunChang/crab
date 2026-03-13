@@ -139,6 +139,44 @@ class SimulatedAgentTests(unittest.TestCase):
             self.assertEqual(reloaded.memory_notes, ["remembered"])
             self.assertNotEqual(reloaded.state["runtime_id"], first_runtime_id)
 
+    def test_runtime_writes_info_warning_and_debug_logs_to_work_dir(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sim_agent_") as tmp:
+            runtime = AgentRuntime(
+                provider="openai",
+                interceptor_url="http://127.0.0.1:1",
+                sandbox_id="sbx-logs",
+                work_dir=Path(tmp),
+                poll_interval_s=0.0,
+                status_port=0,
+            )
+
+            calls = iter(
+                [
+                    TimeoutError("socket dropped"),
+                    [{"name": "show_pwd", "input": {}}],
+                ]
+            )
+
+            def fake_fetch() -> list[dict[str, object]]:
+                item = next(calls)
+                if isinstance(item, Exception):
+                    raise item
+                return item
+
+            runtime.fetch_tool_calls = fake_fetch  # type: ignore[method-assign]
+
+            runtime.run_cycle()
+            runtime.run_cycle()
+            for handler in runtime.logger.handlers:
+                handler.flush()
+
+            log_text = runtime.log_path.read_text(encoding="utf-8")
+            self.assertIn("INFO agent runtime started", log_text)
+            self.assertIn("DEBUG starting agent cycle", log_text)
+            self.assertIn("WARNING runtime error stage=fetch_tool_calls", log_text)
+            self.assertIn("INFO running tool name=show_pwd", log_text)
+            self.assertIn("DEBUG tool result name=show_pwd", log_text)
+
 
 if __name__ == "__main__":
     unittest.main()
