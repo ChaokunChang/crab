@@ -193,7 +193,10 @@ class CRExecutor:
                     attempt + 1,
                 )
                 last_result = self._checkpoint_worker.checkpoint(job)
-                if last_result.status == JobStatus.SUCCEEDED:
+                if (
+                    last_result.status == JobStatus.SUCCEEDED
+                    or last_result.failure_code == FailureCode.VALIDATION_ERROR
+                ):
                     break
             except Exception as exc:
                 logger.exception(
@@ -258,7 +261,10 @@ class CRExecutor:
                 "checkpoint_id": str(last_result.checkpoint_id),
             },
         )
-        log_fn = logger.info if last_result.status == JobStatus.SUCCEEDED else logger.error
+        log_fn = logger.info if (
+            last_result.status == JobStatus.SUCCEEDED
+            or last_result.failure_code == FailureCode.VALIDATION_ERROR
+        ) else logger.error
         log_fn(
             "Finished checkpoint job %s for sandbox %s with status=%s checkpoint=%s",
             job.job_id,

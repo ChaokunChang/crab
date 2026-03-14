@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import logging
 from pathlib import Path
 from queue import Empty, Queue
@@ -49,6 +49,19 @@ _CAPTURES_INFLIGHT_LLM = "captures_inflight_llm"
 _CAPTURED_REQUEST_ID = "captured_request_id"
 _CAPTURED_REQUEST_PROVIDER = "captured_request_provider"
 _CAPTURED_REQUEST_STARTED_AT = "captured_request_started_at"
+
+
+def _checkpoint_guard_from_inspector(inspector: SandboxInspector) -> Callable[[CheckpointJob], tuple[bool, str | None]]:
+    def guard(job: CheckpointJob) -> tuple[bool, str | None]:
+        try:
+            snapshot = inspector.inspect(job.sandbox_id)
+        except Exception:
+            return True, None
+        if snapshot.is_running:
+            return True, None
+        return False, "sandbox_not_running"
+
+    return guard
 
 
 @dataclass
@@ -221,6 +234,7 @@ class AgentCRSystem:
 
     def notify_fault(self, sandbox_id: SandboxId, *, reason: str = "fault") -> None:
         logger.info("Received fault notification for sandbox=%s reason=%s", sandbox_id, reason)
+        self._mark_sandbox_not_running(sandbox_id)
         event = RecoveryEvent(
             sandbox_id=sandbox_id,
             event_type="fault",
@@ -780,6 +794,12 @@ class AgentCRSystem:
 
     def _resume_sandbox(self, sandbox_id: SandboxId) -> None:
         try:
+            snapshot = self.inspector.inspect(sandbox_id)
+        except Exception:
+            snapshot = None
+        if snapshot is not None and not snapshot.is_running:
+            return
+        try:
             description = self.sandbox_manager.describe(sandbox_id)
         except Exception:
             return
@@ -789,6 +809,26 @@ class AgentCRSystem:
             self.sandbox_manager.resume(sandbox_id)
         except Exception:
             logger.exception("Failed to resume sandbox %s", sandbox_id)
+
+    def _mark_sandbox_not_running(self, sandbox_id: SandboxId) -> None:
+        upsert = getattr(self.inspector, "upsert_snapshot", None)
+        if upsert is not None:
+            try:
+                snapshot = self.inspector.inspect(sandbox_id)
+            except Exception:
+                snapshot = None
+            if snapshot is not None and snapshot.is_running:
+                upsert(
+                    replace(
+                        snapshot,
+                        is_running=False,
+                        observed_at=utc_now(),
+                    )
+                )
+        try:
+            self.sandbox_manager.sync_runtime_state(sandbox_id, is_running=False)
+        except Exception:
+            logger.debug("Failed to sync runtime state for faulted sandbox %s", sandbox_id, exc_info=True)
 
     def _release_response_gate(self, sandbox_id: SandboxId) -> None:
         if self.response_gate_registry is not None:
@@ -844,16 +884,6 @@ def build_default_system(
 
     telemetry = InMemoryTelemetrySink() if use_in_memory_telemetry else NoopTelemetrySink()
     storage = checkpoint_manager or LocalCheckpointManager(store_cfg)
-
-    process_c = AdapterProcessCWorker(adapter)
-    process_r = AdapterProcessRWorker(adapter)
-    fs_c = AdapterFileSystemCWorker(adapter)
-    fs_r = AdapterFileSystemRWorker(adapter)
-
-    c_worker = DefaultCWorker(process_c, fs_c, storage, adapter)
-    r_worker = DefaultRWorker(process_r, fs_r, storage)
-
-    executor = CRExecutor(executor_cfg, c_worker, r_worker, telemetry)
     request_store = request_state_store or InMemoryRequestStateStore()
     response_gate_registry = SandboxResponseGateRegistry()
     base_inspector: SandboxInspector
@@ -862,6 +892,22 @@ def build_default_system(
     else:
         base_inspector = EBPFSandboxInspector()
     inspector = RequestAwareSandboxInspector(base_inspector, request_store)
+
+    process_c = AdapterProcessCWorker(adapter)
+    process_r = AdapterProcessRWorker(adapter)
+    fs_c = AdapterFileSystemCWorker(adapter)
+    fs_r = AdapterFileSystemRWorker(adapter)
+
+    c_worker = DefaultCWorker(
+        process_c,
+        fs_c,
+        storage,
+        adapter,
+        checkpoint_guard=_checkpoint_guard_from_inspector(inspector),
+    )
+    r_worker = DefaultRWorker(process_r, fs_r, storage)
+
+    executor = CRExecutor(executor_cfg, c_worker, r_worker, telemetry)
     scheduler = CRScheduler(
         scheduler_cfg,
         inspector,

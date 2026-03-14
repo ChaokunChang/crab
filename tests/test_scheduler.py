@@ -62,6 +62,16 @@ class RecordingSandboxManager:
             metadata=current.metadata,
         )
 
+    def sync_runtime_state(self, sandbox_id: SandboxId, *, is_running: bool) -> None:
+        self.calls.append(("sync_runtime_state", sandbox_id))
+        current = self._items[sandbox_id]
+        self._items[sandbox_id] = SandboxDescription(
+            sandbox_id=sandbox_id,
+            runtime_name=current.runtime_name,
+            status="running" if is_running else "stopped",
+            metadata=current.metadata,
+        )
+
     def delete(self, sandbox_id: SandboxId) -> None:
         self.calls.append(("delete", sandbox_id))
         self._items.pop(sandbox_id, None)
@@ -125,6 +135,27 @@ class SchedulerTests(unittest.TestCase):
         self.assertFalse(decision.leave_running)
         self.assertEqual(self.sandbox_manager.calls, [("pause", self.sandbox_id)])
         self.assertEqual(self.sandbox_manager.describe(self.sandbox_id).status, "paused")
+
+    def test_query_does_not_resume_after_pause_when_inspector_reports_not_running(self) -> None:
+        self.inspector.upsert_snapshot(
+            SandboxSnapshot(
+                sandbox_id=self.sandbox_id,
+                runtime_name="runc",
+                is_running=False,
+                process_changed=False,
+                filesystem_changed=False,
+                observed_at=utc_now(),
+            )
+        )
+
+        decision = self.scheduler.query_checkpoint(self.sandbox_id)
+
+        self.assertFalse(decision.should_checkpoint)
+        self.assertEqual(
+            self.sandbox_manager.calls,
+            [("pause", self.sandbox_id), ("sync_runtime_state", self.sandbox_id)],
+        )
+        self.assertEqual(self.sandbox_manager.describe(self.sandbox_id).status, "stopped")
 
     def test_query_promotes_filesystem_change_to_full_checkpoint(self) -> None:
         self.inspector.upsert_snapshot(

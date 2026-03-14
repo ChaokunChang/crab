@@ -42,6 +42,8 @@ from agent_cr import (
     EBPFEvent,
     EBPFEventKind,
     EBPFSandboxInspector,
+    HostInspectorServiceClient,
+    RemoteSandboxInspector,
     ExecutorConfig,
     InMemoryEBPFEventCollector,
     InMemoryRequestStateStore,
@@ -63,10 +65,29 @@ from agent_cr import (
     TelemetryRequestInterceptorHook,
 )
 from agent_cr.models import ArtifactPayload, utc_now
+from agent_cr.host_inspector.fs_helper import LibbpfFilesystemMonitor
+from agent_cr.host_inspector.runtime_resolver import RuntimeResolver
+from agent_cr.host_inspector.server import HostInspectorDaemon, HostInspectorServer
 from simulated_agent.image import build_image, export_image_rootfs
 from simulated_agent.service import serve
 
 logger = logging.getLogger(__name__)
+
+_HOST_INSPECTOR_HOST = "127.0.0.1"
+_HOST_INSPECTOR_PORT = 9782
+
+
+def checkpoint_guard_from_inspector(inspector):
+    def guard(job):
+        try:
+            snapshot = inspector.inspect(job.sandbox_id)
+        except Exception:
+            return True, None
+        if snapshot.is_running:
+            return True, None
+        return False, "sandbox_not_running"
+
+    return guard
 
 
 def configure_logging(level_name: str) -> None:
@@ -419,6 +440,7 @@ class RealHostScenarioHarness:
         self.pool_name = ""
         self.image_tag = ""
         self.runtime_state_root: Path | None = None
+        self._host_inspector_server: HostInspectorServer | None = None
         self.telemetry: InMemoryTelemetrySink | None = None
         self.collector: InMemoryEBPFEventCollector | None = None
         self.request_state_store: InMemoryRequestStateStore | None = None
@@ -442,6 +464,42 @@ class RealHostScenarioHarness:
         self._tree_search_network_leases: dict[SandboxId, TreeSearchNetworkLease] = {}
         self._tree_search_ip_to_sandbox: dict[str, SandboxId] = {}
 
+    def _start_host_inspector_server(self) -> str:
+        assert self.runtime_state_root is not None
+        if self._host_inspector_server is not None:
+            return f"http://{_HOST_INSPECTOR_HOST}:{_HOST_INSPECTOR_PORT}"
+
+        self.runtime_state_root.mkdir(parents=True, exist_ok=True)
+        self._host_inspector_server = HostInspectorServer(
+            host=_HOST_INSPECTOR_HOST,
+            port=_HOST_INSPECTOR_PORT,
+            daemon=HostInspectorDaemon(
+                resolver=RuntimeResolver(runc_state_root=self.runtime_state_root),
+                fs_monitor=LibbpfFilesystemMonitor(),
+            ),
+        )
+        logger.info(
+            "Starting host inspector server in-process host=%s port=%d runc_state_root=%s",
+            _HOST_INSPECTOR_HOST,
+            _HOST_INSPECTOR_PORT,
+            self.runtime_state_root,
+        )
+        self._host_inspector_server.start()
+        url = f"http://{_HOST_INSPECTOR_HOST}:{_HOST_INSPECTOR_PORT}"
+        try:
+            wait_for_http_json(f"{url}/healthz")
+        except Exception:
+            self._stop_host_inspector_server()
+            raise
+        return url
+
+    def _stop_host_inspector_server(self) -> None:
+        server = self._host_inspector_server
+        self._host_inspector_server = None
+        if server is None:
+            return
+        server.stop()
+
     def __enter__(self) -> "RealHostScenarioHarness":
         require_binaries()
         self._tmpdir = tempfile.TemporaryDirectory(prefix="agent_cr_scenario_bench_")
@@ -450,6 +508,7 @@ class RealHostScenarioHarness:
         self.pool_name = f"agentcrbench{unique_suffix}"
         self.image_tag = f"agent-cr-scenario-bench:{unique_suffix}"
         self.runtime_state_root = self.root / "runtime-state"
+        host_inspector_url = self._start_host_inspector_server()
         self.llm_server = serve(host="127.0.0.1", port=0, response_delay_ms=250)
         self.llm_thread = threading.Thread(target=self.llm_server.serve_forever, daemon=True)
         self.llm_thread.start()
@@ -463,7 +522,9 @@ class RealHostScenarioHarness:
         self.telemetry = InMemoryTelemetrySink()
         self.collector = InMemoryEBPFEventCollector()
         self.request_state_store = InMemoryRequestStateStore()
-        self.base_inspector = EBPFSandboxInspector(self.collector)
+
+        host_inspector_client = HostInspectorServiceClient(host_inspector_url)
+        self.base_inspector = RemoteSandboxInspector(host_inspector_client)
         self.inspector = RequestAwareSandboxInspector(self.base_inspector, self.request_state_store)
         self.runtime = RuncRuntimeAdapter(
             paths=RuncRuntimePaths(
@@ -482,6 +543,7 @@ class RealHostScenarioHarness:
                 AdapterFileSystemCWorker(self.runtime),
                 self.storage,
                 self.runtime,
+                checkpoint_guard=checkpoint_guard_from_inspector(self.inspector),
             ),
             DefaultRWorker(
                 AdapterProcessRWorker(self.runtime),
@@ -496,7 +558,8 @@ class RealHostScenarioHarness:
                 bundle_root=self.root / "bundles",
                 metadata_root=self.root / "sandbox-meta",
                 zfs_dataset_prefix=f"{self.pool_name}/agent-cr",
-            )
+            ),
+            host_inspector_client=host_inspector_client
         )
         self.system = AgentCRSystem(
             scheduler=CRScheduler(
@@ -584,6 +647,7 @@ class RealHostScenarioHarness:
             self.llm_server.server_close()
         if self.llm_thread is not None:
             self.llm_thread.join(timeout=5.0)
+        self._stop_host_inspector_server()
         if self._tmpdir is not None:
             self._tmpdir.cleanup()
 

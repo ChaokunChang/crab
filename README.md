@@ -161,9 +161,9 @@ python3 benchmarks/bench_spot_agent.py --auto-cr --sandboxes 1 --iters 3 --preem
 python3 benchmarks/bench_spot_agent.py --auto-cr --sandboxes 10 --iters 10 --preemption-rate 0.3 --first-preempt-iteration 2
 
 python3 benchmarks/bench_tree_search.py --sandboxes 1 --initial-steps 3 --replay-points 1 --fork-steps 2 --replay-mode sequential
-python3 benchmarks/bench_tree_search.py --sandboxes 1 --initial-steps 3 --replay-points 1 --fork-steps 2 --replay-mode concurrent
+python3 benchmarks/bench_tree_search.py --sandboxes 1 --initial-steps 3 --replay-points 2 --fork-steps 2 --replay-mode concurrent
 python3 benchmarks/bench_tree_search.py --auto-cr --sandboxes 1 --initial-steps 10 --replay-points 3 --fork-steps 2 --replay-mode concurrent
-python3 benchmarks/bench_tree_search.py --sandboxes 3 --initial-steps 10 --replay-points 3 --fork-steps 2 --replay-mode concurrent
+python3 benchmarks/bench_tree_search.py --auto-cr --sandboxes 3 --initial-steps 10 --replay-points 3 --fork-steps 2 --replay-mode concurrent
 ```
 
 The real-host benchmarks allocate temporary runtime state, create a ZFS pool, build the simulated agent image, and launch `runc` sandboxes through the shared harness in [benchmarks/real_host_scenario_base.py](/root/workspace/agent-cr/benchmarks/real_host_scenario_base.py).
