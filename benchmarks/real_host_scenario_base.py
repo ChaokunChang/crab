@@ -405,7 +405,7 @@ class SandboxHandle:
 
 
 @dataclass(frozen=True)
-class TreeSearchNetworkLease:
+class BenchmarkNetworkLease:
     sandbox_id: SandboxId
     namespace_name: str
     namespace_path: Path
@@ -457,12 +457,12 @@ class RealHostScenarioHarness:
         self.llm_thread: threading.Thread | None = None
         self.sandboxes: list[SandboxHandle] = []
         self._sandbox_by_id: dict[SandboxId, SandboxHandle] = {}
-        self._tree_search_bridge_name: str | None = None
-        self._tree_search_bridge_ip = "10.250.0.1"
-        self._tree_search_network_cidr = "10.250.0.0/24"
-        self._tree_search_ip_cursor = 2
-        self._tree_search_network_leases: dict[SandboxId, TreeSearchNetworkLease] = {}
-        self._tree_search_ip_to_sandbox: dict[str, SandboxId] = {}
+        self._benchmark_bridge_name: str | None = None
+        self._benchmark_bridge_ip = "10.250.0.1"
+        self._benchmark_network_cidr = "10.250.0.0/24"
+        self._benchmark_ip_cursor = 2
+        self._benchmark_network_leases: dict[SandboxId, BenchmarkNetworkLease] = {}
+        self._benchmark_ip_to_sandbox: dict[str, SandboxId] = {}
 
     def _start_host_inspector_server(self) -> str:
         assert self.runtime_state_root is not None
@@ -612,16 +612,16 @@ class RealHostScenarioHarness:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-        for sandbox_id in list(self._tree_search_network_leases):
-            self._release_tree_search_network_lease(sandbox_id)
-        if self._tree_search_bridge_name is not None:
+        for sandbox_id in list(self._benchmark_network_leases):
+            self._release_benchmark_network_lease(sandbox_id)
+        if self._benchmark_bridge_name is not None:
             subprocess.run(
-                ["ip", "link", "delete", self._tree_search_bridge_name],
+                ["ip", "link", "delete", self._benchmark_bridge_name],
                 check=False,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            self._tree_search_bridge_name = None
+            self._benchmark_bridge_name = None
         if self.image_tag:
             subprocess.run(
                 ["docker", "rmi", "-f", self.image_tag],
@@ -658,11 +658,14 @@ class RealHostScenarioHarness:
         assert self.system is not None
         assert self.interceptor is not None
 
+        network_lease = self._allocate_benchmark_network_lease(SandboxId(sandbox_name))
         handle, work_dir_host_path = self._prepare_sandbox_handle(
             sandbox_name,
-            interceptor_host="127.0.0.1",
+            interceptor_host=self._benchmark_bridge_ip,
+            network_lease=network_lease,
         )
         sandbox_id = handle.sandbox_id
+        self._benchmark_ip_to_sandbox[network_lease.guest_ip] = sandbox_id
         self.base_inspector.upsert_snapshot(
             SandboxSnapshot(
                 sandbox_id=sandbox_id,
@@ -694,12 +697,13 @@ class RealHostScenarioHarness:
                 "rootfs_copy_paths": [{"source": str(self.exported_rootfs), "destination": "/"}],
             },
         )
-        payload = wait_for_http_json(f"http://127.0.0.1:{handle.status_port}/status")
+        payload = wait_for_http_json(handle.status_url)
         handle.last_status = payload
         logger.info(
-            "Launched benchmark sandbox name=%s sandbox_id=%s status_port=%d auto_cr=%s",
+            "Launched benchmark sandbox name=%s sandbox_id=%s guest_ip=%s status_port=%d auto_cr=%s",
             sandbox_name,
             sandbox_id,
+            network_lease.guest_ip,
             handle.status_port,
             self.auto_cr,
         )
@@ -712,14 +716,14 @@ class RealHostScenarioHarness:
         assert self.system is not None
         assert self.interceptor is not None
 
-        network_lease = self._allocate_tree_search_network_lease(SandboxId(sandbox_name))
+        network_lease = self._allocate_benchmark_network_lease(SandboxId(sandbox_name))
         handle, work_dir_host_path = self._prepare_sandbox_handle(
             sandbox_name,
-            interceptor_host=self._tree_search_bridge_ip,
+            interceptor_host=self._benchmark_bridge_ip,
             network_lease=network_lease,
         )
         sandbox_id = handle.sandbox_id
-        self._tree_search_ip_to_sandbox[network_lease.guest_ip] = sandbox_id
+        self._benchmark_ip_to_sandbox[network_lease.guest_ip] = sandbox_id
         self.base_inspector.upsert_snapshot(
             SandboxSnapshot(
                 sandbox_id=sandbox_id,
@@ -776,7 +780,7 @@ class RealHostScenarioHarness:
         _ = (headers, body)
         if client_host is None:
             return None
-        sandbox_id = self._tree_search_ip_to_sandbox.get(client_host)
+        sandbox_id = self._benchmark_ip_to_sandbox.get(client_host)
         if sandbox_id is None:
             return None
         return str(sandbox_id)
@@ -1049,7 +1053,7 @@ class RealHostScenarioHarness:
         try:
             description = self.sandbox_manager.describe(sandbox.sandbox_id)
         except KeyError:
-            self._release_tree_search_network_lease(sandbox.sandbox_id)
+            self._release_benchmark_network_lease(sandbox.sandbox_id)
             self._sandbox_by_id.pop(sandbox.sandbox_id, None)
             return
         dataset = str(description.metadata.get("zfs_dataset", ""))
@@ -1060,7 +1064,7 @@ class RealHostScenarioHarness:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-        self._release_tree_search_network_lease(sandbox.sandbox_id)
+        self._release_benchmark_network_lease(sandbox.sandbox_id)
         self._sandbox_by_id.pop(sandbox.sandbox_id, None)
 
     def _relaunch_sandbox(self, sandbox_id: SandboxId, event_type: str) -> None:
@@ -1119,10 +1123,13 @@ class RealHostScenarioHarness:
         assert self.sandbox_manager is not None
         assert self.base_inspector is not None
 
+        network_lease = self._allocate_benchmark_network_lease(SandboxId(fork_name))
         target, work_dir_host_path = self._prepare_sandbox_handle(
             fork_name,
-            interceptor_host="127.0.0.1",
+            interceptor_host=self._benchmark_bridge_ip,
+            network_lease=network_lease,
         )
+        self._benchmark_ip_to_sandbox[network_lease.guest_ip] = target.sandbox_id
 
         source_dataset = f"{self.pool_name}/agent-cr/{source.sandbox_id}"
         target_dataset = f"{self.pool_name}/agent-cr/{target.sandbox_id}"
@@ -1244,12 +1251,12 @@ class RealHostScenarioHarness:
         fork_name: str,
     ) -> SandboxHandle:
         target = self.clone_checkpoint_to_fork(source, checkpoint_id, fork_name)
-        network_lease = self._allocate_tree_search_network_lease(target.sandbox_id)
+        network_lease = self._benchmark_network_leases[target.sandbox_id]
         work_dir_host_path = resolve_work_dir_host_path(self.work_dir_host_root, str(target.sandbox_id))
         write_bundle_config(
             bundle_dir=target.bundle_dir,
             interceptor_port=self.interceptor.port if self.interceptor is not None else 0,
-            interceptor_host=self._tree_search_bridge_ip,
+            interceptor_host=self._benchmark_bridge_ip,
             provider=self.provider,
             sandbox_name=str(target.sandbox_id),
             status_port=source.status_port,
@@ -1259,7 +1266,7 @@ class RealHostScenarioHarness:
         )
         target.status_host = network_lease.guest_ip
         target.status_port = source.status_port
-        self._tree_search_ip_to_sandbox[network_lease.guest_ip] = target.sandbox_id
+        self._benchmark_ip_to_sandbox[network_lease.guest_ip] = target.sandbox_id
         logger.info(
             "Prepared tree-search fork sandbox=%s guest_ip=%s status_port=%d source=%s checkpoint=%s",
             target.sandbox_id,
@@ -1275,7 +1282,7 @@ class RealHostScenarioHarness:
         sandbox_name: str,
         *,
         interceptor_host: str,
-        network_lease: TreeSearchNetworkLease | None = None,
+        network_lease: BenchmarkNetworkLease | None = None,
     ) -> tuple[SandboxHandle, Path | None]:
         assert self.root is not None
         assert self.interceptor is not None
@@ -1306,32 +1313,32 @@ class RealHostScenarioHarness:
         self._sandbox_by_id[handle.sandbox_id] = handle
         return handle, work_dir_host_path
 
-    def _ensure_tree_search_bridge(self) -> None:
-        if self._tree_search_bridge_name is not None:
+    def _ensure_benchmark_bridge(self) -> None:
+        if self._benchmark_bridge_name is not None:
             return
         assert self.root is not None
         bridge_name = f"acb{uuid.uuid4().hex[:8]}"
         subprocess.run(["ip", "link", "add", bridge_name, "type", "bridge"], check=True)
         subprocess.run(
-            ["ip", "addr", "add", f"{self._tree_search_bridge_ip}/24", "dev", bridge_name],
+            ["ip", "addr", "add", f"{self._benchmark_bridge_ip}/24", "dev", bridge_name],
             check=True,
         )
         subprocess.run(["ip", "link", "set", bridge_name, "up"], check=True)
-        self._tree_search_bridge_name = bridge_name
+        self._benchmark_bridge_name = bridge_name
         logger.info(
-            "Created tree-search bridge name=%s bridge_ip=%s",
+            "Created benchmark bridge name=%s bridge_ip=%s",
             bridge_name,
-            self._tree_search_bridge_ip,
+            self._benchmark_bridge_ip,
         )
 
-    def _allocate_tree_search_network_lease(self, sandbox_id: SandboxId) -> TreeSearchNetworkLease:
-        self._ensure_tree_search_bridge()
-        assert self._tree_search_bridge_name is not None
-        network = ipaddress.ip_network(self._tree_search_network_cidr)
-        if self._tree_search_ip_cursor >= network.num_addresses - 1:
-            raise RuntimeError("tree-search network exhausted guest IP capacity")
-        guest_ip = str(network[self._tree_search_ip_cursor])
-        self._tree_search_ip_cursor += 1
+    def _allocate_benchmark_network_lease(self, sandbox_id: SandboxId) -> BenchmarkNetworkLease:
+        self._ensure_benchmark_bridge()
+        assert self._benchmark_bridge_name is not None
+        network = ipaddress.ip_network(self._benchmark_network_cidr)
+        if self._benchmark_ip_cursor >= network.num_addresses - 1:
+            raise RuntimeError("benchmark network exhausted guest IP capacity")
+        guest_ip = str(network[self._benchmark_ip_cursor])
+        self._benchmark_ip_cursor += 1
         suffix = uuid.uuid4().hex[:8]
         namespace_name = f"ts-{suffix}"
         host_veth_name = f"vh{suffix[:6]}"
@@ -1341,7 +1348,7 @@ class RealHostScenarioHarness:
             ["ip", "link", "add", host_veth_name, "type", "veth", "peer", "name", guest_veth_name],
             check=True,
         )
-        subprocess.run(["ip", "link", "set", host_veth_name, "master", self._tree_search_bridge_name], check=True)
+        subprocess.run(["ip", "link", "set", host_veth_name, "master", self._benchmark_bridge_name], check=True)
         subprocess.run(["ip", "link", "set", host_veth_name, "up"], check=True)
         subprocess.run(["ip", "link", "set", guest_veth_name, "netns", namespace_name], check=True)
         subprocess.run(["ip", "netns", "exec", namespace_name, "ip", "link", "set", "lo", "up"], check=True)
@@ -1365,11 +1372,11 @@ class RealHostScenarioHarness:
                 "replace",
                 "default",
                 "via",
-                self._tree_search_bridge_ip,
+                self._benchmark_bridge_ip,
             ],
             check=True,
         )
-        lease = TreeSearchNetworkLease(
+        lease = BenchmarkNetworkLease(
             sandbox_id=sandbox_id,
             namespace_name=namespace_name,
             namespace_path=Path("/var/run/netns") / namespace_name,
@@ -1377,20 +1384,20 @@ class RealHostScenarioHarness:
             guest_veth_name=guest_veth_name,
             guest_ip=guest_ip,
         )
-        self._tree_search_network_leases[sandbox_id] = lease
+        self._benchmark_network_leases[sandbox_id] = lease
         logger.info(
-            "Allocated tree-search network lease sandbox=%s guest_ip=%s namespace=%s",
+            "Allocated benchmark network lease sandbox=%s guest_ip=%s namespace=%s",
             sandbox_id,
             guest_ip,
             namespace_name,
         )
         return lease
 
-    def _release_tree_search_network_lease(self, sandbox_id: SandboxId) -> None:
-        lease = self._tree_search_network_leases.pop(sandbox_id, None)
+    def _release_benchmark_network_lease(self, sandbox_id: SandboxId) -> None:
+        lease = self._benchmark_network_leases.pop(sandbox_id, None)
         if lease is None:
             return
-        self._tree_search_ip_to_sandbox.pop(lease.guest_ip, None)
+        self._benchmark_ip_to_sandbox.pop(lease.guest_ip, None)
         subprocess.run(
             ["ip", "netns", "del", lease.namespace_name],
             check=False,
@@ -1404,7 +1411,7 @@ class RealHostScenarioHarness:
             stderr=subprocess.DEVNULL,
         )
         logger.info(
-            "Released tree-search network lease sandbox=%s guest_ip=%s namespace=%s",
+            "Released benchmark network lease sandbox=%s guest_ip=%s namespace=%s",
             sandbox_id,
             lease.guest_ip,
             lease.namespace_name,

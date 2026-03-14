@@ -3,8 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 import urllib.request
 from pathlib import Path
+
+from agent_cr import AgentCRRequestInterceptorServer, InMemoryRequestStateStore
 
 from .harness import prepare_iflow_runtime, prepare_iflow_state
 from .image import build_image, export_image_rootfs
@@ -50,7 +53,13 @@ def main() -> None:
     manual_serve_parser = subparsers.add_parser("serve-manual-llm")
     manual_serve_parser.add_argument("--host", default="127.0.0.1")
     manual_serve_parser.add_argument("--port", type=int, required=True)
-    manual_serve_parser.add_argument("--default-sandbox-id", default="sbx-iflow-manual")
+
+    manual_interceptor_parser = subparsers.add_parser("serve-manual-interceptor")
+    manual_interceptor_parser.add_argument("--host", default="0.0.0.0")
+    manual_interceptor_parser.add_argument("--port", type=int, required=True)
+    manual_interceptor_parser.add_argument("--upstream-url", required=True)
+    manual_interceptor_parser.add_argument("--sandbox-id", required=True)
+    manual_interceptor_parser.add_argument("--sandbox-ip", required=True)
 
     build_parser = subparsers.add_parser("build-rootfs")
     build_parser.add_argument("--tag", required=True)
@@ -100,14 +109,14 @@ def main() -> None:
     enqueue_parser = subparsers.add_parser("enqueue-run-shell-command")
     enqueue_parser.add_argument("--base-url", required=True)
     enqueue_parser.add_argument("--command", dest="shell_command", required=True)
-    enqueue_parser.add_argument("--sandbox-id", default=None)
+    enqueue_parser.add_argument("--sandbox-id", required=True)
     enqueue_parser.add_argument("--content", default="Run the requested shell command and report the result.")
     enqueue_parser.add_argument("--response-delay-ms", type=int, default=0)
 
     final_parser = subparsers.add_parser("enqueue-final-response")
     final_parser.add_argument("--base-url", required=True)
     final_parser.add_argument("--content", required=True)
-    final_parser.add_argument("--sandbox-id", default=None)
+    final_parser.add_argument("--sandbox-id", required=True)
     final_parser.add_argument("--response-delay-ms", type=int, default=0)
 
     state_parser = subparsers.add_parser("manual-llm-state")
@@ -119,9 +128,25 @@ def main() -> None:
         server.serve_forever()
         return
     if args.command == "serve-manual-llm":
-        server = serve_manual(host=args.host, port=args.port, default_sandbox_id=args.default_sandbox_id)
+        server = serve_manual(host=args.host, port=args.port)
         server.serve_forever()
         return
+    if args.command == "serve-manual-interceptor":
+        interceptor = AgentCRRequestInterceptorServer(
+            upstream_url=args.upstream_url,
+            request_state_store=InMemoryRequestStateStore(),
+            sandbox_id_resolver=lambda client_host, headers, body: args.sandbox_id if client_host == args.sandbox_ip else None,
+            host=args.host,
+            port=args.port,
+        )
+        interceptor.start()
+        try:
+            while True:
+                time.sleep(3600.0)
+        except KeyboardInterrupt:
+            return
+        finally:
+            interceptor.stop()
     if args.command == "prepare-runtime":
         work_root = Path(args.work_root)
         runtime = prepare_iflow_runtime(

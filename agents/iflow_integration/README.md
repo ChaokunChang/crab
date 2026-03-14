@@ -149,8 +149,7 @@ export MANUAL_LLM_URL=http://127.0.0.1:8091
 
 python3 -m agents.iflow_integration serve-manual-llm \
   --host 0.0.0.0 \
-  --port 8091 \
-  --default-sandbox-id sbx-iflow-manual
+  --port 8091
 ```
 
 This server exposes:
@@ -160,14 +159,31 @@ This server exposes:
 - `POST /control/final_response`: enqueue a final assistant message
 - `GET /control/state`: inspect queued responses and request history
 
-### 3. Launch The Real `iflow` Sandbox
+### 3. Start The Interceptor
+
+Route sandbox requests through the interceptor so sandbox identity is resolved
+from the bridged sandbox IP instead of a hidden default.
+
+```bash
+export INTERCEPTOR_URL=http://127.0.0.1:8092
+
+python3 -m agents.iflow_integration serve-manual-interceptor \
+  --host 0.0.0.0 \
+  --port 8092 \
+  --upstream-url "$MANUAL_LLM_URL" \
+  --sandbox-id sbx-iflow-manual \
+  --sandbox-ip 172.17.0.240
+```
+
+### 4. Launch The Real `iflow` Sandbox
 
 ```bash
 python3 -m agents.iflow_integration launch-manual-sandbox \
   --work-root "$WORK_ROOT" \
   --sandbox-id sbx-iflow-manual \
   --host-inspector-url "$HOST_INSPECTOR_URL" \
-  --llm-base-url http://172.17.0.1:8091/v1
+  --llm-base-url http://172.17.0.1:8092/v1 \
+  --sandbox-ip 172.17.0.240
 ```
 
 The command prints a JSON summary containing:
@@ -181,7 +197,7 @@ The command prints a JSON summary containing:
 At this point, `iflow` is running and blocked on the manual LLM server, waiting
 for the next completion response.
 
-### 4. Reset And Watch Inspector Status
+### 5. Reset And Watch Inspector Status
 
 Reset once before each manual tool call:
 
@@ -200,13 +216,14 @@ python3 -m agent_cr.host_inspector.watch \
   sbx-iflow-manual
 ```
 
-### 5. Manually Send A `run_shell_command` Tool Call
+### 6. Manually Send A `run_shell_command` Tool Call
 
 Example: transient no-op command
 
 ```bash
 python3 -m agents.iflow_integration enqueue-run-shell-command \
   --base-url "$MANUAL_LLM_URL" \
+  --sandbox-id sbx-iflow-manual \
   --command 'sh -lc "printf noop >/dev/null"'
 ```
 
@@ -215,6 +232,7 @@ Example: sticky filesystem write
 ```bash
 python3 -m agents.iflow_integration enqueue-run-shell-command \
   --base-url "$MANUAL_LLM_URL" \
+  --sandbox-id sbx-iflow-manual \
   --command 'sh -lc "mkdir -p /work/iflow-probe && printf iflow-artifact >/work/iflow-probe/artifact.txt"'
 ```
 
@@ -223,6 +241,7 @@ Example: detached daemon
 ```bash
 python3 -m agents.iflow_integration enqueue-run-shell-command \
   --base-url "$MANUAL_LLM_URL" \
+  --sandbox-id sbx-iflow-manual \
   --command 'sh -lc "mkdir -p /work/iflow-probe && python3 -m http.server 8123 >/work/iflow-probe/http.log 2>&1 & echo $! >/work/iflow-probe/http.pid"'
 ```
 
@@ -230,6 +249,7 @@ After each tool call:
 
 - `iflow` executes the tool
 - it sends a new `/v1/chat/completions` request
+- the interceptor forwards that request with the resolved sandbox id
 - the manual server blocks again, waiting for your next queued response
 - `watch.py` shows when `process_changed` or `filesystem_changed` flips
 
@@ -239,7 +259,7 @@ You can inspect the manual server queue and history at any time:
 python3 -m agents.iflow_integration manual-llm-state --base-url "$MANUAL_LLM_URL"
 ```
 
-### 6. Manually Checkpoint, Restore, And Enter The Sandbox
+### 7. Manually Checkpoint, Restore, And Enter The Sandbox
 
 Once the sandbox is running, you can trigger checkpoint/restore directly from the
 same `WORK_ROOT` used to launch it.
@@ -249,6 +269,7 @@ Create a long-running counter workload:
 ```bash
 python3 -m agents.iflow_integration enqueue-run-shell-command \
   --base-url "$MANUAL_LLM_URL" \
+  --sandbox-id sbx-iflow-manual \
   --command 'bash -lc '"'"'mkdir -p /work/iflow-observe; count=0; while [ "$count" -lt 200 ]; do count=$((count + 1)); printf "%s\n" "$count" >/work/iflow-observe/counter.txt; sleep 1; done'"'"''
 ```
 
@@ -298,13 +319,14 @@ watch -n 1 cat /work/iflow-observe/counter.txt
 The wrapper uses `runc exec` under the session's saved `runtime_state_root`, so
 you do not need to remember the raw `runc --root ... exec ...` form.
 
-### 7. Stop The Agent Cleanly
+### 8. Stop The Agent Cleanly
 
 Tell `iflow` to stop:
 
 ```bash
 python3 -m agents.iflow_integration enqueue-final-response \
   --base-url "$MANUAL_LLM_URL" \
+  --sandbox-id sbx-iflow-manual \
   --content 'The session is complete. Summarize briefly and stop.'
 ```
 

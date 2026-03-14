@@ -266,7 +266,7 @@ class BenchmarkHelperTests(unittest.TestCase):
 
         self.assertEqual(handle.status_url, "http://10.250.0.22:8123/status")
 
-    def test_allocate_tree_search_network_lease_assigns_unique_guest_ips(self) -> None:
+    def test_allocate_benchmark_network_lease_assigns_unique_guest_ips(self) -> None:
         harness = RealHostScenarioHarness(
             provider="openai",
             transfer_delay_ms=0.0,
@@ -282,15 +282,15 @@ class BenchmarkHelperTests(unittest.TestCase):
         harness.root = Path("/tmp")
 
         with patch("benchmarks.real_host_scenario_base.subprocess.run") as run:
-            first = harness._allocate_tree_search_network_lease(SandboxId("sbx-a"))
-            second = harness._allocate_tree_search_network_lease(SandboxId("sbx-b"))
+            first = harness._allocate_benchmark_network_lease(SandboxId("sbx-a"))
+            second = harness._allocate_benchmark_network_lease(SandboxId("sbx-b"))
 
         self.assertNotEqual(first.guest_ip, second.guest_ip)
         self.assertEqual(first.namespace_path.name, first.namespace_name)
         self.assertEqual(second.namespace_path.name, second.namespace_name)
         self.assertTrue(run.called)
 
-    def test_release_tree_search_network_lease_cleans_up_ip_mapping(self) -> None:
+    def test_release_benchmark_network_lease_cleans_up_ip_mapping(self) -> None:
         harness = RealHostScenarioHarness(
             provider="openai",
             transfer_delay_ms=0.0,
@@ -306,12 +306,33 @@ class BenchmarkHelperTests(unittest.TestCase):
         harness.root = Path("/tmp")
 
         with patch("benchmarks.real_host_scenario_base.subprocess.run"):
-            lease = harness._allocate_tree_search_network_lease(SandboxId("sbx-a"))
-            harness._tree_search_ip_to_sandbox[lease.guest_ip] = SandboxId("sbx-a")
-            harness._release_tree_search_network_lease(SandboxId("sbx-a"))
+            lease = harness._allocate_benchmark_network_lease(SandboxId("sbx-a"))
+            harness._benchmark_ip_to_sandbox[lease.guest_ip] = SandboxId("sbx-a")
+            harness._release_benchmark_network_lease(SandboxId("sbx-a"))
 
-        self.assertNotIn(lease.guest_ip, harness._tree_search_ip_to_sandbox)
-        self.assertNotIn(SandboxId("sbx-a"), harness._tree_search_network_leases)
+        self.assertNotIn(lease.guest_ip, harness._benchmark_ip_to_sandbox)
+        self.assertNotIn(SandboxId("sbx-a"), harness._benchmark_network_leases)
+
+    def test_resolve_interceptor_sandbox_id_uses_registered_guest_ip_for_any_benchmark(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(
+                min_checkpoint_interval_seconds=0.0,
+                force_checkpoint_after_seconds=0.0,
+                require_change_signal=False,
+            ),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        harness._benchmark_ip_to_sandbox["10.250.0.42"] = SandboxId("spot-0")
+
+        self.assertEqual(
+            harness.resolve_interceptor_sandbox_id("10.250.0.42", {}, b""),
+            "spot-0",
+        )
+        self.assertIsNone(harness.resolve_interceptor_sandbox_id("10.250.0.43", {}, b""))
 
 
 if __name__ == "__main__":

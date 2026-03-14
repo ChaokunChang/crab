@@ -337,6 +337,19 @@ def _wait_for_http_text(url: str, *, predicate, timeout_s: float = 30.0) -> str:
     raise RuntimeError(f"timed out waiting for {url}: {last_exc}")
 
 
+def _single_sandbox_ip_resolver(
+    sandbox_ip: str,
+    sandbox_id: SandboxId,
+):
+    def _resolve(client_host: str | None, headers: dict[str, str], body: bytes) -> str | None:
+        _ = (headers, body)
+        if client_host == sandbox_ip:
+            return str(sandbox_id)
+        return None
+
+    return _resolve
+
+
 @dataclass
 class _RealIFlowManualFixture:
     root: Path
@@ -407,7 +420,7 @@ class IFlowRealIntegrationTests(unittest.TestCase):
             "phases": {},
         }
 
-        manual_server = serve_manual(host="127.0.0.1", port=manual_port, default_sandbox_id=str(sandbox_id))
+        manual_server = serve_manual(host="127.0.0.1", port=manual_port)
         manual_thread = threading.Thread(target=manual_server.serve_forever, daemon=True)
         manual_thread.start()
         _wait_for_http_json(f"http://127.0.0.1:{manual_port}/healthz")
@@ -516,7 +529,7 @@ class IFlowRealIntegrationTests(unittest.TestCase):
                 request_state_store=request_state_store,
                 hook=CompositeRequestInterceptorHook([TelemetryRequestInterceptorHook(telemetry)]),
                 on_state_change=system.notify_interceptor_state_change,
-                default_sandbox_id=sandbox_id,
+                sandbox_id_resolver=_single_sandbox_ip_resolver(sandbox_ip, sandbox_id),
                 host="0.0.0.0",
                 port=0,
             )
@@ -833,21 +846,35 @@ class IFlowRealIntegrationTests(unittest.TestCase):
         self.addCleanup(inspector_server.stop)
         host_client = HostInspectorServiceClient(f"http://127.0.0.1:{inspector_server.port}")
 
-        manual_server = serve_manual(host="0.0.0.0", port=manual_port, default_sandbox_id=str(sandbox_id))
+        sandbox_ip = os.environ.get("AGENT_CR_IFLOW_SANDBOX_IP", "172.17.0.240")
+        manual_server = serve_manual(host="0.0.0.0", port=manual_port)
         manual_thread = threading.Thread(target=manual_server.serve_forever, daemon=True)
         manual_thread.start()
         self.addCleanup(manual_server.shutdown)
         self.addCleanup(manual_server.server_close)
         self.addCleanup(manual_thread.join, 5.0)
 
+        request_state_store = InMemoryRequestStateStore()
+        interceptor = AgentCRRequestInterceptorServer(
+            upstream_url=f"http://127.0.0.1:{manual_port}",
+            request_state_store=request_state_store,
+            sandbox_id_resolver=_single_sandbox_ip_resolver(sandbox_ip, sandbox_id),
+            host="0.0.0.0",
+            port=0,
+        )
+        interceptor.start()
+        self.addCleanup(interceptor.stop)
+        _wait_for_http_json(f"http://127.0.0.1:{interceptor.port}/healthz")
+
         session = None
         try:
             session = launch_manual_iflow(
                 work_root=root,
-                llm_base_url=f"http://172.17.0.1:{manual_port}/v1",
+                llm_base_url=f"http://172.17.0.1:{interceptor.port}/v1",
                 sandbox_id=str(sandbox_id),
                 task_description="Wait for the next tool instruction, execute it exactly once, then ask for the next instruction.",
                 host_inspector_url=f"http://127.0.0.1:{inspector_server.port}",
+                sandbox_ip=sandbox_ip,
             )
             _wait_for_manual_turn(manual_server.manual_state, str(sandbox_id), minimum_turns=1, timeout_s=240.0)  # type: ignore[attr-defined]
             _wait_for_status(
@@ -1361,7 +1388,7 @@ class IFlowRealIntegrationTests(unittest.TestCase):
                 request_state_store=request_state_store,
                 hook=CompositeRequestInterceptorHook([TelemetryRequestInterceptorHook(telemetry)]),
                 on_state_change=system.notify_interceptor_state_change,
-                default_sandbox_id=sandbox_id,
+                sandbox_id_resolver=_single_sandbox_ip_resolver(network.ip_address, sandbox_id),
                 host="0.0.0.0",
                 port=0,
             )

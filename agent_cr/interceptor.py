@@ -301,7 +301,6 @@ class AgentCRRequestInterceptor:
         hook: RequestInterceptorHook | None = None,
         on_state_change: Callable[[SandboxId], None] | None = None,
         response_gate_registry: SandboxResponseGateRegistry | None = None,
-        default_sandbox_id: SandboxId | str | None = None,
         sandbox_id_resolver: Callable[[str | None, dict[str, str], bytes], str | None] | None = None,
     ) -> None:
         self._upstream_transport = upstream_transport
@@ -309,9 +308,6 @@ class AgentCRRequestInterceptor:
         self._hook = hook or CompositeRequestInterceptorHook()
         self._on_state_change = on_state_change
         self._response_gate_registry = response_gate_registry
-        self._default_sandbox_id = (
-            None if default_sandbox_id is None else SandboxId(str(default_sandbox_id))
-        )
         self._sandbox_id_resolver = sandbox_id_resolver
 
     def intercept(
@@ -327,10 +323,8 @@ class AgentCRRequestInterceptor:
             resolved = self._sandbox_id_resolver(client_host, headers, body)
             if resolved is not None and resolved.strip():
                 sandbox_id_raw = resolved.strip()
-        if not sandbox_id_raw and self._default_sandbox_id is not None:
-            sandbox_id_raw = str(self._default_sandbox_id)
         if not sandbox_id_raw:
-            raise ValueError("missing X-Agent-Sandbox-Id")
+            raise ValueError("missing sandbox identity")
         upstream_headers = dict(headers)
         upstream_headers["X-Agent-Sandbox-Id"] = sandbox_id_raw
         provider = "openai" if path == "/v1/chat/completions" else "anthropic"
@@ -373,7 +367,6 @@ class AgentCRRequestInterceptorServer:
         hook: RequestInterceptorHook | None = None,
         on_state_change: Callable[[SandboxId], None] | None = None,
         response_gate_registry: SandboxResponseGateRegistry | None = None,
-        default_sandbox_id: SandboxId | str | None = None,
         sandbox_id_resolver: Callable[[str | None, dict[str, str], bytes], str | None] | None = None,
         host: str = "127.0.0.1",
         port: int = 0,
@@ -385,7 +378,6 @@ class AgentCRRequestInterceptorServer:
             hook=hook,
             on_state_change=on_state_change,
             response_gate_registry=response_gate_registry,
-            default_sandbox_id=default_sandbox_id,
             sandbox_id_resolver=sandbox_id_resolver,
         )
         self._server = ThreadingHTTPServer((host, port), self._build_handler())

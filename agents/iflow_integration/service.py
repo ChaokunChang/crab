@@ -100,8 +100,7 @@ class ScriptedLLMState:
 
 
 class ManualLLMState:
-    def __init__(self, *, default_sandbox_id: str = "sbx-iflow-manual") -> None:
-        self._default_sandbox_id = default_sandbox_id
+    def __init__(self) -> None:
         self._condition = threading.Condition()
         self._turns: dict[str, int] = defaultdict(int)
         self._events: list[dict[str, Any]] = []
@@ -111,7 +110,7 @@ class ManualLLMState:
         self,
         *,
         command: str,
-        sandbox_id: str | None = None,
+        sandbox_id: str,
         content: str | None = None,
         response_delay_ms: int = 0,
     ) -> dict[str, Any]:
@@ -134,7 +133,7 @@ class ManualLLMState:
         self,
         *,
         content: str,
-        sandbox_id: str | None = None,
+        sandbox_id: str,
         response_delay_ms: int = 0,
     ) -> dict[str, Any]:
         return self._enqueue_step(
@@ -159,9 +158,7 @@ class ManualLLMState:
     ) -> dict[str, Any]:
         if path != "/v1/chat/completions":
             raise ValueError(f"unsupported path: {path}")
-        sandbox_id = _sandbox_id_from_request(headers, payload)
-        if sandbox_id == "sandbox-unknown":
-            sandbox_id = self._default_sandbox_id
+        sandbox_id = _require_sandbox_id_from_request(headers, payload)
         with self._condition:
             turn = self._turns[sandbox_id]
             self._turns[sandbox_id] += 1
@@ -197,7 +194,6 @@ class ManualLLMState:
     def snapshot(self) -> dict[str, Any]:
         with self._condition:
             return {
-                "default_sandbox_id": self._default_sandbox_id,
                 "events": list(self._events),
                 "queue_depths": {sandbox_id: len(queue) for sandbox_id, queue in self._queues.items()},
                 "turns": dict(self._turns),
@@ -206,12 +202,14 @@ class ManualLLMState:
     def _enqueue_step(
         self,
         *,
-        sandbox_id: str | None,
+        sandbox_id: str,
         phase: str,
         response_delay_ms: int,
         response: dict[str, Any],
     ) -> dict[str, Any]:
-        target_sandbox_id = sandbox_id or self._default_sandbox_id
+        target_sandbox_id = sandbox_id.strip()
+        if not target_sandbox_id:
+            raise ValueError("sandbox_id is required")
         with self._condition:
             self._queues[target_sandbox_id].append(
                 {
@@ -245,6 +243,13 @@ def _sandbox_id_from_request(headers: dict[str, str], payload: dict[str, Any]) -
     if isinstance(metadata, dict) and isinstance(metadata.get("sandbox_id"), str):
         return metadata["sandbox_id"]
     return "sandbox-unknown"
+
+
+def _require_sandbox_id_from_request(headers: dict[str, str], payload: dict[str, Any]) -> str:
+    sandbox_id = _sandbox_id_from_request(headers, payload).strip()
+    if sandbox_id and sandbox_id != "sandbox-unknown":
+        return sandbox_id
+    raise ValueError("missing sandbox identity")
 
 
 def _tool_response(step: ScriptStep, turn: int) -> dict[str, Any]:
@@ -386,9 +391,8 @@ def serve_manual(
     *,
     host: str,
     port: int,
-    default_sandbox_id: str = "sbx-iflow-manual",
 ) -> ThreadingHTTPServer:
-    state = ManualLLMState(default_sandbox_id=default_sandbox_id)
+    state = ManualLLMState()
 
     class ManualLLMHandler(BaseHTTPRequestHandler):
         manual_state = state
@@ -419,32 +423,35 @@ def serve_manual(
 
         def do_POST(self) -> None:  # noqa: N802
             payload = self._read_json()
-            if self.path == "/v1/chat/completions":
-                response = self.manual_state.next_response(
-                    path=self.path,
-                    headers=dict(self.headers.items()),
-                    payload=payload,
-                )
-                self._write_json(response)
-                return
-            if self.path == "/control/run_shell_command":
-                result = self.manual_state.enqueue_run_shell_command(
-                    command=str(payload["command"]),
-                    sandbox_id=payload.get("sandbox_id"),
-                    content=None if payload.get("content") is None else str(payload["content"]),
-                    response_delay_ms=int(payload.get("response_delay_ms", 0)),
-                )
-                self._write_json({"ok": True, "result": result})
-                return
-            if self.path == "/control/final_response":
-                result = self.manual_state.enqueue_final_response(
-                    content=str(payload["content"]),
-                    sandbox_id=payload.get("sandbox_id"),
-                    response_delay_ms=int(payload.get("response_delay_ms", 0)),
-                )
-                self._write_json({"ok": True, "result": result})
-                return
-            self.send_error(404)
+            try:
+                if self.path == "/v1/chat/completions":
+                    response = self.manual_state.next_response(
+                        path=self.path,
+                        headers=dict(self.headers.items()),
+                        payload=payload,
+                    )
+                    self._write_json(response)
+                    return
+                if self.path == "/control/run_shell_command":
+                    result = self.manual_state.enqueue_run_shell_command(
+                        command=str(payload["command"]),
+                        sandbox_id=str(payload["sandbox_id"]),
+                        content=None if payload.get("content") is None else str(payload["content"]),
+                        response_delay_ms=int(payload.get("response_delay_ms", 0)),
+                    )
+                    self._write_json({"ok": True, "result": result})
+                    return
+                if self.path == "/control/final_response":
+                    result = self.manual_state.enqueue_final_response(
+                        content=str(payload["content"]),
+                        sandbox_id=str(payload["sandbox_id"]),
+                        response_delay_ms=int(payload.get("response_delay_ms", 0)),
+                    )
+                    self._write_json({"ok": True, "result": result})
+                    return
+                self.send_error(404)
+            except (KeyError, ValueError) as exc:
+                self.send_error(400, str(exc))
 
         def log_message(self, format: str, *args) -> None:
             _ = (format, args)
@@ -461,11 +468,10 @@ def main() -> None:
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--idle-delay-ms", type=int, default=2000)
     parser.add_argument("--manual", action="store_true")
-    parser.add_argument("--default-sandbox-id", default="sbx-iflow-manual")
     args = parser.parse_args()
 
     if args.manual:
-        server = serve_manual(host=args.host, port=args.port, default_sandbox_id=args.default_sandbox_id)
+        server = serve_manual(host=args.host, port=args.port)
     else:
         server = serve(host=args.host, port=args.port, steps=default_script_steps(idle_delay_ms=args.idle_delay_ms))
     server.serve_forever()
