@@ -857,8 +857,7 @@ class RealHostScenarioHarness:
         assert self.system is not None
         logger.debug("Benchmark requesting checkpoint_manual for sandbox=%s", sandbox.sandbox_id)
         return self.system.checkpoint_once(sandbox.sandbox_id, leave_running=leave_running)
-        
-        
+
     def checkpoint_if_due(self, sandbox: SandboxHandle):
         assert self.system is not None
         logger.debug("Benchmark requesting checkpoint_if_due for sandbox=%s", sandbox.sandbox_id)
