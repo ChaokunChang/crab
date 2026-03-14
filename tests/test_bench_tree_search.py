@@ -10,7 +10,7 @@ import unittest
 
 from agent_cr import CheckpointId, SandboxId
 from benchmarks.bench_tree_search import run_tree_search_benchmark
-from benchmarks.real_host_scenario_base import SandboxHandle, TreeSearchCheckpointRecord
+from benchmarks.real_host_scenario_base import BenchmarkTaskRecord, SandboxHandle, TreeSearchCheckpointRecord
 
 
 class _FakeStorage:
@@ -31,6 +31,36 @@ class _FakeSystem:
 
     def stop(self) -> None:
         self.stop_calls += 1
+
+
+class _FakeTaskRun:
+    def __init__(self, harness: "_FakeHarness", sandbox: SandboxHandle) -> None:
+        self._harness = harness
+        self._sandbox = sandbox
+
+    def wait_for_action_delta(self, *, delta: int) -> dict[str, object]:
+        sandbox_id = str(self._sandbox.sandbox_id)
+        if sandbox_id.startswith("tree-source-") and self._harness.source_action_delay_s > 0:
+            with self._harness._source_action_lock:
+                self._harness._active_source_actions += 1
+                self._harness.max_concurrent_source_actions = max(
+                    self._harness.max_concurrent_source_actions,
+                    self._harness._active_source_actions,
+                )
+            try:
+                time.sleep(self._harness.source_action_delay_s)
+            finally:
+                with self._harness._source_action_lock:
+                    self._harness._active_source_actions -= 1
+        self._harness.action_delta_calls.append((sandbox_id, delta))
+        current = int(self._harness._statuses[sandbox_id]["total_actions"])
+        payload = {"total_actions": current + delta}
+        self._harness._statuses[sandbox_id] = payload
+        self._sandbox.last_status = payload
+        return payload
+
+    def poll_status(self) -> dict[str, object]:
+        return dict(self._harness._statuses[str(self._sandbox.sandbox_id)])
 
 
 class _FakeHarness:
@@ -58,7 +88,8 @@ class _FakeHarness:
         self._active_source_actions = 0
         self.max_concurrent_source_actions = 0
 
-    def launch_tree_search_sandbox(self, sandbox_name: str) -> SandboxHandle:
+    def launch_sandbox_and_task(self, sandbox_name: str, *, agent_type, task_description, task_config) -> SandboxHandle:
+        _ = (agent_type, task_description, task_config)
         sandbox_id = SandboxId(sandbox_name)
         handle = SandboxHandle(
             sandbox_id=sandbox_id,
@@ -71,28 +102,37 @@ class _FakeHarness:
         self._source_launches.append(sandbox_name)
         self._statuses[str(sandbox_id)] = {"total_actions": 0}
         self._snapshot_steps[str(sandbox_id)] = []
+        handle.task_run = _FakeTaskRun(self, handle)
         return handle
 
-    def wait_for_action_delta(self, sandbox: SandboxHandle, *, delta: int) -> dict[str, object]:
-        sandbox_id = str(sandbox.sandbox_id)
-        if sandbox_id.startswith("tree-source-") and self.source_action_delay_s > 0:
-            with self._source_action_lock:
-                self._active_source_actions += 1
-                self.max_concurrent_source_actions = max(
-                    self.max_concurrent_source_actions,
-                    self._active_source_actions,
-                )
-            try:
-                time.sleep(self.source_action_delay_s)
-            finally:
-                with self._source_action_lock:
-                    self._active_source_actions -= 1
-        self.action_delta_calls.append((sandbox_id, delta))
-        current = int(self._statuses[sandbox_id]["total_actions"])
-        payload = {"total_actions": current + delta}
-        self._statuses[sandbox_id] = payload
-        sandbox.last_status = payload
-        return payload
+    def load_dataset(self, path):
+        raise AssertionError(f"dataset should not be loaded in this test: {path}")
+
+    def select_task_record(
+        self,
+        dataset,
+        *,
+        sandbox_index: int,
+        default_agent_type: str,
+        default_task_description,
+        default_task_config,
+    ) -> BenchmarkTaskRecord:
+        _ = dataset
+        _ = sandbox_index
+        return BenchmarkTaskRecord(
+            agent_type=default_agent_type,
+            task_description=default_task_description,
+            task_config=default_task_config,
+        )
+
+    def launch_task_record(self, sandbox_name: str, record: BenchmarkTaskRecord) -> SandboxHandle:
+        _ = record
+        return self.launch_sandbox_and_task(
+            sandbox_name,
+            agent_type="simulated",
+            task_description=SimpleNamespace(prompt=""),
+            task_config=SimpleNamespace(),
+        )
 
     def drain_request_state_changes(self) -> int:
         return 0
@@ -154,6 +194,7 @@ class _FakeHarness:
         self._next_port += 1
         self._statuses[str(fork.sandbox_id)] = {"total_actions": 0}
         self._checkpoint_steps[str(fork.sandbox_id)] = step
+        fork.task_run = _FakeTaskRun(self, fork)
         return fork
 
     def restore_once(self, sandbox: SandboxHandle, checkpoint_id: CheckpointId):
@@ -177,9 +218,6 @@ class _FakeHarness:
             message=None,
         )
 
-    def poll_status(self, sandbox: SandboxHandle) -> dict[str, object]:
-        return dict(self._statuses[str(sandbox.sandbox_id)])
-
     def destroy_sandbox_dataset(self, sandbox: SandboxHandle) -> None:
         self.destroyed.append(str(sandbox.sandbox_id))
 
@@ -200,6 +238,7 @@ class TreeSearchBenchmarkTests(unittest.TestCase):
             "fork_steps": 2,
             "auto_cr": False,
             "replay_mode": "sequential",
+            "agent_type": "simulated",
         }
         values.update(overrides)
         return argparse.Namespace(**values)

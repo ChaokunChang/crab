@@ -8,6 +8,7 @@ import random
 import time
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -16,6 +17,7 @@ if str(ROOT) not in sys.path:
 from agent_cr import DeleteAfterRestoreCheckpointManager, SchedulerConfig, SpotPreemptionCheckpointingPolicy
 from agent_cr.models import utc_now
 
+from benchmarks.agents import TaskConfig, TaskDescription
 from benchmarks.real_host_scenario_base import (
     RealHostScenarioHarness,
     add_common_args,
@@ -25,8 +27,18 @@ from benchmarks.real_host_scenario_base import (
     write_rows,
 )
 
+if TYPE_CHECKING:
+    from benchmarks.real_host_scenario_base import SandboxHandle
 
 logger = logging.getLogger(__name__)
+
+
+def benchmark_task_description() -> TaskDescription:
+    return TaskDescription("Continuously work on the benchmark task inside the sandbox.")
+
+
+def default_task_config() -> TaskConfig:
+    return TaskConfig(minimum_actions=0)
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,13 +70,14 @@ def should_inject_preemption(
 
 def wait_for_iteration_progress(
     harness: RealHostScenarioHarness,
-    sandbox,
+    sandbox: SandboxHandle,
     *,
     iteration: int,
 ) -> dict[str, object]:
+    assert sandbox.task_run is not None
     if iteration == 1:
-        return harness.wait_for_progress(sandbox, minimum_actions=6)
-    return harness.wait_for_action_delta(sandbox, delta=1)
+        return sandbox.task_run.wait_for_progress(minimum_actions=6)
+    return sandbox.task_run.wait_for_action_delta(delta=1)
 
 
 def run_spot_agent_sandbox(
@@ -72,7 +85,7 @@ def run_spot_agent_sandbox(
     harness: RealHostScenarioHarness,
     *,
     sandbox_index: int,
-    sandbox,
+    sandbox: SandboxHandle,
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     rng = random.Random(sandbox_index)
@@ -130,7 +143,8 @@ def run_spot_agent_sandbox(
             recovery_finished = time.perf_counter()
             ready_at = recovery_finished
             if record.status in {"restored", "relaunched"}:
-                sandbox.last_status = harness.poll_status(sandbox)
+                assert sandbox.task_run is not None
+                sandbox.last_status = sandbox.task_run.poll_status()
                 ready_at = time.perf_counter()
             else:
                 logger.warning(
@@ -165,44 +179,44 @@ def run_spot_agent_sandbox(
             )
             if record.status not in {"restored", "relaunched"}:
                 break
-            continue
-
-        wait_for_iteration_progress(harness, sandbox, iteration=iteration)
-        event_started = time.perf_counter()
-        harness.set_snapshot_metadata(
-            sandbox,
-            preemption_notice=True,
-            preemption_grace_remaining_seconds=args.grace_period_seconds,
-        )
-        recovery_started = time.perf_counter()
-        checkpoint_result = harness.checkpoint_if_due(sandbox)
-        if checkpoint_result is None:
-            raise RuntimeError("spot benchmark expected a checkpoint after preemption notice")
-        checkpoint_finished = time.perf_counter()
-        restore_result = harness.restore_once(sandbox, checkpoint_result.checkpoint_id)
-        recovery_finished = time.perf_counter()
-        harness.poll_status(sandbox)
-        ready_at = time.perf_counter()
-        harness.clear_snapshot_metadata(
-            sandbox,
-            "preemption_notice",
-            "preemption_grace_remaining_seconds",
-        )
-        rows.append(
-            {
-                "iter": iteration,
-                "sandbox_id": str(sandbox.sandbox_id),
-                "grace_period_ms": args.grace_period_seconds * 1000.0,
-                "checkpoint_ms": (checkpoint_finished - recovery_started) * 1000.0,
-                "restore_ms": (restore_result.finished_at - restore_result.started_at).total_seconds() * 1000.0,
-                "recovery_ms": (recovery_finished - recovery_started) * 1000.0,
-                "readiness_ms": (ready_at - recovery_finished) * 1000.0,
-                "end_to_end_recovery_ms": (ready_at - event_started) * 1000.0,
-                "migration_ms": (ready_at - event_started) * 1000.0,
-                "budget_slack_ms": args.grace_period_seconds * 1000.0 - (ready_at - event_started) * 1000.0,
-                "retained_checkpoints": len(harness.storage.list_checkpoints(sandbox.sandbox_id)),
-            }
-        )
+        else:
+            wait_for_iteration_progress(harness, sandbox, iteration=iteration)
+            event_started = time.perf_counter()
+            harness.set_snapshot_metadata(
+                sandbox,
+                preemption_notice=True,
+                preemption_grace_remaining_seconds=args.grace_period_seconds,
+            )
+            recovery_started = time.perf_counter()
+            checkpoint_result = harness.checkpoint_if_due(sandbox)
+            if checkpoint_result is None:
+                raise RuntimeError("spot benchmark expected a checkpoint after preemption notice")
+            checkpoint_finished = time.perf_counter()
+            restore_result = harness.restore_once(sandbox, checkpoint_result.checkpoint_id)
+            recovery_finished = time.perf_counter()
+            assert sandbox.task_run is not None
+            sandbox.task_run.poll_status()
+            ready_at = time.perf_counter()
+            harness.clear_snapshot_metadata(
+                sandbox,
+                "preemption_notice",
+                "preemption_grace_remaining_seconds",
+            )
+            rows.append(
+                {
+                    "iter": iteration,
+                    "sandbox_id": str(sandbox.sandbox_id),
+                    "grace_period_ms": args.grace_period_seconds * 1000.0,
+                    "checkpoint_ms": (checkpoint_finished - recovery_started) * 1000.0,
+                    "restore_ms": (restore_result.finished_at - restore_result.started_at).total_seconds() * 1000.0,
+                    "recovery_ms": (recovery_finished - recovery_started) * 1000.0,
+                    "readiness_ms": (ready_at - recovery_finished) * 1000.0,
+                    "end_to_end_recovery_ms": (ready_at - event_started) * 1000.0,
+                    "migration_ms": (ready_at - event_started) * 1000.0,
+                    "budget_slack_ms": args.grace_period_seconds * 1000.0 - (ready_at - event_started) * 1000.0,
+                    "retained_checkpoints": len(harness.storage.list_checkpoints(sandbox.sandbox_id)),
+                }
+            )
     return rows
 
 
@@ -210,7 +224,24 @@ def run_spot_agent_benchmark(
     args: argparse.Namespace,
     harness: RealHostScenarioHarness,
 ) -> list[dict[str, object]]:
-    sandboxes = [harness.launch_sandbox(f"spot-{index}") for index in range(args.sandboxes)]
+    dataset_path = getattr(args, "dataset", None)
+    dataset = harness.load_dataset(dataset_path) if dataset_path is not None else None
+    with ThreadPoolExecutor(max_workers=max(1, args.sandboxes)) as launcher:
+        sandboxes = list(
+            launcher.map(
+                lambda index: harness.launch_task_record(
+                    f"spot-{index}",
+                    harness.select_task_record(
+                        dataset,
+                        sandbox_index=index,
+                        default_agent_type=args.agent_type,
+                        default_task_description=benchmark_task_description(),
+                        default_task_config=default_task_config(),
+                    ),
+                ),
+                range(args.sandboxes),
+            )
+        )
     with ThreadPoolExecutor(max_workers=max(1, args.sandboxes)) as executor:
         row_groups = list(
             executor.map(

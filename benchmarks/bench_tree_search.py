@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
 
 from agent_cr import KeepAllCheckpointManager, RequestContext, RequestInterceptorHook, SchedulerConfig, TreeSearchCheckpointingPolicy
 
+from benchmarks.agents import TaskConfig, TaskDescription
 from benchmarks.real_host_scenario_base import (
     RealHostScenarioHarness,
     TreeSearchCheckpointRecord,
@@ -31,6 +32,14 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+def benchmark_task_description() -> TaskDescription:
+    return TaskDescription("Continuously explore the search tree and make forward progress.")
+
+
+def default_task_config() -> TaskConfig:
+    return TaskConfig(minimum_actions=0)
 
 
 def parse_args() -> argparse.Namespace:
@@ -99,8 +108,9 @@ def collect_manual_checkpoint_indexes(
     source_index: int,
 ) -> dict[int, TreeSearchCheckpointRecord]:
     checkpoints_by_step: dict[int, TreeSearchCheckpointRecord] = {}
+    assert source.task_run is not None
     for step in range(1, initial_steps + 1):
-        harness.wait_for_action_delta(source, delta=1)
+        source.task_run.wait_for_action_delta(delta=1)
         harness.set_snapshot_metadata(source, tree_search_step=step)
         checkpoint_started = time.perf_counter()
         checkpoint_result = harness.checkpoint_manual(source, leave_running=True)
@@ -130,7 +140,8 @@ def collect_auto_checkpoint_indexes(
     initial_steps: int,
     source_index: int,
 ) -> dict[int, TreeSearchCheckpointRecord]:
-    harness.wait_for_action_delta(source, delta=initial_steps)
+    assert source.task_run is not None
+    source.task_run.wait_for_action_delta(delta=initial_steps)
     checkpoints_by_step = harness.wait_for_tree_search_checkpoints(
         source.sandbox_id,
         initial_steps=initial_steps,
@@ -190,7 +201,8 @@ def restore_prepared_replay_fork(
             f"tree-search restore failed for step {prepared.replay_step}: {restore_result.message}"
         )
     recovery_finished = time.perf_counter()
-    prepared.fork.last_status = harness.poll_status(prepared.fork)
+    assert prepared.fork.task_run is not None
+    prepared.fork.last_status = prepared.fork.task_run.poll_status()
     ready_at = time.perf_counter()
     logger.info(
         "TreeSearch fork ready source_index=%d fork=%s replay_step=%d recovery_ms=%.3f readiness_ms=%.3f end_to_end_recovery_ms=%.3f",
@@ -221,8 +233,9 @@ def run_replay_progress(
     retained_source_checkpoints: int,
     fork_steps: int,
 ) -> dict[str, object]:
+    assert restored.prepared.fork.task_run is not None
     for _ in range(fork_steps):
-        harness.wait_for_action_delta(restored.prepared.fork, delta=1)
+        restored.prepared.fork.task_run.wait_for_action_delta(delta=1)
     progress_finished = time.perf_counter()
     return {
         "source_index": restored.prepared.source_index,
@@ -401,7 +414,24 @@ def run_tree_search_benchmark(
         args.replay_mode,
         replay_steps,
     )
-    sources = [harness.launch_tree_search_sandbox(f"tree-source-{source_index}") for source_index in range(args.sandboxes)]
+    dataset_path = getattr(args, "dataset", None)
+    dataset = harness.load_dataset(dataset_path) if dataset_path is not None else None
+    with ThreadPoolExecutor(max_workers=max(1, args.sandboxes)) as launcher:
+        sources = list(
+            launcher.map(
+                lambda source_index: harness.launch_task_record(
+                    f"tree-source-{source_index}",
+                    harness.select_task_record(
+                        dataset,
+                        sandbox_index=source_index,
+                        default_agent_type=args.agent_type,
+                        default_task_description=benchmark_task_description(),
+                        default_task_config=default_task_config(),
+                    ),
+                ),
+                range(args.sandboxes),
+            )
+        )
     indexed_sources = list(enumerate(sources))
 
     if args.auto_cr:

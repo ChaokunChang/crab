@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from agent_cr import ArtifactKind, ArtifactReference, CheckpointId, CheckpointManifest, SandboxId, SchedulerConfig
+from benchmarks.agents import IFlowAgent, TaskConfig, TaskDescription
+from benchmarks.bench_agent_cr_sandbox_e2e import run_benchmark
 from agent_cr.models import utc_now
 from benchmarks.bench_tree_search import choose_replay_steps
 from benchmarks.real_host_scenario_base import (
+    BenchmarkTaskRecord,
     RealHostScenarioHarness,
     SandboxHandle,
     TreeSearchCheckpointRecord,
@@ -333,6 +339,470 @@ class BenchmarkHelperTests(unittest.TestCase):
             "spot-0",
         )
         self.assertIsNone(harness.resolve_interceptor_sandbox_id("10.250.0.43", {}, b""))
+
+    def test_launch_sandbox_and_task_records_task_metadata(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        handle = SandboxHandle(
+            sandbox_id=SandboxId("sbx-launch"),
+            bundle_dir=Path("/tmp/sbx-launch"),
+            status_port=8123,
+            last_status={},
+        )
+        task_description = TaskDescription("solve a task")
+        task_config = TaskConfig(minimum_actions=3)
+
+        with patch.object(harness, "launch_sandbox", return_value=handle) as launch_sandbox:
+            with patch.object(harness, "launch_task") as launch_task:
+                result = harness.launch_sandbox_and_task(
+                    "sbx-launch",
+                    agent_type="simulated",
+                    task_description=task_description,
+                    task_config=task_config,
+                )
+
+        self.assertIs(result, handle)
+        launch_sandbox.assert_called_once_with("sbx-launch", agent_type="simulated")
+        launch_task.assert_called_once_with("simulated", task_description, task_config, "sbx-launch")
+
+    def test_launch_task_creates_task_run_and_future(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        handle = SandboxHandle(
+            sandbox_id=SandboxId("sbx-agent"),
+            bundle_dir=Path("/tmp/sbx-agent"),
+            status_port=8123,
+            last_status={},
+        )
+        harness._sandbox_by_id[handle.sandbox_id] = handle
+        mock_task_run = Mock()
+        mock_future = Mock()
+        task_description = TaskDescription("progress")
+        task_config = TaskConfig(minimum_actions=2)
+
+        with patch.object(harness, "build_task_run", return_value=mock_task_run) as build_task_run:
+            with patch.object(harness._task_executor, "submit", return_value=mock_future) as submit:
+                returned = harness.launch_task("simulated", task_description, task_config, "sbx-agent")
+
+        self.assertIs(returned, mock_task_run)
+        self.assertEqual(handle.agent_type, "simulated")
+        self.assertEqual(handle.task_description, task_description)
+        self.assertEqual(handle.task_config, task_config)
+        self.assertIs(handle.task_run, mock_task_run)
+        self.assertIs(handle.task_future, mock_future)
+        build_task_run.assert_called_once_with("simulated", handle, task_description, task_config)
+        submit.assert_called_once_with(mock_task_run.perform_task)
+
+    def test_relaunch_sandbox_creates_fresh_task_run(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-relaunch"),
+            bundle_dir=Path("/tmp/sbx-relaunch"),
+            status_port=8123,
+            last_status={},
+            agent_type="iflow",
+            task_description=TaskDescription("resume"),
+            task_config=TaskConfig(minimum_actions=0),
+        )
+        harness.sandbox_manager = SimpleNamespace(
+            describe=lambda sandbox_id: SimpleNamespace(metadata={"zfs_dataset": "", "bundle_path": "/tmp/bundle"}),
+            launch=Mock(),
+        )
+        harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())
+        harness.runtime_state_root = Path("/tmp/runtime")
+
+        fake_task_run = SimpleNamespace(
+            wait_for_task_ready=Mock(),
+            poll_status=Mock(return_value={"total_actions": 0}),
+        )
+        with patch.object(harness, "launch_task", side_effect=lambda *args, **kwargs: setattr(sandbox, "task_run", fake_task_run)):
+            harness.relaunch_sandbox(sandbox)
+
+        self.assertIs(sandbox.task_run, fake_task_run)
+        fake_task_run.wait_for_task_ready.assert_called_once()
+        fake_task_run.poll_status.assert_called_once()
+
+    def test_launch_sandbox_from_docker_compose_file_translates_supported_service(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        harness.root = Path(tempfile.mkdtemp(prefix="agent_cr_compose_test_"))
+        harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())
+        launch_mock = Mock()
+        harness.system = SimpleNamespace(sandbox_manager=SimpleNamespace(launch=launch_mock))
+        config_dir = harness.root / "bundle"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "linux": {"namespaces": [], "cgroupsPath": ""},
+                    "mounts": [],
+                    "process": {"terminal": False, "cwd": "/", "args": [], "env": []},
+                    "root": {"path": "rootfs", "readonly": False},
+                }
+            ),
+            encoding="utf-8",
+        )
+        handle = SandboxHandle(
+            sandbox_id=SandboxId("sbx-compose"),
+            bundle_dir=config_dir,
+            status_port=8123,
+            status_host="127.0.0.1",
+            last_status={},
+        )
+        compose_file = harness.root / "compose.yaml"
+        compose_file.write_text(
+            """
+services:
+  app:
+    image: alpine:3.20
+    command: "echo hello"
+    working_dir: /work
+    environment:
+      HELLO: world
+""".strip(),
+            encoding="utf-8",
+        )
+        env_file = harness.root / ".env"
+        env_file.write_text("", encoding="utf-8")
+
+        with patch.object(harness, "_allocate_benchmark_network_lease", return_value=SimpleNamespace(guest_ip="10.250.0.2")):
+            with patch.object(harness, "_prepare_sandbox_handle", return_value=(handle, None)):
+                with patch("benchmarks.real_host_scenario_base.export_docker_image_rootfs", return_value=harness.root / "rootfs"):
+                    result = harness.launch_sandbox_from_docker_compose_file(
+                        compose_file,
+                        env_file,
+                        sandbox_name="sbx-compose",
+                        service_name="app",
+                    )
+
+        self.assertEqual(result.launch_source, "compose")
+        launch_mock.assert_called_once()
+        metadata = launch_mock.call_args.args[1]
+        self.assertEqual(metadata["compose_service_name"], "app")
+
+    def test_launch_sandbox_uses_host_network_for_simulated_agents(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        harness.root = Path(tempfile.mkdtemp(prefix="agent_cr_launch_test_"))
+        harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())
+        harness.system = SimpleNamespace(sandbox_manager=SimpleNamespace(launch=Mock()))
+        harness.interceptor = SimpleNamespace(port=43123)
+        harness.exported_rootfs = harness.root / "rootfs"
+        harness.exported_rootfs.mkdir(parents=True, exist_ok=True)
+
+        handle = SandboxHandle(
+            sandbox_id=SandboxId("sbx-sim"),
+            bundle_dir=harness.root / "bundle",
+            status_port=8123,
+            status_host="127.0.0.1",
+            last_status={},
+        )
+        task_run = SimpleNamespace(
+            prepare_sandbox=Mock(),
+            configure_bundle=Mock(),
+            rootfs_init_dirs=Mock(return_value=[]),
+            extra_launch_metadata=Mock(return_value={}),
+            wait_for_task_ready=Mock(),
+        )
+
+        with patch.object(harness, "_allocate_benchmark_network_lease") as allocate_network:
+            with patch.object(harness, "_prepare_sandbox_handle", return_value=(handle, None)) as prepare_handle:
+                with patch.object(harness, "build_task_run", return_value=task_run):
+                    result = harness.launch_sandbox("sbx-sim", agent_type="simulated")
+
+        self.assertIs(result, handle)
+        allocate_network.assert_not_called()
+        prepare_handle.assert_called_once_with(
+            "sbx-sim",
+            interceptor_host="127.0.0.1",
+            network_lease=None,
+            agent_type="simulated",
+        )
+
+    def test_launch_sandbox_uses_benchmark_network_for_iflow_agents(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        harness.root = Path(tempfile.mkdtemp(prefix="agent_cr_launch_test_"))
+        harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())
+        harness.system = SimpleNamespace(sandbox_manager=SimpleNamespace(launch=Mock()))
+        harness.interceptor = SimpleNamespace(port=43123)
+        harness.exported_rootfs = harness.root / "rootfs"
+        harness.exported_rootfs.mkdir(parents=True, exist_ok=True)
+
+        lease = SimpleNamespace(guest_ip="10.250.0.2", namespace_path=Path("/var/run/netns/test-iflow"))
+        handle = SandboxHandle(
+            sandbox_id=SandboxId("sbx-iflow"),
+            bundle_dir=harness.root / "bundle-iflow",
+            status_port=8124,
+            status_host=lease.guest_ip,
+            last_status={},
+        )
+        task_run = SimpleNamespace(
+            prepare_sandbox=Mock(),
+            configure_bundle=Mock(),
+            rootfs_init_dirs=Mock(return_value=[]),
+            extra_launch_metadata=Mock(return_value={}),
+            wait_for_task_ready=Mock(),
+        )
+
+        with patch.object(harness, "_allocate_benchmark_network_lease", return_value=lease) as allocate_network:
+            with patch.object(harness, "_prepare_sandbox_handle", return_value=(handle, None)) as prepare_handle:
+                with patch.object(harness, "build_task_run", return_value=task_run):
+                    result = harness.launch_sandbox("sbx-iflow", agent_type="iflow")
+
+        self.assertIs(result, handle)
+        allocate_network.assert_called_once_with(SandboxId("sbx-iflow"))
+        prepare_handle.assert_called_once_with(
+            "sbx-iflow",
+            interceptor_host=harness._benchmark_bridge_ip,
+            network_lease=lease,
+            agent_type="iflow",
+        )
+        self.assertEqual(harness._benchmark_ip_to_sandbox[lease.guest_ip], SandboxId("sbx-iflow"))
+
+    def test_launch_sandbox_from_docker_compose_file_rejects_unsupported_features(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            compose_file = root / "compose.yaml"
+            compose_file.write_text(
+                """
+services:
+  app:
+    image: alpine
+    depends_on:
+      - db
+""".strip(),
+                encoding="utf-8",
+            )
+            env_file = root / ".env"
+            env_file.write_text("", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "unsupported compose features"):
+                harness.launch_sandbox_from_docker_compose_file(
+                    compose_file,
+                    env_file,
+                    sandbox_name="sbx-compose",
+                    service_name="app",
+                )
+
+    def test_iflow_agent_uses_foreground_runc_exec(self) -> None:
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-iflow"),
+            bundle_dir=Path("/tmp/sbx-iflow"),
+            status_port=8123,
+            last_status={},
+            launch_metadata={
+                "iflow": {
+                    "entrypoint": "/opt/iflow-runtime/global/lib/node_modules/@iflow-ai/iflow-cli/bundle/entry.js",
+                }
+            },
+        )
+        harness = SimpleNamespace(runtime_state_root=Path("/tmp/runtime"))
+        agent = IFlowAgent(harness, sandbox, TaskDescription("do work"), TaskConfig(options={"FOO": "bar"}))
+        with patch("benchmarks.agents.iflow.subprocess.run") as run:
+            agent.perform_task()
+
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:4], ["runc", "--root", "/tmp/runtime", "exec"])
+        self.assertNotIn("-d", argv)
+        self.assertIn("sbx-iflow", argv)
+
+    def test_iflow_agent_exposes_synthetic_progress_status(self) -> None:
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-iflow-progress"),
+            bundle_dir=Path("/tmp/sbx-iflow-progress"),
+            status_port=8123,
+            last_status={},
+            launch_metadata={
+                "iflow": {
+                    "entrypoint": "/opt/iflow-runtime/global/lib/node_modules/@iflow-ai/iflow-cli/bundle/entry.js",
+                }
+            },
+        )
+        harness = SimpleNamespace(runtime_state_root=Path("/tmp/runtime"), record_activity=Mock())
+        agent = IFlowAgent(
+            harness,
+            sandbox,
+            TaskDescription("do work"),
+            TaskConfig(options={"action_tick_seconds": 0.01}),
+        )
+
+        def _sleeping_run(*args, **kwargs):
+            _ = (args, kwargs)
+            time.sleep(0.2)
+            return SimpleNamespace(returncode=0)
+
+        with patch("benchmarks.agents.iflow.subprocess.run", side_effect=_sleeping_run):
+            worker = threading.Thread(target=agent.perform_task)
+            worker.start()
+            payload = agent.wait_for_progress(minimum_actions=2)
+            delta_payload = agent.wait_for_action_delta(delta=1)
+            worker.join(timeout=1.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertGreaterEqual(int(payload["total_actions"]), 2)
+        self.assertGreaterEqual(int(delta_payload["total_actions"]), int(payload["total_actions"]) + 1)
+        final_payload = agent.poll_status()
+        self.assertEqual(final_payload["state"], "finished")
+        self.assertGreaterEqual(int(final_payload["total_actions"]), int(delta_payload["total_actions"]))
+        self.assertGreaterEqual(harness.record_activity.call_count, 2)
+
+    def test_load_dataset_normalizes_relative_paths_and_cycles_rows(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset_path = root / "tasks.jsonl"
+            dataset_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "agent_type": "simulated",
+                                "task_description": "task-a",
+                                "task_config": {"minimum_actions": 1},
+                                "docker_compose_file": "compose.yaml",
+                                "env_file": "task.env",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "agent_type": "iflow",
+                                "task_description": {"prompt": "task-b"},
+                            }
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            records = harness.load_dataset(dataset_path)
+            self.assertEqual(len(records), 2)
+            self.assertEqual(records[0].docker_compose_file, (root / "compose.yaml").resolve())
+            self.assertEqual(records[0].env_file, (root / "task.env").resolve())
+            selected = harness.select_task_record(
+                records,
+                sandbox_index=3,
+                default_agent_type="simulated",
+                default_task_description=TaskDescription("ignored"),
+                default_task_config=TaskConfig(),
+            )
+            self.assertEqual(selected.agent_type, "iflow")
+            self.assertEqual(selected.task_description.prompt, "task-b")
+
+    def test_launch_task_record_routes_dataset_compose_rows(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        record = BenchmarkTaskRecord(
+            agent_type="simulated",
+            task_description=TaskDescription("compose"),
+            task_config=TaskConfig(),
+            docker_compose_file=Path("/tmp/compose.yaml"),
+            env_file=Path("/tmp/task.env"),
+        )
+        with patch.object(harness, "launch_sandbox_from_docker_compose_file", return_value="compose-handle") as launch_compose:
+            result = harness.launch_task_record("sbx-compose", record)
+
+        self.assertEqual(result, "compose-handle")
+        launch_compose.assert_called_once()
+
+    def test_e2e_benchmark_uses_shared_harness_launch_flow(self) -> None:
+        task_run = SimpleNamespace(
+            wait_for_progress=Mock(return_value={"total_actions": 6}),
+        )
+        harness = SimpleNamespace(
+            load_dataset=lambda path: [],
+            select_task_record=lambda *args, **kwargs: BenchmarkTaskRecord(
+                agent_type="simulated",
+                task_description=TaskDescription("task"),
+                task_config=TaskConfig(),
+            ),
+            launch_task_record=Mock(
+                side_effect=lambda name, record: SandboxHandle(
+                    sandbox_id=SandboxId(name),
+                    bundle_dir=Path("/tmp") / name,
+                    status_port=8123,
+                    last_status={
+                        "total_actions": 6,
+                        "filesystem_actions": 1,
+                        "process_actions": 1,
+                        "network_actions": 1,
+                    },
+                    task_run=task_run,
+                )
+            ),
+            request_state_store=None,
+            checkpoint_if_due=Mock(return_value=None),
+            restore_once=Mock(),
+            get_sandbox_handle=lambda sandbox_id: SandboxHandle(
+                sandbox_id=SandboxId(sandbox_id),
+                bundle_dir=Path("/tmp") / sandbox_id,
+                status_port=8123,
+                last_status={},
+            ),
+            set_snapshot_metadata=Mock(),
+        )
+        rows = run_benchmark(
+            SimpleNamespace(sandboxes=1, iters=1, provider="openai", agent_type="simulated", dataset=None),
+            harness,
+        )
+        self.assertEqual(len(rows), 1)
+        harness.launch_task_record.assert_called_once()
 
 
 if __name__ == "__main__":
