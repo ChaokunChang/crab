@@ -203,6 +203,7 @@ class RealHostIntegrationTests(unittest.TestCase):
                 request_state_store=request_state_store,
                 hook=hook,
                 on_state_change=system.notify_interceptor_state_change,
+                response_gate_registry=system.response_gate_registry,
                 host="127.0.0.1",
                 port=0,
             )

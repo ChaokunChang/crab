@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import logging
+from typing import Callable
 
 from ..contracts import (
     CheckpointManager,
@@ -31,6 +32,70 @@ logger = logging.getLogger(__name__)
 
 _PROCESS_RESTORE_CHECKPOINT_ID = "process_restore_checkpoint_id"
 _FILESYSTEM_RESTORE_CHECKPOINT_ID = "filesystem_restore_checkpoint_id"
+_CAPTURES_INFLIGHT_LLM = "captures_inflight_llm"
+_CAPTURED_REQUEST_ID = "captured_request_id"
+_CAPTURED_REQUEST_PROVIDER = "captured_request_provider"
+_CAPTURED_REQUEST_STARTED_AT = "captured_request_started_at"
+
+
+def resolve_restore_manifest(
+    checkpoint_manager: CheckpointManager,
+    manifest: CheckpointManifest,
+) -> CheckpointManifest:
+    process_artifacts = list(manifest.process_artifacts)
+    filesystem_artifacts = list(manifest.filesystem_artifacts)
+    metadata = dict(manifest.metadata)
+    process_manifest = manifest if process_artifacts else None
+    process_checkpoint_id = manifest.checkpoint_id if process_artifacts else None
+    filesystem_checkpoint_id = manifest.checkpoint_id if filesystem_artifacts else None
+
+    if process_artifacts and filesystem_artifacts:
+        metadata.setdefault(_PROCESS_RESTORE_CHECKPOINT_ID, str(manifest.checkpoint_id))
+        metadata.setdefault(_FILESYSTEM_RESTORE_CHECKPOINT_ID, str(manifest.checkpoint_id))
+        _copy_process_restore_metadata(metadata, manifest.metadata)
+        return replace(manifest, metadata=metadata).with_integrity()
+
+    checkpoints = checkpoint_manager.list_checkpoints(manifest.sandbox_id)
+    try:
+        current_index = checkpoints.index(manifest.checkpoint_id)
+        candidate_ids = reversed(checkpoints[:current_index])
+    except ValueError:
+        candidate_ids = reversed(checkpoints)
+
+    for checkpoint_id in candidate_ids:
+        if process_artifacts and filesystem_artifacts:
+            break
+        candidate = checkpoint_manager.get_manifest(manifest.sandbox_id, checkpoint_id)
+        if not process_artifacts and candidate.process_artifacts:
+            process_artifacts = list(candidate.process_artifacts)
+            process_manifest = candidate
+            process_checkpoint_id = candidate.checkpoint_id
+        if not filesystem_artifacts and candidate.filesystem_artifacts:
+            filesystem_artifacts = list(candidate.filesystem_artifacts)
+            filesystem_checkpoint_id = candidate.checkpoint_id
+
+    if process_checkpoint_id is not None:
+        metadata[_PROCESS_RESTORE_CHECKPOINT_ID] = str(process_checkpoint_id)
+    if filesystem_checkpoint_id is not None:
+        metadata[_FILESYSTEM_RESTORE_CHECKPOINT_ID] = str(filesystem_checkpoint_id)
+    _copy_process_restore_metadata(metadata, {} if process_manifest is None else process_manifest.metadata)
+
+    return replace(
+        manifest,
+        process_artifacts=process_artifacts,
+        filesystem_artifacts=filesystem_artifacts,
+        metadata=metadata,
+    ).with_integrity()
+
+
+def _copy_process_restore_metadata(target: dict[str, object], source: dict[str, object]) -> None:
+    target[_CAPTURES_INFLIGHT_LLM] = bool(source.get(_CAPTURES_INFLIGHT_LLM, False))
+    for key in (_CAPTURED_REQUEST_ID, _CAPTURED_REQUEST_PROVIDER, _CAPTURED_REQUEST_STARTED_AT):
+        value = source.get(key)
+        if value is None:
+            target.pop(key, None)
+        else:
+            target[key] = value
 
 
 class DefaultCWorker(CompositeCheckpointWorker):
@@ -40,15 +105,38 @@ class DefaultCWorker(CompositeCheckpointWorker):
         filesystem_worker: FileSystemCWorker,
         checkpoint_manager: CheckpointManager,
         runtime_adapter: SandboxRuntimeAdapter,
+        checkpoint_guard: Callable[[CheckpointJob], tuple[bool, str | None]] | None = None,
     ):
         self._process_worker = process_worker
         self._filesystem_worker = filesystem_worker
         self._checkpoint_manager = checkpoint_manager
         self._runtime_adapter = runtime_adapter
+        self._checkpoint_guard = checkpoint_guard
 
     def checkpoint(self, job: CheckpointJob) -> CheckpointResult:
         started = utc_now()
         checkpoint_id = CheckpointId(str(job.metadata.get("checkpoint_id", CheckpointId.new())))
+        if self._checkpoint_guard is not None:
+            allowed, message = self._checkpoint_guard(job)
+            if not allowed:
+                logger.info(
+                    "Skipping composite checkpoint for job %s sandbox=%s checkpoint=%s reason=%s",
+                    job.job_id,
+                    job.sandbox_id,
+                    checkpoint_id,
+                    "" if message is None else message,
+                )
+                return CheckpointResult(
+                    job_id=job.job_id,
+                    sandbox_id=job.sandbox_id,
+                    checkpoint_id=checkpoint_id,
+                    status=JobStatus.FAILED,
+                    started_at=started,
+                    finished_at=utc_now(),
+                    manifest=None,
+                    failure_code=FailureCode.VALIDATION_ERROR,
+                    message=message or "checkpoint_rejected",
+                )
         logger.info(
             "Starting composite checkpoint for job %s sandbox=%s checkpoint=%s",
             job.job_id,
@@ -139,12 +227,15 @@ class DefaultCWorker(CompositeCheckpointWorker):
             process_artifacts=process_refs,
             filesystem_artifacts=fs_refs,
             metadata={
+                **job.metadata,
                 "job_id": str(job.job_id),
                 "reason": job.reason,
+                "leave_running": job.leave_running,
             },
         ).with_integrity()
         try:
             self._checkpoint_manager.put_manifest(manifest)
+            self._checkpoint_manager.handle_checkpoint_complete(manifest)
         except Exception as exc:
             logger.exception(
                 "Failed to persist manifest for job %s sandbox=%s checkpoint=%s",
@@ -207,7 +298,7 @@ class DefaultRWorker(CompositeRestoreWorker):
                 sandbox_id=job.sandbox_id,
                 checkpoint_id=job.checkpoint_id,
             )
-            manifest = self._resolve_restore_manifest(manifest)
+            manifest = resolve_restore_manifest(self._checkpoint_manager, manifest)
         except Exception as exc:
             logger.exception(
                 "Failed to load manifest for restore job %s sandbox=%s checkpoint=%s",
@@ -293,45 +384,3 @@ class DefaultRWorker(CompositeRestoreWorker):
             finished_at=utc_now(),
             operation_statuses=tuple(operation_statuses),
         )
-
-    def _resolve_restore_manifest(self, manifest: CheckpointManifest) -> CheckpointManifest:
-        process_artifacts = list(manifest.process_artifacts)
-        filesystem_artifacts = list(manifest.filesystem_artifacts)
-        metadata = dict(manifest.metadata)
-        process_checkpoint_id = manifest.checkpoint_id if process_artifacts else None
-        filesystem_checkpoint_id = manifest.checkpoint_id if filesystem_artifacts else None
-
-        if process_artifacts and filesystem_artifacts:
-            metadata.setdefault(_PROCESS_RESTORE_CHECKPOINT_ID, str(manifest.checkpoint_id))
-            metadata.setdefault(_FILESYSTEM_RESTORE_CHECKPOINT_ID, str(manifest.checkpoint_id))
-            return replace(manifest, metadata=metadata).with_integrity()
-
-        checkpoints = self._checkpoint_manager.list_checkpoints(manifest.sandbox_id)
-        try:
-            current_index = checkpoints.index(manifest.checkpoint_id)
-            candidate_ids = reversed(checkpoints[:current_index])
-        except ValueError:
-            candidate_ids = reversed(checkpoints)
-
-        for checkpoint_id in candidate_ids:
-            if process_artifacts and filesystem_artifacts:
-                break
-            candidate = self._checkpoint_manager.get_manifest(manifest.sandbox_id, checkpoint_id)
-            if not process_artifacts and candidate.process_artifacts:
-                process_artifacts = list(candidate.process_artifacts)
-                process_checkpoint_id = candidate.checkpoint_id
-            if not filesystem_artifacts and candidate.filesystem_artifacts:
-                filesystem_artifacts = list(candidate.filesystem_artifacts)
-                filesystem_checkpoint_id = candidate.checkpoint_id
-
-        if process_checkpoint_id is not None:
-            metadata[_PROCESS_RESTORE_CHECKPOINT_ID] = str(process_checkpoint_id)
-        if filesystem_checkpoint_id is not None:
-            metadata[_FILESYSTEM_RESTORE_CHECKPOINT_ID] = str(filesystem_checkpoint_id)
-
-        return replace(
-            manifest,
-            process_artifacts=process_artifacts,
-            filesystem_artifacts=filesystem_artifacts,
-            metadata=metadata,
-        ).with_integrity()

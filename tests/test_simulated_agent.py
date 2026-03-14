@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
-from simulated_agent.agent_cli import parse_anthropic_tool_calls, parse_openai_tool_calls
+from simulated_agent.agent_cli import AgentRuntime, parse_anthropic_tool_calls, parse_openai_tool_calls
 from simulated_agent.service import (
     SimulatedLLMState,
     build_anthropic_response,
@@ -69,6 +71,111 @@ class SimulatedAgentTests(unittest.TestCase):
             state=state,
         )
         self.assertEqual(anthropic_payload["content"][0]["name"], "fetch_proxy_health")
+
+    def test_runtime_run_cycle_records_fetch_errors_and_recovers(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sim_agent_") as tmp:
+            runtime = AgentRuntime(
+                provider="openai",
+                interceptor_url="http://127.0.0.1:1",
+                sandbox_id="sbx-1",
+                work_dir=Path(tmp),
+                poll_interval_s=0.0,
+                status_port=0,
+            )
+
+            calls = iter(
+                [
+                    TimeoutError("socket dropped"),
+                    [{"name": "show_pwd", "input": {}}],
+                ]
+            )
+
+            def fake_fetch() -> list[dict[str, object]]:
+                item = next(calls)
+                if isinstance(item, Exception):
+                    raise item
+                return item
+
+            runtime.fetch_tool_calls = fake_fetch  # type: ignore[method-assign]
+
+            runtime.run_cycle()
+            self.assertEqual(runtime.state["request_errors"], 1)
+            self.assertEqual(runtime.state["total_actions"], 0)
+            self.assertEqual(runtime.state["last_error"]["stage"], "fetch_tool_calls")
+
+            runtime.run_cycle()
+            self.assertEqual(runtime.state["request_errors"], 1)
+            self.assertEqual(runtime.state["total_actions"], 1)
+            self.assertTrue(runtime.state["last_tool_result"]["cwd"].startswith(str(Path(tmp))))
+
+    def test_runtime_reloads_persisted_state_on_relaunch(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sim_agent_") as tmp:
+            work_dir = Path(tmp)
+            runtime = AgentRuntime(
+                provider="openai",
+                interceptor_url="http://127.0.0.1:1",
+                sandbox_id="sbx-1",
+                work_dir=work_dir,
+                poll_interval_s=0.0,
+                status_port=0,
+            )
+            runtime.memory_notes.append("remembered")
+            runtime.state["total_actions"] = 7
+            runtime.state["completed_requests"] = 3
+            runtime.persist_state()
+            first_runtime_id = runtime.state["runtime_id"]
+
+            reloaded = AgentRuntime(
+                provider="openai",
+                interceptor_url="http://127.0.0.1:1",
+                sandbox_id="sbx-1",
+                work_dir=work_dir,
+                poll_interval_s=0.0,
+                status_port=0,
+            )
+
+            self.assertEqual(reloaded.state["total_actions"], 7)
+            self.assertEqual(reloaded.state["completed_requests"], 3)
+            self.assertEqual(reloaded.memory_notes, ["remembered"])
+            self.assertNotEqual(reloaded.state["runtime_id"], first_runtime_id)
+
+    def test_runtime_writes_info_warning_and_debug_logs_to_work_dir(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sim_agent_") as tmp:
+            runtime = AgentRuntime(
+                provider="openai",
+                interceptor_url="http://127.0.0.1:1",
+                sandbox_id="sbx-logs",
+                work_dir=Path(tmp),
+                poll_interval_s=0.0,
+                status_port=0,
+            )
+
+            calls = iter(
+                [
+                    TimeoutError("socket dropped"),
+                    [{"name": "show_pwd", "input": {}}],
+                ]
+            )
+
+            def fake_fetch() -> list[dict[str, object]]:
+                item = next(calls)
+                if isinstance(item, Exception):
+                    raise item
+                return item
+
+            runtime.fetch_tool_calls = fake_fetch  # type: ignore[method-assign]
+
+            runtime.run_cycle()
+            runtime.run_cycle()
+            for handler in runtime.logger.handlers:
+                handler.flush()
+
+            log_text = runtime.log_path.read_text(encoding="utf-8")
+            self.assertIn("INFO agent runtime started", log_text)
+            self.assertIn("DEBUG starting agent cycle", log_text)
+            self.assertIn("WARNING runtime error stage=fetch_tool_calls", log_text)
+            self.assertIn("INFO running tool name=show_pwd", log_text)
+            self.assertIn("DEBUG tool result name=show_pwd", log_text)
 
 
 if __name__ == "__main__":

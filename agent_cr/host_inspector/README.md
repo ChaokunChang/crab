@@ -25,7 +25,7 @@ make -C agent_cr/host_inspector/bpf
 ## Start The Server
 
 ```bash
-python3 -m agent_cr.host_inspector --port 9782 --process-poll-interval 0.1 --log-level INFO
+python3 -m agent_cr.host_inspector --port 9782 --log-level INFO
 ```
 
 `--process-poll-interval` is kept for CLI compatibility, but `process_changed` is evaluated on demand when `/get_proc_and_fs_status` is queried. It no longer drives a sticky polling result.

@@ -112,10 +112,21 @@ class CommandRuntimeAdapter(SandboxRuntimeAdapter):
         self,
         sandbox_id: SandboxId,
         checkpoint_id: CheckpointId,
+        *,
+        leave_running: bool,
     ) -> RuntimeOperationStatus:
         return self._execute(
-            self._checkpoint_cmd(sandbox_id=sandbox_id, checkpoint_id=checkpoint_id),
-            metadata=self._process_metadata(sandbox_id, checkpoint_id, phase="process_checkpoint"),
+            self._checkpoint_cmd(
+                sandbox_id=sandbox_id,
+                checkpoint_id=checkpoint_id,
+                leave_running=leave_running,
+            ),
+            metadata=self._process_metadata(
+                sandbox_id,
+                checkpoint_id,
+                phase="process_checkpoint",
+                leave_running=leave_running,
+            ),
         )
 
     def restore_process(
@@ -209,6 +220,7 @@ class CommandRuntimeAdapter(SandboxRuntimeAdapter):
         checkpoint_id: CheckpointId,
         *,
         phase: str,
+        leave_running: bool | None = None,
     ) -> dict[str, Any]:
         raise NotImplementedError
 
@@ -223,7 +235,13 @@ class CommandRuntimeAdapter(SandboxRuntimeAdapter):
         raise NotImplementedError
 
     @abstractmethod
-    def _checkpoint_cmd(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> list[str]:
+    def _checkpoint_cmd(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+        *,
+        leave_running: bool,
+    ) -> list[str]:
         raise NotImplementedError
 
     @abstractmethod
