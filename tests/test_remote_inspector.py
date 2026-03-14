@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timezone
 
-from agent_cr import HostInspectorServiceClient, RemoteSandboxInspector, SandboxId
+from agent_cr import HostInspectorServiceClient, RemoteSandboxInspector, SandboxId, SandboxSnapshot
 
 
 class RecordingServiceClient(HostInspectorServiceClient):
@@ -44,6 +44,37 @@ class FailingServiceClient(HostInspectorServiceClient):
         raise RuntimeError("boom")
 
 
+class DeferredResetServiceClient(HostInspectorServiceClient):
+    def __init__(self) -> None:
+        super().__init__("http://127.0.0.1:1")
+        self.registered = False
+        self.reset_calls: list[tuple[SandboxId, datetime | None]] = []
+        self._last_reset_at: datetime | None = None
+
+    def get_proc_and_fs_status(self, sandbox_id: SandboxId) -> dict[str, object]:
+        if not self.registered:
+            raise KeyError(str(sandbox_id))
+        return {
+            "ok": True,
+            "status": {
+                "runtime_name": "runc",
+                "is_running": True,
+                "process_changed": False,
+                "filesystem_changed": False,
+                "observed_at": "2026-03-11T12:00:01+00:00",
+                "last_reset_at": None if self._last_reset_at is None else self._last_reset_at.isoformat(),
+                "metadata": {"object_id": str(sandbox_id)},
+            },
+        }
+
+    def reset_sandbox(self, sandbox_id: SandboxId, at: datetime | None) -> dict[str, object]:
+        if not self.registered:
+            raise KeyError(str(sandbox_id))
+        self.reset_calls.append((sandbox_id, at))
+        self._last_reset_at = at
+        return {"ok": True}
+
+
 class RemoteInspectorTests(unittest.TestCase):
     def test_remote_inspector_maps_status_response(self) -> None:
         inspector = RemoteSandboxInspector(RecordingServiceClient())
@@ -76,6 +107,40 @@ class RemoteInspectorTests(unittest.TestCase):
         inspector.mark_checkpoint_complete(SandboxId("sbx-1"), process=True, filesystem=False, at=at)
 
         self.assertEqual(client.reset_calls, [(SandboxId("sbx-1"), at)])
+
+    def test_remote_inspector_uses_seed_snapshot_until_remote_registration_then_syncs_reset(self) -> None:
+        client = DeferredResetServiceClient()
+        inspector = RemoteSandboxInspector(client)
+        observed_at = datetime(2026, 3, 11, 11, 59, tzinfo=timezone.utc)
+        sandbox_id = SandboxId("sbx-seeded")
+
+        inspector.upsert_snapshot(
+            SandboxSnapshot(
+                sandbox_id=sandbox_id,
+                runtime_name="runc",
+                is_running=True,
+                process_changed=False,
+                filesystem_changed=False,
+                observed_at=observed_at,
+                metadata={"seeded": True},
+            )
+        )
+
+        seeded = inspector.inspect(sandbox_id)
+        self.assertEqual(seeded.runtime_name, "runc")
+        self.assertFalse(seeded.process_changed)
+        self.assertFalse(seeded.filesystem_changed)
+        self.assertEqual(seeded.metadata, {"seeded": True})
+
+        client.registered = True
+        synced = inspector.inspect(sandbox_id)
+
+        self.assertEqual(client.reset_calls, [(sandbox_id, observed_at)])
+        self.assertFalse(synced.process_changed)
+        self.assertFalse(synced.filesystem_changed)
+        self.assertTrue(synced.metadata["seeded"])
+        self.assertEqual(synced.metadata["object_id"], "sbx-seeded")
+        self.assertEqual(synced.last_checkpoint_at, observed_at)
 
 
 if __name__ == "__main__":

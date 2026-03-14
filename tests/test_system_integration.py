@@ -345,6 +345,44 @@ class SystemIntegrationTests(unittest.TestCase):
             self.assertIn("executor.job_finished", event_names)
             executor.shutdown()
 
+    def test_notify_fault_marks_sandbox_not_running_before_recovery_runs(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
+            root = Path(tmp)
+            runner = FakeCommandRunner()
+            telemetry = InMemoryTelemetrySink()
+            collector = InMemoryEBPFEventCollector()
+            inspector = EBPFSandboxInspector(collector)
+            system, executor = self._build_runc_system(
+                root=root,
+                runner=runner,
+                telemetry=telemetry,
+                inspector=inspector,
+            )
+
+            sandbox_id = system.sandbox_manager.launch(
+                "runc",
+                {
+                    "sandbox_id": "sbx-faulted",
+                    "bundle_path": str(root / "bundles" / "sbx-faulted"),
+                },
+            )
+            inspector.upsert_snapshot(
+                SandboxSnapshot(
+                    sandbox_id=sandbox_id,
+                    runtime_name="runc",
+                    is_running=True,
+                    process_changed=False,
+                    filesystem_changed=False,
+                    observed_at=utc_now(),
+                )
+            )
+
+            system.notify_fault(sandbox_id)
+
+            self.assertFalse(inspector.inspect(sandbox_id).is_running)
+            self.assertEqual(system.sandbox_manager.describe(sandbox_id).status, "stopped")
+            executor.shutdown()
+
     def test_fault_tolerance_policy_resumes_sandbox_after_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
             root = Path(tmp)

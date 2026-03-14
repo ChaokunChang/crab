@@ -60,6 +60,12 @@ class InMemorySandboxManager(SandboxManager):
             self._items[sandbox_id] = replace(cur, status="running")
         logger.info("Resumed in-memory sandbox %s", sandbox_id)
 
+    def sync_runtime_state(self, sandbox_id: SandboxId, *, is_running: bool) -> None:
+        with self._lock:
+            cur = self._items[sandbox_id]
+            self._items[sandbox_id] = replace(cur, status="running" if is_running else "stopped")
+        logger.info("Synced in-memory sandbox %s runtime state running=%s", sandbox_id, is_running)
+
     def prepare_for_restore(self, sandbox_id: SandboxId) -> None:
         logger.info("Prepared in-memory sandbox %s for restore", sandbox_id)
 
@@ -168,7 +174,15 @@ class RuncSandboxManager(SandboxManager):
     def pause(self, sandbox_id: SandboxId) -> None:
         description = self.describe(sandbox_id)
         logger.info("Pausing sandbox %s", sandbox_id)
-        self._run([self._runtime_bin, "--root", str(self._paths.state_root), "pause", str(sandbox_id)])
+        try:
+            self._run(
+                [self._runtime_bin, "--root", str(self._paths.state_root), "pause", str(sandbox_id)],
+                expected_error_substrings=("container not running", "container does not exist"),
+            )
+        except RuntimeError as exc:
+            if "container not running" in str(exc) or "container does not exist" in str(exc):
+                self.sync_runtime_state(sandbox_id, is_running=False)
+            raise
         updated = replace(description, status="paused")
         with self._lock:
             self._items[sandbox_id] = updated
@@ -184,6 +198,14 @@ class RuncSandboxManager(SandboxManager):
             self._items[sandbox_id] = updated
         self._persist(updated)
         logger.info("Sandbox %s resumed", sandbox_id)
+
+    def sync_runtime_state(self, sandbox_id: SandboxId, *, is_running: bool) -> None:
+        description = self.describe(sandbox_id)
+        updated = replace(description, status="running" if is_running else "stopped")
+        with self._lock:
+            self._items[sandbox_id] = updated
+        self._persist(updated)
+        logger.info("Synced sandbox %s runtime state running=%s", sandbox_id, is_running)
 
     def prepare_for_restore(self, sandbox_id: SandboxId) -> None:
         logger.info("Preparing sandbox %s for restore", sandbox_id)
@@ -263,20 +285,25 @@ class RuncSandboxManager(SandboxManager):
     def _metadata_path(self, sandbox_id: SandboxId) -> Path:
         return self._paths.metadata_root / f"{sandbox_id}.json"
 
-    def _run(self, command: list[str]) -> None:
+    def _run(self, command: list[str], *, expected_error_substrings: tuple[str, ...] = ()) -> None:
         logger.debug("Running sandbox manager command: %s", " ".join(command))
         result = self._runner.run(command)
         if result.returncode != 0:
-            logger.error(
+            stderr = result.stderr.strip()
+            stdout = result.stdout.strip()
+            log_fn = logger.error
+            if any(fragment in stderr for fragment in expected_error_substrings):
+                log_fn = logger.info
+            log_fn(
                 "Sandbox manager command failed rc=%d command=%s stdout=%s stderr=%s",
                 result.returncode,
                 " ".join(command),
-                result.stdout.strip(),
-                result.stderr.strip(),
+                stdout,
+                stderr,
             )
             raise RuntimeError(
                 f"command failed ({result.returncode}): {' '.join(command)}"
-                f"\nstdout: {result.stdout.strip()}"
-                f"\nstderr: {result.stderr.strip()}"
+                f"\nstdout: {stdout}"
+                f"\nstderr: {stderr}"
             )
         logger.debug("Sandbox manager command completed: %s", " ".join(command))

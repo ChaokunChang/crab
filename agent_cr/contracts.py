@@ -289,6 +289,10 @@ class SandboxManager(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def sync_runtime_state(self, sandbox_id: SandboxId, *, is_running: bool) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
     def prepare_for_restore(self, sandbox_id: SandboxId) -> None:
         raise NotImplementedError
 

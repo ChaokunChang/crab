@@ -21,6 +21,7 @@ from agent_cr import (
     EBPFSandboxInspector,
     EBPFEvent,
     EBPFEventKind,
+    FailureCode,
     InMemoryEBPFEventCollector,
     JobId,
     LocalCheckpointManager,
@@ -523,6 +524,34 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(len(manager.completed), 1)
         assert result.manifest is not None
         self.assertEqual(result.manifest.filesystem_artifacts, [])
+
+    def test_default_checkpoint_worker_rejects_guarded_job_before_workers_run(self) -> None:
+        manager = RecordingCheckpointManager()
+        process_worker = RecordingCheckpointWorker("process")
+        filesystem_worker = RecordingCheckpointWorker("filesystem")
+        worker = DefaultCWorker(
+            process_worker=process_worker,
+            filesystem_worker=filesystem_worker,
+            checkpoint_manager=manager,
+            runtime_adapter=DockerRuntimeAdapter(),
+            checkpoint_guard=lambda job: (False, f"{job.sandbox_id}:sandbox_not_running"),
+        )
+        job = CheckpointJob(
+            job_id=JobId("job-guarded"),
+            sandbox_id=SandboxId("sbx-1"),
+            requested_at=utc_now(),
+            checkpoint_process=True,
+            checkpoint_filesystem=True,
+        )
+
+        result = worker.checkpoint(job)
+
+        self.assertEqual(result.status.value, "failed")
+        self.assertEqual(result.failure_code, FailureCode.VALIDATION_ERROR)
+        self.assertEqual(result.message, "sbx-1:sandbox_not_running")
+        self.assertEqual(process_worker.calls, [])
+        self.assertEqual(filesystem_worker.calls, [])
+        self.assertEqual(manager.completed, [])
 
     def test_default_restore_worker_backfills_missing_process_from_previous_checkpoint(self) -> None:
         sid = SandboxId("sbx-1")

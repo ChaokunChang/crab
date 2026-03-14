@@ -335,7 +335,10 @@ class CRScheduler:
             snapshot = self._inspector.inspect(sandbox_id)
             decision = self.evaluate(snapshot)
             if not decision.should_checkpoint:
-                self._sandbox_manager.resume(sandbox_id)
+                if snapshot.is_running:
+                    self._sandbox_manager.resume(sandbox_id)
+                else:
+                    self._sandbox_manager.sync_runtime_state(sandbox_id, is_running=False)
                 logger.debug(
                     "Scheduler declined checkpoint for sandbox %s reason=%s",
                     sandbox_id,
@@ -353,7 +356,14 @@ class CRScheduler:
             return decision
         except Exception:
             try:
-                self._sandbox_manager.resume(sandbox_id)
+                snapshot = self._inspector.inspect(sandbox_id)
+            except Exception:
+                snapshot = None
+            try:
+                if snapshot is not None and not snapshot.is_running:
+                    self._sandbox_manager.sync_runtime_state(sandbox_id, is_running=False)
+                else:
+                    self._sandbox_manager.resume(sandbox_id)
             except Exception:
                 logger.exception("Failed to resume sandbox %s after scheduler exception", sandbox_id)
             raise

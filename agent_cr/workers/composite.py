@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import logging
+from typing import Callable
 
 from ..contracts import (
     CheckpointManager,
@@ -104,15 +105,38 @@ class DefaultCWorker(CompositeCheckpointWorker):
         filesystem_worker: FileSystemCWorker,
         checkpoint_manager: CheckpointManager,
         runtime_adapter: SandboxRuntimeAdapter,
+        checkpoint_guard: Callable[[CheckpointJob], tuple[bool, str | None]] | None = None,
     ):
         self._process_worker = process_worker
         self._filesystem_worker = filesystem_worker
         self._checkpoint_manager = checkpoint_manager
         self._runtime_adapter = runtime_adapter
+        self._checkpoint_guard = checkpoint_guard
 
     def checkpoint(self, job: CheckpointJob) -> CheckpointResult:
         started = utc_now()
         checkpoint_id = CheckpointId(str(job.metadata.get("checkpoint_id", CheckpointId.new())))
+        if self._checkpoint_guard is not None:
+            allowed, message = self._checkpoint_guard(job)
+            if not allowed:
+                logger.info(
+                    "Skipping composite checkpoint for job %s sandbox=%s checkpoint=%s reason=%s",
+                    job.job_id,
+                    job.sandbox_id,
+                    checkpoint_id,
+                    "" if message is None else message,
+                )
+                return CheckpointResult(
+                    job_id=job.job_id,
+                    sandbox_id=job.sandbox_id,
+                    checkpoint_id=checkpoint_id,
+                    status=JobStatus.FAILED,
+                    started_at=started,
+                    finished_at=utc_now(),
+                    manifest=None,
+                    failure_code=FailureCode.VALIDATION_ERROR,
+                    message=message or "checkpoint_rejected",
+                )
         logger.info(
             "Starting composite checkpoint for job %s sandbox=%s checkpoint=%s",
             job.job_id,

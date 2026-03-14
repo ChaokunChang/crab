@@ -74,8 +74,8 @@ class HostInspectorDaemon:
             init_pid=resolved.init_pid,
             cgroup_path=resolved.cgroup_path,
             cgroup_id=resolved.cgroup_id,
-            process_changed=True,
-            filesystem_changed=True,
+            process_changed=False,
+            filesystem_changed=False,
             observed_at=observed_at,
         )
         with self._lock:
