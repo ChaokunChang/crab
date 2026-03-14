@@ -285,7 +285,7 @@ class SystemIntegrationTests(unittest.TestCase):
                     str(root / "checkpoints" / "sbx-int" / str(checkpoint_result.checkpoint_id) / "process"),
                     "--work-path",
                     str(root / "checkpoints" / "sbx-int" / str(checkpoint_result.checkpoint_id) / "work"),
-                    "--leave-running=false",
+                    "--leave-running=true",
                     "--tcp-established",
                     "--shell-job",
                     "--tcp-skip-in-flight",

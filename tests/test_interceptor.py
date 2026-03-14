@@ -219,6 +219,44 @@ class InterceptorTests(unittest.TestCase):
             self.assertIn("interceptor.state_changed", event_names)
             system.executor.shutdown()
 
+    def test_interceptor_can_use_default_sandbox_id_when_header_missing(self) -> None:
+        request_state_store = InMemoryRequestStateStore()
+        interceptor = AgentCRRequestInterceptor(
+            upstream_transport=lambda path, headers, body: (
+                200,
+                [("Content-Type", "application/json")],
+                json.dumps(
+                    handle_request(
+                        path=path,
+                        headers=headers,
+                        payload=json.loads(body.decode("utf-8")),
+                        state=SimulatedLLMState(),
+                    ),
+                    sort_keys=True,
+                ).encode("utf-8"),
+            ),
+            request_state_store=request_state_store,
+            default_sandbox_id=SandboxId("sbx-default"),
+        )
+
+        _, _, body = interceptor.intercept(
+            path="/v1/chat/completions",
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(
+                {
+                    "model": "simulated-openai",
+                    "messages": [{"role": "user", "content": "continue"}],
+                }
+            ).encode("utf-8"),
+        )
+
+        payload = json.loads(body.decode("utf-8"))
+        self.assertIn("choices", payload)
+        state = request_state_store.get(SandboxId("sbx-default"))
+        self.assertEqual(state.total_llm_requests, 1)
+        self.assertEqual(state.completed_llm_requests, 1)
+        self.assertEqual(state.active_llm_requests, 0)
+
     def test_interceptor_waits_for_system_checkpoint_flow(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_interceptor_system_") as tmp:
             system = build_default_system(
