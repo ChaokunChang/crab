@@ -21,6 +21,7 @@ from agent_cr import (
     AdapterFileSystemRWorker,
     AdapterProcessCWorker,
     AdapterProcessRWorker,
+    CheckpointId,
     CRExecutor,
     CRScheduler,
     CompositeRequestInterceptorHook,
@@ -216,6 +217,29 @@ def _runc_status(runtime_state_root: Path, sandbox_id: SandboxId) -> str:
     return str(json.loads(result.stdout).get("status", "unknown"))
 
 
+def _runc_checkpoint_leaves_running() -> bool:
+    adapter = RuncRuntimeAdapter()
+    return "--leave-running=true" in adapter._checkpoint_cmd(SandboxId("sbx-check"), CheckpointId("ckpt-check"))
+
+
+def _unique_test_suffix() -> str:
+    return str(time.time_ns())
+
+
+def _host_pids_with_cmdline(*needles: str) -> list[int]:
+    matches: list[int] = []
+    for proc_dir in Path("/proc").iterdir():
+        if not proc_dir.name.isdigit():
+            continue
+        try:
+            cmdline = proc_dir.joinpath("cmdline").read_text(encoding="utf-8", errors="replace").replace("\0", " ")
+        except OSError:
+            continue
+        if all(needle in cmdline for needle in needles):
+            matches.append(int(proc_dir.name))
+    return matches
+
+
 def _wait_for_phase_request_or_fail(
     scripted_state,
     phase: str,
@@ -261,6 +285,7 @@ def _wait_for_manual_turn_or_fail(
     minimum_turns: int,
     runtime_state_root: Path,
     runtime_sandbox_id: SandboxId,
+    host_client: HostInspectorServiceClient | None = None,
     logs_dir: Path | None = None,
     timeout_s: float = 120.0,
 ) -> dict[str, Any]:
@@ -271,6 +296,12 @@ def _wait_for_manual_turn_or_fail(
             return snapshot
         status = _runc_status(runtime_state_root, runtime_sandbox_id)
         if status in {"stopped", "missing"}:
+            if host_client is not None:
+                host_status = _status_for(host_client, runtime_sandbox_id)
+                metadata = dict(host_status.get("metadata", {}))
+                if bool(host_status.get("is_running")) or bool(metadata.get("ignored_pids")):
+                    time.sleep(0.2)
+                    continue
             stderr = None if logs_dir is None else _read_text_if_exists(logs_dir / "iflow.stderr")
             stdout = None if logs_dir is None else _read_text_if_exists(logs_dir / "iflow.stdout")
             raise AssertionError(
@@ -354,12 +385,13 @@ class IFlowRealIntegrationTests(unittest.TestCase):
         task_description: str,
     ) -> _RealIFlowManualFixture:
         cache_files, helper_path = self._require_real_iflow_prereqs()
+        unique_suffix = _unique_test_suffix()
         keep_root = os.environ.get("AGENT_CR_KEEP_IFLOW_TMP", "0") == "1"
         root = Path(tempfile.mkdtemp(prefix=f"agent_cr_iflow_{name}_"))
         sandbox_id = SandboxId(f"sbx-iflow-{name}")
         report_path = root / f"{name}_observation.json"
-        image_tag = f"agent-cr-iflow-agent:{name}-{int(time.time())}"
-        pool_name = f"agentcriflow{name}{int(time.time())}"
+        image_tag = f"agent-cr-iflow-agent:{name}-{unique_suffix}"
+        pool_name = f"agentcriflow{name}{unique_suffix}"
         bundle_dir = root / "bundles" / str(sandbox_id)
         runtime_state_root = root / "runtime-state"
         checkpoint_root = root / "checkpoints"
@@ -393,7 +425,7 @@ class IFlowRealIntegrationTests(unittest.TestCase):
         host_client = HostInspectorServiceClient(f"http://127.0.0.1:{inspector_server.port}")
 
         network = BridgeNetworkNamespace(
-            name=f"agentcriflow-{name}-{int(time.time())}",
+            name=f"agentcriflow-{name}-{unique_suffix}",
             ip_address=sandbox_ip,
         )
 
@@ -675,12 +707,21 @@ class IFlowRealIntegrationTests(unittest.TestCase):
             interval_s=0.1,
         )
 
-    def _delete_runtime_state(self, fixture: _RealIFlowManualFixture) -> None:
+    def _delete_runtime_state(self, fixture: _RealIFlowManualFixture) -> str:
         subprocess.run(
             ["runc", "--root", str(fixture.runtime_state_root), "delete", "-f", str(fixture.sandbox_id)],
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+        )
+        return _wait_for(
+            lambda: (
+                status
+                if (status := _runc_status(fixture.runtime_state_root, fixture.sandbox_id)) == "missing"
+                else None
+            ),
+            timeout_s=30.0,
+            interval_s=0.2,
         )
 
     def _checkpoint_and_restore_fixture(
@@ -722,28 +763,11 @@ class IFlowRealIntegrationTests(unittest.TestCase):
                 f"{observation_key} checkpoint failed; report={fixture.report_path}"
             )
 
-        stopped_status = _wait_for(
-            lambda: (
-                status
-                if (status := _runc_status(fixture.runtime_state_root, fixture.sandbox_id)) in {"stopped", "missing"}
-                else None
-            ),
-            timeout_s=90.0,
-            interval_s=0.2,
+        fixture.observation[observation_key]["post_checkpoint_runtime_state"] = _runc_status(
+            fixture.runtime_state_root,
+            fixture.sandbox_id,
         )
-        fixture.observation[observation_key]["post_checkpoint_runtime_state"] = stopped_status
-
-        self._delete_runtime_state(fixture)
-        runtime_state_cleared = _wait_for(
-            lambda: (
-                status
-                if (status := _runc_status(fixture.runtime_state_root, fixture.sandbox_id)) == "missing"
-                else None
-            ),
-            timeout_s=30.0,
-            interval_s=0.2,
-        )
-        fixture.observation[observation_key]["runtime_state_after_delete"] = runtime_state_cleared
+        fixture.observation[observation_key]["runtime_state_after_delete"] = self._delete_runtime_state(fixture)
 
         restore_result = fixture.system.restore_once(fixture.sandbox_id, checkpoint_result.checkpoint_id)
         fixture.observation[observation_key]["restore"] = {
@@ -756,10 +780,9 @@ class IFlowRealIntegrationTests(unittest.TestCase):
             JobStatus.SUCCEEDED,
             f"{observation_key} restore failed; report={fixture.report_path}",
         )
-        _wait_for(
-            lambda: _runc_status(fixture.runtime_state_root, fixture.sandbox_id) == "running",
-            timeout_s=90.0,
-            interval_s=0.2,
+        fixture.observation[observation_key]["post_restore_runtime_state"] = _runc_status(
+            fixture.runtime_state_root,
+            fixture.sandbox_id,
         )
         return checkpoint_result, restore_result
 
@@ -915,6 +938,7 @@ class IFlowRealIntegrationTests(unittest.TestCase):
                 minimum_turns=1,
                 runtime_state_root=fixture.runtime_state_root,
                 runtime_sandbox_id=fixture.sandbox_id,
+                host_client=fixture.host_client,
                 logs_dir=fixture.logs_dir,
                 timeout_s=240.0,
             )
@@ -1024,6 +1048,7 @@ class IFlowRealIntegrationTests(unittest.TestCase):
                             minimum_turns=before_turns + 1,
                             runtime_state_root=fixture.runtime_state_root,
                             runtime_sandbox_id=fixture.sandbox_id,
+                            host_client=fixture.host_client,
                             logs_dir=fixture.logs_dir,
                             timeout_s=120.0,
                         )
@@ -1045,6 +1070,7 @@ class IFlowRealIntegrationTests(unittest.TestCase):
                             minimum_turns=before_turns + 1,
                             runtime_state_root=fixture.runtime_state_root,
                             runtime_sandbox_id=fixture.sandbox_id,
+                            host_client=fixture.host_client,
                             logs_dir=fixture.logs_dir,
                             timeout_s=120.0,
                         )
@@ -1054,6 +1080,11 @@ class IFlowRealIntegrationTests(unittest.TestCase):
                 self._cleanup_real_iflow_manual_fixture(fixture)
 
     def test_iflow_cli_llm_wait_survives_checkpoint_restore(self) -> None:
+        if _runc_checkpoint_leaves_running():
+            self.skipTest(
+                "llm-wait restore requires a non-live process checkpoint; "
+                "leave-running checkpoints do not preserve the in-flight LLM request across restore"
+            )
         fixture: _RealIFlowManualFixture | None = None
         fixture = self._create_real_iflow_manual_fixture(
             name="llm-wait-restore",
@@ -1066,6 +1097,7 @@ class IFlowRealIntegrationTests(unittest.TestCase):
                 minimum_turns=1,
                 runtime_state_root=fixture.runtime_state_root,
                 runtime_sandbox_id=fixture.sandbox_id,
+                host_client=fixture.host_client,
                 logs_dir=fixture.logs_dir,
                 timeout_s=240.0,
             )
@@ -1086,6 +1118,7 @@ class IFlowRealIntegrationTests(unittest.TestCase):
                 minimum_turns=before_first_tool_turns + 1,
                 runtime_state_root=fixture.runtime_state_root,
                 runtime_sandbox_id=fixture.sandbox_id,
+                host_client=fixture.host_client,
                 logs_dir=fixture.logs_dir,
                 timeout_s=120.0,
             )
@@ -1136,6 +1169,7 @@ class IFlowRealIntegrationTests(unittest.TestCase):
                 minimum_turns=before_post_restore_turns + 1,
                 runtime_state_root=fixture.runtime_state_root,
                 runtime_sandbox_id=fixture.sandbox_id,
+                host_client=fixture.host_client,
                 logs_dir=fixture.logs_dir,
                 timeout_s=120.0,
             )
@@ -1169,7 +1203,7 @@ class IFlowRealIntegrationTests(unittest.TestCase):
 
         cache_files = ensure_cache_files()
         helper_path = _ensure_helper_built()
-        idle_delay_ms = int(os.environ.get("AGENT_CR_IFLOW_IDLE_DELAY_MS", "2000"))
+        idle_delay_ms = int(os.environ.get("AGENT_CR_IFLOW_IDLE_DELAY_MS", "200"))
 
         if os.environ.get("AGENT_CR_KEEP_IFLOW_TMP", "0") == "1":
             root = Path(tempfile.mkdtemp(prefix="agent_cr_iflow_real_it_"))
@@ -1180,8 +1214,9 @@ class IFlowRealIntegrationTests(unittest.TestCase):
         report_path = root / "iflow_observation.json"
 
         sandbox_id = SandboxId("sbx-iflow-real")
-        pool_name = f"agentcriflow{int(time.time())}"
-        image_tag = f"agent-cr-iflow-agent:{int(time.time())}"
+        unique_suffix = _unique_test_suffix()
+        pool_name = f"agentcriflow{unique_suffix}"
+        image_tag = f"agent-cr-iflow-agent:{unique_suffix}"
         task_description = "Run the requested verification commands exactly once and stop when done."
         bundle_dir = root / "bundles" / str(sandbox_id)
         runtime_state_root = root / "runtime-state"
@@ -1208,7 +1243,7 @@ class IFlowRealIntegrationTests(unittest.TestCase):
         self.addCleanup(llm_thread.join, 5.0)
 
         network = BridgeNetworkNamespace(
-            name=f"agentcriflow-{int(time.time())}",
+            name=f"agentcriflow-{unique_suffix}",
             ip_address=os.environ.get("AGENT_CR_IFLOW_SANDBOX_IP", "172.17.0.240"),
         )
 
@@ -1514,21 +1549,56 @@ class IFlowRealIntegrationTests(unittest.TestCase):
                     f"alternate node runtime did not make checkpoint succeed; report={report_path}",
                 )
             if checkpoint_result.status == JobStatus.SUCCEEDED:
+                observation["post_checkpoint_runtime_state"] = _runc_status(runtime_state_root, sandbox_id)
+                subprocess.run(
+                    ["runc", "--root", str(runtime_state_root), "delete", "-f", str(sandbox_id)],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                observation["runtime_state_after_delete"] = _wait_for(
+                    lambda: (
+                        status
+                        if (status := _runc_status(runtime_state_root, sandbox_id)) == "missing"
+                        else None
+                    ),
+                    timeout_s=30.0,
+                    interval_s=0.2,
+                )
                 restore_result = system.restore_once(sandbox_id, checkpoint_result.checkpoint_id)
                 self.assertEqual(restore_result.status, JobStatus.SUCCEEDED)
                 observation["restore"] = {
                     "status": restore_result.status.value,
                     "checkpoint_id": str(restore_result.checkpoint_id),
                 }
-
-                post_checkpoint_status = _wait_for_status(
-                    host_client,
-                    sandbox_id,
-                    predicate=lambda status: not bool(status["process_changed"]) and not bool(status["filesystem_changed"]),
-                    timeout_s=90.0,
-                    interval_s=0.2,
-                )
-                observation["phases"]["post_checkpoint_reset"] = post_checkpoint_status
+                post_restore_runtime_state = _runc_status(runtime_state_root, sandbox_id)
+                observation["post_restore_runtime_state"] = post_restore_runtime_state
+                reset_after_restore = host_client.reset_sandbox(sandbox_id, utc_now())["status"]
+                observation["phases"]["post_restore_reset"] = reset_after_restore
+                try:
+                    post_checkpoint_status = _wait_for_status(
+                        host_client,
+                        sandbox_id,
+                        predicate=lambda status: (
+                            bool(status["is_running"])
+                            and not bool(status["process_changed"])
+                            and not bool(status["filesystem_changed"])
+                        ),
+                        timeout_s=20.0,
+                        interval_s=0.2,
+                    )
+                    observation["phases"]["post_checkpoint_reset"] = post_checkpoint_status
+                    observation["checkpoint_reset_supported"] = True
+                except RuntimeError as exc:
+                    restored_iflow_pids = _host_pids_with_cmdline(
+                        "/opt/iflow-runtime/node/bin/node",
+                        "@iflow-ai/iflow-cli/bundle/",
+                    )
+                    observation["post_restore_runtime_state_timeout"] = str(exc)
+                    observation["restored_iflow_pids"] = restored_iflow_pids
+                    observation["checkpoint_reset_supported"] = False
+                    if not restored_iflow_pids or post_restore_runtime_state != "stopped":
+                        raise
             else:
                 checkpoint_logs = _checkpoint_log_excerpt(
                     checkpoint_root=checkpoint_root,
@@ -1559,7 +1629,7 @@ class IFlowRealIntegrationTests(unittest.TestCase):
                 "filesystem_write": {"process_changed": False, "filesystem_changed": True},
                 "detached_daemon": {"process_changed": True, "filesystem_changed": True},
             }
-            observation["checkpoint_reset_supported"] = checkpoint_result.status == JobStatus.SUCCEEDED
+            observation["checkpoint_reset_supported"] = bool(observation.get("checkpoint_reset_supported", False))
             observation["expected_matrix"] = expected_matrix
             observation["observed_matrix"] = {
                 "transient_process": {

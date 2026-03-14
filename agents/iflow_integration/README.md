@@ -13,7 +13,7 @@ filtering out `iflow`'s own long-lived runtime noise.
 - `zfs`
 - `ip`
 - build dependencies for `agent_cr/host_inspector/bpf`
-- cached `iflow` artifacts in `/root/workspace/rbenv/rbenv/iflow/cache`
+- vendored `iflow` artifacts under `agents/iflow_integration/cache`
 
 Required cache files:
 
@@ -28,7 +28,7 @@ Required cache files:
 - `service.py`: scripted OpenAI-compatible responder that emits native `iflow` tool calls
 - `harness.py`: mounted-runtime preparation, bind-mount/state setup, bundle config helpers, and bridge-netns setup
 
-The legacy repo under `../rbenv/rbenv` is treated as read-only input.
+Set `AGENT_CR_IFLOW_CACHE_DIR` only if you want to override the repo-default cache location.
 
 ## Build The Rootfs
 

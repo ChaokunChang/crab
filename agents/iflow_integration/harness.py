@@ -12,7 +12,7 @@ from pathlib import Path
 from agent_cr.ids import SandboxId
 
 
-DEFAULT_CACHE_DIR = Path("/root/workspace/rbenv/rbenv/iflow/cache")
+DEFAULT_CACHE_DIR = Path(__file__).resolve().parent / "cache"
 REQUIRED_CACHE_FILES = (
     "node-v22.18.0-linux-x64.tar.xz",
     "iflow-ai-iflow-cli-for-roll-0-4-4-v4.tgz",
