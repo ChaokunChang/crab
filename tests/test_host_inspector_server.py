@@ -83,8 +83,8 @@ class HostInspectorServerTests(unittest.TestCase):
         fs_monitor = FakeFilesystemMonitor()
         daemon = HostInspectorDaemon(resolver=resolver, fs_monitor=fs_monitor, process_poll_interval_s=60.0)
         registered = {"status": daemon.register("sbx-1", "docker", "container-1")}
-        self.assertTrue(registered["status"]["process_changed"])
-        self.assertTrue(registered["status"]["filesystem_changed"])
+        self.assertFalse(registered["status"]["process_changed"])
+        self.assertFalse(registered["status"]["filesystem_changed"])
         self.assertEqual(fs_monitor.upserts, [("sbx-1", 6869)])
 
         with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111, 222}), patch(

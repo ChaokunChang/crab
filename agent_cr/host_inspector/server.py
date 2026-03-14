@@ -101,8 +101,8 @@ class HostInspectorDaemon:
             cgroup_path=resolved.cgroup_path,
             cgroup_id=resolved.cgroup_id,
             ignore_process_rules=parsed_ignore_rules,
-            process_changed=True,
-            filesystem_changed=True,
+            process_changed=False,
+            filesystem_changed=False,
             observed_at=observed_at,
         )
         with self._lock:
