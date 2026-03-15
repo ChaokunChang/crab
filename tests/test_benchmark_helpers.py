@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import tempfile
 import threading
@@ -22,8 +23,10 @@ from benchmarks.real_host_scenario_base import (
     build_tree_search_checkpoint_index,
     bounded_probability,
     compute_summary,
+    parse_ipv4_route_networks,
     resolve_checkpoint_copy_plan,
     resolve_work_dir_host_path,
+    select_benchmark_network,
     select_injected_indices,
     total_actions,
     write_bundle_config,
@@ -116,6 +119,31 @@ class BenchmarkHelperTests(unittest.TestCase):
             compute_summary(rows, ["checkpoint_ms", "restore_ms"]),
             {"checkpoint_ms": 20.0, "restore_ms": 30.0},
         )
+
+    def test_parse_ipv4_route_networks_ignores_default_and_host_routes(self) -> None:
+        self.assertEqual(
+            parse_ipv4_route_networks(
+                "\n".join(
+                    [
+                        "default via 172.24.95.253 dev eth0",
+                        "10.250.0.0/24 dev acb0 proto kernel scope link src 10.250.0.1",
+                        "172.24.95.253 dev eth0 scope link src 172.24.82.236",
+                    ]
+                )
+            ),
+            [ipaddress.ip_network("10.250.0.0/24")],
+        )
+
+    def test_select_benchmark_network_skips_occupied_routes(self) -> None:
+        bridge_ip, network_cidr = select_benchmark_network(
+            existing_routes="\n".join(
+                [
+                    "10.250.0.0/24 dev acb0 proto kernel scope link src 10.250.0.1",
+                    "10.250.1.0/24 dev acb1 proto kernel scope link src 10.250.1.1",
+                ]
+            )
+        )
+        self.assertEqual((bridge_ip, network_cidr), ("10.250.2.1", "10.250.2.0/24"))
 
     def test_total_actions_reads_payload(self) -> None:
         self.assertEqual(total_actions({"total_actions": 7}), 7)
@@ -651,6 +679,76 @@ services:
         self.assertNotIn("-d", argv)
         self.assertIn("sbx-iflow", argv)
 
+    def test_iflow_configure_bundle_redirects_idle_init_stdio(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = Path(tmp)
+            config_path = bundle_dir / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "linux": {"namespaces": [], "cgroupsPath": ""},
+                        "mounts": [],
+                        "process": {"terminal": False, "cwd": "/", "args": [], "env": []},
+                        "root": {"path": "rootfs", "readonly": False},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            sandbox = SandboxHandle(
+                sandbox_id=SandboxId("sbx-iflow-config"),
+                bundle_dir=bundle_dir,
+                status_port=8123,
+                last_status={},
+                launch_metadata={
+                    "iflow": {
+                        "runtime_root": "/tmp/runtime-root",
+                        "iflow_home": "/tmp/iflow-home",
+                        "npm_home": "/tmp/npm-home",
+                        "logs_dir": "/tmp/logs",
+                    }
+                },
+            )
+            agent = IFlowAgent(SimpleNamespace(), sandbox, TaskDescription("do work"), TaskConfig())
+
+            agent.configure_bundle()
+
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["process"]["args"][:2], ["/bin/sh", "-lc"])
+            self.assertIn("exec >/dev/null 2>&1", payload["process"]["args"][2])
+
+    def test_iflow_prepare_sandbox_uses_extended_benchmark_session_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sandbox = SandboxHandle(
+                sandbox_id=SandboxId("sbx-iflow-prepare"),
+                bundle_dir=Path(tmp) / "bundle",
+                status_port=8123,
+                last_status={},
+            )
+            harness = SimpleNamespace(
+                root=Path(tmp),
+                interceptor=SimpleNamespace(port=4567),
+                _benchmark_bridge_ip="10.250.9.1",
+            )
+            runtime = SimpleNamespace(
+                root=Path(tmp) / "runtime",
+                mounted_entrypoint="/opt/iflow-runtime/entry.js",
+                ignore_process_rules=[],
+            )
+            state = SimpleNamespace(
+                iflow_home=Path(tmp) / ".iflow",
+                npm_home=Path(tmp) / ".npm",
+                logs_dir=Path(tmp) / "logs",
+            )
+            agent = IFlowAgent(harness, sandbox, TaskDescription("do work"), TaskConfig())
+
+            with patch("benchmarks.agents.iflow.prepare_iflow_runtime", return_value=runtime), patch(
+                "benchmarks.agents.iflow.prepare_iflow_state",
+                return_value=state,
+            ) as prepare_state:
+                agent.prepare_sandbox()
+
+        self.assertEqual(prepare_state.call_args.kwargs["max_session_turns"], 4096)
+
     def test_iflow_agent_exposes_synthetic_progress_status(self) -> None:
         sandbox = SandboxHandle(
             sandbox_id=SandboxId("sbx-iflow-progress"),
@@ -690,6 +788,111 @@ services:
         self.assertEqual(final_payload["state"], "finished")
         self.assertGreaterEqual(int(final_payload["total_actions"]), int(delta_payload["total_actions"]))
         self.assertGreaterEqual(harness.record_activity.call_count, 2)
+
+    def test_iflow_agent_uses_one_second_default_action_tick(self) -> None:
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-iflow-default-tick"),
+            bundle_dir=Path("/tmp/sbx-iflow-default-tick"),
+            status_port=8123,
+            last_status={},
+            launch_metadata={
+                "iflow": {
+                    "entrypoint": "/opt/iflow-runtime/global/lib/node_modules/@iflow-ai/iflow-cli/bundle/entry.js",
+                }
+            },
+        )
+        agent = IFlowAgent(SimpleNamespace(runtime_state_root=Path("/tmp/runtime")), sandbox, TaskDescription("do work"), TaskConfig())
+        self.assertEqual(agent._tick_seconds, 1.0)
+
+    def test_iflow_agent_on_restore_complete_resumes_synthetic_progress(self) -> None:
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-iflow-restore"),
+            bundle_dir=Path("/tmp/sbx-iflow-restore"),
+            status_port=8123,
+            last_status={"total_actions": 4},
+            launch_metadata={
+                "iflow": {
+                    "entrypoint": "/opt/iflow-runtime/global/lib/node_modules/@iflow-ai/iflow-cli/bundle/entry.js",
+                }
+            },
+        )
+        agent = IFlowAgent(SimpleNamespace(runtime_state_root=Path("/tmp/runtime")), sandbox, TaskDescription("do work"), TaskConfig())
+        agent._started_at_monotonic = time.monotonic() - 0.8
+        agent._finished_at_monotonic = time.monotonic()
+
+        baseline = agent._synthetic_action_count()
+        agent.on_restore_complete()
+
+        self.assertEqual(agent._task_state(), "running")
+        self.assertGreaterEqual(agent._synthetic_action_count(), baseline)
+
+    def test_restore_once_notifies_task_run_after_successful_restore(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-restore"),
+            bundle_dir=Path("/tmp/sbx-restore"),
+            status_port=8123,
+            last_status={},
+            task_run=SimpleNamespace(on_restore_complete=Mock()),
+        )
+        harness.system = SimpleNamespace(
+            restore_once=Mock(
+                return_value=SimpleNamespace(
+                    status=SimpleNamespace(value="succeeded"),
+                    checkpoint_id=CheckpointId("ckpt-1"),
+                )
+            )
+        )
+
+        result = harness.restore_once(sandbox, CheckpointId("ckpt-1"))
+
+        sandbox.task_run.on_restore_complete.assert_called_once()
+        self.assertEqual(result.checkpoint_id, CheckpointId("ckpt-1"))
+
+    def test_wait_for_recovery_notifies_task_run_after_successful_restore(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        observed_at = utc_now()
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-recovery"),
+            bundle_dir=Path("/tmp/sbx-recovery"),
+            status_port=8123,
+            last_status={},
+            task_run=SimpleNamespace(on_restore_complete=Mock()),
+        )
+        harness.system = SimpleNamespace(
+            get_last_recovery_record=Mock(
+                return_value=SimpleNamespace(
+                    event_type="fault",
+                    started_at=observed_at,
+                    status="restored",
+                    checkpoint_id=CheckpointId("ckpt-1"),
+                )
+            )
+        )
+
+        record = harness.wait_for_recovery(
+            sandbox,
+            event_type="fault",
+            observed_after=observed_at,
+            timeout_s=0.1,
+        )
+
+        sandbox.task_run.on_restore_complete.assert_called_once()
+        self.assertEqual(record.checkpoint_id, CheckpointId("ckpt-1"))
 
     def test_load_dataset_normalizes_relative_paths_and_cycles_rows(self) -> None:
         harness = RealHostScenarioHarness(

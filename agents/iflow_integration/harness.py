@@ -161,6 +161,7 @@ def prepare_iflow_state(
     work_root: Path,
     base_url: str,
     model_name: str,
+    max_session_turns: int | None = None,
 ) -> PreparedIFlowState:
     state_root = work_root / "iflow-state"
     if state_root.exists():
@@ -180,7 +181,11 @@ def prepare_iflow_state(
                 "modelName": model_name,
                 "bootAnimationShown": True,
                 "disableAutoUpdate": True,
-                "maxSessionTurns": int(os.environ.get("AGENT_CR_IFLOW_MAX_SESSION_TURNS", "32")),
+                "maxSessionTurns": (
+                    int(max_session_turns)
+                    if max_session_turns is not None
+                    else int(os.environ.get("AGENT_CR_IFLOW_MAX_SESSION_TURNS", "32"))
+                ),
                 "approvalMode": "yolo",
                 "mcpServers": {},
             },

@@ -74,7 +74,8 @@ from agent_cr.host_inspector.fs_helper import LibbpfFilesystemMonitor
 from agent_cr.host_inspector.runtime_resolver import RuntimeResolver
 from agent_cr.host_inspector.server import HostInspectorDaemon, HostInspectorServer
 from benchmarks.agents import BaseAgent, TaskConfig, TaskDescription, build_agent_registry
-from simulated_agent.image import build_image, export_image_rootfs
+# from simulated_agent.image import build_image, export_image_rootfs
+from agents.iflow_integration import build_image, export_image_rootfs
 from simulated_agent.service import serve
 
 logger = logging.getLogger(__name__)
@@ -170,6 +171,39 @@ def wait_for(
     if raise_on_timeout:
         raise RuntimeError("timed out waiting for predicate")
     return False
+
+
+def parse_ipv4_route_networks(raw_routes: str) -> list[ipaddress.IPv4Network]:
+    networks: list[ipaddress.IPv4Network] = []
+    for raw_line in raw_routes.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        destination = line.split()[0]
+        if destination == "default":
+            continue
+        try:
+            network = ipaddress.ip_network(destination, strict=False)
+        except ValueError:
+            continue
+        if isinstance(network, ipaddress.IPv4Network) and network.prefixlen < 32:
+            networks.append(network)
+    return networks
+
+
+def select_benchmark_network(*, existing_routes: str, candidate_pool: str = "10.250.0.0/16") -> tuple[str, str]:
+    pool = ipaddress.ip_network(candidate_pool, strict=False)
+    if not isinstance(pool, ipaddress.IPv4Network):
+        raise ValueError(f"candidate pool must be IPv4, got {candidate_pool}")
+    if pool.prefixlen > 24:
+        raise ValueError(f"candidate pool must be at most /24, got {candidate_pool}")
+    existing_networks = parse_ipv4_route_networks(existing_routes)
+    candidates = [pool] if pool.prefixlen == 24 else list(pool.subnets(new_prefix=24))
+    for network in candidates:
+        if any(network.overlaps(existing) for existing in existing_networks):
+            continue
+        return str(next(network.hosts())), str(network)
+    raise RuntimeError(f"unable to find an available benchmark /24 inside {candidate_pool}")
 
 
 def enough_progress(payload: dict[str, object], *, total_actions: int = 6) -> bool:
@@ -579,8 +613,35 @@ class RealHostScenarioHarness:
             return
         server.stop()
 
+    def _configure_benchmark_network(self) -> None:
+        configured_cidr = os.environ.get("AGENT_CR_BENCHMARK_NETWORK_CIDR", "").strip()
+        if configured_cidr:
+            network = ipaddress.ip_network(configured_cidr, strict=False)
+            if not isinstance(network, ipaddress.IPv4Network):
+                raise ValueError(f"benchmark network must be IPv4, got {configured_cidr}")
+            if network.prefixlen != 24:
+                raise ValueError(f"benchmark network must be a /24, got {configured_cidr}")
+            self._benchmark_network_cidr = str(network)
+            self._benchmark_bridge_ip = str(next(network.hosts()))
+            return
+        route_result = subprocess.run(
+            ["ip", "-4", "route", "show", "table", "main"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self._benchmark_bridge_ip, self._benchmark_network_cidr = select_benchmark_network(
+            existing_routes=route_result.stdout,
+        )
+
     def __enter__(self) -> "RealHostScenarioHarness":
         require_binaries()
+        self._configure_benchmark_network()
+        logger.info(
+            "Selected benchmark network cidr=%s bridge_ip=%s",
+            self._benchmark_network_cidr,
+            self._benchmark_bridge_ip,
+        )
         self._tmpdir = tempfile.TemporaryDirectory(prefix="agent_cr_scenario_bench_")
         self.root = Path(self._tmpdir.name)
         unique_suffix = uuid.uuid4().hex[:10]
@@ -1082,7 +1143,10 @@ class RealHostScenarioHarness:
         )
         if self.transfer_delay_ms > 0:
             time.sleep(self.transfer_delay_ms / 1000.0)
-        return self.system.restore_once(sandbox.sandbox_id, checkpoint_id)
+        result = self.system.restore_once(sandbox.sandbox_id, checkpoint_id)
+        if result.status.value == "succeeded" and sandbox.task_run is not None:
+            sandbox.task_run.on_restore_complete()
+        return result
 
     def notify_fault(self, sandbox: SandboxHandle, *, reason: str = "fault") -> None:
         assert self.system is not None
@@ -1120,6 +1184,8 @@ class RealHostScenarioHarness:
 
         wait_for(lambda: _matching_record() is not None, timeout_s=timeout_s)
         record = _matching_record()
+        if record is not None and record.status == "restored" and sandbox.task_run is not None:
+            sandbox.task_run.on_restore_complete()
         logger.info(
             "Observed recovery record sandbox=%s event_type=%s status=%s checkpoint=%s",
             sandbox.sandbox_id,

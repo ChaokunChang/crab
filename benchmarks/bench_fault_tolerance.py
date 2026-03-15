@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from agent_cr import FaultToleranceCheckpointingPolicy, LatestOnlyCheckpointManager, SchedulerConfig
+from agent_cr import FaultToleranceCheckpointingPolicy, JobStatus, LatestOnlyCheckpointManager, SchedulerConfig
 from agent_cr.models import utc_now
 
 from benchmarks.agents import TaskConfig, TaskDescription
@@ -164,6 +164,16 @@ def run_fault_tolerance_sandbox(
             checkpoint_result = harness.checkpoint_if_due(sandbox)
             t1 = time.perf_counter()
             if checkpoint_result is None:
+                continue
+            if checkpoint_result.status != JobStatus.SUCCEEDED:
+                logger.warning(
+                    "FaultTolerance checkpoint failed iteration=%d sandbox=%s status=%s checkpoint=%s message=%s",
+                    iteration,
+                    sandbox.sandbox_id,
+                    checkpoint_result.status.value,
+                    checkpoint_result.checkpoint_id,
+                    checkpoint_result.message,
+                )
                 continue
             pre_fault = sandbox.task_run.wait_for_action_delta(delta=2)
             event_started = time.perf_counter()

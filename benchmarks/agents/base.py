@@ -110,6 +110,9 @@ class BaseAgent(ABC):
     def wait_for_task_ready(self) -> None:
         return None
 
+    def on_restore_complete(self) -> None:
+        return None
+
     def resolve_sandbox_id(self) -> SandboxId:
         return SandboxId(str(self.sandbox.sandbox_id))
 

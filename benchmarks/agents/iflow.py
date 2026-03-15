@@ -22,10 +22,15 @@ class IFlowAgent(BaseAgent):
     agent_type = "iflow"
     requires_manual_task_launch = True
     requires_network_namespace = True
+    DEFAULT_ACTION_TICK_SECONDS = 1.0
+    DEFAULT_MAX_SESSION_TURNS = 4096
 
     def __init__(self, harness, sandbox, task_description, task_config) -> None:
         super().__init__(harness, sandbox, task_description, task_config)
-        self._tick_seconds = max(0.001, float(self.task_config.options.get("action_tick_seconds", 0.2)))
+        self._tick_seconds = max(
+            0.001,
+            float(self.task_config.options.get("action_tick_seconds", self.DEFAULT_ACTION_TICK_SECONDS)),
+        )
         self._state_lock = threading.Lock()
         self._started_at_monotonic: float | None = None
         self._finished_at_monotonic: float | None = None
@@ -39,6 +44,9 @@ class IFlowAgent(BaseAgent):
             work_root=sandbox_root,
             base_url=f"http://{self.harness._benchmark_bridge_ip}:{self.harness.interceptor.port}/v1",
             model_name=str(os.environ.get("AGENT_CR_IFLOW_MODEL_NAME", "agent-cr-iflow-scripted")),
+            max_session_turns=int(
+                os.environ.get("AGENT_CR_IFLOW_BENCHMARK_MAX_SESSION_TURNS", str(self.DEFAULT_MAX_SESSION_TURNS))
+            ),
         )
         self.sandbox.launch_metadata["iflow"] = {
             "runtime_root": str(prepared_runtime.root),
@@ -57,7 +65,11 @@ class IFlowAgent(BaseAgent):
         cfg = json.loads(config_path.read_text(encoding="utf-8"))
         cfg["process"]["terminal"] = False
         cfg["process"]["cwd"] = "/work"
-        cfg["process"]["args"] = ["/bin/sh", "-lc", "trap : TERM INT; while true; do sleep 3600; done"]
+        cfg["process"]["args"] = [
+            "/bin/sh",
+            "-lc",
+            "exec >/dev/null 2>&1; trap : TERM INT; while true; do sleep 3600; done",
+        ]
         cfg["process"]["env"] = [
             f"PATH={RUNTIME_MOUNT_PATH}/global/bin:{RUNTIME_MOUNT_PATH}/node/bin:/usr/local/bin:/usr/bin:/bin",
             "PYTHONUNBUFFERED=1",
@@ -132,7 +144,8 @@ class IFlowAgent(BaseAgent):
             "export IFLOW_NON_INTERACTIVE=true; "
             "cd /work && "
             f"exec {RUNTIME_MOUNT_PATH}/node/bin/node {entrypoint} -p {escaped_task} "
-            ">/dev/null 2>/dev/null"
+            ">/opt/iflow-logs/iflow.stdout 2>/opt/iflow-logs/iflow.stderr"
+            # ">/dev/null 2>/dev/null"
         )
         exec_command = [
             "runc",
@@ -175,6 +188,16 @@ class IFlowAgent(BaseAgent):
         payload = self.poll_status()
         self._record_activity(payload)
         return payload
+
+    def on_restore_complete(self) -> None:
+        with self._state_lock:
+            started_at = self._started_at_monotonic
+            finished_at = self._finished_at_monotonic
+            if started_at is None or finished_at is None:
+                return
+            baseline = max(0, int((finished_at - started_at) / self._tick_seconds))
+            self._started_at_monotonic = time.monotonic() - (baseline * self._tick_seconds)
+            self._finished_at_monotonic = None
 
     def _synthetic_action_count(self) -> int:
         with self._state_lock:

@@ -628,21 +628,25 @@ class HostInspectorServer:
                             object_id=str(payload["object_id"]),
                             ignore_process_rules=payload.get("ignore_process_rules"),
                         )
+                        logger.debug(f"host-inspector: register {payload=} {result=}")
                         self._write_json(HTTPStatus.OK, {"ok": True, "status": result})
                         return
                     if self.path == "/get_proc_and_fs_status":
                         payload = self._read_json()
                         result = daemon.status(str(payload["sandbox_id"]))
+                        logger.debug(f"host-inspector: get_proc_and_fs_status {payload=} {result=}")
                         self._write_json(HTTPStatus.OK, {"ok": True, "status": result})
                         return
                     if self.path == "/reset":
                         payload = self._read_json()
                         result = daemon.reset(str(payload["sandbox_id"]), at=_parse_ts(payload.get("at")))
+                        logger.debug(f"host-inspector: reset {payload=} {result=}")
                         self._write_json(HTTPStatus.OK, {"ok": True, "status": result})
                         return
                     if self.path == "/unregister":
                         payload = self._read_json()
                         result = daemon.unregister(str(payload["sandbox_id"]))
+                        logger.debug(f"host-inspector: unregister {payload=} {result=}")
                         self._write_json(HTTPStatus.OK, {"ok": True, **result})
                         return
                     self._write_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
