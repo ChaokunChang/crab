@@ -14,6 +14,8 @@ from integrations.llm_services.simulated_for_iflow.service import (
     handle_request as handle_iflow_simulated_request,
 )
 
+_IFLOW_BENCHMARK_MAX_TOOL_CALLS_BEFORE_FINISH = 4096
+
 
 def _sandbox_id_from_request(headers: dict[str, str], payload: dict[str, Any]) -> str:
     sandbox_id = headers.get("X-Agent-Sandbox-Id", "").strip()
@@ -73,7 +75,10 @@ class ManualServiceState:
 
 class SimulatedForIFlowServiceState:
     def __init__(self) -> None:
-        self._state = SimulatedIFlowLLMState(response_delay_ms=250, max_tool_calls_before_finish=3)
+        self._state = SimulatedIFlowLLMState(
+            response_delay_ms=250,
+            max_tool_calls_before_finish=_IFLOW_BENCHMARK_MAX_TOOL_CALLS_BEFORE_FINISH,
+        )
 
     def handle_request(self, *, path: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
         return handle_iflow_simulated_request(path=path, headers=headers, payload=payload, state=self._state)
