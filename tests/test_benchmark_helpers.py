@@ -252,6 +252,63 @@ class BenchmarkHelperTests(unittest.TestCase):
             (Path.cwd() / "logs/tmp").resolve() / "sandbox-1",
         )
 
+    def test_sandbox_build_context_is_narrow_for_iflow(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+
+        self.assertEqual(
+            harness._sandbox_build_context_path("iflow"),
+            Path("integrations/sandboxes/iflow").resolve(),
+        )
+        self.assertEqual(
+            harness._sandbox_build_context_path("simulated"),
+            Path("integrations/sandboxes/simulated").resolve(),
+        )
+        self.assertEqual(
+            harness._sandbox_image_tag("simulated"),
+            "agent-cr-simulated-bench:workspace",
+        )
+
+    def test_compose_build_tag_is_stable_for_same_definition(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            compose_file = Path(tmp) / "compose.yaml"
+            compose_file.write_text("services: {}\n", encoding="utf-8")
+            build_spec = {"context": ".", "dockerfile": "Dockerfile", "args": {"A": "1", "B": "2"}}
+
+            first = harness._compose_build_tag(
+                compose_file=compose_file,
+                service_name="web",
+                build_spec=build_spec,
+            )
+            second = harness._compose_build_tag(
+                compose_file=compose_file,
+                service_name="web",
+                build_spec=build_spec,
+            )
+            changed = harness._compose_build_tag(
+                compose_file=compose_file,
+                service_name="worker",
+                build_spec=build_spec,
+            )
+
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, changed)
+
     def test_clone_host_work_dir_copies_source_contents_for_fork(self) -> None:
         harness = RealHostScenarioHarness(
             provider="openai",
@@ -654,6 +711,57 @@ services:
             agent_type="simulated",
             llm_service_type="simulated",
         )
+
+    def test_ensure_sandbox_image_serializes_parallel_calls(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=2,
+        )
+        call_counts = {"build": 0, "export": 0}
+        count_lock = threading.Lock()
+        results: list[object] = []
+        start_barrier = threading.Barrier(3)
+
+        with tempfile.TemporaryDirectory(prefix="agent_cr_image_lock_test_") as tmp:
+            harness.root = Path(tmp)
+            exported_rootfs = harness.root / "image" / "simulated" / "rootfs"
+            exported_rootfs.mkdir(parents=True, exist_ok=True)
+
+            def fake_build_image(*, tag: str, build_context: Path, dockerfile_path: Path) -> None:
+                del tag, build_context, dockerfile_path
+                with count_lock:
+                    call_counts["build"] += 1
+                time.sleep(0.05)
+
+            def fake_export_image_rootfs(*, tag: str, output_dir: Path) -> Path:
+                del tag, output_dir
+                with count_lock:
+                    call_counts["export"] += 1
+                time.sleep(0.05)
+                return exported_rootfs
+
+            def worker() -> None:
+                start_barrier.wait()
+                results.append(harness.ensure_sandbox_image("simulated"))
+
+            with patch("benchmarks.real_host_scenario_base.build_image", side_effect=fake_build_image), patch(
+                "benchmarks.real_host_scenario_base.export_image_rootfs",
+                side_effect=fake_export_image_rootfs,
+            ):
+                threads = [threading.Thread(target=worker) for _ in range(2)]
+                for thread in threads:
+                    thread.start()
+                start_barrier.wait()
+                for thread in threads:
+                    thread.join()
+
+        self.assertEqual(call_counts, {"build": 1, "export": 1})
+        self.assertEqual(len(results), 2)
+        self.assertIs(results[0], results[1])
 
     def test_prepare_sandbox_handle_sets_llm_base_url(self) -> None:
         harness = RealHostScenarioHarness(

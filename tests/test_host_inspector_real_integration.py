@@ -683,7 +683,7 @@ class HostInspectorRealIntegrationTests(unittest.TestCase):
 
             build_image(
                 tag=image_tag,
-                build_context=Path(__file__).resolve().parents[1],
+                build_context=SIMULATED_DOCKERFILE_PATH.parent,
                 dockerfile_path=SIMULATED_DOCKERFILE_PATH,
             )
             self.addCleanup(

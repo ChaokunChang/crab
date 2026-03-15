@@ -177,6 +177,38 @@ class SimulatedAgentTests(unittest.TestCase):
             self.assertIn("INFO running tool name=show_pwd", log_text)
             self.assertIn("DEBUG tool result name=show_pwd", log_text)
 
+    def test_runtime_normalizes_v1_llm_base_for_chat_requests(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sim_agent_") as tmp:
+            runtime = AgentRuntime(
+                provider="openai",
+                llm_base_url="http://127.0.0.1:9000/v1",
+                sandbox_id="sbx-v1",
+                work_dir=Path(tmp),
+                poll_interval_s=0.0,
+                status_port=0,
+            )
+
+            self.assertEqual(
+                runtime._build_url("/v1/chat/completions"),
+                "http://127.0.0.1:9000/v1/chat/completions",
+            )
+
+    def test_runtime_normalizes_v1_llm_base_for_proxy_health_requests(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sim_agent_") as tmp:
+            runtime = AgentRuntime(
+                provider="openai",
+                llm_base_url="http://127.0.0.1:9000/v1",
+                sandbox_id="sbx-v1",
+                work_dir=Path(tmp),
+                poll_interval_s=0.0,
+                status_port=0,
+            )
+
+            self.assertEqual(
+                runtime._build_url("/healthz"),
+                "http://127.0.0.1:9000/healthz",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

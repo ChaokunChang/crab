@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import csv
+import hashlib
 import ipaddress
 import json
 import logging
@@ -258,6 +259,11 @@ def parse_env_file(path: Path) -> dict[str, str]:
 
 
 _ENV_VAR_PATTERN = re.compile(r"\$\{([^}:]+)(?::-([^}]*))?\}")
+
+
+def _docker_tag_component(raw: str) -> str:
+    normalized = re.sub(r"[^a-z0-9_.-]+", "-", raw.lower()).strip("-.")
+    return normalized or "image"
 
 
 def interpolate_compose_value(value: Any, env: dict[str, str]) -> Any:
@@ -542,6 +548,7 @@ class RealHostScenarioHarness:
         self._compose_image_tags: set[str] = set()
         self._agent_registry = build_agent_registry()
         self._sandbox_images: dict[str, AgentSandboxImage] = {}
+        self._sandbox_image_lock = threading.Lock()
         self._task_executor = ThreadPoolExecutor(max_workers=max(1, self.max_workers))
 
     @property
@@ -733,19 +740,21 @@ class RealHostScenarioHarness:
             if self.llm_server is not None:
                 self.llm_server.benchmark_llm_router.unregister_sandbox(str(sandbox.sandbox_id))  # type: ignore[attr-defined]
         for image in self._sandbox_images.values():
-            subprocess.run(
-                ["docker", "rmi", "-f", image.image_tag],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            pass
+            # subprocess.run(
+            #     ["docker", "rmi", "-f", image.image_tag],
+            #     check=False,
+            #     stdout=subprocess.DEVNULL,
+            #     stderr=subprocess.DEVNULL,
+            # )
         for image_tag in sorted(self._compose_image_tags):
-            subprocess.run(
-                ["docker", "rmi", "-f", image_tag],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            pass
+            # subprocess.run(
+            #     ["docker", "rmi", "-f", image_tag],
+            #     check=False,
+            #     stdout=subprocess.DEVNULL,
+            #     stderr=subprocess.DEVNULL,
+            # )
         if self.pool_name:
             subprocess.run(
                 ["zfs", "destroy", "-r", f"{self.pool_name}/agent-cr"],
@@ -806,21 +815,46 @@ class RealHostScenarioHarness:
             return SIMULATED_DOCKERFILE_PATH
         raise ValueError(f"unsupported benchmark agent type for sandbox image: {agent_type}")
 
+    def _sandbox_build_context_path(self, agent_type: str) -> Path:
+        if agent_type == "iflow":
+            return IFLOW_DOCKERFILE_PATH.parent
+        if agent_type == "simulated":
+            return SIMULATED_DOCKERFILE_PATH.parent
+        raise ValueError(f"unsupported benchmark agent type for sandbox image: {agent_type}")
+
+    def _sandbox_image_tag(self, agent_type: str) -> str:
+        return f"agent-cr-{_docker_tag_component(agent_type)}-bench:workspace"
+
+    def _compose_build_tag(
+        self,
+        *,
+        compose_file: Path,
+        service_name: str,
+        build_spec: str | dict[str, object],
+    ) -> str:
+        fingerprint = hashlib.sha256()
+        fingerprint.update(str(compose_file.resolve()).encode("utf-8"))
+        fingerprint.update(service_name.encode("utf-8"))
+        fingerprint.update(json.dumps(build_spec, sort_keys=True).encode("utf-8"))
+        service_component = _docker_tag_component(service_name)
+        return f"agent-cr-compose-{service_component}:{fingerprint.hexdigest()[:12]}"
+
     def ensure_sandbox_image(self, agent_type: str) -> AgentSandboxImage:
         assert self.root is not None
-        if agent_type in self._sandbox_images:
-            return self._sandbox_images[agent_type]
-        suffix = uuid.uuid4().hex[:10]
-        image_tag = f"agent-cr-{agent_type}-bench:{suffix}"
-        build_image(
-            tag=image_tag,
-            build_context=ROOT,
-            dockerfile_path=self._sandbox_dockerfile_path(agent_type),
-        )
-        exported_rootfs = export_image_rootfs(tag=image_tag, output_dir=self.root / "image" / agent_type)
-        built = AgentSandboxImage(agent_type=agent_type, image_tag=image_tag, exported_rootfs=exported_rootfs)
-        self._sandbox_images[agent_type] = built
-        return built
+        with self._sandbox_image_lock:
+            cached = self._sandbox_images.get(agent_type)
+            if cached is not None:
+                return cached
+            image_tag = self._sandbox_image_tag(agent_type)
+            build_image(
+                tag=image_tag,
+                build_context=self._sandbox_build_context_path(agent_type),
+                dockerfile_path=self._sandbox_dockerfile_path(agent_type),
+            )
+            exported_rootfs = export_image_rootfs(tag=image_tag, output_dir=self.root / "image" / agent_type)
+            built = AgentSandboxImage(agent_type=agent_type, image_tag=image_tag, exported_rootfs=exported_rootfs)
+            self._sandbox_images[agent_type] = built
+            return built
 
     def get_sandbox_handle(self, sandbox_id: str | SandboxId) -> SandboxHandle:
         target = SandboxId(str(sandbox_id))
@@ -1712,7 +1746,11 @@ class RealHostScenarioHarness:
             return image_ref
         if build_spec is None:
             raise ValueError(f"compose service {service_name} requires image or build")
-        tag = f"agent-cr-compose-{service_name}-{uuid.uuid4().hex[:10]}"
+        tag = self._compose_build_tag(
+            compose_file=compose_file,
+            service_name=service_name,
+            build_spec=build_spec,
+        )
         self._compose_image_tags.add(tag)
         build_context = compose_file.parent
         dockerfile = None

@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from integrations.llm_services.simulated.tool_catalog import TOOL_DEFINITIONS, get_tool, provider_tools
+from .tool_catalog import TOOL_DEFINITIONS, get_tool, provider_tools
 
 
 def parse_openai_tool_calls(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -106,6 +106,14 @@ class AgentRuntime:
             self.poll_interval_s,
             self.status_port,
         )
+
+    def _build_url(self, path: str) -> str:
+        normalized_path = path if path.startswith("/") else f"/{path}"
+        if self.llm_base_url.endswith("/v1"):
+            if normalized_path.startswith("/v1/"):
+                return self.llm_base_url + normalized_path[len("/v1") :]
+            return self.llm_base_url[: -len("/v1")] + normalized_path
+        return self.llm_base_url + normalized_path
 
     def _build_logger(self) -> logging.Logger:
         logger = logging.getLogger(f"integrations.sandboxes.simulated.agent_cli.{self.sandbox_id}.{id(self)}")
@@ -209,7 +217,7 @@ class AgentRuntime:
             self.state["total_actions"],
         )
         req = urllib.request.Request(
-            self.llm_base_url + path,
+            self._build_url(path),
             data=body,
             headers=headers,
             method="POST",
@@ -282,7 +290,7 @@ class AgentRuntime:
             )
             result = {"returncode": proc.returncode}
         elif name == "fetch_proxy_health":
-            with urllib.request.urlopen(self.llm_base_url + str(tool_input["path"]), timeout=10.0) as resp:
+            with urllib.request.urlopen(self._build_url(str(tool_input["path"])), timeout=10.0) as resp:
                 result = {"status": int(resp.status), "body": resp.read().decode("utf-8")}
         else:
             raise ValueError(f"unsupported tool: {name}")
