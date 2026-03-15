@@ -13,6 +13,7 @@ from integrations.sandboxes.iflow.harness import (
     LOGS_MOUNT_PATH,
     NPM_HOME_MOUNT_PATH,
     RUNTIME_MOUNT_PATH,
+    _IO_URING_SECCOMP,
     prepare_iflow_runtime,
     prepare_iflow_state,
 )
@@ -79,6 +80,11 @@ class IFlowAgent(BaseAgent):
             raise RuntimeError(f"missing iflow launch metadata for sandbox {self.sandbox.sandbox_id}")
         config_path = self.sandbox.bundle_dir / "config.json"
         cfg = json.loads(config_path.read_text(encoding="utf-8"))
+        
+        linux_cfg = cfg.get("linux", {})
+        linux_cfg["seccomp"] = _IO_URING_SECCOMP
+        cfg["linux"] = linux_cfg
+        
         cfg["process"]["terminal"] = False
         cfg["process"]["cwd"] = "/work"
         cfg["process"]["args"] = [

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shutil
@@ -8,9 +7,6 @@ import subprocess
 import tarfile
 from dataclasses import dataclass
 from pathlib import Path
-
-from agent_cr.ids import SandboxId
-
 
 DEFAULT_CACHE_DIR = Path(__file__).resolve().parent / "cache"
 REQUIRED_CACHE_FILES = (
@@ -83,10 +79,6 @@ def ensure_cache_files(cache_dir: Path | None = None) -> dict[str, Path]:
     if missing:
         raise FileNotFoundError(f"missing iflow cache files in {cache_dir or cache_dir_from_env()}: {missing}")
     return paths
-
-
-def rootfs_copy_paths(*, exported_rootfs: Path) -> list[dict[str, str]]:
-    return [{"source": str(exported_rootfs), "destination": "/"}]
 
 
 def prepare_iflow_runtime(
@@ -194,140 +186,3 @@ def prepare_iflow_state(
         encoding="utf-8",
     )
     return PreparedIFlowState(root=state_root, iflow_home=iflow_home, npm_home=npm_home, logs_dir=logs_dir)
-
-
-def write_bundle_config(
-    *,
-    bundle_dir: Path,
-    interceptor_port: int,
-    cgroup_path: str,
-    sandbox_id: SandboxId,
-    task_description: str,
-    prepared_runtime: PreparedIFlowRuntime,
-    prepared_state: PreparedIFlowState,
-    network_namespace_path: str | None = None,
-    base_url: str | None = None,
-) -> None:
-    config_path = bundle_dir / "config.json"
-    cfg = json.loads(config_path.read_text())
-    linux_cfg = cfg.get("linux", {})
-    namespaces = [ns for ns in linux_cfg.get("namespaces", []) if ns.get("type") != "cgroup"]
-    if network_namespace_path is not None:
-        updated_namespaces: list[dict[str, str]] = []
-        network_attached = False
-        for namespace in namespaces:
-            if namespace.get("type") == "network":
-                updated_namespaces.append({"type": "network", "path": network_namespace_path})
-                network_attached = True
-            else:
-                updated_namespaces.append(namespace)
-        if not network_attached:
-            updated_namespaces.append({"type": "network", "path": network_namespace_path})
-        namespaces = updated_namespaces
-    linux_cfg["namespaces"] = namespaces
-    linux_cfg["cgroupsPath"] = cgroup_path
-    if os.environ.get("AGENT_CR_IFLOW_BLOCK_IO_URING", "1") == "1":
-        linux_cfg["seccomp"] = _IO_URING_SECCOMP
-    else:
-        linux_cfg.pop("seccomp", None)
-    cfg["linux"] = linux_cfg
-
-    cfg["process"]["terminal"] = False
-    cfg["process"]["cwd"] = "/work"
-    cfg["process"]["args"] = [
-        "/bin/sh",
-        "-lc",
-        (
-            "export HOME=/root; "
-            "export IFLOW_NON_INTERACTIVE=true; "
-            "cd /work && "
-            f"exec {RUNTIME_MOUNT_PATH}/node/bin/node {prepared_runtime.mounted_entrypoint} "
-            f"-p \"$AGENT_CR_IFLOW_TASK\" >/dev/null 2>/dev/null"
-        ),
-    ]
-    cfg["process"]["env"] = [
-        f"PATH={RUNTIME_MOUNT_PATH}/global/bin:{RUNTIME_MOUNT_PATH}/node/bin:/usr/local/bin:/usr/bin:/bin",
-        "PYTHONUNBUFFERED=1",
-        "UV_USE_IO_URING=0",
-        f"AGENT_CR_IFLOW_BASE_URL={base_url or os.environ.get('AGENT_CR_IFLOW_BASE_URL', f'http://172.17.0.1:{interceptor_port}/v1')}",
-        f"AGENT_CR_IFLOW_MODEL_NAME={os.environ.get('AGENT_CR_IFLOW_MODEL_NAME', 'agent-cr-iflow-scripted')}",
-        f"AGENT_CR_IFLOW_TASK={task_description}",
-        "AGENT_CR_IFLOW_MAX_SESSION_TURNS=32",
-        "HOME=/root",
-        "IFLOW_NON_INTERACTIVE=true",
-    ]
-    cfg["mounts"] = [
-        mount
-        for mount in cfg.get("mounts", [])
-        if mount.get("destination")
-        not in {RUNTIME_MOUNT_PATH, IFLOW_HOME_MOUNT_PATH, NPM_HOME_MOUNT_PATH, LOGS_MOUNT_PATH}
-    ]
-    cfg["mounts"].extend(
-        [
-            {
-                "destination": RUNTIME_MOUNT_PATH,
-                "type": "bind",
-                "source": str(prepared_runtime.root),
-                "options": ["rbind", "ro"],
-            },
-            {
-                "destination": IFLOW_HOME_MOUNT_PATH,
-                "type": "bind",
-                "source": str(prepared_state.iflow_home),
-                "options": ["rbind", "rw"],
-            },
-            {
-                "destination": NPM_HOME_MOUNT_PATH,
-                "type": "bind",
-                "source": str(prepared_state.npm_home),
-                "options": ["rbind", "rw"],
-            },
-            {
-                "destination": LOGS_MOUNT_PATH,
-                "type": "bind",
-                "source": str(prepared_state.logs_dir),
-                "options": ["rbind", "rw"],
-            },
-        ]
-    )
-    cfg["root"]["path"] = "rootfs"
-    cfg["root"]["readonly"] = False
-    config_path.write_text(json.dumps(cfg, indent=2))
-
-
-@dataclass
-class BridgeNetworkNamespace:
-    name: str
-    ip_address: str
-    bridge_name: str = "docker0"
-    gateway: str = "172.17.0.1"
-
-    def __post_init__(self) -> None:
-        suffix = hashlib.sha1(self.name.encode("utf-8")).hexdigest()[:6]
-        self.host_veth = f"vethh{suffix}"[:15]
-        self.peer_veth = f"vethc{suffix}"[:15]
-        self.namespace_path = f"/var/run/netns/{self.name}"
-
-    def create(self) -> None:
-        if shutil.which("ip") is None:
-            raise RuntimeError("ip command is required for bridge namespace setup")
-        self._run(["ip", "netns", "add", self.name])
-        try:
-            self._run(["ip", "link", "add", self.host_veth, "type", "veth", "peer", "name", self.peer_veth])
-            self._run(["ip", "link", "set", self.host_veth, "master", self.bridge_name])
-            self._run(["ip", "link", "set", self.host_veth, "up"])
-            self._run(["ip", "link", "set", self.peer_veth, "netns", self.name])
-            self._run(["ip", "netns", "exec", self.name, "ip", "link", "set", "lo", "up"])
-            self._run(["ip", "netns", "exec", self.name, "ip", "addr", "add", f"{self.ip_address}/16", "dev", self.peer_veth])
-            self._run(["ip", "netns", "exec", self.name, "ip", "link", "set", self.peer_veth, "up"])
-            self._run(["ip", "netns", "exec", self.name, "ip", "route", "add", "default", "via", self.gateway])
-        except Exception:
-            self.cleanup()
-            raise
-
-    def cleanup(self) -> None:
-        subprocess.run(["ip", "link", "del", self.host_veth], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["ip", "netns", "del", self.name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    def _run(self, argv: list[str]) -> None:
-        subprocess.run(argv, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
