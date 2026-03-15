@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 import csv
 import ipaddress
 import json
@@ -19,7 +19,7 @@ import threading
 import time
 import urllib.request
 import uuid
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -44,13 +44,10 @@ from agent_cr import (
     CompositeRequestInterceptorHook,
     DefaultCWorker,
     DefaultRWorker,
-    EBPFEvent,
-    EBPFEventKind,
     EBPFSandboxInspector,
     HostInspectorServiceClient,
     RemoteSandboxInspector,
     ExecutorConfig,
-    InMemoryEBPFEventCollector,
     InMemoryRequestStateStore,
     InMemorySchedulerStateStore,
     InMemoryTelemetrySink,
@@ -73,10 +70,15 @@ from agent_cr.models import ArtifactPayload, utc_now
 from agent_cr.host_inspector.fs_helper import LibbpfFilesystemMonitor
 from agent_cr.host_inspector.runtime_resolver import RuntimeResolver
 from agent_cr.host_inspector.server import HostInspectorDaemon, HostInspectorServer
-from benchmarks.agents import BaseAgent, TaskConfig, TaskDescription, build_agent_registry
-# from simulated_agent.image import build_image, export_image_rootfs
-from agents.iflow_integration import build_image, export_image_rootfs
-from simulated_agent.service import serve
+from integrations.agents import BaseAgent, SandboxHandle, TaskConfig, TaskDescription, build_agent_registry
+from integrations.llm_services import (
+    default_llm_service_type_for_agent,
+    serve_benchmark_llm_router,
+    validate_llm_service_type,
+)
+from integrations.sandboxes.image import build_image, export_image_rootfs
+from integrations.sandboxes.iflow import DOCKERFILE_PATH as IFLOW_DOCKERFILE_PATH
+from integrations.sandboxes.simulated import DOCKERFILE_PATH as SIMULATED_DOCKERFILE_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +116,7 @@ def bounded_probability(raw: str) -> float:
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--provider", choices=["openai", "anthropic"], default="openai")
     parser.add_argument("--agent-type", choices=["simulated", "iflow"], default="simulated")
+    parser.add_argument("--llm-service-type", choices=["simulated", "manual", "simulated_for_iflow"], default=None)
     parser.add_argument("--dataset", type=Path, default=None)
     parser.add_argument("--out", default="")
     parser.add_argument("--transfer-delay-ms", type=float, default=0.0)
@@ -270,8 +273,7 @@ def interpolate_compose_value(value: Any, env: dict[str, str]) -> Any:
 def write_bundle_config(
     *,
     bundle_dir: Path,
-    interceptor_port: int,
-    interceptor_host: str,
+    llm_base_url: str,
     provider: str,
     sandbox_name: str,
     status_port: int,
@@ -322,7 +324,7 @@ def write_bundle_config(
     cfg["process"]["env"] = [
         "PATH=/usr/local/bin:/usr/bin:/bin",
         "PYTHONUNBUFFERED=1",
-        f"INTERCEPTOR_URL=http://{interceptor_host}:{interceptor_port}",
+        f"AGENT_CR_LLM_BASE_URL={llm_base_url}",
         f"STATUS_PORT={status_port}",
         "POLL_INTERVAL_S=0.2",
         "AGENT_WORK_DIR=/work",
@@ -332,30 +334,6 @@ def write_bundle_config(
     cfg["root"]["path"] = "rootfs"
     cfg["root"]["readonly"] = False
     config_path.write_text(json.dumps(cfg, indent=2))
-
-
-def record_activity_events(
-    *,
-    collector: InMemoryEBPFEventCollector,
-    sandbox_id: SandboxId,
-    previous: dict[str, object],
-    current: dict[str, object],
-) -> None:
-    mappings = [
-        ("filesystem_actions", EBPFEventKind.FILE_WRITE, {"path": "/work/tool_artifact.txt"}),
-        ("process_actions", EBPFEventKind.PROCESS_EXEC, {"command": "/bin/sh"}),
-        ("network_actions", EBPFEventKind.NETWORK_EGRESS, {"address": "127.0.0.1"}),
-    ]
-    for field, kind, metadata in mappings:
-        if int(current.get(field, 0)) > int(previous.get(field, 0)):
-            collector.record(
-                EBPFEvent(
-                    sandbox_id=sandbox_id,
-                    kind=kind,
-                    observed_at=utc_now(),
-                    metadata=metadata,
-                )
-            )
 
 
 def total_actions(payload: dict[str, object]) -> int:
@@ -484,34 +462,22 @@ class NoopRequestInterceptorHook(RequestInterceptorHook):
         _ = context
 
 
-@dataclass
-class SandboxHandle:
-    sandbox_id: SandboxId
-    bundle_dir: Path
-    status_port: int
-    last_status: dict[str, object]
-    status_host: str = "127.0.0.1"
-    agent_type: str = "simulated"
-    task_description: TaskDescription | None = None
-    task_config: TaskConfig | None = None
-    launch_source: str = "runc"
-    launch_metadata: dict[str, object] = field(default_factory=dict)
-    task_run: BaseAgent | None = None
-    task_future: Future[None] | None = None
-
-    @property
-    def status_url(self) -> str:
-        return f"http://{self.status_host}:{self.status_port}/status"
-
-
 @dataclass(frozen=True)
 class BenchmarkTaskRecord:
     agent_type: str
     task_description: TaskDescription
     task_config: TaskConfig
+    llm_service_type: str | None = None
     docker_compose_file: Path | None = None
     env_file: Path | None = None
     service_name: str | None = None
+
+
+@dataclass(frozen=True)
+class AgentSandboxImage:
+    agent_type: str
+    image_tag: str
+    exported_rootfs: Path
 
 
 @dataclass(frozen=True)
@@ -548,11 +514,11 @@ class RealHostScenarioHarness:
         self._tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self.root: Path | None = None
         self.pool_name = ""
-        self.image_tag = ""
         self.runtime_state_root: Path | None = None
+        self.host_inspector_url: str = ""
         self._host_inspector_server: HostInspectorServer | None = None
+        self.host_inspector_client: HostInspectorServiceClient = None
         self.telemetry: InMemoryTelemetrySink | None = None
-        self.collector: InMemoryEBPFEventCollector | None = None
         self.request_state_store: InMemoryRequestStateStore | None = None
         self.base_inspector: EBPFSandboxInspector | None = None
         self.inspector: RequestAwareSandboxInspector | None = None
@@ -575,7 +541,12 @@ class RealHostScenarioHarness:
         self._benchmark_ip_to_sandbox: dict[str, SandboxId] = {}
         self._compose_image_tags: set[str] = set()
         self._agent_registry = build_agent_registry()
+        self._sandbox_images: dict[str, AgentSandboxImage] = {}
         self._task_executor = ThreadPoolExecutor(max_workers=max(1, self.max_workers))
+
+    @property
+    def benchmark_bridge_ip(self) -> str:
+        return self._benchmark_bridge_ip
 
     def _start_host_inspector_server(self) -> str:
         assert self.runtime_state_root is not None
@@ -646,25 +617,21 @@ class RealHostScenarioHarness:
         self.root = Path(self._tmpdir.name)
         unique_suffix = uuid.uuid4().hex[:10]
         self.pool_name = f"agentcrbench{unique_suffix}"
-        self.image_tag = f"agent-cr-scenario-bench:{unique_suffix}"
         self.runtime_state_root = self.root / "runtime-state"
-        host_inspector_url = self._start_host_inspector_server()
-        self.llm_server = serve(host="127.0.0.1", port=0, response_delay_ms=250)
+        self.host_inspector_url = self._start_host_inspector_server()
+        self.llm_server = serve_benchmark_llm_router(host="127.0.0.1", port=0)
         self.llm_thread = threading.Thread(target=self.llm_server.serve_forever, daemon=True)
         self.llm_thread.start()
-
-        build_image(tag=self.image_tag)
-        exported_rootfs = export_image_rootfs(tag=self.image_tag, output_dir=self.root / "image")
+        wait_for_http_json(f"http://127.0.0.1:{self.llm_server.server_address[1]}/healthz")
         subprocess.run(["truncate", "-s", "10G", str(self.root / "zpool.img")], check=True)
         subprocess.run(["zpool", "create", "-f", self.pool_name, str(self.root / "zpool.img")], check=True)
         subprocess.run(["zfs", "create", f"{self.pool_name}/agent-cr"], check=True)
 
         self.telemetry = InMemoryTelemetrySink()
-        self.collector = InMemoryEBPFEventCollector()
         self.request_state_store = InMemoryRequestStateStore()
 
-        host_inspector_client = HostInspectorServiceClient(host_inspector_url)
-        self.base_inspector = RemoteSandboxInspector(host_inspector_client)
+        self.host_inspector_client = HostInspectorServiceClient(self.host_inspector_url)
+        self.base_inspector = RemoteSandboxInspector(self.host_inspector_client)
         self.inspector = RequestAwareSandboxInspector(self.base_inspector, self.request_state_store)
         self.runtime = RuncRuntimeAdapter(
             paths=RuncRuntimePaths(
@@ -699,7 +666,7 @@ class RealHostScenarioHarness:
                 metadata_root=self.root / "sandbox-meta",
                 zfs_dataset_prefix=f"{self.pool_name}/agent-cr",
             ),
-            host_inspector_client=host_inspector_client
+            host_inspector_client=self.host_inspector_client,
         )
         self.system = AgentCRSystem(
             scheduler=CRScheduler(
@@ -734,7 +701,6 @@ class RealHostScenarioHarness:
         wait_for_http_json(f"http://127.0.0.1:{self.interceptor.port}/healthz")
         if self.auto_cr:
             self.system.start()
-        self.exported_rootfs = exported_rootfs
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -763,9 +729,12 @@ class RealHostScenarioHarness:
                 stderr=subprocess.DEVNULL,
             )
             self._benchmark_bridge_name = None
-        if self.image_tag:
+        for sandbox in self.sandboxes:
+            if self.llm_server is not None:
+                self.llm_server.benchmark_llm_router.unregister_sandbox(str(sandbox.sandbox_id))  # type: ignore[attr-defined]
+        for image in self._sandbox_images.values():
             subprocess.run(
-                ["docker", "rmi", "-f", self.image_tag],
+                ["docker", "rmi", "-f", image.image_tag],
                 check=False,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -812,10 +781,46 @@ class RealHostScenarioHarness:
         task_description: TaskDescription,
         task_config: TaskConfig,
     ) -> BaseAgent:
-        return self.get_agent_class(agent_type)(self, sandbox, task_description, task_config)
+        assert self.root is not None
+        return self.get_agent_class(agent_type)(
+            sandbox,
+            task_description,
+            task_config,
+            runtime_state_root=self.runtime_state_root,
+            agent_host_dir=self.root / agent_type / str(sandbox.sandbox_id),
+            llm_base_url=sandbox.llm_base_url,
+        )
 
     def _agent_requires_benchmark_network(self, agent_type: str) -> bool:
         return bool(self.get_agent_class(agent_type).requires_network_namespace)
+
+    def resolve_llm_service_type(self, *, agent_type: str, llm_service_type: str | None) -> str:
+        resolved = llm_service_type or default_llm_service_type_for_agent(agent_type)
+        validate_llm_service_type(provider=self.provider, llm_service_type=resolved)
+        return resolved
+
+    def _sandbox_dockerfile_path(self, agent_type: str) -> Path:
+        if agent_type == "iflow":
+            return IFLOW_DOCKERFILE_PATH
+        if agent_type == "simulated":
+            return SIMULATED_DOCKERFILE_PATH
+        raise ValueError(f"unsupported benchmark agent type for sandbox image: {agent_type}")
+
+    def ensure_sandbox_image(self, agent_type: str) -> AgentSandboxImage:
+        assert self.root is not None
+        if agent_type in self._sandbox_images:
+            return self._sandbox_images[agent_type]
+        suffix = uuid.uuid4().hex[:10]
+        image_tag = f"agent-cr-{agent_type}-bench:{suffix}"
+        build_image(
+            tag=image_tag,
+            build_context=ROOT,
+            dockerfile_path=self._sandbox_dockerfile_path(agent_type),
+        )
+        exported_rootfs = export_image_rootfs(tag=image_tag, output_dir=self.root / "image" / agent_type)
+        built = AgentSandboxImage(agent_type=agent_type, image_tag=image_tag, exported_rootfs=exported_rootfs)
+        self._sandbox_images[agent_type] = built
+        return built
 
     def get_sandbox_handle(self, sandbox_id: str | SandboxId) -> SandboxHandle:
         target = SandboxId(str(sandbox_id))
@@ -838,6 +843,7 @@ class RealHostScenarioHarness:
                     agent_type=str(payload.get("agent_type", "simulated")),
                     task_description=TaskDescription.from_json_value(payload.get("task_description", "")),
                     task_config=TaskConfig.from_json_value(payload.get("task_config")),
+                    llm_service_type=None if payload.get("llm_service_type") is None else str(payload["llm_service_type"]),
                     docker_compose_file=None if compose_file is None else (dataset_root / str(compose_file)).resolve(),
                     env_file=None if env_file is None else (dataset_root / str(env_file)).resolve(),
                     service_name=None if payload.get("service_name") is None else str(payload["service_name"]),
@@ -853,6 +859,7 @@ class RealHostScenarioHarness:
         *,
         sandbox_index: int,
         default_agent_type: str,
+        default_llm_service_type: str | None,
         default_task_description: TaskDescription,
         default_task_config: TaskConfig,
     ) -> BenchmarkTaskRecord:
@@ -862,9 +869,16 @@ class RealHostScenarioHarness:
             agent_type=default_agent_type,
             task_description=default_task_description,
             task_config=default_task_config,
+            llm_service_type=default_llm_service_type,
         )
 
-    def launch_sandbox(self, sandbox_name: str, *, agent_type: str = "simulated") -> SandboxHandle:
+    def launch_sandbox(
+        self,
+        sandbox_name: str,
+        *,
+        agent_type: str = "simulated",
+        llm_service_type: str | None = None,
+    ) -> SandboxHandle:
         assert self.root is not None
         assert self.base_inspector is not None
         assert self.system is not None
@@ -872,6 +886,7 @@ class RealHostScenarioHarness:
 
         default_task_description = TaskDescription("")
         default_task_config = TaskConfig()
+        resolved_llm_service_type = self.resolve_llm_service_type(agent_type=agent_type, llm_service_type=llm_service_type)
         network_lease = (
             self._allocate_benchmark_network_lease(SandboxId(sandbox_name))
             if self._agent_requires_benchmark_network(agent_type)
@@ -882,10 +897,12 @@ class RealHostScenarioHarness:
             interceptor_host=self._benchmark_bridge_ip if network_lease is not None else "127.0.0.1",
             network_lease=network_lease,
             agent_type=agent_type,
+            llm_service_type=resolved_llm_service_type,
         )
         task_run = self.build_task_run(agent_type, handle, default_task_description, default_task_config)
         task_run.prepare_sandbox()
         task_run.configure_bundle()
+        sandbox_image = self.ensure_sandbox_image(agent_type)
         sandbox_id = handle.sandbox_id
         self.base_inspector.upsert_snapshot(
             SandboxSnapshot(
@@ -904,7 +921,7 @@ class RealHostScenarioHarness:
             "bundle_path": str(handle.bundle_dir),
             "work_dir_host_path": None if work_dir_host_path is None else str(work_dir_host_path),
             "rootfs_init_dirs": task_run.rootfs_init_dirs(),
-            "rootfs_copy_paths": [{"source": str(self.exported_rootfs), "destination": "/"}],
+            "rootfs_copy_paths": [{"source": str(sandbox_image.exported_rootfs), "destination": "/"}],
             **task_run.extra_launch_metadata(),
             **handle.launch_metadata.get("runtime", {}),
         }
@@ -944,10 +961,11 @@ class RealHostScenarioHarness:
         sandbox_name: str,
         *,
         agent_type: str,
+        llm_service_type: str | None = None,
         task_description: TaskDescription,
         task_config: TaskConfig,
     ) -> SandboxHandle:
-        handle = self.launch_sandbox(sandbox_name, agent_type=agent_type)
+        handle = self.launch_sandbox(sandbox_name, agent_type=agent_type, llm_service_type=llm_service_type)
         self.launch_task(agent_type, task_description, task_config, str(handle.sandbox_id))
         return handle
 
@@ -965,12 +983,14 @@ class RealHostScenarioHarness:
                 sandbox_name=sandbox_name,
                 service_name=task_record.service_name,
                 agent_type=task_record.agent_type,
+                llm_service_type=task_record.llm_service_type,
                 task_description=task_record.task_description,
                 task_config=task_record.task_config,
             )
         return self.launch_sandbox_and_task(
             sandbox_name,
             agent_type=task_record.agent_type,
+            llm_service_type=task_record.llm_service_type,
             task_description=task_record.task_description,
             task_config=task_record.task_config,
         )
@@ -985,6 +1005,7 @@ class RealHostScenarioHarness:
         status_host: str | None = None,
         status_port: int | None = None,
         agent_type: str | None = None,
+        llm_service_type: str | None = None,
         task_description: TaskDescription | None = None,
         task_config: TaskConfig | None = None,
     ) -> SandboxHandle:
@@ -1011,6 +1032,10 @@ class RealHostScenarioHarness:
             interceptor_host=self._benchmark_bridge_ip,
             network_lease=network_lease,
             agent_type=agent_type or "simulated",
+            llm_service_type=self.resolve_llm_service_type(
+                agent_type=agent_type or "simulated",
+                llm_service_type=llm_service_type,
+            ),
             status_port=status_port,
             status_host=status_host if status_host is not None else network_lease.guest_ip,
         )
@@ -1074,16 +1099,6 @@ class RealHostScenarioHarness:
         if drained:
             logger.info("Drained %d queued request-state changes", drained)
         return drained
-
-    def record_activity(self, sandbox: SandboxHandle, current: dict[str, object]) -> None:
-        assert self.collector is not None
-        record_activity_events(
-            collector=self.collector,
-            sandbox_id=sandbox.sandbox_id,
-            previous=sandbox.last_status,
-            current=current,
-        )
-        sandbox.last_status = current
 
     def set_snapshot_metadata(self, sandbox: SandboxHandle, **metadata: object) -> None:
         self.set_snapshot_metadata_by_id(sandbox.sandbox_id, **metadata)
@@ -1327,6 +1342,8 @@ class RealHostScenarioHarness:
         try:
             description = self.sandbox_manager.describe(sandbox.sandbox_id)
         except KeyError:
+            if self.llm_server is not None:
+                self.llm_server.benchmark_llm_router.unregister_sandbox(str(sandbox.sandbox_id))  # type: ignore[attr-defined]
             self._release_benchmark_network_lease(sandbox.sandbox_id)
             self._sandbox_by_id.pop(sandbox.sandbox_id, None)
             return
@@ -1338,6 +1355,8 @@ class RealHostScenarioHarness:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+        if self.llm_server is not None:
+            self.llm_server.benchmark_llm_router.unregister_sandbox(str(sandbox.sandbox_id))  # type: ignore[attr-defined]
         self._release_benchmark_network_lease(sandbox.sandbox_id)
         self._sandbox_by_id.pop(sandbox.sandbox_id, None)
 
@@ -1420,9 +1439,11 @@ class RealHostScenarioHarness:
             interceptor_host=self._benchmark_bridge_ip if network_lease is not None else "127.0.0.1",
             network_lease=network_lease,
             agent_type=source.agent_type,
+            llm_service_type=source.llm_service_type,
         )
         if network_lease is not None:
             self._benchmark_ip_to_sandbox[network_lease.guest_ip] = target.sandbox_id
+        self._clone_host_work_dir(source.sandbox_id, target.sandbox_id)
 
         source_dataset = f"{self.pool_name}/agent-cr/{source.sandbox_id}"
         target_dataset = f"{self.pool_name}/agent-cr/{target.sandbox_id}"
@@ -1536,6 +1557,8 @@ class RealHostScenarioHarness:
             )
         )
         target.agent_type = source.agent_type
+        target.llm_service_type = source.llm_service_type
+        target.llm_base_url = source.llm_base_url
         target.task_description = source.task_description
         target.task_config = source.task_config
         target.launch_source = source.launch_source
@@ -1551,6 +1574,30 @@ class RealHostScenarioHarness:
             )
         return target
 
+    def _clone_host_work_dir(self, source_sandbox_id: SandboxId, target_sandbox_id: SandboxId) -> None:
+        source_work_dir = resolve_work_dir_host_path(self.work_dir_host_root, str(source_sandbox_id))
+        target_work_dir = resolve_work_dir_host_path(self.work_dir_host_root, str(target_sandbox_id))
+        if source_work_dir is None or target_work_dir is None:
+            return
+        if target_work_dir.exists():
+            shutil.rmtree(target_work_dir, ignore_errors=True)
+        if not source_work_dir.exists():
+            target_work_dir.mkdir(parents=True, exist_ok=True)
+            logger.debug(
+                "Prepared empty fork work dir because source work dir is missing source=%s target=%s",
+                source_work_dir,
+                target_work_dir,
+            )
+            return
+        shutil.copytree(source_work_dir, target_work_dir)
+        logger.debug(
+            "Cloned host work dir for fork source_sandbox=%s target_sandbox=%s source=%s target=%s",
+            source_sandbox_id,
+            target_sandbox_id,
+            source_work_dir,
+            target_work_dir,
+        )
+
     def clone_tree_search_checkpoint_to_fork(
         self,
         source: SandboxHandle,
@@ -1562,8 +1609,7 @@ class RealHostScenarioHarness:
         work_dir_host_path = resolve_work_dir_host_path(self.work_dir_host_root, str(target.sandbox_id))
         write_bundle_config(
             bundle_dir=target.bundle_dir,
-            interceptor_port=self.interceptor.port if self.interceptor is not None else 0,
-            interceptor_host=self._benchmark_bridge_ip if network_lease is not None else "127.0.0.1",
+            llm_base_url=target.llm_base_url or "",
             provider=self.provider,
             sandbox_name=str(target.sandbox_id),
             status_port=source.status_port,
@@ -1767,20 +1813,22 @@ class RealHostScenarioHarness:
         interceptor_host: str,
         network_lease: BenchmarkNetworkLease | None = None,
         agent_type: str = "simulated",
+        llm_service_type: str = "simulated",
         status_port: int | None = None,
         status_host: str | None = None,
     ) -> tuple[SandboxHandle, Path | None]:
         assert self.root is not None
         assert self.interceptor is not None
+        assert self.llm_server is not None
         resolved_status_port = find_free_port() if status_port is None else status_port
         bundle_dir = self.root / "bundles" / sandbox_name
         work_dir_host_path = resolve_work_dir_host_path(self.work_dir_host_root, sandbox_name)
         bundle_dir.mkdir(parents=True, exist_ok=True)
         subprocess.run(["runc", "spec"], cwd=bundle_dir, check=True)
+        llm_base_url = f"http://{interceptor_host}:{self.interceptor.port}/v1"
         write_bundle_config(
             bundle_dir=bundle_dir,
-            interceptor_port=self.interceptor.port,
-            interceptor_host=interceptor_host,
+            llm_base_url=llm_base_url,
             provider=self.provider,
             sandbox_name=sandbox_name,
             status_port=resolved_status_port,
@@ -1799,9 +1847,15 @@ class RealHostScenarioHarness:
                 else ("127.0.0.1" if network_lease is None else network_lease.guest_ip)
             ),
             agent_type=agent_type,
+            llm_service_type=llm_service_type,
+            llm_base_url=llm_base_url,
         )
         self.sandboxes.append(handle)
         self._sandbox_by_id[handle.sandbox_id] = handle
+        self.llm_server.benchmark_llm_router.register_sandbox(  # type: ignore[attr-defined]
+            sandbox_id=str(handle.sandbox_id),
+            llm_service_type=llm_service_type,
+        )
         return handle, work_dir_host_path
 
     def _ensure_benchmark_bridge(self) -> None:

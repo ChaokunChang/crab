@@ -9,7 +9,6 @@ import logging
 import sys
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -17,7 +16,7 @@ if str(ROOT) not in sys.path:
 
 from agent_cr import KeepAllCheckpointManager, RequestContext, RequestInterceptorHook, SchedulerConfig, TreeSearchCheckpointingPolicy
 
-from benchmarks.agents import TaskConfig, TaskDescription
+from integrations.agents import SandboxHandle, TaskConfig, TaskDescription
 from benchmarks.real_host_scenario_base import (
     RealHostScenarioHarness,
     TreeSearchCheckpointRecord,
@@ -26,9 +25,6 @@ from benchmarks.real_host_scenario_base import (
     configure_logging,
     write_rows,
 )
-
-if TYPE_CHECKING:
-    from benchmarks.real_host_scenario_base import SandboxHandle
 
 
 logger = logging.getLogger(__name__)
@@ -425,6 +421,7 @@ def run_tree_search_benchmark(
                         dataset,
                         sandbox_index=source_index,
                         default_agent_type=args.agent_type,
+                        default_llm_service_type=args.llm_service_type,
                         default_task_description=benchmark_task_description(),
                         default_task_config=default_task_config(),
                     ),

@@ -65,7 +65,7 @@ cleanup() {
   local exit_code="$?"
   set +e
   if [[ -f "$WORK_ROOT/manual_session.json" ]]; then
-    python3 -m agents.iflow_integration stop-manual-sandbox \
+    python3 -m integrations.sandboxes.iflow stop-manual-sandbox \
       --work-root "$WORK_ROOT" >/dev/null 2>&1 || true
   fi
   if [[ -n "$MANUAL_LLM_PID" ]]; then
@@ -91,7 +91,7 @@ trap cleanup EXIT INT TERM
 if [[ -f "$WORK_ROOT/manual_session.json" ]]; then
   echo "existing manual session found at $WORK_ROOT/manual_session.json" >&2
   echo "stop it first with:" >&2
-  echo "  python3 -m agents.iflow_integration stop-manual-sandbox --work-root \"$WORK_ROOT\"" >&2
+  echo "  python3 -m integrations.sandboxes.iflow stop-manual-sandbox --work-root \"$WORK_ROOT\"" >&2
   exit 1
 fi
 
@@ -107,7 +107,7 @@ HOST_INSPECTOR_PID="$!"
 wait_for_http_json "$HOST_INSPECTOR_URL/healthz" "host inspector"
 
 echo "Starting manual LLM server on $MANUAL_LLM_URL"
-python3 -m agents.iflow_integration serve-manual-llm \
+python3 -m integrations.sandboxes.iflow serve-manual-llm \
   --host 0.0.0.0 \
   --port "$MANUAL_LLM_PORT" \
   >"$MANUAL_LLM_LOG" 2>&1 &
@@ -115,7 +115,7 @@ MANUAL_LLM_PID="$!"
 wait_for_http_json "$MANUAL_LLM_URL/healthz" "manual llm server"
 
 echo "Starting interceptor on $INTERCEPTOR_URL"
-python3 -m agents.iflow_integration serve-manual-interceptor \
+python3 -m integrations.sandboxes.iflow serve-manual-interceptor \
   --host 0.0.0.0 \
   --port "$INTERCEPTOR_PORT" \
   --upstream-url "$MANUAL_LLM_URL" \
@@ -126,7 +126,7 @@ INTERCEPTOR_PID="$!"
 wait_for_http_json "$INTERCEPTOR_URL/healthz" "interceptor"
 
 echo "Launching manual iflow sandbox"
-python3 -m agents.iflow_integration launch-manual-sandbox \
+python3 -m integrations.sandboxes.iflow launch-manual-sandbox \
   --work-root "$WORK_ROOT" \
   --sandbox-id "$SANDBOX_ID" \
   --host-inspector-url "$HOST_INSPECTOR_URL" \
@@ -160,47 +160,47 @@ python3 -m agent_cr.host_inspector.watch \\
   "\$SANDBOX_ID"
 
 # Send a transient tool call
-python3 -m agents.iflow_integration enqueue-run-shell-command \\
+python3 -m integrations.sandboxes.iflow enqueue-run-shell-command \\
   --base-url "\$MANUAL_LLM_URL" \\
   --sandbox-id "\$SANDBOX_ID" \\
   --command 'sh -lc "printf noop >/dev/null"'
 
 # Send a filesystem-writing tool call
-python3 -m agents.iflow_integration enqueue-run-shell-command \\
+python3 -m integrations.sandboxes.iflow enqueue-run-shell-command \\
   --base-url "\$MANUAL_LLM_URL" \\
   --sandbox-id "\$SANDBOX_ID" \\
   --command 'sh -lc "mkdir -p /work/iflow-probe && printf iflow-artifact >/work/iflow-probe/artifact.txt"'
 
 # Send a detached-daemon tool call
-python3 -m agents.iflow_integration enqueue-run-shell-command \\
+python3 -m integrations.sandboxes.iflow enqueue-run-shell-command \\
   --base-url "\$MANUAL_LLM_URL" \\
   --sandbox-id "\$SANDBOX_ID" \\
   --command 'sh -lc "mkdir -p /work/iflow-probe && python3 -m http.server 8123 >/work/iflow-probe/http.log 2>&1 & echo \$! >/work/iflow-probe/http.pid"'
 
 # Send a long-running counter workload for manual checkpoint/restore observation
-python3 -m agents.iflow_integration enqueue-run-shell-command \\
+python3 -m integrations.sandboxes.iflow enqueue-run-shell-command \\
   --base-url "\$MANUAL_LLM_URL" \\
   --sandbox-id "\$SANDBOX_ID" \\
   --command 'bash -lc '"'"'mkdir -p /work/iflow-observe; count=0; while [ "\$count" -lt 200 ]; do count=\$((count + 1)); printf "%s\n" "\$count" >/work/iflow-observe/counter.txt; sleep 1; done'"'"''
 
 # Checkpoint the running sandbox
-python3 -m agents.iflow_integration checkpoint-manual-sandbox \\
+python3 -m integrations.sandboxes.iflow checkpoint-manual-sandbox \\
   --work-root "\$WORK_ROOT"
 
 # List available checkpoints
-python3 -m agents.iflow_integration list-manual-checkpoints \\
+python3 -m integrations.sandboxes.iflow list-manual-checkpoints \\
   --work-root "\$WORK_ROOT"
 
 # Restore the latest checkpoint
-python3 -m agents.iflow_integration restore-manual-sandbox \\
+python3 -m integrations.sandboxes.iflow restore-manual-sandbox \\
   --work-root "\$WORK_ROOT"
 
 # Enter the sandbox and watch the counter continue after restore
-python3 -m agents.iflow_integration manual-shell \\
+python3 -m integrations.sandboxes.iflow manual-shell \\
   --work-root "\$WORK_ROOT"
 
 # Stop the agent
-python3 -m agents.iflow_integration enqueue-final-response \\
+python3 -m integrations.sandboxes.iflow enqueue-final-response \\
   --base-url "\$MANUAL_LLM_URL" \\
   --sandbox-id "\$SANDBOX_ID" \\
   --content 'The session is complete. Summarize briefly and stop.'

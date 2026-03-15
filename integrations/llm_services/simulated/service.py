@@ -9,7 +9,7 @@ from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from .tool_catalog import TOOL_DEFINITIONS, allowed_tool_names, default_input_for_tool, get_tool
+from .tool_catalog import TOOL_DEFINITIONS, allowed_tool_names, default_input_for_tool
 
 
 class SimulatedLLMState:
@@ -23,6 +23,10 @@ class SimulatedLLMState:
             value = self._turns[key]
             self._turns[key] += 1
             return value
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return {f"{sandbox_id}:{provider}": turn for (sandbox_id, provider), turn in self._turns.items()}
 
 
 def _sandbox_id_from_request(headers, payload: dict[str, Any]) -> str:

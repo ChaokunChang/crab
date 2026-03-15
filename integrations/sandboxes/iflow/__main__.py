@@ -8,9 +8,11 @@ import urllib.request
 from pathlib import Path
 
 from agent_cr import AgentCRRequestInterceptorServer, InMemoryRequestStateStore
+from integrations.llm_services.manual import serve_manual
+from integrations.llm_services.simulated_for_iflow import default_script_steps, serve
+from integrations.sandboxes.image import build_image, export_image_rootfs
 
 from .harness import prepare_iflow_runtime, prepare_iflow_state
-from .image import build_image, export_image_rootfs
 from .manual import (
     checkpoint_manual_iflow,
     launch_manual_iflow,
@@ -21,7 +23,7 @@ from .manual import (
     session_summary,
     stop_manual_iflow,
 )
-from .service import default_script_steps, serve, serve_manual
+from . import DOCKERFILE_PATH
 
 
 def _post_json(base_url: str, path: str, payload: dict[str, object]) -> dict[str, object]:
@@ -245,7 +247,7 @@ def main() -> None:
         print(json.dumps(_get_json(args.base_url, "/control/state"), sort_keys=True, indent=2))
         return
 
-    build_image(tag=args.tag)
+    build_image(tag=args.tag, build_context=Path(__file__).resolve().parents[3], dockerfile_path=DOCKERFILE_PATH)
     rootfs = export_image_rootfs(tag=args.tag, output_dir=Path(args.output_dir))
     print(rootfs)
 

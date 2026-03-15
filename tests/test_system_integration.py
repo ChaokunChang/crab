@@ -42,7 +42,7 @@ from agent_cr import (
     StorageConfig,
 )
 from agent_cr.models import JobStatus, RecoveryEvent, utc_now
-from simulated_agent.service import SimulatedLLMState, handle_request
+from integrations.llm_services.simulated.service import SimulatedLLMState, handle_request
 from agent_cr.runtime import CommandRunner
 
 

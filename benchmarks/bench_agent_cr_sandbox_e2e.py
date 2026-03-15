@@ -13,7 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from agent_cr import SchedulerConfig
-from benchmarks.agents import TaskConfig, TaskDescription
+from integrations.agents import TaskConfig, TaskDescription
 from benchmarks.real_host_scenario_base import (
     RealHostScenarioHarness,
     add_common_args,
@@ -58,6 +58,7 @@ def run_benchmark(args: argparse.Namespace, harness: RealHostScenarioHarness) ->
                         dataset,
                         sandbox_index=index,
                         default_agent_type=args.agent_type,
+                        default_llm_service_type=args.llm_service_type,
                         default_task_description=benchmark_task_description(),
                         default_task_config=default_task_config(),
                     ),

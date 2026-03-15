@@ -8,11 +8,11 @@ import time
 from types import SimpleNamespace
 import unittest
 
-from agent_cr import CheckpointId, SandboxId
+from agent_cr import CheckpointId, JobStatus, SandboxId
+from integrations.agents import SandboxHandle
 from benchmarks.real_host_scenario_base import BenchmarkTaskRecord
 from benchmarks.bench_fault_tolerance import run_fault_tolerance_benchmark
 from benchmarks.bench_spot_agent import run_spot_agent_benchmark
-from benchmarks.real_host_scenario_base import SandboxHandle
 
 
 class _FakeStorage:
@@ -109,19 +109,27 @@ class _BaseScenarioHarness:
         *,
         sandbox_index: int,
         default_agent_type: str,
+        default_llm_service_type: str | None,
         default_task_description,
         default_task_config,
     ) -> BenchmarkTaskRecord:
-        _ = dataset
-        _ = sandbox_index
+        _ = (dataset, sandbox_index, default_llm_service_type)
         return BenchmarkTaskRecord(
             agent_type=default_agent_type,
             task_description=default_task_description,
             task_config=default_task_config,
         )
 
-    def launch_sandbox_and_task(self, sandbox_name: str, *, agent_type, task_description, task_config) -> SandboxHandle:
-        _ = (agent_type, task_description, task_config)
+    def launch_sandbox_and_task(
+        self,
+        sandbox_name: str,
+        *,
+        agent_type,
+        llm_service_type=None,
+        task_description,
+        task_config,
+    ) -> SandboxHandle:
+        _ = (agent_type, llm_service_type, task_description, task_config)
         return self.launch_sandbox(sandbox_name)
 
     def launch_task_record(self, sandbox_name: str, record: BenchmarkTaskRecord) -> SandboxHandle:
@@ -132,7 +140,11 @@ class _BaseScenarioHarness:
         sandbox_id = str(sandbox.sandbox_id)
         self.checkpoint_if_due_calls.append(sandbox_id)
         self._checkpoint_counts[sandbox_id] += 1
-        return SimpleNamespace(checkpoint_id=CheckpointId(f"{sandbox_id}-ckpt-{self._checkpoint_counts[sandbox_id]}"))
+        return SimpleNamespace(
+            checkpoint_id=CheckpointId(f"{sandbox_id}-ckpt-{self._checkpoint_counts[sandbox_id]}"),
+            status=JobStatus.SUCCEEDED,
+            message="",
+        )
 
     def inject_fault(self, sandbox: SandboxHandle) -> None:
         self.inject_fault_calls.append(str(sandbox.sandbox_id))
@@ -193,6 +205,7 @@ class FaultToleranceBenchmarkTests(unittest.TestCase):
             "fault_rate": 0.5,
             "first_fault_iteration": 0,
             "agent_type": "simulated",
+            "llm_service_type": "simulated",
         }
         values.update(overrides)
         return argparse.Namespace(**values)
@@ -241,6 +254,7 @@ class SpotAgentBenchmarkTests(unittest.TestCase):
             "preemption_rate": 0.5,
             "first_preempt_iteration": 0,
             "agent_type": "simulated",
+            "llm_service_type": "simulated",
         }
         values.update(overrides)
         return argparse.Namespace(**values)

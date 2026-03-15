@@ -8,7 +8,6 @@ import random
 import time
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -17,7 +16,7 @@ if str(ROOT) not in sys.path:
 from agent_cr import DeleteAfterRestoreCheckpointManager, SchedulerConfig, SpotPreemptionCheckpointingPolicy
 from agent_cr.models import utc_now
 
-from benchmarks.agents import TaskConfig, TaskDescription
+from integrations.agents import SandboxHandle, TaskConfig, TaskDescription
 from benchmarks.real_host_scenario_base import (
     RealHostScenarioHarness,
     add_common_args,
@@ -26,9 +25,6 @@ from benchmarks.real_host_scenario_base import (
     configure_logging,
     write_rows,
 )
-
-if TYPE_CHECKING:
-    from benchmarks.real_host_scenario_base import SandboxHandle
 
 logger = logging.getLogger(__name__)
 
@@ -235,6 +231,7 @@ def run_spot_agent_benchmark(
                         dataset,
                         sandbox_index=index,
                         default_agent_type=args.agent_type,
+                        default_llm_service_type=args.llm_service_type,
                         default_task_description=benchmark_task_description(),
                         default_task_config=default_task_config(),
                     ),

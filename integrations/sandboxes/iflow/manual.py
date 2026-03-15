@@ -45,7 +45,8 @@ from .harness import (
     rootfs_copy_paths,
     write_bundle_config,
 )
-from .image import build_image, export_image_rootfs
+from . import DOCKERFILE_PATH
+from ..image import build_image, export_image_rootfs
 
 
 @dataclass(frozen=True)
@@ -144,7 +145,11 @@ def launch_manual_iflow(
     network_created = False
     launched = False
     try:
-        build_image(tag=image_tag)
+        build_image(
+            tag=image_tag,
+            build_context=Path(__file__).resolve().parents[3],
+            dockerfile_path=DOCKERFILE_PATH,
+        )
         image_built = True
         exported_rootfs = export_image_rootfs(tag=image_tag, output_dir=image_root)
         prepared_runtime = prepare_iflow_runtime(

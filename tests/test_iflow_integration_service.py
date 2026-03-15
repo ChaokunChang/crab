@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from agents.iflow_integration.service import ManualLLMState
+from integrations.llm_services.manual.service import ManualLLMState
 
 
 class ManualLLMStateTests(unittest.TestCase):

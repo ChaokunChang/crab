@@ -19,7 +19,7 @@ from agent_cr import (
     build_default_system,
 )
 from agent_cr.models import utc_now
-from simulated_agent.service import SimulatedLLMState, handle_request
+from integrations.llm_services.simulated.service import SimulatedLLMState, handle_request
 
 
 class InterceptorTests(unittest.TestCase):

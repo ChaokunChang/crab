@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from benchmarks.agents.base import BaseAgent
+from integrations.agents.base import BaseAgent
 
 
 class SimulatedAgent(BaseAgent):
@@ -8,7 +8,7 @@ class SimulatedAgent(BaseAgent):
     requires_manual_task_launch = False
 
     def wait_for_task_ready(self) -> None:
-        self.sandbox.last_status = self.poll_status()
+        self._set_status(self.poll_status())
 
     def perform_task(self) -> None:
         if self.task_config.minimum_actions > 0:
@@ -36,9 +36,6 @@ class SimulatedAgent(BaseAgent):
         payload = self.poll_status()
         self._record_activity(payload)
         return payload
-
-    def _record_activity(self, payload: dict[str, object]) -> None:
-        self.harness.record_activity(self.sandbox, payload)
 
     @staticmethod
     def _total_actions(payload: dict[str, object]) -> int:

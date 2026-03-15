@@ -44,8 +44,9 @@ from agent_cr import (
     TelemetryRequestInterceptorHook,
 )
 from agent_cr.models import JobStatus, utc_now
-from simulated_agent.image import build_image, export_image_rootfs
-from simulated_agent.service import serve
+from integrations.llm_services.simulated.service import serve
+from integrations.sandboxes.image import build_image, export_image_rootfs
+from integrations.sandboxes.simulated import DOCKERFILE_PATH as SIMULATED_DOCKERFILE_PATH
 
 
 def _find_free_port() -> int:
@@ -112,7 +113,11 @@ class RealHostIntegrationTests(unittest.TestCase):
             status_port = _find_free_port()
             image_root = root / "image"
 
-            build_image(tag=image_tag)
+            build_image(
+                tag=image_tag,
+                build_context=Path(__file__).resolve().parents[1],
+                dockerfile_path=SIMULATED_DOCKERFILE_PATH,
+            )
             self.addCleanup(
                 lambda: subprocess.run(
                     ["docker", "rmi", "-f", image_tag],
@@ -213,7 +218,7 @@ class RealHostIntegrationTests(unittest.TestCase):
 
             self._write_bundle_config(
                 bundle_dir=bundle_dir,
-                interceptor_port=interceptor.port,
+                llm_base_url=f"http://127.0.0.1:{interceptor.port}/v1",
                 provider=provider,
                 status_port=status_port,
                 cgroup_path=f"agent-cr-tests/{pool_name}/sbx-real",
@@ -369,7 +374,7 @@ class RealHostIntegrationTests(unittest.TestCase):
         self,
         *,
         bundle_dir: Path,
-        interceptor_port: int,
+        llm_base_url: str,
         provider: str,
         status_port: int,
         cgroup_path: str,
@@ -395,7 +400,7 @@ class RealHostIntegrationTests(unittest.TestCase):
         cfg["process"]["env"] = [
             "PATH=/usr/local/bin:/usr/bin:/bin",
             "PYTHONUNBUFFERED=1",
-            f"INTERCEPTOR_URL=http://127.0.0.1:{interceptor_port}",
+            f"AGENT_CR_LLM_BASE_URL={llm_base_url}",
             f"STATUS_PORT={status_port}",
             "POLL_INTERVAL_S=0.2",
             "AGENT_WORK_DIR=/work",

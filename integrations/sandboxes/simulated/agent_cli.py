@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from simulated_agent.tool_catalog import TOOL_DEFINITIONS, get_tool, provider_tools
+from integrations.llm_services.simulated.tool_catalog import TOOL_DEFINITIONS, get_tool, provider_tools
 
 
 def parse_openai_tool_calls(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -54,14 +54,14 @@ class AgentRuntime:
         self,
         *,
         provider: str,
-        interceptor_url: str,
+        llm_base_url: str,
         sandbox_id: str,
         work_dir: Path,
         poll_interval_s: float,
         status_port: int,
     ) -> None:
         self.provider = provider
-        self.interceptor_url = interceptor_url.rstrip("/")
+        self.llm_base_url = llm_base_url.rstrip("/")
         self.sandbox_id = sandbox_id
         self.work_dir = work_dir
         self.poll_interval_s = poll_interval_s
@@ -108,7 +108,7 @@ class AgentRuntime:
         )
 
     def _build_logger(self) -> logging.Logger:
-        logger = logging.getLogger(f"simulated_agent.agent_cli.{self.sandbox_id}.{id(self)}")
+        logger = logging.getLogger(f"integrations.sandboxes.simulated.agent_cli.{self.sandbox_id}.{id(self)}")
         logger.setLevel(logging.DEBUG)
         logger.propagate = False
         for existing in list(logger.handlers):
@@ -209,7 +209,7 @@ class AgentRuntime:
             self.state["total_actions"],
         )
         req = urllib.request.Request(
-            self.interceptor_url + path,
+            self.llm_base_url + path,
             data=body,
             headers=headers,
             method="POST",
@@ -282,7 +282,7 @@ class AgentRuntime:
             )
             result = {"returncode": proc.returncode}
         elif name == "fetch_proxy_health":
-            with urllib.request.urlopen(self.interceptor_url + str(tool_input["path"]), timeout=10.0) as resp:
+            with urllib.request.urlopen(self.llm_base_url + str(tool_input["path"]), timeout=10.0) as resp:
                 result = {"status": int(resp.status), "body": resp.read().decode("utf-8")}
         else:
             raise ValueError(f"unsupported tool: {name}")
@@ -381,7 +381,7 @@ def main() -> None:
 
     runtime = AgentRuntime(
         provider=args.provider,
-        interceptor_url=os.environ["INTERCEPTOR_URL"],
+        llm_base_url=os.environ["AGENT_CR_LLM_BASE_URL"],
         sandbox_id=os.environ.get("AGENT_SANDBOX_ID", "sandbox-unknown"),
         work_dir=Path(os.environ.get("AGENT_WORK_DIR", "/work")),
         poll_interval_s=float(os.environ.get("POLL_INTERVAL_S", "0.2")),

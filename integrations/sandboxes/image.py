@@ -6,13 +6,9 @@ import tarfile
 from pathlib import Path
 
 
-PACKAGE_ROOT = Path(__file__).resolve().parent
-DOCKERFILE_PATH = PACKAGE_ROOT / "Dockerfile"
-
-
-def build_image(*, tag: str) -> None:
+def build_image(*, tag: str, build_context: Path, dockerfile_path: Path) -> None:
     subprocess.run(
-        ["docker", "build", "-t", tag, "-f", str(DOCKERFILE_PATH), str(PACKAGE_ROOT)],
+        ["docker", "build", "-t", tag, "-f", str(dockerfile_path), str(build_context)],
         check=True,
     )
 
@@ -39,5 +35,10 @@ def export_image_rootfs(*, tag: str, output_dir: Path) -> Path:
         with tarfile.open(tar_path) as tf:
             tf.extractall(rootfs_dir)
     finally:
-        subprocess.run(["docker", "rm", "-f", container_id], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(
+            ["docker", "rm", "-f", container_id],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
     return rootfs_dir

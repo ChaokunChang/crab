@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from benchmarks.agents.base import BaseAgent, TaskConfig, TaskDescription
-from benchmarks.agents.iflow import IFlowAgent
-from benchmarks.agents.simulated import SimulatedAgent
+from integrations.agents.base import BaseAgent, TaskConfig, TaskDescription
+from integrations.agents.contracts import SandboxHandle
+from integrations.agents.iflow import IFlowAgent
+from integrations.agents.simulated import SimulatedAgent
 
 
 def build_agent_registry() -> dict[str, type[BaseAgent]]:
@@ -15,6 +16,7 @@ def build_agent_registry() -> dict[str, type[BaseAgent]]:
 __all__ = [
     "BaseAgent",
     "IFlowAgent",
+    "SandboxHandle",
     "SimulatedAgent",
     "TaskConfig",
     "TaskDescription",

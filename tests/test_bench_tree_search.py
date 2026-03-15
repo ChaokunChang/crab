@@ -9,8 +9,9 @@ from types import SimpleNamespace
 import unittest
 
 from agent_cr import CheckpointId, SandboxId
+from integrations.agents import SandboxHandle
 from benchmarks.bench_tree_search import run_tree_search_benchmark
-from benchmarks.real_host_scenario_base import BenchmarkTaskRecord, SandboxHandle, TreeSearchCheckpointRecord
+from benchmarks.real_host_scenario_base import BenchmarkTaskRecord, TreeSearchCheckpointRecord
 
 
 class _FakeStorage:
@@ -88,8 +89,16 @@ class _FakeHarness:
         self._active_source_actions = 0
         self.max_concurrent_source_actions = 0
 
-    def launch_sandbox_and_task(self, sandbox_name: str, *, agent_type, task_description, task_config) -> SandboxHandle:
-        _ = (agent_type, task_description, task_config)
+    def launch_sandbox_and_task(
+        self,
+        sandbox_name: str,
+        *,
+        agent_type,
+        llm_service_type=None,
+        task_description,
+        task_config,
+    ) -> SandboxHandle:
+        _ = (agent_type, llm_service_type, task_description, task_config)
         sandbox_id = SandboxId(sandbox_name)
         handle = SandboxHandle(
             sandbox_id=sandbox_id,
@@ -114,11 +123,11 @@ class _FakeHarness:
         *,
         sandbox_index: int,
         default_agent_type: str,
+        default_llm_service_type: str | None,
         default_task_description,
         default_task_config,
     ) -> BenchmarkTaskRecord:
-        _ = dataset
-        _ = sandbox_index
+        _ = (dataset, sandbox_index, default_llm_service_type)
         return BenchmarkTaskRecord(
             agent_type=default_agent_type,
             task_description=default_task_description,
@@ -239,6 +248,7 @@ class TreeSearchBenchmarkTests(unittest.TestCase):
             "auto_cr": False,
             "replay_mode": "sequential",
             "agent_type": "simulated",
+            "llm_service_type": "simulated",
         }
         values.update(overrides)
         return argparse.Namespace(**values)

@@ -6,12 +6,12 @@ import time
 import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
 
-from agent_cr import SandboxId
+from agent_cr import EBPFEvent, EBPFEventKind, InMemoryEBPFEventCollector, SandboxId
+from agent_cr.models import utc_now
 
-if TYPE_CHECKING:
-    from benchmarks.real_host_scenario_base import RealHostScenarioHarness, SandboxHandle
+from .contracts import SandboxHandle
 
 
 @dataclass(frozen=True)
@@ -58,15 +58,21 @@ class BaseAgent(ABC):
 
     def __init__(
         self,
-        harness: RealHostScenarioHarness,
         sandbox: SandboxHandle,
         task_description: TaskDescription,
         task_config: TaskConfig,
+        *,
+        runtime_state_root: Path | None = None,
+        agent_host_dir: Path | None = None,
+        llm_base_url: str | None = None,
     ) -> None:
-        self.harness = harness
         self.sandbox = sandbox
         self.task_description = task_description
         self.task_config = task_config
+        self.runtime_state_root = runtime_state_root
+        self.agent_host_dir = agent_host_dir
+        self.llm_base_url = llm_base_url
+        self._activity_collector = InMemoryEBPFEventCollector()
 
     @abstractmethod
     def perform_task(self) -> None:
@@ -117,8 +123,8 @@ class BaseAgent(ABC):
         return SandboxId(str(self.sandbox.sandbox_id))
 
     def wait_for_sandbox_exit(self, *, poll_interval_s: float = 0.2) -> None:
-        assert self.harness.runtime_state_root is not None
-        command = ["runc", "--root", str(self.harness.runtime_state_root), "state", str(self.sandbox.sandbox_id)]
+        assert self.runtime_state_root is not None
+        command = ["runc", "--root", str(self.runtime_state_root), "state", str(self.sandbox.sandbox_id)]
         while True:
             result = subprocess.run(
                 command,
@@ -164,3 +170,29 @@ class BaseAgent(ABC):
         if raise_on_timeout:
             raise RuntimeError("timed out waiting for agent condition")
         return False
+
+    def _set_status(self, payload: dict[str, object]) -> None:
+        self.sandbox.last_status = dict(payload)
+
+    def _record_activity(self, payload: dict[str, object]) -> None:
+        previous = dict(self.sandbox.last_status)
+        current = dict(payload)
+        mappings = [
+            ("filesystem_actions", EBPFEventKind.FILE_WRITE, {"path": "/work/tool_artifact.txt"}),
+            ("process_actions", EBPFEventKind.PROCESS_EXEC, {"command": "/bin/sh"}),
+            ("network_actions", EBPFEventKind.NETWORK_EGRESS, {"address": "127.0.0.1"}),
+        ]
+        for field, kind, metadata in mappings:
+            if int(current.get(field, 0)) > int(previous.get(field, 0)):
+                self._activity_collector.record(
+                    EBPFEvent(
+                        sandbox_id=self.sandbox.sandbox_id,
+                        kind=kind,
+                        observed_at=utc_now(),
+                        metadata=metadata,
+                    )
+                )
+        self._set_status(current)
+
+    def _recorded_activity_events(self) -> list[EBPFEvent]:
+        return self._activity_collector.poll(self.sandbox.sandbox_id)

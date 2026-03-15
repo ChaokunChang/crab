@@ -48,18 +48,19 @@ from agent_cr.host_inspector.fs_helper import LibbpfFilesystemMonitor
 from agent_cr.host_inspector.runtime_resolver import RuntimeResolver
 from agent_cr.host_inspector.server import HostInspectorDaemon, HostInspectorServer
 from agent_cr.models import JobStatus, utc_now
-from agents.iflow_integration import (
+from integrations.llm_services.manual import serve_manual
+from integrations.llm_services.simulated_for_iflow import default_script_steps, serve
+from integrations.sandboxes.iflow import (
     BridgeNetworkNamespace,
-    build_image,
-    export_image_rootfs,
+    DOCKERFILE_PATH as IFLOW_DOCKERFILE_PATH,
     ensure_cache_files,
     launch_manual_iflow,
     prepare_iflow_runtime,
     prepare_iflow_state,
     stop_manual_iflow,
 )
-from agents.iflow_integration.harness import rootfs_copy_paths, write_bundle_config
-from agents.iflow_integration.service import default_script_steps, serve, serve_manual
+from integrations.sandboxes.iflow.harness import rootfs_copy_paths, write_bundle_config
+from integrations.sandboxes.image import build_image, export_image_rootfs
 
 
 def _find_free_port() -> int:
@@ -446,7 +447,11 @@ class IFlowRealIntegrationTests(unittest.TestCase):
         interceptor: AgentCRRequestInterceptorServer | None = None
         fixture: _RealIFlowManualFixture | None = None
         try:
-            build_image(tag=image_tag)
+            build_image(
+                tag=image_tag,
+                build_context=Path(__file__).resolve().parents[1],
+                dockerfile_path=IFLOW_DOCKERFILE_PATH,
+            )
             exported_rootfs = export_image_rootfs(tag=image_tag, output_dir=image_root)
             alternate_node_runtime_dir_raw = os.environ.get("AGENT_CR_IFLOW_NODE_RUNTIME_DIR")
             prepared_runtime = prepare_iflow_runtime(
@@ -1288,7 +1293,11 @@ class IFlowRealIntegrationTests(unittest.TestCase):
             self.addCleanup(inspector_server.stop)
             host_client = HostInspectorServiceClient(f"http://127.0.0.1:{inspector_server.port}")
 
-            build_image(tag=image_tag)
+            build_image(
+                tag=image_tag,
+                build_context=Path(__file__).resolve().parents[1],
+                dockerfile_path=IFLOW_DOCKERFILE_PATH,
+            )
             self.addCleanup(
                 lambda: subprocess.run(
                     ["docker", "rmi", "-f", image_tag],

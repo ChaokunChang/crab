@@ -15,7 +15,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/iflow
-COPY install_iflow.sh /opt/iflow/install_iflow.sh
+COPY integrations/sandboxes/iflow/install_iflow.sh /opt/iflow/install_iflow.sh
 RUN chmod +x /opt/iflow/install_iflow.sh \
     && mkdir -p /opt/cache /work /root/.iflow
 

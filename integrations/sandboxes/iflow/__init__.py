@@ -1,3 +1,11 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+
+PACKAGE_ROOT = Path(__file__).resolve().parent
+DOCKERFILE_PATH = PACKAGE_ROOT / "Dockerfile"
+
 from .harness import (
     BridgeNetworkNamespace,
     PreparedIFlowRuntime,
@@ -9,23 +17,23 @@ from .harness import (
     required_cache_paths,
     write_bundle_config,
 )
-from .image import build_image, export_image_rootfs
 from .manual import ManualIFlowSession, launch_manual_iflow, load_session, session_summary, stop_manual_iflow
-from .service import ManualLLMState, ScriptStep, ScriptedLLMState, default_script_steps, serve, serve_manual
+from integrations.llm_services.manual import ManualLLMState, serve_manual
+from integrations.llm_services.simulated_for_iflow import ScriptStep, ScriptedLLMState, default_script_steps, serve
 
 __all__ = [
     "BridgeNetworkNamespace",
+    "DOCKERFILE_PATH",
     "ManualIFlowSession",
     "ManualLLMState",
+    "PACKAGE_ROOT",
     "PreparedIFlowRuntime",
     "PreparedIFlowState",
     "ScriptStep",
     "ScriptedLLMState",
-    "build_image",
     "cache_dir_from_env",
     "default_script_steps",
     "ensure_cache_files",
-    "export_image_rootfs",
     "launch_manual_iflow",
     "load_session",
     "prepare_iflow_runtime",

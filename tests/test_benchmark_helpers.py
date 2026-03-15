@@ -10,15 +10,22 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from agent_cr import ArtifactKind, ArtifactReference, CheckpointId, CheckpointManifest, SandboxId, SchedulerConfig
-from benchmarks.agents import IFlowAgent, TaskConfig, TaskDescription
+from agent_cr import (
+    ArtifactKind,
+    ArtifactReference,
+    CheckpointId,
+    CheckpointManifest,
+    EBPFEventKind,
+    SandboxId,
+    SchedulerConfig,
+)
+from integrations.agents import BaseAgent, IFlowAgent, SandboxHandle, TaskConfig, TaskDescription
 from benchmarks.bench_agent_cr_sandbox_e2e import run_benchmark
 from agent_cr.models import utc_now
 from benchmarks.bench_tree_search import choose_replay_steps
 from benchmarks.real_host_scenario_base import (
     BenchmarkTaskRecord,
     RealHostScenarioHarness,
-    SandboxHandle,
     TreeSearchCheckpointRecord,
     build_tree_search_checkpoint_index,
     bounded_probability,
@@ -245,6 +252,35 @@ class BenchmarkHelperTests(unittest.TestCase):
             (Path.cwd() / "logs/tmp").resolve() / "sandbox-1",
         )
 
+    def test_clone_host_work_dir_copies_source_contents_for_fork(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+            work_dir_host_root=Path("/tmp/placeholder"),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            harness.work_dir_host_root = Path(tmp)
+            source_dir = resolve_work_dir_host_path(harness.work_dir_host_root, "source-box")
+            target_dir = resolve_work_dir_host_path(harness.work_dir_host_root, "fork-box")
+            assert source_dir is not None
+            assert target_dir is not None
+            source_dir.mkdir(parents=True, exist_ok=True)
+            (source_dir / "agent_cli.log").write_text("from-source\n", encoding="utf-8")
+            (source_dir / "nested").mkdir()
+            (source_dir / "nested" / "state.json").write_text('{"step": 1}\n', encoding="utf-8")
+            target_dir.mkdir(parents=True, exist_ok=True)
+            (target_dir / "stale.txt").write_text("stale\n", encoding="utf-8")
+
+            harness._clone_host_work_dir(SandboxId("source-box"), SandboxId("fork-box"))
+
+            self.assertEqual((target_dir / "agent_cli.log").read_text(encoding="utf-8"), "from-source\n")
+            self.assertEqual((target_dir / "nested" / "state.json").read_text(encoding="utf-8"), '{"step": 1}\n')
+            self.assertFalse((target_dir / "stale.txt").exists())
+
     def test_write_bundle_config_adds_work_dir_bind_mount(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bundle_dir = Path(tmp)
@@ -264,8 +300,7 @@ class BenchmarkHelperTests(unittest.TestCase):
             work_dir_host_path = bundle_dir / "host-work" / "sandbox-1"
             write_bundle_config(
                 bundle_dir=bundle_dir,
-                interceptor_port=9000,
-                interceptor_host="127.0.0.1",
+                llm_base_url="http://127.0.0.1:9000/v1",
                 provider="openai",
                 sandbox_name="sandbox-1",
                 status_port=9001,
@@ -274,6 +309,7 @@ class BenchmarkHelperTests(unittest.TestCase):
             )
 
             payload = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertIn("AGENT_CR_LLM_BASE_URL=http://127.0.0.1:9000/v1", payload["process"]["env"])
             work_mounts = [mount for mount in payload["mounts"] if mount["destination"] == "/work"]
             self.assertEqual(
                 work_mounts,
@@ -391,12 +427,13 @@ class BenchmarkHelperTests(unittest.TestCase):
                 result = harness.launch_sandbox_and_task(
                     "sbx-launch",
                     agent_type="simulated",
+                    llm_service_type=None,
                     task_description=task_description,
                     task_config=task_config,
                 )
 
         self.assertIs(result, handle)
-        launch_sandbox.assert_called_once_with("sbx-launch", agent_type="simulated")
+        launch_sandbox.assert_called_once_with("sbx-launch", agent_type="simulated", llm_service_type=None)
         launch_task.assert_called_once_with("simulated", task_description, task_config, "sbx-launch")
 
     def test_launch_task_creates_task_run_and_future(self) -> None:
@@ -433,6 +470,38 @@ class BenchmarkHelperTests(unittest.TestCase):
         build_task_run.assert_called_once_with("simulated", handle, task_description, task_config)
         submit.assert_called_once_with(mock_task_run.perform_task)
 
+    def test_build_task_run_passes_explicit_runtime_inputs(self) -> None:
+        class _RecordingAgent(BaseAgent):
+            agent_type = "recording"
+
+            def perform_task(self) -> None:
+                return None
+
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        harness.root = Path("/tmp/harness-root")
+        harness.runtime_state_root = Path("/tmp/runtime-root")
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-explicit"),
+            bundle_dir=Path("/tmp/sbx-explicit"),
+            status_port=8123,
+            last_status={},
+            llm_base_url="http://127.0.0.1:43123/v1",
+        )
+
+        with patch.object(harness, "get_agent_class", return_value=_RecordingAgent):
+            agent = harness.build_task_run("recording", sandbox, TaskDescription("go"), TaskConfig())
+
+        self.assertEqual(agent.runtime_state_root, Path("/tmp/runtime-root"))
+        self.assertEqual(agent.agent_host_dir, Path("/tmp/harness-root/recording/sbx-explicit"))
+        self.assertEqual(agent.llm_base_url, "http://127.0.0.1:43123/v1")
+
     def test_relaunch_sandbox_creates_fresh_task_run(self) -> None:
         harness = RealHostScenarioHarness(
             provider="openai",
@@ -448,6 +517,7 @@ class BenchmarkHelperTests(unittest.TestCase):
             status_port=8123,
             last_status={},
             agent_type="iflow",
+            llm_base_url="http://10.250.0.1:43123/v1",
             task_description=TaskDescription("resume"),
             task_config=TaskConfig(minimum_actions=0),
         )
@@ -468,6 +538,7 @@ class BenchmarkHelperTests(unittest.TestCase):
         self.assertIs(sandbox.task_run, fake_task_run)
         fake_task_run.wait_for_task_ready.assert_called_once()
         fake_task_run.poll_status.assert_called_once()
+        self.assertEqual(sandbox.llm_base_url, "http://10.250.0.1:43123/v1")
 
     def test_launch_sandbox_from_docker_compose_file_translates_supported_service(self) -> None:
         harness = RealHostScenarioHarness(
@@ -546,8 +617,9 @@ services:
         harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())
         harness.system = SimpleNamespace(sandbox_manager=SimpleNamespace(launch=Mock()))
         harness.interceptor = SimpleNamespace(port=43123)
-        harness.exported_rootfs = harness.root / "rootfs"
-        harness.exported_rootfs.mkdir(parents=True, exist_ok=True)
+        harness.llm_server = SimpleNamespace(benchmark_llm_router=SimpleNamespace(register_sandbox=Mock()))
+        sandbox_image = SimpleNamespace(exported_rootfs=harness.root / "rootfs")
+        sandbox_image.exported_rootfs.mkdir(parents=True, exist_ok=True)
 
         handle = SandboxHandle(
             sandbox_id=SandboxId("sbx-sim"),
@@ -566,7 +638,11 @@ services:
 
         with patch.object(harness, "_allocate_benchmark_network_lease") as allocate_network:
             with patch.object(harness, "_prepare_sandbox_handle", return_value=(handle, None)) as prepare_handle:
-                with patch.object(harness, "build_task_run", return_value=task_run):
+                with patch.object(harness, "build_task_run", return_value=task_run), patch.object(
+                    harness,
+                    "ensure_sandbox_image",
+                    return_value=sandbox_image,
+                ):
                     result = harness.launch_sandbox("sbx-sim", agent_type="simulated")
 
         self.assertIs(result, handle)
@@ -576,6 +652,38 @@ services:
             interceptor_host="127.0.0.1",
             network_lease=None,
             agent_type="simulated",
+            llm_service_type="simulated",
+        )
+
+    def test_prepare_sandbox_handle_sets_llm_base_url(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        harness.root = Path(tempfile.mkdtemp(prefix="agent_cr_handle_test_"))
+        harness.interceptor = SimpleNamespace(port=43123)
+        register_sandbox = Mock()
+        harness.llm_server = SimpleNamespace(benchmark_llm_router=SimpleNamespace(register_sandbox=register_sandbox))
+
+        with patch("benchmarks.real_host_scenario_base.subprocess.run"), patch(
+            "benchmarks.real_host_scenario_base.write_bundle_config"
+        ), patch("benchmarks.real_host_scenario_base.find_free_port", return_value=8123):
+            handle, _ = harness._prepare_sandbox_handle(
+                "sbx-url",
+                interceptor_host="10.250.0.1",
+                network_lease=None,
+                agent_type="iflow",
+                llm_service_type="simulated_for_iflow",
+            )
+
+        self.assertEqual(handle.llm_base_url, "http://10.250.0.1:43123/v1")
+        register_sandbox.assert_called_once_with(
+            sandbox_id="sbx-url",
+            llm_service_type="simulated_for_iflow",
         )
 
     def test_launch_sandbox_uses_benchmark_network_for_iflow_agents(self) -> None:
@@ -591,8 +699,9 @@ services:
         harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())
         harness.system = SimpleNamespace(sandbox_manager=SimpleNamespace(launch=Mock()))
         harness.interceptor = SimpleNamespace(port=43123)
-        harness.exported_rootfs = harness.root / "rootfs"
-        harness.exported_rootfs.mkdir(parents=True, exist_ok=True)
+        harness.llm_server = SimpleNamespace(benchmark_llm_router=SimpleNamespace(register_sandbox=Mock()))
+        sandbox_image = SimpleNamespace(exported_rootfs=harness.root / "rootfs")
+        sandbox_image.exported_rootfs.mkdir(parents=True, exist_ok=True)
 
         lease = SimpleNamespace(guest_ip="10.250.0.2", namespace_path=Path("/var/run/netns/test-iflow"))
         handle = SandboxHandle(
@@ -612,16 +721,21 @@ services:
 
         with patch.object(harness, "_allocate_benchmark_network_lease", return_value=lease) as allocate_network:
             with patch.object(harness, "_prepare_sandbox_handle", return_value=(handle, None)) as prepare_handle:
-                with patch.object(harness, "build_task_run", return_value=task_run):
+                with patch.object(harness, "build_task_run", return_value=task_run), patch.object(
+                    harness,
+                    "ensure_sandbox_image",
+                    return_value=sandbox_image,
+                ):
                     result = harness.launch_sandbox("sbx-iflow", agent_type="iflow")
 
         self.assertIs(result, handle)
         allocate_network.assert_called_once_with(SandboxId("sbx-iflow"))
         prepare_handle.assert_called_once_with(
             "sbx-iflow",
-            interceptor_host=harness._benchmark_bridge_ip,
+            interceptor_host=harness.benchmark_bridge_ip,
             network_lease=lease,
             agent_type="iflow",
+            llm_service_type="simulated_for_iflow",
         )
         self.assertEqual(harness._benchmark_ip_to_sandbox[lease.guest_ip], SandboxId("sbx-iflow"))
 
@@ -669,9 +783,13 @@ services:
                 }
             },
         )
-        harness = SimpleNamespace(runtime_state_root=Path("/tmp/runtime"))
-        agent = IFlowAgent(harness, sandbox, TaskDescription("do work"), TaskConfig(options={"FOO": "bar"}))
-        with patch("benchmarks.agents.iflow.subprocess.run") as run:
+        agent = IFlowAgent(
+            sandbox,
+            TaskDescription("do work"),
+            TaskConfig(options={"FOO": "bar"}),
+            runtime_state_root=Path("/tmp/runtime"),
+        )
+        with patch("integrations.agents.iflow.subprocess.run") as run:
             agent.perform_task()
 
         argv = run.call_args.args[0]
@@ -708,7 +826,7 @@ services:
                     }
                 },
             )
-            agent = IFlowAgent(SimpleNamespace(), sandbox, TaskDescription("do work"), TaskConfig())
+            agent = IFlowAgent(sandbox, TaskDescription("do work"), TaskConfig())
 
             agent.configure_bundle()
 
@@ -724,11 +842,6 @@ services:
                 status_port=8123,
                 last_status={},
             )
-            harness = SimpleNamespace(
-                root=Path(tmp),
-                interceptor=SimpleNamespace(port=4567),
-                _benchmark_bridge_ip="10.250.9.1",
-            )
             runtime = SimpleNamespace(
                 root=Path(tmp) / "runtime",
                 mounted_entrypoint="/opt/iflow-runtime/entry.js",
@@ -739,15 +852,22 @@ services:
                 npm_home=Path(tmp) / ".npm",
                 logs_dir=Path(tmp) / "logs",
             )
-            agent = IFlowAgent(harness, sandbox, TaskDescription("do work"), TaskConfig())
+            agent = IFlowAgent(
+                sandbox,
+                TaskDescription("do work"),
+                TaskConfig(),
+                agent_host_dir=Path(tmp) / "iflow" / "sbx-iflow-prepare",
+                llm_base_url="http://10.250.9.1:4567/v1",
+            )
 
-            with patch("benchmarks.agents.iflow.prepare_iflow_runtime", return_value=runtime), patch(
-                "benchmarks.agents.iflow.prepare_iflow_state",
+            with patch("integrations.agents.iflow.prepare_iflow_runtime", return_value=runtime), patch(
+                "integrations.agents.iflow.prepare_iflow_state",
                 return_value=state,
             ) as prepare_state:
                 agent.prepare_sandbox()
 
         self.assertEqual(prepare_state.call_args.kwargs["max_session_turns"], 4096)
+        self.assertEqual(prepare_state.call_args.kwargs["base_url"], "http://10.250.9.1:4567/v1")
 
     def test_iflow_agent_exposes_synthetic_progress_status(self) -> None:
         sandbox = SandboxHandle(
@@ -761,12 +881,11 @@ services:
                 }
             },
         )
-        harness = SimpleNamespace(runtime_state_root=Path("/tmp/runtime"), record_activity=Mock())
         agent = IFlowAgent(
-            harness,
             sandbox,
             TaskDescription("do work"),
             TaskConfig(options={"action_tick_seconds": 0.01}),
+            runtime_state_root=Path("/tmp/runtime"),
         )
 
         def _sleeping_run(*args, **kwargs):
@@ -774,7 +893,7 @@ services:
             time.sleep(0.2)
             return SimpleNamespace(returncode=0)
 
-        with patch("benchmarks.agents.iflow.subprocess.run", side_effect=_sleeping_run):
+        with patch("integrations.agents.iflow.subprocess.run", side_effect=_sleeping_run):
             worker = threading.Thread(target=agent.perform_task)
             worker.start()
             payload = agent.wait_for_progress(minimum_actions=2)
@@ -784,10 +903,16 @@ services:
         self.assertFalse(worker.is_alive())
         self.assertGreaterEqual(int(payload["total_actions"]), 2)
         self.assertGreaterEqual(int(delta_payload["total_actions"]), int(payload["total_actions"]) + 1)
+        self.assertEqual(sandbox.last_status, delta_payload)
         final_payload = agent.poll_status()
         self.assertEqual(final_payload["state"], "finished")
         self.assertGreaterEqual(int(final_payload["total_actions"]), int(delta_payload["total_actions"]))
-        self.assertGreaterEqual(harness.record_activity.call_count, 2)
+        self.assertEqual(sandbox.last_status, delta_payload)
+        self.assertEqual(len(agent._recorded_activity_events()), 6)
+        self.assertEqual(
+            {event.kind for event in agent._recorded_activity_events()},
+            {EBPFEventKind.FILE_WRITE, EBPFEventKind.PROCESS_EXEC, EBPFEventKind.NETWORK_EGRESS},
+        )
 
     def test_iflow_agent_uses_one_second_default_action_tick(self) -> None:
         sandbox = SandboxHandle(
@@ -801,7 +926,7 @@ services:
                 }
             },
         )
-        agent = IFlowAgent(SimpleNamespace(runtime_state_root=Path("/tmp/runtime")), sandbox, TaskDescription("do work"), TaskConfig())
+        agent = IFlowAgent(sandbox, TaskDescription("do work"), TaskConfig(), runtime_state_root=Path("/tmp/runtime"))
         self.assertEqual(agent._tick_seconds, 1.0)
 
     def test_iflow_agent_on_restore_complete_resumes_synthetic_progress(self) -> None:
@@ -816,7 +941,7 @@ services:
                 }
             },
         )
-        agent = IFlowAgent(SimpleNamespace(runtime_state_root=Path("/tmp/runtime")), sandbox, TaskDescription("do work"), TaskConfig())
+        agent = IFlowAgent(sandbox, TaskDescription("do work"), TaskConfig(), runtime_state_root=Path("/tmp/runtime"))
         agent._started_at_monotonic = time.monotonic() - 0.8
         agent._finished_at_monotonic = time.monotonic()
 
@@ -825,6 +950,88 @@ services:
 
         self.assertEqual(agent._task_state(), "running")
         self.assertGreaterEqual(agent._synthetic_action_count(), baseline)
+
+    def test_iflow_poll_status_is_non_mutating_until_status_helpers_run(self) -> None:
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-iflow-poll"),
+            bundle_dir=Path("/tmp/sbx-iflow-poll"),
+            status_port=8123,
+            last_status={"total_actions": 1},
+            launch_metadata={
+                "iflow": {
+                    "entrypoint": "/opt/iflow-runtime/global/lib/node_modules/@iflow-ai/iflow-cli/bundle/entry.js",
+                }
+            },
+        )
+        agent = IFlowAgent(sandbox, TaskDescription("do work"), TaskConfig())
+        agent._started_at_monotonic = time.monotonic() - 0.05
+
+        polled = agent.poll_status()
+
+        self.assertGreaterEqual(int(polled["total_actions"]), 0)
+        self.assertEqual(sandbox.last_status, {"total_actions": 1})
+        agent._set_status(polled)
+        self.assertEqual(sandbox.last_status, polled)
+
+    def test_clone_checkpoint_to_fork_preserves_llm_base_url(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        source = SandboxHandle(
+            sandbox_id=SandboxId("sbx-source"),
+            bundle_dir=Path("/tmp/sbx-source"),
+            status_port=8123,
+            last_status={},
+            agent_type="iflow",
+            llm_service_type="simulated_for_iflow",
+            llm_base_url="http://10.250.0.1:43123/v1",
+            task_description=TaskDescription("resume"),
+            task_config=TaskConfig(),
+        )
+        target = SandboxHandle(
+            sandbox_id=SandboxId("sbx-fork"),
+            bundle_dir=Path("/tmp/sbx-fork"),
+            status_port=8124,
+            last_status={},
+        )
+        harness.root = Path("/tmp")
+        harness.runtime = object()
+        harness.sandbox_manager = SimpleNamespace(_items={}, _persist=Mock())
+        harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())
+        harness.storage = SimpleNamespace(
+            put_manifest=Mock(),
+            get_artifact=Mock(),
+            put_artifact=Mock(),
+        )
+
+        manifest = CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=CheckpointId("ckpt-1"),
+            sandbox_id=source.sandbox_id,
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version=None,
+            process_artifacts=[],
+            filesystem_artifacts=[],
+            metadata={},
+        ).with_integrity()
+
+        with patch.object(harness, "_agent_requires_benchmark_network", return_value=False), patch.object(
+            harness, "_prepare_sandbox_handle", return_value=(target, None)
+        ), patch.object(harness, "list_checkpoint_manifests", return_value=[manifest]), patch.object(
+            harness, "build_task_run", return_value=Mock()
+        ), patch("benchmarks.real_host_scenario_base.resolve_checkpoint_copy_plan", return_value=[(CheckpointId("ckpt-1"), False, True)]), patch(
+            "benchmarks.real_host_scenario_base.subprocess.run"
+        ):
+            forked = harness.clone_checkpoint_to_fork(source, CheckpointId("ckpt-1"), "sbx-fork")
+
+        self.assertIs(forked, target)
+        self.assertEqual(target.llm_base_url, "http://10.250.0.1:43123/v1")
 
     def test_restore_once_notifies_task_run_after_successful_restore(self) -> None:
         harness = RealHostScenarioHarness(
@@ -912,6 +1119,7 @@ services:
                         json.dumps(
                             {
                                 "agent_type": "simulated",
+                                "llm_service_type": "manual",
                                 "task_description": "task-a",
                                 "task_config": {"minimum_actions": 1},
                                 "docker_compose_file": "compose.yaml",
@@ -930,17 +1138,52 @@ services:
             )
             records = harness.load_dataset(dataset_path)
             self.assertEqual(len(records), 2)
+            self.assertEqual(records[0].llm_service_type, "manual")
             self.assertEqual(records[0].docker_compose_file, (root / "compose.yaml").resolve())
             self.assertEqual(records[0].env_file, (root / "task.env").resolve())
             selected = harness.select_task_record(
                 records,
                 sandbox_index=3,
                 default_agent_type="simulated",
+                default_llm_service_type="simulated",
                 default_task_description=TaskDescription("ignored"),
                 default_task_config=TaskConfig(),
             )
             self.assertEqual(selected.agent_type, "iflow")
             self.assertEqual(selected.task_description.prompt, "task-b")
+            self.assertIsNone(selected.llm_service_type)
+
+    def test_resolve_llm_service_type_defaults_from_agent(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+
+        self.assertEqual(
+            harness.resolve_llm_service_type(agent_type="simulated", llm_service_type=None),
+            "simulated",
+        )
+        self.assertEqual(
+            harness.resolve_llm_service_type(agent_type="iflow", llm_service_type=None),
+            "simulated_for_iflow",
+        )
+
+    def test_resolve_llm_service_type_rejects_anthropic_for_manual_only_services(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="anthropic",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+
+        with self.assertRaisesRegex(ValueError, "only supports provider=openai"):
+            harness.resolve_llm_service_type(agent_type="simulated", llm_service_type="manual")
 
     def test_launch_task_record_routes_dataset_compose_rows(self) -> None:
         harness = RealHostScenarioHarness(
@@ -1001,7 +1244,14 @@ services:
             set_snapshot_metadata=Mock(),
         )
         rows = run_benchmark(
-            SimpleNamespace(sandboxes=1, iters=1, provider="openai", agent_type="simulated", dataset=None),
+            SimpleNamespace(
+                sandboxes=1,
+                iters=1,
+                provider="openai",
+                agent_type="simulated",
+                llm_service_type="simulated",
+                dataset=None,
+            ),
             harness,
         )
         self.assertEqual(len(rows), 1)

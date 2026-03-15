@@ -7,7 +7,8 @@ import subprocess
 import threading
 import time
 
-from agents.iflow_integration.harness import (
+from integrations.agents.base import BaseAgent
+from integrations.sandboxes.iflow.harness import (
     IFLOW_HOME_MOUNT_PATH,
     LOGS_MOUNT_PATH,
     NPM_HOME_MOUNT_PATH,
@@ -15,7 +16,6 @@ from agents.iflow_integration.harness import (
     prepare_iflow_runtime,
     prepare_iflow_state,
 )
-from benchmarks.agents.base import BaseAgent
 
 
 class IFlowAgent(BaseAgent):
@@ -25,8 +25,24 @@ class IFlowAgent(BaseAgent):
     DEFAULT_ACTION_TICK_SECONDS = 1.0
     DEFAULT_MAX_SESSION_TURNS = 4096
 
-    def __init__(self, harness, sandbox, task_description, task_config) -> None:
-        super().__init__(harness, sandbox, task_description, task_config)
+    def __init__(
+        self,
+        sandbox,
+        task_description,
+        task_config,
+        *,
+        runtime_state_root=None,
+        agent_host_dir=None,
+        llm_base_url=None,
+    ) -> None:
+        super().__init__(
+            sandbox,
+            task_description,
+            task_config,
+            runtime_state_root=runtime_state_root,
+            agent_host_dir=agent_host_dir,
+            llm_base_url=llm_base_url,
+        )
         self._tick_seconds = max(
             0.001,
             float(self.task_config.options.get("action_tick_seconds", self.DEFAULT_ACTION_TICK_SECONDS)),
@@ -36,13 +52,13 @@ class IFlowAgent(BaseAgent):
         self._finished_at_monotonic: float | None = None
 
     def prepare_sandbox(self) -> None:
-        assert self.harness.root is not None
-        assert self.harness.interceptor is not None
-        sandbox_root = self.harness.root / "iflow" / str(self.sandbox.sandbox_id)
+        assert self.agent_host_dir is not None
+        assert self.llm_base_url is not None
+        sandbox_root = self.agent_host_dir
         prepared_runtime = prepare_iflow_runtime(work_root=sandbox_root)
         prepared_state = prepare_iflow_state(
             work_root=sandbox_root,
-            base_url=f"http://{self.harness._benchmark_bridge_ip}:{self.harness.interceptor.port}/v1",
+            base_url=self.llm_base_url,
             model_name=str(os.environ.get("AGENT_CR_IFLOW_MODEL_NAME", "agent-cr-iflow-scripted")),
             max_session_turns=int(
                 os.environ.get("AGENT_CR_IFLOW_BENCHMARK_MAX_SESSION_TURNS", str(self.DEFAULT_MAX_SESSION_TURNS))
@@ -134,7 +150,7 @@ class IFlowAgent(BaseAgent):
         entrypoint = metadata.get("entrypoint")
         if entrypoint is None:
             raise RuntimeError(f"missing iflow entrypoint for sandbox {self.sandbox.sandbox_id}")
-        assert self.harness.runtime_state_root is not None
+        assert self.runtime_state_root is not None
         with self._state_lock:
             self._started_at_monotonic = time.monotonic()
             self._finished_at_monotonic = None
@@ -150,7 +166,7 @@ class IFlowAgent(BaseAgent):
         exec_command = [
             "runc",
             "--root",
-            str(self.harness.runtime_state_root),
+            str(self.runtime_state_root),
             "exec",
         ]
         for key, value in self.task_config.options.items():
@@ -164,7 +180,7 @@ class IFlowAgent(BaseAgent):
 
     def poll_status(self) -> dict[str, object]:
         actions = self._synthetic_action_count()
-        payload = {
+        return {
             "agent_type": self.agent_type,
             "state": self._task_state(),
             "total_actions": actions,
@@ -173,8 +189,6 @@ class IFlowAgent(BaseAgent):
             "network_actions": actions,
             "stateful_actions": actions,
         }
-        self.sandbox.last_status = payload
-        return payload
 
     def wait_for_progress(self, *, minimum_actions: int) -> dict[str, object]:
         self._wait_for_action_count(minimum_actions)
@@ -217,13 +231,6 @@ class IFlowAgent(BaseAgent):
         if finished_at is None:
             return "running"
         return "finished"
-
-    def _record_activity(self, payload: dict[str, object]) -> None:
-        record_activity = getattr(self.harness, "record_activity", None)
-        if callable(record_activity):
-            record_activity(self.sandbox, payload)
-            return
-        self.sandbox.last_status = payload
 
     def _wait_for_action_count(self, target_actions: int) -> None:
         deadline = time.monotonic() + max(45.0, target_actions * self._tick_seconds * 4.0)

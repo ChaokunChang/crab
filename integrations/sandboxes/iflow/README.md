@@ -13,7 +13,7 @@ filtering out `iflow`'s own long-lived runtime noise.
 - `zfs`
 - `ip`
 - build dependencies for `agent_cr/host_inspector/bpf`
-- vendored `iflow` artifacts under `agents/iflow_integration/cache`
+- vendored `iflow` artifacts under `integrations/sandboxes/iflow/cache`
 
 Required cache files:
 
@@ -33,7 +33,7 @@ Set `AGENT_CR_IFLOW_CACHE_DIR` only if you want to override the repo-default cac
 ## Build The Rootfs
 
 ```bash
-python3 -m agents.iflow_integration build-rootfs \
+python3 -m integrations.sandboxes.iflow build-rootfs \
   --tag agent-cr-iflow-agent:latest \
   --output-dir /tmp/agent-cr-iflow-rootfs
 ```
@@ -43,7 +43,7 @@ This builds the maintained image and exports its rootfs.
 ## Run The Scripted LLM Service
 
 ```bash
-python3 -m agents.iflow_integration serve-scripted-llm \
+python3 -m integrations.sandboxes.iflow serve-scripted-llm \
   --port 8091 \
   --idle-delay-ms 2000
 ```
@@ -111,7 +111,7 @@ Terminal 1:
 
 ```bash
 cd /root/workspace/agent-cr
-sudo agents/iflow_integration/start-manual-demo.sh
+sudo integrations/sandboxes/iflow/start-manual-demo.sh
 ```
 
 That single command:
@@ -147,7 +147,7 @@ python3 -m agent_cr.host_inspector \
 ```bash
 export MANUAL_LLM_URL=http://127.0.0.1:8091
 
-python3 -m agents.iflow_integration serve-manual-llm \
+python3 -m integrations.sandboxes.iflow serve-manual-llm \
   --host 0.0.0.0 \
   --port 8091
 ```
@@ -167,7 +167,7 @@ from the bridged sandbox IP instead of a hidden default.
 ```bash
 export INTERCEPTOR_URL=http://127.0.0.1:8092
 
-python3 -m agents.iflow_integration serve-manual-interceptor \
+python3 -m integrations.sandboxes.iflow serve-manual-interceptor \
   --host 0.0.0.0 \
   --port 8092 \
   --upstream-url "$MANUAL_LLM_URL" \
@@ -178,7 +178,7 @@ python3 -m agents.iflow_integration serve-manual-interceptor \
 ### 4. Launch The Real `iflow` Sandbox
 
 ```bash
-python3 -m agents.iflow_integration launch-manual-sandbox \
+python3 -m integrations.sandboxes.iflow launch-manual-sandbox \
   --work-root "$WORK_ROOT" \
   --sandbox-id sbx-iflow-manual \
   --host-inspector-url "$HOST_INSPECTOR_URL" \
@@ -221,7 +221,7 @@ python3 -m agent_cr.host_inspector.watch \
 Example: transient no-op command
 
 ```bash
-python3 -m agents.iflow_integration enqueue-run-shell-command \
+python3 -m integrations.sandboxes.iflow enqueue-run-shell-command \
   --base-url "$MANUAL_LLM_URL" \
   --sandbox-id sbx-iflow-manual \
   --command 'sh -lc "printf noop >/dev/null"'
@@ -230,7 +230,7 @@ python3 -m agents.iflow_integration enqueue-run-shell-command \
 Example: sticky filesystem write
 
 ```bash
-python3 -m agents.iflow_integration enqueue-run-shell-command \
+python3 -m integrations.sandboxes.iflow enqueue-run-shell-command \
   --base-url "$MANUAL_LLM_URL" \
   --sandbox-id sbx-iflow-manual \
   --command 'sh -lc "mkdir -p /work/iflow-probe && printf iflow-artifact >/work/iflow-probe/artifact.txt"'
@@ -239,7 +239,7 @@ python3 -m agents.iflow_integration enqueue-run-shell-command \
 Example: detached daemon
 
 ```bash
-python3 -m agents.iflow_integration enqueue-run-shell-command \
+python3 -m integrations.sandboxes.iflow enqueue-run-shell-command \
   --base-url "$MANUAL_LLM_URL" \
   --sandbox-id sbx-iflow-manual \
   --command 'sh -lc "mkdir -p /work/iflow-probe && python3 -m http.server 8123 >/work/iflow-probe/http.log 2>&1 & echo $! >/work/iflow-probe/http.pid"'
@@ -256,7 +256,7 @@ After each tool call:
 You can inspect the manual server queue and history at any time:
 
 ```bash
-python3 -m agents.iflow_integration manual-llm-state --base-url "$MANUAL_LLM_URL"
+python3 -m integrations.sandboxes.iflow manual-llm-state --base-url "$MANUAL_LLM_URL"
 ```
 
 ### 7. Manually Checkpoint, Restore, And Enter The Sandbox
@@ -267,7 +267,7 @@ same `WORK_ROOT` used to launch it.
 Create a long-running counter workload:
 
 ```bash
-python3 -m agents.iflow_integration enqueue-run-shell-command \
+python3 -m integrations.sandboxes.iflow enqueue-run-shell-command \
   --base-url "$MANUAL_LLM_URL" \
   --sandbox-id sbx-iflow-manual \
   --command 'bash -lc '"'"'mkdir -p /work/iflow-observe; count=0; while [ "$count" -lt 200 ]; do count=$((count + 1)); printf "%s\n" "$count" >/work/iflow-observe/counter.txt; sleep 1; done'"'"''
@@ -276,28 +276,28 @@ python3 -m agents.iflow_integration enqueue-run-shell-command \
 Checkpoint it:
 
 ```bash
-python3 -m agents.iflow_integration checkpoint-manual-sandbox \
+python3 -m integrations.sandboxes.iflow checkpoint-manual-sandbox \
   --work-root "$WORK_ROOT"
 ```
 
 List available checkpoints:
 
 ```bash
-python3 -m agents.iflow_integration list-manual-checkpoints \
+python3 -m integrations.sandboxes.iflow list-manual-checkpoints \
   --work-root "$WORK_ROOT"
 ```
 
 Restore the latest checkpoint:
 
 ```bash
-python3 -m agents.iflow_integration restore-manual-sandbox \
+python3 -m integrations.sandboxes.iflow restore-manual-sandbox \
   --work-root "$WORK_ROOT"
 ```
 
 Or restore a specific checkpoint id:
 
 ```bash
-python3 -m agents.iflow_integration restore-manual-sandbox \
+python3 -m integrations.sandboxes.iflow restore-manual-sandbox \
   --work-root "$WORK_ROOT" \
   --checkpoint-id ckpt-...
 ```
@@ -305,7 +305,7 @@ python3 -m agents.iflow_integration restore-manual-sandbox \
 Open an interactive shell inside the restored sandbox:
 
 ```bash
-python3 -m agents.iflow_integration manual-shell \
+python3 -m integrations.sandboxes.iflow manual-shell \
   --work-root "$WORK_ROOT"
 ```
 
@@ -324,7 +324,7 @@ you do not need to remember the raw `runc --root ... exec ...` form.
 Tell `iflow` to stop:
 
 ```bash
-python3 -m agents.iflow_integration enqueue-final-response \
+python3 -m integrations.sandboxes.iflow enqueue-final-response \
   --base-url "$MANUAL_LLM_URL" \
   --sandbox-id sbx-iflow-manual \
   --content 'The session is complete. Summarize briefly and stop.'
@@ -333,7 +333,7 @@ python3 -m agents.iflow_integration enqueue-final-response \
 Then delete the sandbox and clean up the temporary ZFS pool and netns:
 
 ```bash
-python3 -m agents.iflow_integration stop-manual-sandbox \
+python3 -m integrations.sandboxes.iflow stop-manual-sandbox \
   --work-root "$WORK_ROOT"
 ```
 
