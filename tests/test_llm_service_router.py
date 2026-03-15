@@ -41,7 +41,19 @@ class BenchmarkLLMRouterTests(unittest.TestCase):
         response = router.handle_request(
             path="/v1/chat/completions",
             headers={"X-Agent-Sandbox-Id": "sbx-iflow"},
-            payload={"messages": [{"role": "user", "content": "continue"}]},
+            payload={
+                "messages": [{"role": "user", "content": "continue"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "run_shell_command",
+                            "description": "x",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+            },
         )
 
         self.assertEqual(

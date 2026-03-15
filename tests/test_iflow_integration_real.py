@@ -49,7 +49,7 @@ from agent_cr.host_inspector.runtime_resolver import RuntimeResolver
 from agent_cr.host_inspector.server import HostInspectorDaemon, HostInspectorServer
 from agent_cr.models import JobStatus, utc_now
 from integrations.llm_services.manual import serve_manual
-from integrations.llm_services.simulated_for_iflow import default_script_steps, serve
+from integrations.llm_services.simulated_for_iflow import serve
 from integrations.sandboxes.iflow import (
     BridgeNetworkNamespace,
     DOCKERFILE_PATH as IFLOW_DOCKERFILE_PATH,
@@ -195,9 +195,9 @@ def _checkpoint_log_excerpt(checkpoint_root: Path, sandbox_id: SandboxId, checkp
     return "\n\n".join(parts)
 
 
-def _wait_for_phase_request(scripted_state, phase: str, *, timeout_s: float = 120.0) -> dict[str, Any]:
+def _wait_for_phase_request(simulated_state, phase: str, *, timeout_s: float = 120.0) -> dict[str, Any]:
     def _match() -> dict[str, Any] | None:
-        snapshot = scripted_state.snapshot()
+        snapshot = simulated_state.snapshot()
         for event in snapshot["events"]:
             if event["event"] == "request" and event["phase"] == phase:
                 return event
@@ -242,7 +242,7 @@ def _host_pids_with_cmdline(*needles: str) -> list[int]:
 
 
 def _wait_for_phase_request_or_fail(
-    scripted_state,
+    simulated_state,
     phase: str,
     *,
     runtime_state_root: Path,
@@ -253,7 +253,7 @@ def _wait_for_phase_request_or_fail(
 ) -> dict[str, Any]:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        snapshot = scripted_state.snapshot()
+        snapshot = simulated_state.snapshot()
         for event in snapshot["events"]:
             if event["event"] == "request" and event["phase"] == phase:
                 return event
@@ -1267,7 +1267,7 @@ class IFlowRealIntegrationTests(unittest.TestCase):
         system: AgentCRSystem | None = None
         host_client: HostInspectorServiceClient | None = None
 
-        llm_server = serve(host="127.0.0.1", port=0, steps=default_script_steps(idle_delay_ms=idle_delay_ms))
+        llm_server = serve(host="127.0.0.1", port=0, response_delay_ms=idle_delay_ms)
         llm_thread = threading.Thread(target=llm_server.serve_forever, daemon=True)
         llm_thread.start()
         self.addCleanup(llm_server.shutdown)
@@ -1467,7 +1467,7 @@ class IFlowRealIntegrationTests(unittest.TestCase):
             )
 
             _wait_for_phase_request_or_fail(
-                llm_server.scripted_state,  # type: ignore[attr-defined]
+                llm_server.simulated_state,  # type: ignore[attr-defined]
                 "transient_process",
                 runtime_state_root=runtime_state_root,
                 sandbox_id=sandbox_id,
@@ -1491,7 +1491,7 @@ class IFlowRealIntegrationTests(unittest.TestCase):
             observation["phases"]["idle_wait"] = idle_wait_status
 
             _wait_for_phase_request_or_fail(
-                llm_server.scripted_state,  # type: ignore[attr-defined]
+                llm_server.simulated_state,  # type: ignore[attr-defined]
                 "filesystem_write",
                 runtime_state_root=runtime_state_root,
                 sandbox_id=sandbox_id,
@@ -1512,7 +1512,7 @@ class IFlowRealIntegrationTests(unittest.TestCase):
             )
 
             _wait_for_phase_request_or_fail(
-                llm_server.scripted_state,  # type: ignore[attr-defined]
+                llm_server.simulated_state,  # type: ignore[attr-defined]
                 "detached_daemon",
                 runtime_state_root=runtime_state_root,
                 sandbox_id=sandbox_id,
@@ -1533,7 +1533,7 @@ class IFlowRealIntegrationTests(unittest.TestCase):
             )
 
             _wait_for_phase_request_or_fail(
-                llm_server.scripted_state,  # type: ignore[attr-defined]
+                llm_server.simulated_state,  # type: ignore[attr-defined]
                 "final_response",
                 runtime_state_root=runtime_state_root,
                 sandbox_id=sandbox_id,
@@ -1651,7 +1651,7 @@ class IFlowRealIntegrationTests(unittest.TestCase):
                 lambda: len(
                     [
                         event
-                        for event in llm_server.scripted_state.snapshot()["events"]  # type: ignore[attr-defined]
+                        for event in llm_server.simulated_state.snapshot()["events"]  # type: ignore[attr-defined]
                         if event["event"] == "response"
                     ]
                 )
@@ -1703,7 +1703,7 @@ class IFlowRealIntegrationTests(unittest.TestCase):
 
         finally:
             root_dir = bundle_dir / "rootfs" / "root"
-            observation["scripted_llm"] = llm_server.scripted_state.snapshot()  # type: ignore[attr-defined]
+            observation["simulated_llm"] = llm_server.simulated_state.snapshot()  # type: ignore[attr-defined]
             observation["work_tree"] = _report_tree(work_dir)
             observation["root_tree"] = _report_tree(root_dir)
             observation["iflow_stdout"] = _read_text_if_exists(root / "iflow-state" / "logs" / "iflow.stdout")
