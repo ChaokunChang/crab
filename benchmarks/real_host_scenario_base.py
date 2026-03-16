@@ -621,7 +621,7 @@ class RealHostScenarioHarness:
             self._benchmark_bridge_ip,
         )
         self._tmpdir = tempfile.TemporaryDirectory(prefix="agent_cr_scenario_bench_")
-        self.root = Path(self._tmpdir.name)
+        self.root = Path("/root/workspace/agent-cr/logs/tmp/agent_cr_bench")
         unique_suffix = uuid.uuid4().hex[:10]
         self.pool_name = f"agentcrbench{unique_suffix}"
         self.runtime_state_root = self.root / "runtime-state"
@@ -914,14 +914,19 @@ class RealHostScenarioHarness:
         *,
         agent_type: str = "simulated",
         llm_service_type: str | None = None,
+        task_description: TaskDescription | None = None,
+        task_config: TaskConfig | None = None,
     ) -> SandboxHandle:
         assert self.root is not None
         assert self.base_inspector is not None
         assert self.system is not None
         assert self.interceptor is not None
 
-        default_task_description = TaskDescription("")
-        default_task_config = TaskConfig()
+        if (task_description is None) != (task_config is None):
+            raise ValueError("task_description and task_config must be provided together")
+
+        resolved_task_description = task_description or TaskDescription("")
+        resolved_task_config = task_config or TaskConfig()
         resolved_llm_service_type = self.resolve_llm_service_type(agent_type=agent_type, llm_service_type=llm_service_type)
         network_lease = (
             self._allocate_benchmark_network_lease(SandboxId(sandbox_name))
@@ -935,7 +940,7 @@ class RealHostScenarioHarness:
             agent_type=agent_type,
             llm_service_type=resolved_llm_service_type,
         )
-        task_run = self.build_task_run(agent_type, handle, default_task_description, default_task_config)
+        task_run = self.build_task_run(agent_type, handle, resolved_task_description, resolved_task_config)
         task_run.prepare_sandbox()
         task_run.configure_bundle()
         sandbox_image = self.ensure_sandbox_image(agent_type)
@@ -1003,7 +1008,13 @@ class RealHostScenarioHarness:
         task_description: TaskDescription,
         task_config: TaskConfig,
     ) -> SandboxHandle:
-        handle = self.launch_sandbox(sandbox_name, agent_type=agent_type, llm_service_type=llm_service_type)
+        handle = self.launch_sandbox(
+            sandbox_name,
+            agent_type=agent_type,
+            llm_service_type=llm_service_type,
+            task_description=task_description,
+            task_config=task_config,
+        )
         self.launch_task(agent_type, task_description, task_config, str(handle.sandbox_id))
         return handle
 
