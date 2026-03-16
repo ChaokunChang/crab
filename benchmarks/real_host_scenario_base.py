@@ -545,6 +545,7 @@ class RealHostScenarioHarness:
         self._benchmark_ip_cursor = 2
         self._benchmark_network_leases: dict[SandboxId, BenchmarkNetworkLease] = {}
         self._benchmark_ip_to_sandbox: dict[str, SandboxId] = {}
+        self._benchmark_network_lock = threading.Lock()
         self._compose_image_tags: set[str] = set()
         self._agent_registry = build_agent_registry()
         self._sandbox_images: dict[str, AgentSandboxImage] = {}
@@ -1131,10 +1132,14 @@ class RealHostScenarioHarness:
         headers: dict[str, str],
         body: bytes,
     ) -> str | None:
-        _ = (headers, body)
+        _ = body
+        sandbox_id_from_header = str(headers.get("X-Agent-Sandbox-Id", "")).strip()
+        if sandbox_id_from_header:
+            return sandbox_id_from_header
         if client_host is None:
             return None
-        sandbox_id = self._benchmark_ip_to_sandbox.get(client_host)
+        with self._benchmark_network_lock:
+            sandbox_id = self._benchmark_ip_to_sandbox.get(client_host)
         if sandbox_id is None:
             return None
         return str(sandbox_id)
@@ -1923,90 +1928,94 @@ class RealHostScenarioHarness:
         return handle, work_dir_host_path
 
     def _ensure_benchmark_bridge(self) -> None:
-        if self._benchmark_bridge_name is not None:
-            return
-        assert self.root is not None
-        bridge_name = f"acb{uuid.uuid4().hex[:8]}"
-        subprocess.run(["ip", "link", "add", bridge_name, "type", "bridge"], check=True)
-        subprocess.run(
-            ["ip", "addr", "add", f"{self._benchmark_bridge_ip}/24", "dev", bridge_name],
-            check=True,
-        )
-        subprocess.run(["ip", "link", "set", bridge_name, "up"], check=True)
-        self._benchmark_bridge_name = bridge_name
-        logger.info(
-            "Created benchmark bridge name=%s bridge_ip=%s",
-            bridge_name,
-            self._benchmark_bridge_ip,
-        )
+        with self._benchmark_network_lock:
+            if self._benchmark_bridge_name is not None:
+                return
+            assert self.root is not None
+            bridge_name = f"acb{uuid.uuid4().hex[:8]}"
+            subprocess.run(["ip", "link", "add", bridge_name, "type", "bridge"], check=True)
+            subprocess.run(
+                ["ip", "addr", "add", f"{self._benchmark_bridge_ip}/24", "dev", bridge_name],
+                check=True,
+            )
+            subprocess.run(["ip", "link", "set", bridge_name, "up"], check=True)
+            self._benchmark_bridge_name = bridge_name
+            logger.info(
+                "Created benchmark bridge name=%s bridge_ip=%s",
+                bridge_name,
+                self._benchmark_bridge_ip,
+            )
 
     def _allocate_benchmark_network_lease(self, sandbox_id: SandboxId) -> BenchmarkNetworkLease:
         self._ensure_benchmark_bridge()
-        assert self._benchmark_bridge_name is not None
-        network = ipaddress.ip_network(self._benchmark_network_cidr)
-        if self._benchmark_ip_cursor >= network.num_addresses - 1:
-            raise RuntimeError("benchmark network exhausted guest IP capacity")
-        guest_ip = str(network[self._benchmark_ip_cursor])
-        self._benchmark_ip_cursor += 1
-        suffix = uuid.uuid4().hex[:8]
-        namespace_name = f"ts-{suffix}"
-        host_veth_name = f"vh{suffix[:6]}"
-        guest_veth_name = f"vg{suffix[:6]}"
-        subprocess.run(["ip", "netns", "add", namespace_name], check=True)
-        subprocess.run(
-            ["ip", "link", "add", host_veth_name, "type", "veth", "peer", "name", guest_veth_name],
-            check=True,
-        )
-        subprocess.run(["ip", "link", "set", host_veth_name, "master", self._benchmark_bridge_name], check=True)
-        subprocess.run(["ip", "link", "set", host_veth_name, "up"], check=True)
-        subprocess.run(["ip", "link", "set", guest_veth_name, "netns", namespace_name], check=True)
-        subprocess.run(["ip", "netns", "exec", namespace_name, "ip", "link", "set", "lo", "up"], check=True)
-        subprocess.run(
-            ["ip", "netns", "exec", namespace_name, "ip", "link", "set", guest_veth_name, "name", "eth0"],
-            check=True,
-        )
-        subprocess.run(
-            ["ip", "netns", "exec", namespace_name, "ip", "addr", "add", f"{guest_ip}/24", "dev", "eth0"],
-            check=True,
-        )
-        subprocess.run(["ip", "netns", "exec", namespace_name, "ip", "link", "set", "eth0", "up"], check=True)
-        subprocess.run(
-            [
-                "ip",
-                "netns",
-                "exec",
+        with self._benchmark_network_lock:
+            assert self._benchmark_bridge_name is not None
+            network = ipaddress.ip_network(self._benchmark_network_cidr)
+            if self._benchmark_ip_cursor >= network.num_addresses - 1:
+                raise RuntimeError("benchmark network exhausted guest IP capacity")
+            guest_ip = str(network[self._benchmark_ip_cursor])
+            self._benchmark_ip_cursor += 1
+            suffix = uuid.uuid4().hex[:8]
+            namespace_name = f"ts-{suffix}"
+            host_veth_name = f"vh{suffix[:6]}"
+            guest_veth_name = f"vg{suffix[:6]}"
+            subprocess.run(["ip", "netns", "add", namespace_name], check=True)
+            subprocess.run(
+                ["ip", "link", "add", host_veth_name, "type", "veth", "peer", "name", guest_veth_name],
+                check=True,
+            )
+            subprocess.run(["ip", "link", "set", host_veth_name, "master", self._benchmark_bridge_name], check=True)
+            subprocess.run(["ip", "link", "set", host_veth_name, "up"], check=True)
+            subprocess.run(["ip", "link", "set", guest_veth_name, "netns", namespace_name], check=True)
+            subprocess.run(["ip", "netns", "exec", namespace_name, "ip", "link", "set", "lo", "up"], check=True)
+            subprocess.run(
+                ["ip", "netns", "exec", namespace_name, "ip", "link", "set", guest_veth_name, "name", "eth0"],
+                check=True,
+            )
+            subprocess.run(
+                ["ip", "netns", "exec", namespace_name, "ip", "addr", "add", f"{guest_ip}/24", "dev", "eth0"],
+                check=True,
+            )
+            subprocess.run(["ip", "netns", "exec", namespace_name, "ip", "link", "set", "eth0", "up"], check=True)
+            subprocess.run(
+                [
+                    "ip",
+                    "netns",
+                    "exec",
+                    namespace_name,
+                    "ip",
+                    "route",
+                    "replace",
+                    "default",
+                    "via",
+                    self._benchmark_bridge_ip,
+                ],
+                check=True,
+            )
+            lease = BenchmarkNetworkLease(
+                sandbox_id=sandbox_id,
+                namespace_name=namespace_name,
+                namespace_path=Path("/var/run/netns") / namespace_name,
+                host_veth_name=host_veth_name,
+                guest_veth_name=guest_veth_name,
+                guest_ip=guest_ip,
+            )
+            self._benchmark_network_leases[sandbox_id] = lease
+            logger.info(
+                "Allocated benchmark network lease sandbox=%s guest_ip=%s namespace=%s",
+                sandbox_id,
+                guest_ip,
                 namespace_name,
-                "ip",
-                "route",
-                "replace",
-                "default",
-                "via",
-                self._benchmark_bridge_ip,
-            ],
-            check=True,
-        )
-        lease = BenchmarkNetworkLease(
-            sandbox_id=sandbox_id,
-            namespace_name=namespace_name,
-            namespace_path=Path("/var/run/netns") / namespace_name,
-            host_veth_name=host_veth_name,
-            guest_veth_name=guest_veth_name,
-            guest_ip=guest_ip,
-        )
-        self._benchmark_network_leases[sandbox_id] = lease
-        logger.info(
-            "Allocated benchmark network lease sandbox=%s guest_ip=%s namespace=%s",
-            sandbox_id,
-            guest_ip,
-            namespace_name,
-        )
-        return lease
+            )
+            return lease
 
     def _release_benchmark_network_lease(self, sandbox_id: SandboxId) -> None:
-        lease = self._benchmark_network_leases.pop(sandbox_id, None)
+        with self._benchmark_network_lock:
+            lease = self._benchmark_network_leases.pop(sandbox_id, None)
+            if lease is not None:
+                self._benchmark_ip_to_sandbox.pop(lease.guest_ip, None)
         if lease is None:
             return
-        self._benchmark_ip_to_sandbox.pop(lease.guest_ip, None)
         subprocess.run(
             ["ip", "netns", "del", lease.namespace_name],
             check=False,

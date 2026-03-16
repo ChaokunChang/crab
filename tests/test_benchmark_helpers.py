@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import ipaddress
 import json
 import tempfile
@@ -460,6 +461,64 @@ class BenchmarkHelperTests(unittest.TestCase):
             "spot-0",
         )
         self.assertIsNone(harness.resolve_interceptor_sandbox_id("10.250.0.43", {}, b""))
+
+    def test_resolve_interceptor_sandbox_id_prefers_explicit_header_over_guest_ip_mapping(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(
+                min_checkpoint_interval_seconds=0.0,
+                force_checkpoint_after_seconds=0.0,
+                require_change_signal=False,
+            ),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        harness._benchmark_ip_to_sandbox["10.250.0.42"] = SandboxId("spot-0")
+
+        self.assertEqual(
+            harness.resolve_interceptor_sandbox_id(
+                "10.250.0.42",
+                {"X-Agent-Sandbox-Id": "fault-1"},
+                b"",
+            ),
+            "fault-1",
+        )
+
+    def test_allocate_benchmark_network_lease_creates_bridge_once_under_concurrency(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(
+                min_checkpoint_interval_seconds=0.0,
+                force_checkpoint_after_seconds=0.0,
+                require_change_signal=False,
+            ),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=2,
+        )
+        harness.root = Path("/tmp")
+
+        call_lock = threading.Lock()
+        bridge_add_commands: list[list[str]] = []
+
+        def fake_run(cmd, *args, **kwargs):
+            if cmd[:3] == ["ip", "link", "add"] and len(cmd) >= 6 and cmd[4:6] == ["type", "bridge"]:
+                with call_lock:
+                    bridge_add_commands.append(list(cmd))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch("benchmarks.real_host_scenario_base.subprocess.run", side_effect=fake_run):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                first_future = executor.submit(harness._allocate_benchmark_network_lease, SandboxId("sbx-a"))
+                second_future = executor.submit(harness._allocate_benchmark_network_lease, SandboxId("sbx-b"))
+                first = first_future.result()
+                second = second_future.result()
+
+        self.assertNotEqual(first.guest_ip, second.guest_ip)
+        self.assertEqual(len(bridge_add_commands), 1)
 
     def test_launch_sandbox_and_task_records_task_metadata(self) -> None:
         harness = RealHostScenarioHarness(
