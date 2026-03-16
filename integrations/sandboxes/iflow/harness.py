@@ -13,6 +13,7 @@ REQUIRED_CACHE_FILES = (
     "node-v22.18.0-linux-x64.tar.xz",
     "iflow-ai-iflow-cli-for-roll-0-4-4-v4.tgz",
 )
+IFLOW_WRAPPER_ARG = "--agent-cr-iflow-wrapper"
 RUNTIME_MOUNT_PATH = "/opt/iflow-runtime"
 IFLOW_HOME_MOUNT_PATH = "/root/.iflow"
 NPM_HOME_MOUNT_PATH = "/root/.npm"
@@ -42,6 +43,13 @@ class PreparedIFlowRuntime:
     @property
     def ignore_process_rules(self) -> list[dict[str, object]]:
         return [
+            {
+                "executable_basename": "node",
+                "cmdline_contains": [
+                    f"{RUNTIME_MOUNT_PATH}/node/bin/node",
+                    IFLOW_WRAPPER_ARG,
+                ],
+            },
             {
                 "executable_basename": "node",
                 "cmdline_contains": [

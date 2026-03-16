@@ -23,6 +23,51 @@ from integrations.sandboxes.iflow.harness import (
 logger = logging.getLogger(__name__)
 
 SANDBOX_TASK_OUTPUT_DIR = Path("/data/iflow-task-logs")
+IFLOW_WRAPPER_ARG = "--agent-cr-iflow-wrapper"
+_IFLOW_INLINE_WRAPPER = """
+const fs = require("fs");
+const { spawn } = require("child_process");
+
+const entrypoint = process.env.AGENT_CR_IFLOW_ENTRYPOINT;
+const task = process.env.AGENT_CR_IFLOW_TASK || "";
+const donePath = process.env.AGENT_CR_IFLOW_DONE_PATH;
+const exitPath = process.env.AGENT_CR_IFLOW_EXIT_PATH;
+
+let settled = false;
+
+function finish(code) {
+  if (settled) {
+    return;
+  }
+  settled = true;
+  if (code === 0) {
+    fs.writeFileSync(donePath, "done\\n", "utf8");
+  }
+  fs.writeFileSync(exitPath, `${code}\\n`, "utf8");
+}
+
+const child = spawn(process.execPath, [entrypoint, "-p", task], {
+  cwd: "/work",
+  env: process.env,
+  stdio: "inherit",
+});
+
+child.once("error", (error) => {
+  console.error(error && error.stack ? error.stack : String(error));
+  finish(127);
+  process.exit(127);
+});
+
+child.once("exit", (code, signal) => {
+  const exitCode = code === null ? 1 : code;
+  finish(exitCode);
+  if (signal) {
+    process.kill(process.pid, signal);
+    return;
+  }
+  process.exit(exitCode);
+});
+""".strip()
 
 
 class IFlowAgent(BaseAgent):
@@ -111,6 +156,10 @@ class IFlowAgent(BaseAgent):
             [
                 "export HOME=/root",
                 "export IFLOW_NON_INTERACTIVE=true",
+                f"export AGENT_CR_IFLOW_ENTRYPOINT={shlex.quote(entrypoint)}",
+                f"export AGENT_CR_IFLOW_TASK={escaped_task}",
+                f"export AGENT_CR_IFLOW_DONE_PATH={shlex.quote(marker_mount_paths['done'])}",
+                f"export AGENT_CR_IFLOW_EXIT_PATH={shlex.quote(marker_mount_paths['exit'])}",
                 "cd /work",
                 f"mkdir -p {shlex.quote(str(SANDBOX_TASK_OUTPUT_DIR))}",
                 (
@@ -123,18 +172,11 @@ class IFlowAgent(BaseAgent):
                 f"touch {shlex.quote(marker_mount_paths['done'])}",
                 f"touch {shlex.quote(marker_mount_paths['exit'])}",
                 (
-                    f"{RUNTIME_MOUNT_PATH}/node/bin/node {shlex.quote(entrypoint)} -p {escaped_task} "
+                    f"exec {RUNTIME_MOUNT_PATH}/node/bin/node -e {shlex.quote(_IFLOW_INLINE_WRAPPER)} "
+                    f"-- {shlex.quote(IFLOW_WRAPPER_ARG)} "
                     f">{shlex.quote(str(output_paths['stdout']))} "
                     f"2>{shlex.quote(str(output_paths['stderr']))}"
                 ),
-                "status=$?",
-                (
-                    'if [ "$status" -eq 0 ]; then '
-                    f"printf 'done\\n' > {shlex.quote(marker_mount_paths['done'])}; "
-                    "fi"
-                ),
-                f"printf '%s\\n' \"$status\" > {shlex.quote(marker_mount_paths['exit'])}",
-                "exit \"$status\"",
             ]
         )
         cfg["process"]["args"] = [

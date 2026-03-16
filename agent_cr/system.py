@@ -537,7 +537,7 @@ class AgentCRSystem:
         decision = self.scheduler.query_checkpoint(sandbox_id)
         if not decision.should_checkpoint:
             return None
-        input("should checkpoint.")
+        # input("should checkpoint.")
         checkpoint_metadata = self._build_checkpoint_metadata(sandbox_id)
 
         job = CheckpointJob(

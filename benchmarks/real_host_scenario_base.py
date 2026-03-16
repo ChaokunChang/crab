@@ -711,7 +711,7 @@ class RealHostScenarioHarness:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        input("wait for signal to cleanup")
+        # input("wait for signal to cleanup")
         for sandbox in self.sandboxes:
             if sandbox.task_run is not None:
                 sandbox.task_run.request_stop()
