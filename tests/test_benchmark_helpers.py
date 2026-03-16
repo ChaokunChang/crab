@@ -559,6 +559,42 @@ class BenchmarkHelperTests(unittest.TestCase):
         self.assertEqual(agent.agent_host_dir, Path("/tmp/harness-root/recording/sbx-explicit"))
         self.assertEqual(agent.llm_base_url, "http://127.0.0.1:43123/v1")
 
+    def test_launch_task_requests_stop_before_replacing_running_task(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        handle = SandboxHandle(
+            sandbox_id=SandboxId("sbx-agent-stop"),
+            bundle_dir=Path("/tmp/sbx-agent-stop"),
+            status_port=8123,
+            last_status={},
+        )
+        existing_task_run = Mock()
+        existing_future = Mock(done=Mock(return_value=False))
+        handle.task_run = existing_task_run
+        handle.task_future = existing_future
+        harness._sandbox_by_id[handle.sandbox_id] = handle
+        replacement_task_run = Mock()
+        replacement_future = Mock()
+
+        with patch.object(harness, "build_task_run", return_value=replacement_task_run), patch.object(
+            harness._task_executor,
+            "submit",
+            return_value=replacement_future,
+        ):
+            returned = harness.launch_task("simulated", TaskDescription("progress"), TaskConfig(), "sbx-agent-stop")
+
+        existing_task_run.request_stop.assert_called_once()
+        existing_future.cancel.assert_called_once()
+        self.assertIs(returned, replacement_task_run)
+        self.assertIs(handle.task_run, replacement_task_run)
+        self.assertIs(handle.task_future, replacement_future)
+
     def test_relaunch_sandbox_creates_fresh_task_run(self) -> None:
         harness = RealHostScenarioHarness(
             provider="openai",
@@ -596,6 +632,83 @@ class BenchmarkHelperTests(unittest.TestCase):
         fake_task_run.wait_for_task_ready.assert_called_once()
         fake_task_run.poll_status.assert_called_once()
         self.assertEqual(sandbox.llm_base_url, "http://10.250.0.1:43123/v1")
+
+    def test_relaunch_sandbox_reuses_fault_resilient_task_run(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-relaunch-reuse"),
+            bundle_dir=Path("/tmp/sbx-relaunch-reuse"),
+            status_port=8123,
+            last_status={},
+            agent_type="iflow",
+            llm_base_url="http://10.250.0.1:43123/v1",
+            task_description=TaskDescription("resume"),
+            task_config=TaskConfig(minimum_actions=0),
+        )
+        harness.sandbox_manager = SimpleNamespace(
+            describe=lambda sandbox_id: SimpleNamespace(metadata={"zfs_dataset": "", "bundle_path": "/tmp/bundle"}),
+            launch=Mock(),
+        )
+        harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())
+        harness.runtime_state_root = Path("/tmp/runtime")
+
+        fake_task_run = SimpleNamespace(
+            survives_fault_relaunch=Mock(return_value=True),
+            wait_for_task_ready=Mock(),
+            on_restore_complete=Mock(),
+            poll_status=Mock(return_value={"total_actions": 3}),
+        )
+        sandbox.task_run = fake_task_run
+        sandbox.task_future = SimpleNamespace(done=Mock(return_value=False))
+
+        with patch.object(harness, "launch_task") as launch_task:
+            harness.relaunch_sandbox(sandbox)
+
+        launch_task.assert_not_called()
+        self.assertIs(sandbox.task_run, fake_task_run)
+        fake_task_run.wait_for_task_ready.assert_called_once()
+        fake_task_run.on_restore_complete.assert_called_once()
+        fake_task_run.poll_status.assert_called_once()
+
+    def test_harness_exit_requests_stop_for_running_tasks(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-exit"),
+            bundle_dir=Path("/tmp/sbx-exit"),
+            status_port=8123,
+            last_status={},
+            task_run=Mock(),
+        )
+        harness.sandboxes = [sandbox]
+        harness.system = None
+        harness.interceptor = None
+        harness.executor = None
+        harness.runtime_state_root = None
+        harness.pool_name = None
+        harness.llm_server = None
+        harness.llm_thread = None
+        harness._benchmark_network_leases.clear()
+        harness._stop_host_inspector_server = Mock()
+        harness._task_executor.shutdown = Mock()
+
+        harness.__exit__(None, None, None)
+
+        sandbox.task_run.request_stop.assert_called_once()
+        harness._task_executor.shutdown.assert_called_once_with(wait=True, cancel_futures=True)
 
     def test_launch_sandbox_from_docker_compose_file_translates_supported_service(self) -> None:
         harness = RealHostScenarioHarness(
@@ -879,31 +992,50 @@ services:
                     service_name="app",
                 )
 
-    def test_iflow_agent_uses_foreground_runc_exec(self) -> None:
-        sandbox = SandboxHandle(
-            sandbox_id=SandboxId("sbx-iflow"),
-            bundle_dir=Path("/tmp/sbx-iflow"),
-            status_port=8123,
-            last_status={},
-            launch_metadata={
-                "iflow": {
-                    "entrypoint": "/opt/iflow-runtime/global/lib/node_modules/@iflow-ai/iflow-cli/bundle/entry.js",
-                }
-            },
-        )
-        agent = IFlowAgent(
-            sandbox,
-            TaskDescription("do work"),
-            TaskConfig(options={"FOO": "bar"}),
-            runtime_state_root=Path("/tmp/runtime"),
-        )
-        with patch("integrations.agents.iflow.subprocess.run") as run:
-            agent.perform_task()
+    def test_iflow_agent_uses_detached_runc_exec(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            logs_dir = Path(tmp)
+            sandbox = SandboxHandle(
+                sandbox_id=SandboxId("sbx-iflow"),
+                bundle_dir=Path("/tmp/sbx-iflow"),
+                status_port=8123,
+                last_status={},
+                launch_metadata={
+                    "iflow": {
+                        "entrypoint": "/opt/iflow-runtime/global/lib/node_modules/@iflow-ai/iflow-cli/bundle/entry.js",
+                        "logs_dir": str(logs_dir),
+                    }
+                },
+            )
+            agent = IFlowAgent(
+                sandbox,
+                TaskDescription("do work"),
+                TaskConfig(options={"FOO": "bar"}),
+                runtime_state_root=Path("/tmp/runtime"),
+            )
 
-        argv = run.call_args.args[0]
-        self.assertEqual(argv[:4], ["runc", "--root", "/tmp/runtime", "exec"])
-        self.assertNotIn("-d", argv)
+            def _run(argv, **kwargs):
+                _ = kwargs
+                if argv[:4] == ["runc", "--root", "/tmp/runtime", "exec"] and "-d" in argv:
+                    (logs_dir / "iflow.task.done").write_text("done\n", encoding="utf-8")
+                    (logs_dir / "iflow.task.exit").write_text("0\n", encoding="utf-8")
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if argv[:4] == ["runc", "--root", "/tmp/runtime", "state"]:
+                    return SimpleNamespace(returncode=0, stdout=json.dumps({"status": "running"}), stderr="")
+                raise AssertionError(f"unexpected command: {argv}")
+
+            with patch("integrations.agents.iflow.subprocess.run", side_effect=_run) as run:
+                agent.perform_task()
+
+        exec_calls = [call.args[0] for call in run.call_args_list if call.args[0][:4] == ["runc", "--root", "/tmp/runtime", "exec"]]
+        self.assertEqual(len(exec_calls), 1)
+        argv = exec_calls[0]
+        self.assertIn("-d", argv)
         self.assertIn("sbx-iflow", argv)
+        self.assertIn("iflow.task.exit", argv[-1])
+        self.assertIn("iflow.task.done", argv[-1])
+        self.assertNotIn("child=$!", argv[-1])
+        self.assertNotIn("wait \"$child\"", argv[-1])
 
     def test_iflow_configure_bundle_redirects_idle_init_stdio(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -978,37 +1110,54 @@ services:
         self.assertEqual(prepare_state.call_args.kwargs["base_url"], "http://10.250.9.1:4567/v1")
 
     def test_iflow_agent_exposes_synthetic_progress_status(self) -> None:
-        sandbox = SandboxHandle(
-            sandbox_id=SandboxId("sbx-iflow-progress"),
-            bundle_dir=Path("/tmp/sbx-iflow-progress"),
-            status_port=8123,
-            last_status={},
-            launch_metadata={
-                "iflow": {
-                    "entrypoint": "/opt/iflow-runtime/global/lib/node_modules/@iflow-ai/iflow-cli/bundle/entry.js",
-                }
-            },
-        )
-        agent = IFlowAgent(
-            sandbox,
-            TaskDescription("do work"),
-            TaskConfig(options={"action_tick_seconds": 0.01}),
-            runtime_state_root=Path("/tmp/runtime"),
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            logs_dir = Path(tmp)
+            sandbox = SandboxHandle(
+                sandbox_id=SandboxId("sbx-iflow-progress"),
+                bundle_dir=Path("/tmp/sbx-iflow-progress"),
+                status_port=8123,
+                last_status={},
+                launch_metadata={
+                    "iflow": {
+                        "entrypoint": "/opt/iflow-runtime/global/lib/node_modules/@iflow-ai/iflow-cli/bundle/entry.js",
+                        "logs_dir": str(logs_dir),
+                    }
+                },
+            )
+            agent = IFlowAgent(
+                sandbox,
+                TaskDescription("do work"),
+                TaskConfig(options={"action_tick_seconds": 0.01}),
+                runtime_state_root=Path("/tmp/runtime"),
+            )
+            allow_finish = threading.Event()
+            launch_calls = 0
 
-        def _sleeping_run(*args, **kwargs):
-            _ = (args, kwargs)
-            time.sleep(0.2)
-            return SimpleNamespace(returncode=0)
+            def _launch_task(*, exit_path: Path, done_path: Path, **kwargs) -> None:
+                nonlocal launch_calls
+                _ = kwargs
+                launch_calls += 1
 
-        with patch("integrations.agents.iflow.subprocess.run", side_effect=_sleeping_run):
-            worker = threading.Thread(target=agent.perform_task)
-            worker.start()
-            payload = agent.wait_for_progress(minimum_actions=2)
-            delta_payload = agent.wait_for_action_delta(delta=1)
-            worker.join(timeout=1.0)
+                def _finish_later() -> None:
+                    allow_finish.wait(timeout=1.0)
+                    done_path.write_text("done\n", encoding="utf-8")
+                    exit_path.write_text("0\n", encoding="utf-8")
+
+                threading.Thread(target=_finish_later, daemon=True).start()
+
+            with patch.object(agent, "_launch_detached_task", side_effect=_launch_task), patch.object(
+                agent, "_sandbox_is_live", return_value=True
+            ):
+                worker = threading.Thread(target=agent.perform_task)
+                worker.start()
+                payload = agent.wait_for_progress(minimum_actions=2)
+                self.assertEqual(agent.poll_status()["state"], "running")
+                delta_payload = agent.wait_for_action_delta(delta=1)
+                allow_finish.set()
+                worker.join(timeout=1.0)
 
         self.assertFalse(worker.is_alive())
+        self.assertEqual(launch_calls, 1)
         self.assertGreaterEqual(int(payload["total_actions"]), 2)
         self.assertGreaterEqual(int(delta_payload["total_actions"]), int(payload["total_actions"]) + 1)
         self.assertEqual(sandbox.last_status, delta_payload)
@@ -1021,6 +1170,131 @@ services:
             {event.kind for event in agent._recorded_activity_events()},
             {EBPFEventKind.FILE_WRITE, EBPFEventKind.PROCESS_EXEC, EBPFEventKind.NETWORK_EGRESS},
         )
+
+    def test_iflow_agent_waits_across_fault_and_relaunch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            logs_dir = Path(tmp)
+            sandbox = SandboxHandle(
+                sandbox_id=SandboxId("sbx-iflow-fault"),
+                bundle_dir=Path("/tmp/sbx-iflow-fault"),
+                status_port=8123,
+                last_status={},
+                launch_metadata={
+                    "iflow": {
+                        "entrypoint": "/opt/iflow-runtime/global/lib/node_modules/@iflow-ai/iflow-cli/bundle/entry.js",
+                        "logs_dir": str(logs_dir),
+                    }
+                },
+            )
+            agent = IFlowAgent(
+                sandbox,
+                TaskDescription("do work"),
+                TaskConfig(),
+                runtime_state_root=Path("/tmp/runtime"),
+            )
+            sandbox_live = {"value": True}
+            launch_calls = 0
+            allow_finish = threading.Event()
+            errors: list[BaseException] = []
+
+            def _launch_task(*, exit_path: Path, done_path: Path, **kwargs) -> None:
+                nonlocal launch_calls
+                _ = kwargs
+                launch_calls += 1
+                sandbox_live["value"] = False
+
+                def _finish_after_restore() -> None:
+                    allow_finish.wait(timeout=1.0)
+                    done_path.write_text("done\n", encoding="utf-8")
+                    exit_path.write_text("0\n", encoding="utf-8")
+
+                threading.Thread(target=_finish_after_restore, daemon=True).start()
+
+            def _run_task() -> None:
+                try:
+                    agent.perform_task()
+                except BaseException as exc:  # pragma: no cover - exercised via assertion below
+                    errors.append(exc)
+
+            with patch.object(agent, "_launch_detached_task", side_effect=_launch_task), patch.object(
+                agent, "_sandbox_is_live", side_effect=lambda: sandbox_live["value"]
+            ):
+                worker = threading.Thread(target=_run_task)
+                worker.start()
+                time.sleep(0.05)
+                self.assertTrue(worker.is_alive())
+                sandbox.last_status = {"total_actions": 3}
+                sandbox_live["value"] = True
+                agent.on_restore_complete()
+                allow_finish.set()
+                worker.join(timeout=1.0)
+
+        self.assertEqual(launch_calls, 1)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(agent.poll_status()["state"], "finished")
+
+    def test_iflow_agent_fails_fast_when_sandbox_is_dead_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            logs_dir = Path(tmp)
+            sandbox = SandboxHandle(
+                sandbox_id=SandboxId("sbx-iflow-dead"),
+                bundle_dir=Path("/tmp/sbx-iflow-dead"),
+                status_port=8123,
+                last_status={},
+                launch_metadata={
+                    "iflow": {
+                        "entrypoint": "/opt/iflow-runtime/global/lib/node_modules/@iflow-ai/iflow-cli/bundle/entry.js",
+                        "logs_dir": str(logs_dir),
+                    }
+                },
+            )
+            agent = IFlowAgent(
+                sandbox,
+                TaskDescription("do work"),
+                TaskConfig(),
+                runtime_state_root=Path("/tmp/runtime"),
+            )
+
+            with patch.object(agent, "_sandbox_is_live", return_value=False), patch.object(
+                agent, "_launch_detached_task"
+            ) as launch_task:
+                with self.assertRaisesRegex(RuntimeError, "not live before task launch"):
+                    agent.perform_task()
+
+        launch_task.assert_not_called()
+
+    def test_iflow_agent_raises_for_non_zero_exit_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            logs_dir = Path(tmp)
+            sandbox = SandboxHandle(
+                sandbox_id=SandboxId("sbx-iflow-fail"),
+                bundle_dir=Path("/tmp/sbx-iflow-fail"),
+                status_port=8123,
+                last_status={},
+                launch_metadata={
+                    "iflow": {
+                        "entrypoint": "/opt/iflow-runtime/global/lib/node_modules/@iflow-ai/iflow-cli/bundle/entry.js",
+                        "logs_dir": str(logs_dir),
+                    }
+                },
+            )
+            agent = IFlowAgent(
+                sandbox,
+                TaskDescription("do work"),
+                TaskConfig(),
+                runtime_state_root=Path("/tmp/runtime"),
+            )
+
+            def _launch_task(*, exit_path: Path, **kwargs) -> None:
+                _ = kwargs
+                exit_path.write_text("7\n", encoding="utf-8")
+
+            with patch.object(agent, "_launch_detached_task", side_effect=_launch_task), patch.object(
+                agent, "_sandbox_is_live", return_value=True
+            ):
+                with self.assertRaisesRegex(RuntimeError, "exit code 7"):
+                    agent.perform_task()
 
     def test_iflow_agent_uses_one_second_default_action_tick(self) -> None:
         sandbox = SandboxHandle(
@@ -1050,14 +1324,65 @@ services:
             },
         )
         agent = IFlowAgent(sandbox, TaskDescription("do work"), TaskConfig(), runtime_state_root=Path("/tmp/runtime"))
-        agent._started_at_monotonic = time.monotonic() - 0.8
-        agent._finished_at_monotonic = time.monotonic()
+        agent._started_at_monotonic = time.monotonic() - 20.0
+        agent._finished_at_monotonic = None
 
         baseline = agent._synthetic_action_count()
         agent.on_restore_complete()
+        resumed = agent._synthetic_action_count()
 
         self.assertEqual(agent._task_state(), "running")
-        self.assertGreaterEqual(agent._synthetic_action_count(), baseline)
+        self.assertGreaterEqual(baseline, 18)
+        self.assertGreaterEqual(resumed, 4)
+        self.assertLess(resumed, baseline)
+        self.assertTrue(agent._restore_complete_event.is_set())
+
+    def test_iflow_agent_request_stop_unblocks_restore_wait(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            logs_dir = Path(tmp)
+            sandbox = SandboxHandle(
+                sandbox_id=SandboxId("sbx-iflow-stop"),
+                bundle_dir=Path("/tmp/sbx-iflow-stop"),
+                status_port=8123,
+                last_status={},
+                launch_metadata={
+                    "iflow": {
+                        "entrypoint": "/opt/iflow-runtime/global/lib/node_modules/@iflow-ai/iflow-cli/bundle/entry.js",
+                        "logs_dir": str(logs_dir),
+                    }
+                },
+            )
+            agent = IFlowAgent(
+                sandbox,
+                TaskDescription("do work"),
+                TaskConfig(),
+                runtime_state_root=Path("/tmp/runtime"),
+            )
+            sandbox_live = {"value": True}
+            errors: list[BaseException] = []
+
+            def _launch_task(**kwargs) -> None:
+                _ = kwargs
+                sandbox_live["value"] = False
+
+            def _run_task() -> None:
+                try:
+                    agent.perform_task()
+                except BaseException as exc:  # pragma: no cover - exercised via assertion below
+                    errors.append(exc)
+
+            with patch.object(agent, "_launch_detached_task", side_effect=_launch_task), patch.object(
+                agent, "_sandbox_is_live", side_effect=lambda: sandbox_live["value"]
+            ):
+                worker = threading.Thread(target=_run_task)
+                worker.start()
+                time.sleep(0.05)
+                agent.request_stop()
+                worker.join(timeout=1.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(agent.poll_status()["state"], "finished")
 
     def test_iflow_poll_status_is_non_mutating_until_status_helpers_run(self) -> None:
         sandbox = SandboxHandle(

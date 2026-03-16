@@ -711,11 +711,15 @@ class RealHostScenarioHarness:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        input("wait for signal to cleanup")
+        for sandbox in self.sandboxes:
+            if sandbox.task_run is not None:
+                sandbox.task_run.request_stop()
         if self.system is not None and self.auto_cr:
             self.system.stop()
         if self.interceptor is not None:
             self.interceptor.stop()
-        self._task_executor.shutdown(wait=False, cancel_futures=True)
+        self._task_executor.shutdown(wait=True, cancel_futures=True)
         if self.executor is not None:
             self.executor.shutdown()
         if self.runtime_state_root is not None:
@@ -739,16 +743,14 @@ class RealHostScenarioHarness:
         for sandbox in self.sandboxes:
             if self.llm_server is not None:
                 self.llm_server.benchmark_llm_router.unregister_sandbox(str(sandbox.sandbox_id))  # type: ignore[attr-defined]
-        for image in self._sandbox_images.values():
-            pass
+        # for image in self._sandbox_images.values():
             # subprocess.run(
             #     ["docker", "rmi", "-f", image.image_tag],
             #     check=False,
             #     stdout=subprocess.DEVNULL,
             #     stderr=subprocess.DEVNULL,
             # )
-        for image_tag in sorted(self._compose_image_tags):
-            pass
+        # for image_tag in sorted(self._compose_image_tags):
             # subprocess.run(
             #     ["docker", "rmi", "-f", image_tag],
             #     check=False,
@@ -981,6 +983,8 @@ class RealHostScenarioHarness:
     ) -> BaseAgent:
         handle = self.get_sandbox_handle(sandbox_id)
         if handle.task_future is not None and not handle.task_future.done():
+            if handle.task_run is not None:
+                handle.task_run.request_stop()
             handle.task_future.cancel()
         handle.agent_type = agent_type
         handle.task_description = task_description
@@ -1434,15 +1438,26 @@ class RealHostScenarioHarness:
             )
         )
         payload = sandbox.last_status
+        preserve_task_run = (
+            sandbox.task_run is not None
+            and sandbox.task_future is not None
+            and not sandbox.task_future.done()
+            and sandbox.task_run.survives_fault_relaunch()
+        )
+        if sandbox.task_run is not None and not preserve_task_run:
+            sandbox.task_run.request_stop()
         if sandbox.task_description is not None and sandbox.task_config is not None:
-            self.launch_task(
-                sandbox.agent_type,
-                sandbox.task_description,
-                sandbox.task_config,
-                str(sandbox.sandbox_id),
-            )
+            if not preserve_task_run:
+                self.launch_task(
+                    sandbox.agent_type,
+                    sandbox.task_description,
+                    sandbox.task_config,
+                    str(sandbox.sandbox_id),
+                )
             assert sandbox.task_run is not None
             sandbox.task_run.wait_for_task_ready()
+            if preserve_task_run:
+                sandbox.task_run.on_restore_complete()
             try:
                 payload = sandbox.task_run.poll_status()
             except RuntimeError:

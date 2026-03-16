@@ -104,6 +104,9 @@ class BaseAgent(ABC):
     def supports_relaunch_task(self) -> bool:
         return self.requires_manual_task_launch
 
+    def survives_fault_relaunch(self) -> bool:
+        return False
+
     def poll_status(self) -> dict[str, object]:
         raise RuntimeError(f"agent {self.agent_type} does not expose a benchmark status endpoint")
 
@@ -114,6 +117,9 @@ class BaseAgent(ABC):
         raise RuntimeError(f"agent {self.agent_type} does not support action-delta progress checks")
 
     def wait_for_task_ready(self) -> None:
+        return None
+
+    def request_stop(self) -> None:
         return None
 
     def on_restore_complete(self) -> None:

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+from pathlib import Path
 import shlex
 import subprocess
 import threading
@@ -18,13 +20,16 @@ from integrations.sandboxes.iflow.harness import (
     prepare_iflow_state,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class IFlowAgent(BaseAgent):
     agent_type = "iflow"
     requires_manual_task_launch = True
     requires_network_namespace = True
-    DEFAULT_ACTION_TICK_SECONDS = 1.0
+    DEFAULT_ACTION_TICK_SECONDS = 1
     DEFAULT_MAX_SESSION_TURNS = 4096
+    TASK_POLL_INTERVAL_SECONDS = 0.1
 
     def __init__(
         self,
@@ -49,8 +54,13 @@ class IFlowAgent(BaseAgent):
             float(self.task_config.options.get("action_tick_seconds", self.DEFAULT_ACTION_TICK_SECONDS)),
         )
         self._state_lock = threading.Lock()
+        self._restore_complete_event = threading.Event()
+        self._stop_requested = threading.Event()
         self._started_at_monotonic: float | None = None
         self._finished_at_monotonic: float | None = None
+
+    def survives_fault_relaunch(self) -> bool:
+        return True
 
     def prepare_sandbox(self) -> None:
         assert self.agent_host_dir is not None
@@ -157,29 +167,46 @@ class IFlowAgent(BaseAgent):
         if entrypoint is None:
             raise RuntimeError(f"missing iflow entrypoint for sandbox {self.sandbox.sandbox_id}")
         assert self.runtime_state_root is not None
+        logs_dir = self._resolve_logs_dir(metadata)
+        task_paths = self._task_paths(logs_dir)
+        self._stop_requested.clear()
+        self._restore_complete_event.clear()
         with self._state_lock:
             self._started_at_monotonic = time.monotonic()
             self._finished_at_monotonic = None
         escaped_task = shlex.quote(self.task_description.prompt)
-        command = (
-            "export HOME=/root; "
-            "export IFLOW_NON_INTERACTIVE=true; "
-            "cd /work && "
-            f"exec {RUNTIME_MOUNT_PATH}/node/bin/node {entrypoint} -p {escaped_task} "
-            ">/opt/iflow-logs/iflow.stdout 2>/opt/iflow-logs/iflow.stderr"
-            # ">/dev/null 2>/dev/null"
-        )
-        exec_command = [
-            "runc",
-            "--root",
-            str(self.runtime_state_root),
-            "exec",
-        ]
-        for key, value in self.task_config.options.items():
-            exec_command.extend(["--env", f"{key}={value}"])
-        exec_command.extend([str(self.sandbox.sandbox_id), "/bin/sh", "-lc", command])
         try:
-            subprocess.run(exec_command, check=True)
+            logger.info(
+                "Starting iflow task sandbox=%s logs_dir=%s tick_s=%.3f",
+                self.sandbox.sandbox_id,
+                logs_dir,
+                self._tick_seconds,
+            )
+            logger.debug(
+                "Iflow task markers sandbox=%s stdout=%s stderr=%s exit=%s done=%s",
+                self.sandbox.sandbox_id,
+                task_paths["stdout"],
+                task_paths["stderr"],
+                task_paths["exit"],
+                task_paths["done"],
+            )
+            if not self._sandbox_is_live():
+                logger.error("Iflow sandbox is not live before task launch sandbox=%s", self.sandbox.sandbox_id)
+                raise RuntimeError(f"iflow sandbox {self.sandbox.sandbox_id} is not live before task launch")
+            self._clear_task_markers(task_paths)
+            self._launch_detached_task(
+                entrypoint=str(entrypoint),
+                escaped_task=escaped_task,
+                stdout_path=task_paths["stdout"],
+                stderr_path=task_paths["stderr"],
+                exit_path=task_paths["exit"],
+                done_path=task_paths["done"],
+            )
+            self._wait_for_task_completion(exit_path=task_paths["exit"], done_path=task_paths["done"])
+            logger.info("Completed iflow task sandbox=%s", self.sandbox.sandbox_id)
+        except Exception as exc:
+            logger.error("Iflow task failed sandbox=%s error=%s", self.sandbox.sandbox_id, exc)
+            raise
         finally:
             with self._state_lock:
                 self._finished_at_monotonic = time.monotonic()
@@ -209,15 +236,29 @@ class IFlowAgent(BaseAgent):
         self._record_activity(payload)
         return payload
 
+    def request_stop(self) -> None:
+        self._stop_requested.set()
+        self._restore_complete_event.set()
+        logger.info("Stop requested for iflow task sandbox=%s", self.sandbox.sandbox_id)
+
     def on_restore_complete(self) -> None:
         with self._state_lock:
             started_at = self._started_at_monotonic
-            finished_at = self._finished_at_monotonic
-            if started_at is None or finished_at is None:
-                return
-            baseline = max(0, int((finished_at - started_at) / self._tick_seconds))
-            self._started_at_monotonic = time.monotonic() - (baseline * self._tick_seconds)
+            if started_at is None:
+                baseline = None
+            else:
+                baseline = max(0, int(self.sandbox.last_status.get("total_actions", 0)))
+                self._started_at_monotonic = time.monotonic() - (baseline * self._tick_seconds)
             self._finished_at_monotonic = None
+        self._restore_complete_event.set()
+        if baseline is None:
+            logger.info("Observed restore completion for idle iflow task sandbox=%s", self.sandbox.sandbox_id)
+            return
+        logger.info(
+            "Resumed synthetic iflow progress after restore sandbox=%s baseline_actions=%d",
+            self.sandbox.sandbox_id,
+            baseline,
+        )
 
     def _synthetic_action_count(self) -> int:
         with self._state_lock:
@@ -251,3 +292,194 @@ class IFlowAgent(BaseAgent):
                 )
             time.sleep(min(0.2, self._tick_seconds))
         raise RuntimeError(f"timed out waiting for iflow synthetic action count {target_actions}")
+
+    def _resolve_logs_dir(self, metadata: dict[str, object]) -> Path:
+        raw_logs_dir = metadata.get("logs_dir")
+        if not isinstance(raw_logs_dir, str) or not raw_logs_dir:
+            raise RuntimeError(f"missing iflow logs dir for sandbox {self.sandbox.sandbox_id}")
+        logs_dir = Path(raw_logs_dir)
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        return logs_dir
+
+    def _task_paths(self, logs_dir: Path) -> dict[str, Path]:
+        return {
+            "stdout": logs_dir / "iflow.task.stdout",
+            "stderr": logs_dir / "iflow.task.stderr",
+            "exit": logs_dir / "iflow.task.exit",
+            "done": logs_dir / "iflow.task.done",
+        }
+
+    def _clear_task_markers(self, task_paths: dict[str, Path]) -> None:
+        for path in task_paths.values():
+            if "/dev/null" in str(path):
+                continue
+            path.unlink(missing_ok=True)
+
+    def _launch_detached_task(
+        self,
+        *,
+        entrypoint: str,
+        escaped_task: str,
+        stdout_path: Path,
+        stderr_path: Path,
+        exit_path: Path,
+        done_path: Path,
+    ) -> None:
+        iflow_stdout_to = f"{LOGS_MOUNT_PATH}/{stdout_path.name}"
+        iflow_stderr_to = f"{LOGS_MOUNT_PATH}/{stderr_path.name}"
+        iflow_stdout_to = f"/dev/null"
+        iflow_stderr_to = f"/dev/null"
+        iflow_stdout_to = f"/data/debug/iflow.stdout"
+        iflow_stderr_to = f"/data/debug/iflow.err"
+        exit_in_sandbox = f"{LOGS_MOUNT_PATH}/{exit_path.name}"
+        done_in_sandbox = f"{LOGS_MOUNT_PATH}/{done_path.name}"
+        command = "\n".join(
+            [
+                "export HOME=/root",
+                "export IFLOW_NON_INTERACTIVE=true",
+                "cd /work",
+                "mkdir -p /data/debug",
+                f"rm -f {shlex.quote(exit_in_sandbox)} {shlex.quote(done_in_sandbox)}",
+                (
+                    f"{RUNTIME_MOUNT_PATH}/node/bin/node {shlex.quote(entrypoint)} -p {escaped_task} "
+                    f">{shlex.quote(iflow_stdout_to)} 2>{shlex.quote(iflow_stderr_to)}"
+                ),
+                "status=$?",
+                f"if [ \"$status\" -eq 0 ]; then printf 'done\\n' > {shlex.quote(done_in_sandbox)}; fi",
+                f"printf '%s\\n' \"$status\" > {shlex.quote(exit_in_sandbox)}",
+                "exit \"$status\"",
+            ]
+        )
+        logger.debug(
+            "Launching detached iflow task sandbox=%s entrypoint=%s stdout=%s stderr=%s exit=%s done=%s",
+            self.sandbox.sandbox_id,
+            entrypoint,
+            stdout_path,
+            stderr_path,
+            exit_path,
+            done_path,
+        )
+        subprocess.run(
+            self._runc_exec_prefix(detach=True)
+            + [str(self.sandbox.sandbox_id), "/bin/sh", "-lc", command],
+            check=True,
+        )
+
+    def _runc_exec_prefix(self, *, detach: bool = False) -> list[str]:
+        assert self.runtime_state_root is not None
+        command = ["runc", "--root", str(self.runtime_state_root), "exec"]
+        if detach:
+            command.append("-d")
+        for key, value in self.task_config.options.items():
+            command.extend(["--env", f"{key}={value}"])
+        return command
+
+    def _runc_state_command(self) -> list[str]:
+        assert self.runtime_state_root is not None
+        return ["runc", "--root", str(self.runtime_state_root), "state", str(self.sandbox.sandbox_id)]
+
+    def _sandbox_is_live(self) -> bool:
+        result = subprocess.run(
+            self._runc_state_command(),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return False
+        try:
+            payload = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            return False
+        return str(payload.get("status", "")).lower() not in {"", "stopped", "missing"}
+
+    def _read_marker_int(self, path: Path) -> int | None:
+        try:
+            raw = path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return None
+        if not raw:
+            return None
+        try:
+            return int(raw)
+        except ValueError as exc:
+            raise RuntimeError(f"invalid iflow marker {path}: {exc}") from exc
+
+    def _wait_for_task_completion(self, *, exit_path: Path, done_path: Path) -> None:
+        while True:
+            if self._stop_requested.is_set():
+                logger.info("Stopping iflow task wait loop sandbox=%s", self.sandbox.sandbox_id)
+                return
+            if not self._sandbox_is_live():
+                logger.warning(
+                    "Iflow task sandbox=%s became unavailable while waiting; pausing until restore",
+                    self.sandbox.sandbox_id,
+                )
+                if not self._wait_for_restore_or_stop():
+                    return
+                continue
+            done_raw = self._read_marker_text(done_path)
+            if done_raw is not None:
+                logger.debug(
+                    "Observed iflow completion marker sandbox=%s marker=%s value=%s",
+                    self.sandbox.sandbox_id,
+                    done_path,
+                    done_raw,
+                )
+                return
+            exit_code = self._read_marker_int(exit_path)
+            if exit_code is not None:
+                if exit_code != 0:
+                    logger.error(
+                        "Iflow task exited with failure sandbox=%s exit_code=%d stdout=%s stderr=%s",
+                        self.sandbox.sandbox_id,
+                        exit_code,
+                        exit_path.with_name("iflow.task.stdout"),
+                        exit_path.with_name("iflow.task.stderr"),
+                    )
+                    raise RuntimeError(
+                        f"iflow task failed in sandbox {self.sandbox.sandbox_id} with exit code {exit_code}"
+                    )
+                logger.error(
+                    "Iflow task exited without completion marker sandbox=%s exit_path=%s done_path=%s",
+                    self.sandbox.sandbox_id,
+                    exit_path,
+                    done_path,
+                )
+                raise RuntimeError(
+                    f"iflow task in sandbox {self.sandbox.sandbox_id} exited without writing the completion marker"
+                )
+            time.sleep(min(self.TASK_POLL_INTERVAL_SECONDS, self._tick_seconds))
+
+    def _read_marker_text(self, path: Path) -> str | None:
+        try:
+            raw = path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return None
+        return raw or None
+
+    def _wait_for_restore_or_stop(self) -> bool:
+        wait_started = time.monotonic()
+        while True:
+            if self._stop_requested.is_set():
+                logger.info(
+                    "Stop requested while waiting for iflow restore sandbox=%s wait_s=%.3f",
+                    self.sandbox.sandbox_id,
+                    time.monotonic() - wait_started,
+                )
+                return False
+            if self._restore_complete_event.wait(timeout=self.TASK_POLL_INTERVAL_SECONDS):
+                self._restore_complete_event.clear()
+                if self._stop_requested.is_set():
+                    logger.info(
+                        "Stop requested after restore signal for iflow task sandbox=%s wait_s=%.3f",
+                        self.sandbox.sandbox_id,
+                        time.monotonic() - wait_started,
+                    )
+                    return False
+                logger.info(
+                    "Observed restore completion signal for iflow task sandbox=%s wait_s=%.3f",
+                    self.sandbox.sandbox_id,
+                    time.monotonic() - wait_started,
+                )
+                return True
