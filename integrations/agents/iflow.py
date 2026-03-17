@@ -19,6 +19,7 @@ from integrations.sandboxes.iflow.harness import (
     prepare_iflow_runtime,
     prepare_iflow_state,
 )
+from integrations.sandboxes.runtime.bundle import merge_environment_defaults
 
 logger = logging.getLogger(__name__)
 
@@ -184,13 +185,19 @@ class IFlowAgent(BaseAgent):
             "-lc",
             command,
         ]
-        cfg["process"]["env"] = [
+        current_env = cfg["process"].get("env", [])
+        if not isinstance(current_env, list):
+            raise ValueError(f"unsupported process env in {config_path}: {current_env!r}")
+        cfg["process"]["env"] = merge_environment_defaults(
+            [str(item) for item in current_env],
+            [
             f"PATH={RUNTIME_MOUNT_PATH}/global/bin:{RUNTIME_MOUNT_PATH}/node/bin:/usr/local/bin:/usr/bin:/bin",
             "PYTHONUNBUFFERED=1",
             "UV_USE_IO_URING=0",
             "HOME=/root",
             "IFLOW_NON_INTERACTIVE=true",
-        ] + [f"{key}={value}" for key, value in self.task_config.options.items()]
+            ] + [f"{key}={value}" for key, value in self.task_config.options.items()],
+        )
         mounts = [
             mount
             for mount in cfg.get("mounts", [])

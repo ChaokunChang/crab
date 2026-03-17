@@ -4,13 +4,11 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import csv
-import hashlib
 import ipaddress
 import json
 import logging
 import os
 import random
-import re
 import shutil
 import socket
 import subprocess
@@ -22,9 +20,7 @@ import urllib.request
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Iterable
-
-import yaml
+from typing import Iterable
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -77,7 +73,9 @@ from integrations.llm_services import (
     serve_benchmark_llm_router,
     validate_llm_service_type,
 )
-from integrations.sandboxes.image import build_image, export_image_rootfs
+from integrations.sandboxes.runtime import bundle as sandbox_bundle
+from integrations.sandboxes.runtime import compose as sandbox_compose
+from integrations.sandboxes.runtime import image as sandbox_image
 from integrations.sandboxes.iflow import DOCKERFILE_PATH as IFLOW_DOCKERFILE_PATH
 from integrations.sandboxes.simulated import DOCKERFILE_PATH as SIMULATED_DOCKERFILE_PATH
 
@@ -218,128 +216,6 @@ def enough_progress(payload: dict[str, object], *, total_actions: int = 6) -> bo
         and int(payload["network_actions"]) >= 1
         and int(payload["stateful_actions"]) >= 1
     )
-
-
-def export_docker_image_rootfs(*, tag: str, output_dir: Path) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    container_id = (
-        subprocess.run(
-            ["docker", "create", tag],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        .stdout.strip()
-    )
-    tar_path = output_dir / "rootfs.tar"
-    rootfs_dir = output_dir / "rootfs"
-    try:
-        with tar_path.open("wb") as fh:
-            subprocess.run(["docker", "export", container_id], check=True, stdout=fh)
-        if rootfs_dir.exists():
-            shutil.rmtree(rootfs_dir)
-        rootfs_dir.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["tar", "-xf", str(tar_path), "-C", str(rootfs_dir)], check=True)
-    finally:
-        subprocess.run(["docker", "rm", "-f", container_id], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return rootfs_dir
-
-
-def parse_env_file(path: Path) -> dict[str, str]:
-    env: dict[str, str] = {}
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        key, sep, value = line.partition("=")
-        if not sep:
-            raise ValueError(f"invalid env file line in {path}: {raw_line!r}")
-        env[key.strip()] = value.strip()
-    return env
-
-
-_ENV_VAR_PATTERN = re.compile(r"\$\{([^}:]+)(?::-([^}]*))?\}")
-
-
-def _docker_tag_component(raw: str) -> str:
-    normalized = re.sub(r"[^a-z0-9_.-]+", "-", raw.lower()).strip("-.")
-    return normalized or "image"
-
-
-def interpolate_compose_value(value: Any, env: dict[str, str]) -> Any:
-    if isinstance(value, str):
-        return _ENV_VAR_PATTERN.sub(lambda match: env.get(match.group(1), match.group(2) or ""), value)
-    if isinstance(value, list):
-        return [interpolate_compose_value(item, env) for item in value]
-    if isinstance(value, dict):
-        return {str(key): interpolate_compose_value(item, env) for key, item in value.items()}
-    return value
-
-
-def write_bundle_config(
-    *,
-    bundle_dir: Path,
-    llm_base_url: str,
-    provider: str,
-    sandbox_name: str,
-    status_port: int,
-    cgroup_path: str,
-    work_dir_host_path: Path | None = None,
-    network_namespace_path: Path | None = None,
-) -> None:
-    config_path = bundle_dir / "config.json"
-    cfg = json.loads(config_path.read_text())
-    linux_cfg = cfg.get("linux", {})
-    namespaces = []
-    network_namespace_found = False
-    for namespace in linux_cfg.get("namespaces", []):
-        ns_type = namespace.get("type")
-        if ns_type == "cgroup":
-            continue
-        if ns_type == "network":
-            network_namespace_found = True
-            if network_namespace_path is None:
-                continue
-            namespace = {**namespace, "path": str(network_namespace_path)}
-        namespaces.append(namespace)
-    if network_namespace_path is not None and not network_namespace_found:
-        namespaces.append({"type": "network", "path": str(network_namespace_path)})
-    linux_cfg["namespaces"] = namespaces
-    linux_cfg["cgroupsPath"] = cgroup_path
-    linux_cfg.pop("seccomp", None)
-    cfg["linux"] = linux_cfg
-    mounts = [mount for mount in cfg.get("mounts", []) if mount.get("destination") != "/work"]
-    if work_dir_host_path is not None:
-        work_dir_host_path.mkdir(parents=True, exist_ok=True)
-        mounts.append(
-            {
-                "destination": "/work",
-                "source": str(work_dir_host_path),
-                "type": "bind",
-                "options": ["rbind", "rw"],
-            }
-        )
-    cfg["mounts"] = mounts
-    cfg["process"]["terminal"] = False
-    cfg["process"]["cwd"] = "/work"
-    cfg["process"]["args"] = [
-        "/bin/sh",
-        "-lc",
-        f"exec /usr/local/bin/agent-cli run --provider {provider} >/dev/null 2>/dev/null",
-    ]
-    cfg["process"]["env"] = [
-        "PATH=/usr/local/bin:/usr/bin:/bin",
-        "PYTHONUNBUFFERED=1",
-        f"AGENT_CR_LLM_BASE_URL={llm_base_url}",
-        f"STATUS_PORT={status_port}",
-        "POLL_INTERVAL_S=0.2",
-        "AGENT_WORK_DIR=/work",
-        f"AGENT_SANDBOX_ID={sandbox_name}",
-        f"AGENT_PROVIDER={provider}",
-    ]
-    cfg["root"]["path"] = "rootfs"
-    cfg["root"]["readonly"] = False
-    config_path.write_text(json.dumps(cfg, indent=2))
 
 
 def total_actions(payload: dict[str, object]) -> int:
@@ -484,6 +360,7 @@ class AgentSandboxImage:
     agent_type: str
     image_tag: str
     exported_rootfs: Path
+    image_defaults: sandbox_image.ImageRuntimeDefaults
 
 
 @dataclass(frozen=True)
@@ -826,21 +703,7 @@ class RealHostScenarioHarness:
         raise ValueError(f"unsupported benchmark agent type for sandbox image: {agent_type}")
 
     def _sandbox_image_tag(self, agent_type: str) -> str:
-        return f"agent-cr-{_docker_tag_component(agent_type)}-bench:workspace"
-
-    def _compose_build_tag(
-        self,
-        *,
-        compose_file: Path,
-        service_name: str,
-        build_spec: str | dict[str, object],
-    ) -> str:
-        fingerprint = hashlib.sha256()
-        fingerprint.update(str(compose_file.resolve()).encode("utf-8"))
-        fingerprint.update(service_name.encode("utf-8"))
-        fingerprint.update(json.dumps(build_spec, sort_keys=True).encode("utf-8"))
-        service_component = _docker_tag_component(service_name)
-        return f"agent-cr-compose-{service_component}:{fingerprint.hexdigest()[:12]}"
+        return f"agent-cr-{sandbox_image.docker_tag_component(agent_type)}-bench:workspace"
 
     def ensure_sandbox_image(self, agent_type: str) -> AgentSandboxImage:
         assert self.root is not None
@@ -849,13 +712,19 @@ class RealHostScenarioHarness:
             if cached is not None:
                 return cached
             image_tag = self._sandbox_image_tag(agent_type)
-            build_image(
+            sandbox_image.build_image(
                 tag=image_tag,
                 build_context=self._sandbox_build_context_path(agent_type),
                 dockerfile_path=self._sandbox_dockerfile_path(agent_type),
             )
-            exported_rootfs = export_image_rootfs(tag=image_tag, output_dir=self.root / "image" / agent_type)
-            built = AgentSandboxImage(agent_type=agent_type, image_tag=image_tag, exported_rootfs=exported_rootfs)
+            image_defaults = sandbox_image.inspect_image_runtime_defaults(tag=image_tag)
+            exported_rootfs = sandbox_image.export_image_rootfs(tag=image_tag, output_dir=self.root / "image" / agent_type)
+            built = AgentSandboxImage(
+                agent_type=agent_type,
+                image_tag=image_tag,
+                exported_rootfs=exported_rootfs,
+                image_defaults=image_defaults,
+            )
             self._sandbox_images[agent_type] = built
             return built
 
@@ -929,6 +798,7 @@ class RealHostScenarioHarness:
         resolved_task_description = task_description or TaskDescription("")
         resolved_task_config = task_config or TaskConfig()
         resolved_llm_service_type = self.resolve_llm_service_type(agent_type=agent_type, llm_service_type=llm_service_type)
+        sandbox_image = self.ensure_sandbox_image(agent_type)
         network_lease = (
             self._allocate_benchmark_network_lease(SandboxId(sandbox_name))
             if self._agent_requires_benchmark_network(agent_type)
@@ -940,11 +810,12 @@ class RealHostScenarioHarness:
             network_lease=network_lease,
             agent_type=agent_type,
             llm_service_type=resolved_llm_service_type,
+            image_defaults=sandbox_image.image_defaults,
+            image_rootfs_dir=sandbox_image.exported_rootfs,
         )
         task_run = self.build_task_run(agent_type, handle, resolved_task_description, resolved_task_config)
         task_run.prepare_sandbox()
         task_run.configure_bundle()
-        sandbox_image = self.ensure_sandbox_image(agent_type)
         sandbox_id = handle.sandbox_id
         self.base_inspector.upsert_snapshot(
             SandboxSnapshot(
@@ -1059,23 +930,11 @@ class RealHostScenarioHarness:
         task_description: TaskDescription | None = None,
         task_config: TaskConfig | None = None,
     ) -> SandboxHandle:
-        compose_env = {**os.environ, **parse_env_file(env_file)}
-        payload = yaml.safe_load(compose_file.read_text(encoding="utf-8")) or {}
-        payload = interpolate_compose_value(payload, compose_env)
-        services = payload.get("services")
-        if not isinstance(services, dict) or not services:
-            raise ValueError(f"compose file {compose_file} does not define any services")
-        if service_name is None:
-            if len(services) != 1:
-                raise ValueError(f"compose file {compose_file} contains multiple services; specify service_name")
-            service_name = next(iter(services))
-        if service_name not in services:
-            raise ValueError(f"compose service {service_name!r} not found in {compose_file}")
-        service = services[service_name]
-        unsupported = {"depends_on", "profiles", "networks", "configs", "secrets", "healthcheck"}
-        found_unsupported = sorted(key for key in unsupported if key in service)
-        if found_unsupported:
-            raise ValueError(f"unsupported compose features for benchmark translation: {found_unsupported}")
+        service_name, service = sandbox_compose.load_compose_service(
+            compose_file=compose_file,
+            env_file=env_file,
+            service_name=service_name,
+        )
         network_lease = self._allocate_benchmark_network_lease(SandboxId(sandbox_name))
         handle, work_dir_host_path = self._prepare_sandbox_handle(
             sandbox_name,
@@ -1089,12 +948,15 @@ class RealHostScenarioHarness:
             status_port=status_port,
             status_host=status_host if status_host is not None else network_lease.guest_ip,
         )
-        translated = self._translate_compose_service(
+        translation = sandbox_compose.translate_compose_service(
             compose_file=compose_file,
             service_name=service_name,
             service=service,
-            handle=handle,
+            bundle_dir=handle.bundle_dir,
+            sandbox_id=str(handle.sandbox_id),
             work_dir_host_path=work_dir_host_path,
+            compose_image_root=self.root / "compose-images",
+            compose_image_tags=self._compose_image_tags,
         )
         assert self.base_inspector is not None
         assert self.system is not None
@@ -1109,9 +971,10 @@ class RealHostScenarioHarness:
                 observed_at=utc_now(),
             )
         )
-        self.system.sandbox_manager.launch("runc", translated)
+        self.system.sandbox_manager.launch("runc", translation.runtime_launch_metadata)
         handle.launch_source = "compose"
-        handle.launch_metadata["runtime"] = dict(translated)
+        handle.launch_metadata["runtime"] = dict(translation.runtime_launch_metadata)
+        handle.launch_metadata["compose"] = dict(translation.compose_launch_metadata)
         handle.last_status = {}
         if agent_type is not None and task_description is not None and task_config is not None:
             self.launch_task(agent_type, task_description, task_config, str(handle.sandbox_id))
@@ -1672,7 +1535,8 @@ class RealHostScenarioHarness:
         target = self.clone_checkpoint_to_fork(source, checkpoint_id, fork_name)
         network_lease = self._benchmark_network_leases.get(target.sandbox_id)
         work_dir_host_path = resolve_work_dir_host_path(self.work_dir_host_root, str(target.sandbox_id))
-        write_bundle_config(
+        sandbox_image = self.ensure_sandbox_image(target.agent_type) if target.agent_type is not None else None
+        sandbox_bundle.write_bundle_config(
             bundle_dir=target.bundle_dir,
             llm_base_url=target.llm_base_url or "",
             provider=self.provider,
@@ -1681,6 +1545,8 @@ class RealHostScenarioHarness:
             cgroup_path=f"agent-cr-bench/{self.pool_name}/{target.sandbox_id}",
             work_dir_host_path=work_dir_host_path,
             network_namespace_path=None if network_lease is None else network_lease.namespace_path,
+            image_defaults=None if sandbox_image is None else sandbox_image.image_defaults,
+            image_rootfs_dir=None if sandbox_image is None else sandbox_image.exported_rootfs,
         )
         if target.task_run is not None and target.agent_type != "simulated":
             target.task_run.configure_bundle()
@@ -1698,213 +1564,6 @@ class RealHostScenarioHarness:
         )
         return target
 
-    def _translate_compose_service(
-        self,
-        *,
-        compose_file: Path,
-        service_name: str,
-        service: dict[str, object],
-        handle: SandboxHandle,
-        work_dir_host_path: Path | None,
-    ) -> dict[str, object]:
-        bundle_config = handle.bundle_dir / "config.json"
-        config = json.loads(bundle_config.read_text(encoding="utf-8"))
-        image_ref = self._resolve_compose_image_ref(
-            compose_file=compose_file,
-            service_name=service_name,
-            service=service,
-        )
-        rootfs_dir = export_docker_image_rootfs(
-            tag=image_ref,
-            output_dir=self.root / "compose-images" / str(handle.sandbox_id),
-        )
-        config["process"]["cwd"] = str(service.get("working_dir", "/work"))
-        config["process"]["terminal"] = bool(service.get("tty", False))
-        config["process"]["env"] = self._compose_environment(service)
-        config["process"]["args"] = self._compose_process_args(service, image_ref=image_ref)
-        mounts = [mount for mount in config.get("mounts", []) if mount.get("destination") != "/work"]
-        if work_dir_host_path is not None:
-            work_dir_host_path.mkdir(parents=True, exist_ok=True)
-            mounts.append(
-                {
-                    "destination": "/work",
-                    "source": str(work_dir_host_path),
-                    "type": "bind",
-                    "options": ["rbind", "rw"],
-                }
-            )
-        mounts.extend(self._compose_mounts(service, compose_file=compose_file))
-        config["mounts"] = mounts
-        bundle_config.write_text(json.dumps(config, indent=2), encoding="utf-8")
-        handle.launch_metadata["compose"] = {
-            "service_name": service_name,
-            "image_ref": image_ref,
-            "ports": list(service.get("ports", [])),
-        }
-        return {
-            "sandbox_id": str(handle.sandbox_id),
-            "bundle_path": str(handle.bundle_dir),
-            "work_dir_host_path": None if work_dir_host_path is None else str(work_dir_host_path),
-            "rootfs_init_dirs": [
-                "work",
-                "tmp",
-                "proc",
-                "dev",
-                "dev/pts",
-                "dev/shm",
-                "dev/mqueue",
-                "sys",
-                "run",
-                "var",
-            ],
-            "rootfs_copy_paths": [{"source": str(rootfs_dir), "destination": "/"}],
-            "compose_service_name": service_name,
-            "compose_ports": list(service.get("ports", [])),
-        }
-
-    def _resolve_compose_image_ref(
-        self,
-        *,
-        compose_file: Path,
-        service_name: str,
-        service: dict[str, object],
-    ) -> str:
-        image_ref = service.get("image")
-        build_spec = service.get("build")
-        if image_ref and build_spec:
-            raise ValueError(f"compose service {service_name} cannot specify both image and build")
-        if isinstance(image_ref, str) and image_ref:
-            return image_ref
-        if build_spec is None:
-            raise ValueError(f"compose service {service_name} requires image or build")
-        tag = self._compose_build_tag(
-            compose_file=compose_file,
-            service_name=service_name,
-            build_spec=build_spec,
-        )
-        self._compose_image_tags.add(tag)
-        build_context = compose_file.parent
-        dockerfile = None
-        build_args: list[str] = []
-        if isinstance(build_spec, str):
-            build_context = (compose_file.parent / build_spec).resolve()
-        elif isinstance(build_spec, dict):
-            context_value = build_spec.get("context", ".")
-            build_context = (compose_file.parent / str(context_value)).resolve()
-            dockerfile_value = build_spec.get("dockerfile")
-            if dockerfile_value is not None:
-                dockerfile = (build_context / str(dockerfile_value)).resolve()
-            args_value = build_spec.get("args", {})
-            if isinstance(args_value, dict):
-                for key, value in sorted(args_value.items()):
-                    build_args.extend(["--build-arg", f"{key}={value}"])
-        else:
-            raise ValueError(f"unsupported compose build definition for service {service_name}: {build_spec!r}")
-        command = ["docker", "build", "-t", tag]
-        if dockerfile is not None:
-            command.extend(["-f", str(dockerfile)])
-        command.extend(build_args)
-        command.append(str(build_context))
-        subprocess.run(command, check=True)
-        return tag
-
-    def _compose_environment(self, service: dict[str, object]) -> list[str]:
-        environment = service.get("environment", {})
-        if isinstance(environment, dict):
-            items = environment.items()
-        elif isinstance(environment, list):
-            items = []
-            for item in environment:
-                key, sep, value = str(item).partition("=")
-                items.append((key, value if sep else os.environ.get(key, "")))
-        else:
-            raise ValueError(f"unsupported compose environment: {environment!r}")
-        return [f"{key}={value}" for key, value in items]
-
-    def _compose_process_args(self, service: dict[str, object], *, image_ref: str) -> list[str]:
-        entrypoint = service.get("entrypoint")
-        command = service.get("command")
-        segments: list[str] = []
-        for value in (entrypoint, command):
-            if value is None:
-                continue
-            if isinstance(value, list):
-                segments.extend(str(item) for item in value)
-            elif isinstance(value, str):
-                segments.extend(["/bin/sh", "-lc", value])
-            else:
-                raise ValueError(f"unsupported compose command/entrypoint value: {value!r}")
-                # pragma: no cover
-        if segments:
-            return segments
-        defaults = self._compose_image_process_defaults(image_ref)
-        if defaults:
-            return defaults
-        return ["/bin/sh"]
-
-    def _compose_image_process_defaults(self, image_ref: str) -> list[str]:
-        raw_output = subprocess.run(
-            ["docker", "image", "inspect", image_ref, "--format", "{{json .Config}}"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        image_config = json.loads(raw_output) if raw_output else {}
-        if not isinstance(image_config, dict):
-            raise ValueError(f"unexpected docker image config for {image_ref}: {image_config!r}")
-        defaults: list[str] = []
-        for key in ("Entrypoint", "Cmd"):
-            value = image_config.get(key)
-            if value is None:
-                continue
-            if isinstance(value, list):
-                defaults.extend(str(item) for item in value)
-                continue
-            raise ValueError(f"unsupported docker image config {key} for {image_ref}: {value!r}")
-        return defaults
-
-    def _compose_mounts(self, service: dict[str, object], *, compose_file: Path) -> list[dict[str, object]]:
-        mounts: list[dict[str, object]] = []
-        for item in service.get("volumes", []):
-            if isinstance(item, str):
-                parts = item.split(":")
-                if len(parts) < 2:
-                    raise ValueError(f"unsupported compose volume syntax: {item!r}")
-                source = self._resolve_compose_bind_source(parts[0], compose_file=compose_file)
-                destination = parts[1]
-                options = ["rbind", "rw"]
-                if len(parts) > 2 and parts[2] == "ro":
-                    options = ["rbind", "ro"]
-                mounts.append(
-                    {
-                        "destination": destination,
-                        "source": str(source),
-                        "type": "bind",
-                        "options": options,
-                    }
-                )
-                continue
-            if isinstance(item, dict) and item.get("type", "bind") == "bind":
-                source = self._resolve_compose_bind_source(str(item["source"]), compose_file=compose_file)
-                read_only = bool(item.get("read_only", False))
-                mounts.append(
-                    {
-                        "destination": str(item["target"]),
-                        "source": str(source),
-                        "type": "bind",
-                        "options": ["rbind", "ro" if read_only else "rw"],
-                    }
-                )
-                continue
-            raise ValueError(f"unsupported compose volume definition: {item!r}")
-        return mounts
-
-    def _resolve_compose_bind_source(self, source: str, *, compose_file: Path) -> Path:
-        path = Path(source).expanduser()
-        if not path.is_absolute():
-            path = compose_file.parent / path
-        return path.resolve()
-
     def _prepare_sandbox_handle(
         self,
         sandbox_name: str,
@@ -1915,6 +1574,8 @@ class RealHostScenarioHarness:
         llm_service_type: str = "simulated",
         status_port: int | None = None,
         status_host: str | None = None,
+        image_defaults: sandbox_image.ImageRuntimeDefaults | None = None,
+        image_rootfs_dir: Path | None = None,
     ) -> tuple[SandboxHandle, Path | None]:
         assert self.root is not None
         assert self.interceptor is not None
@@ -1925,7 +1586,7 @@ class RealHostScenarioHarness:
         bundle_dir.mkdir(parents=True, exist_ok=True)
         subprocess.run(["runc", "spec"], cwd=bundle_dir, check=True)
         llm_base_url = f"http://{interceptor_host}:{self.interceptor.port}/v1"
-        write_bundle_config(
+        sandbox_bundle.write_bundle_config(
             bundle_dir=bundle_dir,
             llm_base_url=llm_base_url,
             provider=self.provider,
@@ -1934,6 +1595,8 @@ class RealHostScenarioHarness:
             cgroup_path=f"agent-cr-bench/{self.pool_name}/{sandbox_name}",
             work_dir_host_path=work_dir_host_path,
             network_namespace_path=None if network_lease is None else network_lease.namespace_path,
+            image_defaults=image_defaults,
+            image_rootfs_dir=image_rootfs_dir,
         )
         handle = SandboxHandle(
             sandbox_id=SandboxId(sandbox_name),

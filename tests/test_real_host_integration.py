@@ -45,7 +45,7 @@ from agent_cr import (
 )
 from agent_cr.models import JobStatus, utc_now
 from integrations.llm_services.simulated.service import serve
-from integrations.sandboxes.image import build_image, export_image_rootfs
+from integrations.sandboxes.runtime.image import build_image, export_image_rootfs
 from integrations.sandboxes.simulated import DOCKERFILE_PATH as SIMULATED_DOCKERFILE_PATH
 
 

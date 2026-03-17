@@ -21,6 +21,9 @@ from agent_cr import (
     SchedulerConfig,
 )
 from integrations.agents import BaseAgent, IFlowAgent, SandboxHandle, TaskConfig, TaskDescription
+from integrations.sandboxes.runtime import bundle as sandbox_bundle
+from integrations.sandboxes.runtime import compose as sandbox_compose
+from integrations.sandboxes.runtime import image as sandbox_image
 from benchmarks.bench_agent_cr_sandbox_e2e import run_benchmark
 from agent_cr.models import utc_now
 from benchmarks.bench_tree_search import choose_replay_steps
@@ -37,8 +40,9 @@ from benchmarks.real_host_scenario_base import (
     select_benchmark_network,
     select_injected_indices,
     total_actions,
-    write_bundle_config,
 )
+
+ImageRuntimeDefaults = sandbox_image.ImageRuntimeDefaults
 
 
 class BenchmarkHelperTests(unittest.TestCase):
@@ -277,31 +281,22 @@ class BenchmarkHelperTests(unittest.TestCase):
         )
 
     def test_compose_build_tag_is_stable_for_same_definition(self) -> None:
-        harness = RealHostScenarioHarness(
-            provider="openai",
-            transfer_delay_ms=0.0,
-            scheduler_config=SchedulerConfig(require_change_signal=False),
-            scheduler_policy=object(),
-            checkpoint_manager_factory=lambda base: base,
-            max_workers=1,
-        )
-
         with tempfile.TemporaryDirectory() as tmp:
             compose_file = Path(tmp) / "compose.yaml"
             compose_file.write_text("services: {}\n", encoding="utf-8")
             build_spec = {"context": ".", "dockerfile": "Dockerfile", "args": {"A": "1", "B": "2"}}
 
-            first = harness._compose_build_tag(
+            first = sandbox_compose.compose_build_tag(
                 compose_file=compose_file,
                 service_name="web",
                 build_spec=build_spec,
             )
-            second = harness._compose_build_tag(
+            second = sandbox_compose.compose_build_tag(
                 compose_file=compose_file,
                 service_name="web",
                 build_spec=build_spec,
             )
-            changed = harness._compose_build_tag(
+            changed = sandbox_compose.compose_build_tag(
                 compose_file=compose_file,
                 service_name="worker",
                 build_spec=build_spec,
@@ -311,35 +306,16 @@ class BenchmarkHelperTests(unittest.TestCase):
         self.assertNotEqual(first, changed)
 
     def test_compose_process_args_use_image_defaults_when_service_omits_startup(self) -> None:
-        harness = RealHostScenarioHarness(
-            provider="openai",
-            transfer_delay_ms=0.0,
-            scheduler_config=SchedulerConfig(require_change_signal=False),
-            scheduler_policy=object(),
-            checkpoint_manager_factory=lambda base: base,
-            max_workers=1,
+        result = sandbox_compose.compose_process_args(
+            {},
+            image_defaults=ImageRuntimeDefaults(
+                entrypoint=("/docker-entrypoint.sh",),
+                command=("serve", "--port", "8080"),
+            ),
         )
-
-        with patch.object(
-            harness,
-            "_compose_image_process_defaults",
-            return_value=["/docker-entrypoint.sh", "serve", "--port", "8080"],
-        ) as image_defaults:
-            result = harness._compose_process_args({}, image_ref="example:latest")
-
         self.assertEqual(result, ["/docker-entrypoint.sh", "serve", "--port", "8080"])
-        image_defaults.assert_called_once_with("example:latest")
 
     def test_compose_mounts_resolve_relative_bind_sources_from_compose_directory(self) -> None:
-        harness = RealHostScenarioHarness(
-            provider="openai",
-            transfer_delay_ms=0.0,
-            scheduler_config=SchedulerConfig(require_change_signal=False),
-            scheduler_policy=object(),
-            checkpoint_manager_factory=lambda base: base,
-            max_workers=1,
-        )
-
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             compose_dir = root / "dataset" / "scenario"
@@ -347,7 +323,7 @@ class BenchmarkHelperTests(unittest.TestCase):
             compose_file = compose_dir / "compose.yaml"
             compose_file.write_text("services: {}\n", encoding="utf-8")
 
-            mounts = harness._compose_mounts(
+            mounts = sandbox_compose.compose_mounts(
                 {
                     "volumes": [
                         "./data:/app/data:ro",
@@ -421,7 +397,7 @@ class BenchmarkHelperTests(unittest.TestCase):
             )
 
             work_dir_host_path = bundle_dir / "host-work" / "sandbox-1"
-            write_bundle_config(
+            sandbox_bundle.write_bundle_config(
                 bundle_dir=bundle_dir,
                 llm_base_url="http://127.0.0.1:9000/v1",
                 provider="openai",
@@ -447,6 +423,48 @@ class BenchmarkHelperTests(unittest.TestCase):
             )
             self.assertTrue(work_dir_host_path.is_dir())
             self.assertEqual(payload["process"]["cwd"], "/work")
+
+    def test_write_bundle_config_inherits_image_env_workdir_and_user(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = Path(tmp) / "bundle"
+            bundle_dir.mkdir(parents=True, exist_ok=True)
+            config_path = bundle_dir / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "linux": {"namespaces": [], "seccomp": {"defaultAction": "SCMP_ACT_ERRNO"}},
+                        "mounts": [],
+                        "process": {"terminal": True, "cwd": "/", "args": [], "env": []},
+                        "root": {"path": "rootfs", "readonly": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            rootfs_dir = Path(tmp) / "rootfs"
+            (rootfs_dir / "etc").mkdir(parents=True, exist_ok=True)
+            (rootfs_dir / "etc" / "passwd").write_text("app:x:1001:1002::/home/app:/bin/sh\n", encoding="utf-8")
+            (rootfs_dir / "etc" / "group").write_text("app:x:1002:\n", encoding="utf-8")
+
+            sandbox_bundle.write_bundle_config(
+                bundle_dir=bundle_dir,
+                llm_base_url="http://127.0.0.1:9000/v1",
+                provider="openai",
+                sandbox_name="sandbox-1",
+                status_port=9001,
+                cgroup_path="agent-cr/test/sandbox-1",
+                image_defaults=ImageRuntimeDefaults(
+                    environment=("IMAGE_ONLY=1", "PATH=/image/bin"),
+                    working_dir="/app",
+                    user="app",
+                ),
+                image_rootfs_dir=rootfs_dir,
+            )
+
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["process"]["cwd"], "/app")
+            self.assertIn("IMAGE_ONLY=1", payload["process"]["env"])
+            self.assertIn("PATH=/usr/local/bin:/usr/bin:/bin", payload["process"]["env"])
+            self.assertEqual(payload["process"]["user"], {"uid": 1001, "gid": 1002})
 
     def test_sandbox_handle_status_url_uses_status_host(self) -> None:
         handle = SandboxHandle(
@@ -891,18 +909,179 @@ services:
 
         with patch.object(harness, "_allocate_benchmark_network_lease", return_value=SimpleNamespace(guest_ip="10.250.0.2")):
             with patch.object(harness, "_prepare_sandbox_handle", return_value=(handle, None)):
-                with patch("benchmarks.real_host_scenario_base.export_docker_image_rootfs", return_value=harness.root / "rootfs"):
-                    result = harness.launch_sandbox_from_docker_compose_file(
-                        compose_file,
-                        env_file,
-                        sandbox_name="sbx-compose",
-                        service_name="app",
-                    )
+                with patch(
+                    "benchmarks.real_host_scenario_base.sandbox_compose.inspect_image_runtime_defaults",
+                    return_value=ImageRuntimeDefaults(),
+                ):
+                    with patch("benchmarks.real_host_scenario_base.sandbox_compose.export_image_rootfs", return_value=harness.root / "rootfs"):
+                        result = harness.launch_sandbox_from_docker_compose_file(
+                            compose_file,
+                            env_file,
+                            sandbox_name="sbx-compose",
+                            service_name="app",
+                        )
 
         self.assertEqual(result.launch_source, "compose")
         launch_mock.assert_called_once()
         metadata = launch_mock.call_args.args[1]
         self.assertEqual(metadata["compose_service_name"], "app")
+
+    def test_launch_sandbox_from_docker_compose_file_inherits_image_env_workdir_and_user(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        harness.root = Path(tempfile.mkdtemp(prefix="agent_cr_compose_defaults_test_"))
+        harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())
+        launch_mock = Mock()
+        harness.system = SimpleNamespace(sandbox_manager=SimpleNamespace(launch=launch_mock))
+        config_dir = harness.root / "bundle"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "linux": {"namespaces": [], "cgroupsPath": ""},
+                    "mounts": [],
+                    "process": {"terminal": False, "cwd": "/", "args": [], "env": []},
+                    "root": {"path": "rootfs", "readonly": False},
+                }
+            ),
+            encoding="utf-8",
+        )
+        handle = SandboxHandle(
+            sandbox_id=SandboxId("sbx-compose-defaults"),
+            bundle_dir=config_dir,
+            status_port=8123,
+            status_host="127.0.0.1",
+            last_status={},
+        )
+        compose_file = harness.root / "compose.yaml"
+        compose_file.write_text(
+            """
+services:
+  app:
+    image: example:latest
+""".strip(),
+            encoding="utf-8",
+        )
+        env_file = harness.root / ".env"
+        env_file.write_text("", encoding="utf-8")
+        rootfs_dir = harness.root / "rootfs"
+        (rootfs_dir / "etc").mkdir(parents=True, exist_ok=True)
+        (rootfs_dir / "etc" / "passwd").write_text("app:x:1001:1002::/home/app:/bin/sh\n", encoding="utf-8")
+        (rootfs_dir / "etc" / "group").write_text("app:x:1002:\n", encoding="utf-8")
+
+        with patch.object(harness, "_allocate_benchmark_network_lease", return_value=SimpleNamespace(guest_ip="10.250.0.2")):
+            with patch.object(harness, "_prepare_sandbox_handle", return_value=(handle, None)):
+                with patch(
+                    "benchmarks.real_host_scenario_base.sandbox_compose.inspect_image_runtime_defaults",
+                    return_value=ImageRuntimeDefaults(
+                        environment=("IMAGE_ONLY=1",),
+                        working_dir="/srv/app",
+                        user="app",
+                        entrypoint=("python",),
+                        command=("-m", "http.server"),
+                    ),
+                ):
+                    with patch("benchmarks.real_host_scenario_base.sandbox_compose.export_image_rootfs", return_value=rootfs_dir):
+                        harness.launch_sandbox_from_docker_compose_file(
+                            compose_file,
+                            env_file,
+                            sandbox_name="sbx-compose-defaults",
+                            service_name="app",
+                        )
+
+        payload = json.loads((config_dir / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload["process"]["cwd"], "/srv/app")
+        self.assertEqual(payload["process"]["args"], ["python", "-m", "http.server"])
+        self.assertIn("IMAGE_ONLY=1", payload["process"]["env"])
+        self.assertEqual(payload["process"]["user"], {"uid": 1001, "gid": 1002})
+        launch_mock.assert_called_once()
+
+    def test_launch_sandbox_preserves_image_defaults_when_configure_bundle_is_noop(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        harness.root = Path(tempfile.mkdtemp(prefix="agent_cr_launch_defaults_test_"))
+        harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())
+        harness.system = SimpleNamespace(sandbox_manager=SimpleNamespace(launch=Mock()))
+        harness.interceptor = SimpleNamespace(port=43123)
+        harness.llm_server = SimpleNamespace(benchmark_llm_router=SimpleNamespace(register_sandbox=Mock()))
+
+        config_dir = harness.root / "bundle"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "linux": {"namespaces": [], "cgroupsPath": ""},
+                    "mounts": [],
+                    "process": {"terminal": False, "cwd": "/", "args": [], "env": []},
+                    "root": {"path": "rootfs", "readonly": False},
+                }
+            ),
+            encoding="utf-8",
+        )
+        handle = SandboxHandle(
+            sandbox_id=SandboxId("sbx-launch-defaults"),
+            bundle_dir=config_dir,
+            status_port=8123,
+            status_host="127.0.0.1",
+            last_status={},
+        )
+        rootfs_dir = harness.root / "rootfs"
+        (rootfs_dir / "etc").mkdir(parents=True, exist_ok=True)
+        (rootfs_dir / "etc" / "passwd").write_text("app:x:1001:1002::/home/app:/bin/sh\n", encoding="utf-8")
+        (rootfs_dir / "etc" / "group").write_text("app:x:1002:\n", encoding="utf-8")
+        sandbox_image = SimpleNamespace(
+            exported_rootfs=rootfs_dir,
+            image_defaults=ImageRuntimeDefaults(
+                environment=("IMAGE_ONLY=1", "SHARED=image"),
+                working_dir="/app",
+                user="app",
+            ),
+        )
+
+        def prepare_handle(*args, **kwargs):
+            sandbox_bundle.write_bundle_config(
+                bundle_dir=config_dir,
+                llm_base_url="http://127.0.0.1:43123/v1",
+                provider="openai",
+                sandbox_name="sbx-launch-defaults",
+                status_port=8123,
+                cgroup_path="agent-cr/test/sbx-launch-defaults",
+                image_defaults=kwargs["image_defaults"],
+                image_rootfs_dir=kwargs["image_rootfs_dir"],
+            )
+            return handle, None
+
+        task_run = SimpleNamespace(
+            prepare_sandbox=Mock(),
+            configure_bundle=Mock(),
+            rootfs_init_dirs=Mock(return_value=[]),
+            extra_launch_metadata=Mock(return_value={}),
+            wait_for_task_ready=Mock(),
+        )
+
+        with patch.object(harness, "ensure_sandbox_image", return_value=sandbox_image):
+            with patch.object(harness, "_prepare_sandbox_handle", side_effect=prepare_handle):
+                with patch.object(harness, "build_task_run", return_value=task_run):
+                    result = harness.launch_sandbox("sbx-launch-defaults", agent_type="simulated")
+
+        self.assertIs(result, handle)
+        payload = json.loads((config_dir / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload["process"]["cwd"], "/app")
+        self.assertIn("IMAGE_ONLY=1", payload["process"]["env"])
+        self.assertIn("SHARED=image", payload["process"]["env"])
+        self.assertEqual(payload["process"]["user"], {"uid": 1001, "gid": 1002})
 
     def test_launch_sandbox_uses_host_network_for_simulated_agents(self) -> None:
         harness = RealHostScenarioHarness(
@@ -918,7 +1097,10 @@ services:
         harness.system = SimpleNamespace(sandbox_manager=SimpleNamespace(launch=Mock()))
         harness.interceptor = SimpleNamespace(port=43123)
         harness.llm_server = SimpleNamespace(benchmark_llm_router=SimpleNamespace(register_sandbox=Mock()))
-        sandbox_image = SimpleNamespace(exported_rootfs=harness.root / "rootfs")
+        sandbox_image = SimpleNamespace(
+            exported_rootfs=harness.root / "rootfs",
+            image_defaults=ImageRuntimeDefaults(),
+        )
         sandbox_image.exported_rootfs.mkdir(parents=True, exist_ok=True)
 
         handle = SandboxHandle(
@@ -927,6 +1109,18 @@ services:
             status_port=8123,
             status_host="127.0.0.1",
             last_status={},
+        )
+        handle.bundle_dir.mkdir(parents=True, exist_ok=True)
+        (handle.bundle_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "linux": {"namespaces": [], "cgroupsPath": ""},
+                    "mounts": [],
+                    "process": {"terminal": False, "cwd": "/", "args": [], "env": []},
+                    "root": {"path": "rootfs", "readonly": False},
+                }
+            ),
+            encoding="utf-8",
         )
         task_run = SimpleNamespace(
             prepare_sandbox=Mock(),
@@ -953,6 +1147,8 @@ services:
             network_lease=None,
             agent_type="simulated",
             llm_service_type="simulated",
+            image_defaults=ImageRuntimeDefaults(),
+            image_rootfs_dir=sandbox_image.exported_rootfs,
         )
 
     def test_ensure_sandbox_image_serializes_parallel_calls(self) -> None:
@@ -991,8 +1187,11 @@ services:
                 start_barrier.wait()
                 results.append(harness.ensure_sandbox_image("simulated"))
 
-            with patch("benchmarks.real_host_scenario_base.build_image", side_effect=fake_build_image), patch(
-                "benchmarks.real_host_scenario_base.export_image_rootfs",
+            with patch("benchmarks.real_host_scenario_base.sandbox_image.build_image", side_effect=fake_build_image), patch(
+                "benchmarks.real_host_scenario_base.sandbox_image.inspect_image_runtime_defaults",
+                return_value=ImageRuntimeDefaults(),
+            ), patch(
+                "benchmarks.real_host_scenario_base.sandbox_image.export_image_rootfs",
                 side_effect=fake_export_image_rootfs,
             ):
                 threads = [threading.Thread(target=worker) for _ in range(2)]
@@ -1021,7 +1220,7 @@ services:
         harness.llm_server = SimpleNamespace(benchmark_llm_router=SimpleNamespace(register_sandbox=register_sandbox))
 
         with patch("benchmarks.real_host_scenario_base.subprocess.run"), patch(
-            "benchmarks.real_host_scenario_base.write_bundle_config"
+            "benchmarks.real_host_scenario_base.sandbox_bundle.write_bundle_config"
         ), patch("benchmarks.real_host_scenario_base.find_free_port", return_value=8123):
             handle, _ = harness._prepare_sandbox_handle(
                 "sbx-url",
@@ -1051,7 +1250,10 @@ services:
         harness.system = SimpleNamespace(sandbox_manager=SimpleNamespace(launch=Mock()))
         harness.interceptor = SimpleNamespace(port=43123)
         harness.llm_server = SimpleNamespace(benchmark_llm_router=SimpleNamespace(register_sandbox=Mock()))
-        sandbox_image = SimpleNamespace(exported_rootfs=harness.root / "rootfs")
+        sandbox_image = SimpleNamespace(
+            exported_rootfs=harness.root / "rootfs",
+            image_defaults=ImageRuntimeDefaults(),
+        )
         sandbox_image.exported_rootfs.mkdir(parents=True, exist_ok=True)
 
         lease = SimpleNamespace(guest_ip="10.250.0.2", namespace_path=Path("/var/run/netns/test-iflow"))
@@ -1087,6 +1289,8 @@ services:
             network_lease=lease,
             agent_type="iflow",
             llm_service_type="simulated_for_iflow",
+            image_defaults=ImageRuntimeDefaults(),
+            image_rootfs_dir=sandbox_image.exported_rootfs,
         )
         self.assertEqual(harness._benchmark_ip_to_sandbox[lease.guest_ip], SandboxId("sbx-iflow"))
 
@@ -1160,7 +1364,7 @@ services:
                     {
                         "linux": {"namespaces": [], "cgroupsPath": ""},
                         "mounts": [],
-                        "process": {"terminal": False, "cwd": "/", "args": [], "env": []},
+                        "process": {"terminal": False, "cwd": "/", "args": [], "env": ["IMAGE_ONLY=1", "PYTHONUNBUFFERED=0"]},
                         "root": {"path": "rootfs", "readonly": False},
                     }
                 ),
@@ -1194,6 +1398,7 @@ services:
             self.assertIn("/opt/iflow-logs/iflow.task.exit", payload["process"]["args"][2])
             self.assertIn("/opt/iflow-logs/iflow.task.done", payload["process"]["args"][2])
             self.assertNotIn("exec >/dev/null 2>&1", payload["process"]["args"][2])
+            self.assertIn("IMAGE_ONLY=1", payload["process"]["env"])
             self.assertIn("FOO=bar", payload["process"]["env"])
 
     def test_iflow_prepare_sandbox_uses_extended_benchmark_session_limit(self) -> None:

@@ -1,11 +1,63 @@
 from __future__ import annotations
 
 import fcntl
+import json
+import re
 import shutil
 import subprocess
 import tarfile
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
+
+
+@dataclass(frozen=True)
+class ImageRuntimeDefaults:
+    environment: tuple[str, ...] = ()
+    working_dir: str | None = None
+    user: str | None = None
+    entrypoint: tuple[str, ...] = ()
+    command: tuple[str, ...] = ()
+
+
+def docker_tag_component(raw: str) -> str:
+    normalized = re.sub(r"[^a-z0-9_.-]+", "-", raw.lower()).strip("-.")
+    return normalized or "image"
+
+
+def inspect_image_runtime_defaults(*, tag: str) -> ImageRuntimeDefaults:
+    raw_output = subprocess.run(
+        ["docker", "image", "inspect", tag, "--format", "{{json .Config}}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    config = json.loads(raw_output) if raw_output else {}
+    if not isinstance(config, dict):
+        raise ValueError(f"unexpected docker image config for {tag}: {config!r}")
+
+    def _string_list(key: str) -> tuple[str, ...]:
+        value = config.get(key)
+        if value is None:
+            return ()
+        if not isinstance(value, list):
+            raise ValueError(f"unsupported docker image config {key} for {tag}: {value!r}")
+        return tuple(str(item) for item in value)
+
+    working_dir = config.get("WorkingDir")
+    if working_dir is not None and not isinstance(working_dir, str):
+        raise ValueError(f"unsupported docker image config WorkingDir for {tag}: {working_dir!r}")
+    user = config.get("User")
+    if user is not None and not isinstance(user, str):
+        raise ValueError(f"unsupported docker image config User for {tag}: {user!r}")
+
+    return ImageRuntimeDefaults(
+        environment=_string_list("Env"),
+        working_dir=working_dir or None,
+        user=user or None,
+        entrypoint=_string_list("Entrypoint"),
+        command=_string_list("Cmd"),
+    )
 
 
 def build_image(*, tag: str, build_context: Path, dockerfile_path: Path) -> None:
