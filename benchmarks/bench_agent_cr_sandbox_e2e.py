@@ -14,7 +14,16 @@ if str(ROOT) not in sys.path:
 
 from agent_cr import SchedulerConfig
 from integrations.agents import TaskConfig, TaskDescription
-from benchmarks.support import add_common_args, compute_summary, configure_logging, wait_for, write_rows
+from benchmarks.support import (
+    add_common_args,
+    compute_summary,
+    configure_logging,
+    is_replay_llm_service_type,
+    task_timeout_seconds,
+    verification_timeout_seconds,
+    wait_for,
+    write_rows,
+)
 from benchmarks.real_host_scenario_base import (
     RealHostScenarioHarness,
 )
@@ -42,6 +51,93 @@ def default_task_config() -> TaskConfig:
     return TaskConfig()
 
 
+def _sandbox_benchmark_metadata(sandbox) -> dict[str, object]:
+    metadata = sandbox.launch_metadata.get("benchmark", {})
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _task_id_for_sandbox(sandbox) -> str:
+    metadata = _sandbox_benchmark_metadata(sandbox)
+    raw_task_id = metadata.get("task_id")
+    if isinstance(raw_task_id, str) and raw_task_id:
+        return raw_task_id
+    if sandbox.task_config is not None:
+        raw_task_id = sandbox.task_config.options.get("task_id")
+        if isinstance(raw_task_id, str) and raw_task_id:
+            return raw_task_id
+    return str(sandbox.sandbox_id)
+
+
+def _trace_response_count_for_sandbox(sandbox) -> int:
+    metadata = _sandbox_benchmark_metadata(sandbox)
+    raw_value = metadata.get("trace_response_count")
+    try:
+        return max(0, int(raw_value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _run_replay_accuracy_sandbox(
+    args: argparse.Namespace,
+    harness: RealHostScenarioHarness,
+    sandbox,
+) -> dict[str, object]:
+    task_started = time.perf_counter()
+    task_error = ""
+    verification = {
+        "verification_status": "task_failed",
+        "verification_exit_code": -1,
+        "verification_ms": 0.0,
+    }
+    try:
+        harness.wait_for_task_completion(
+            sandbox,
+            timeout_s=task_timeout_seconds(sandbox.task_config or TaskConfig()),
+        )
+    except Exception as exc:
+        task_error = str(exc)
+    task_completion_ms = (time.perf_counter() - task_started) * 1000.0
+    status = dict(sandbox.last_status)
+    if sandbox.task_run is not None:
+        try:
+            status = sandbox.task_run.poll_status()
+        except Exception:
+            status = dict(sandbox.last_status)
+    sandbox.last_status = dict(status)
+    if not task_error:
+        try:
+            verification = harness.verify_task_accuracy(
+                sandbox,
+                timeout_s=verification_timeout_seconds(sandbox.task_config or TaskConfig()),
+            )
+        except Exception as exc:
+            verification = {
+                "verification_status": "verification_error",
+                "verification_exit_code": -1,
+                "verification_ms": 0.0,
+                "verification_stdout": "",
+                "verification_stderr": str(exc),
+                "verification_command": "",
+            }
+    return {
+        "iter": 1,
+        "provider": args.provider,
+        "agent_type": args.agent_type,
+        "sandbox_id": str(sandbox.sandbox_id),
+        "task_id": _task_id_for_sandbox(sandbox),
+        "trace_response_count": _trace_response_count_for_sandbox(sandbox),
+        "task_completion_ms": task_completion_ms,
+        "tool_actions": int(status.get("total_actions", 0)),
+        "fs_actions": int(status.get("filesystem_actions", status.get("total_actions", 0))),
+        "process_actions": int(status.get("process_actions", status.get("total_actions", 0))),
+        "network_actions": int(status.get("network_actions", status.get("total_actions", 0))),
+        "replay_final_index": int(status.get("replay_next_response_index", status.get("total_actions", 0))),
+        "success_ratio": 1.0 if verification["verification_status"] == "passed" else 0.0,
+        "task_error": task_error,
+        **verification,
+    }
+
+
 def run_benchmark(args: argparse.Namespace, harness: RealHostScenarioHarness) -> list[dict[str, object]]:
     dataset_path = getattr(args, "dataset", None)
     dataset = harness.load_dataset(dataset_path) if dataset_path is not None else None
@@ -62,6 +158,15 @@ def run_benchmark(args: argparse.Namespace, harness: RealHostScenarioHarness) ->
                 range(args.sandboxes),
             )
         )
+    if sandboxes and any(is_replay_llm_service_type(sandbox.llm_service_type) for sandbox in sandboxes):
+        with ThreadPoolExecutor(max_workers=max(1, args.sandboxes)) as executor:
+            rows = list(
+                executor.map(
+                    lambda sandbox: _run_replay_accuracy_sandbox(args, harness, sandbox),
+                    sandboxes,
+                )
+            )
+        return sorted(rows, key=lambda row: str(row["sandbox_id"]))
     rows: list[dict[str, object]] = []
 
     for iteration in range(args.iters):
@@ -137,7 +242,10 @@ def main() -> None:
     ) as harness:
         rows = run_benchmark(args, harness)
     write_rows(args.out, rows)
-    summary = compute_summary(rows, ["checkpoint_batch_ms", "restore_batch_ms", "success_ratio"])
+    metric_keys = ["checkpoint_batch_ms", "restore_batch_ms", "success_ratio"]
+    if rows and "verification_status" in rows[0]:
+        metric_keys = ["task_completion_ms", "verification_ms", "success_ratio"]
+    summary = compute_summary(rows, metric_keys)
     for key, value in summary.items():
         print(f"{key}_avg: {value:.3f}")
 

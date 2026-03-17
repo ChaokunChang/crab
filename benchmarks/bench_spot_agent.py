@@ -17,7 +17,18 @@ from agent_cr import DeleteAfterRestoreCheckpointManager, SchedulerConfig, SpotP
 from agent_cr.models import utc_now
 
 from integrations.agents import SandboxHandle, TaskConfig, TaskDescription
-from benchmarks.support import add_common_args, bounded_probability, compute_summary, configure_logging, write_rows
+from benchmarks.support import (
+    add_common_args,
+    average,
+    bounded_probability,
+    choose_replay_points,
+    compute_summary,
+    configure_logging,
+    is_replay_llm_service_type,
+    task_timeout_seconds,
+    verification_timeout_seconds,
+    write_rows,
+)
 from benchmarks.real_host_scenario_base import (
     RealHostScenarioHarness,
 )
@@ -31,6 +42,90 @@ def benchmark_task_description() -> TaskDescription:
 
 def default_task_config() -> TaskConfig:
     return TaskConfig()
+
+
+def _sandbox_benchmark_metadata(sandbox: SandboxHandle) -> dict[str, object]:
+    metadata = sandbox.launch_metadata.get("benchmark", {})
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _task_id_for_sandbox(sandbox: SandboxHandle) -> str:
+    metadata = _sandbox_benchmark_metadata(sandbox)
+    raw_task_id = metadata.get("task_id")
+    if isinstance(raw_task_id, str) and raw_task_id:
+        return raw_task_id
+    if sandbox.task_config is not None:
+        raw_task_id = sandbox.task_config.options.get("task_id")
+        if isinstance(raw_task_id, str) and raw_task_id:
+            return raw_task_id
+    return str(sandbox.sandbox_id)
+
+
+def _trace_response_count_for_sandbox(sandbox: SandboxHandle) -> int:
+    metadata = _sandbox_benchmark_metadata(sandbox)
+    raw_value = metadata.get("trace_response_count")
+    try:
+        return max(0, int(raw_value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _finalize_replay_row(
+    args: argparse.Namespace,
+    harness: RealHostScenarioHarness,
+    sandbox: SandboxHandle,
+    *,
+    row: dict[str, object],
+    task_error: str = "",
+) -> dict[str, object]:
+    verification = {
+        "verification_status": "task_failed" if task_error else "verification_skipped",
+        "verification_exit_code": -1,
+        "verification_ms": 0.0,
+    }
+    if not task_error:
+        try:
+            harness.wait_for_task_completion(
+                sandbox,
+                timeout_s=task_timeout_seconds(sandbox.task_config or TaskConfig()),
+            )
+        except Exception as exc:
+            task_error = str(exc)
+            verification["verification_status"] = "task_failed"
+        else:
+            try:
+                verification = harness.verify_task_accuracy(
+                    sandbox,
+                    timeout_s=verification_timeout_seconds(sandbox.task_config or TaskConfig()),
+                )
+            except Exception as exc:
+                verification = {
+                    "verification_status": "verification_error",
+                    "verification_exit_code": -1,
+                    "verification_ms": 0.0,
+                    "verification_stdout": "",
+                    "verification_stderr": str(exc),
+                    "verification_command": "",
+                }
+    status = dict(sandbox.last_status)
+    if sandbox.task_run is not None:
+        try:
+            status = sandbox.task_run.poll_status()
+        except Exception:
+            status = dict(sandbox.last_status)
+    sandbox.last_status = dict(status)
+    return {
+        **row,
+        "provider": args.provider,
+        "agent_type": sandbox.agent_type,
+        "sandbox_id": str(sandbox.sandbox_id),
+        "task_id": _task_id_for_sandbox(sandbox),
+        "trace_response_count": _trace_response_count_for_sandbox(sandbox),
+        "replay_final_index": int(status.get("replay_next_response_index", status.get("total_actions", 0))),
+        "task_error": task_error,
+        "success_ratio": 1.0 if verification["verification_status"] == "passed" else 0.0,
+        **verification,
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -212,6 +307,131 @@ def run_spot_agent_sandbox(
     return rows
 
 
+def run_replay_spot_agent_sandbox(
+    args: argparse.Namespace,
+    harness: RealHostScenarioHarness,
+    *,
+    sandbox_index: int,
+    sandbox: SandboxHandle,
+) -> dict[str, object]:
+    trace_response_count = _trace_response_count_for_sandbox(sandbox)
+    replay_points = choose_replay_points(trace_response_count, args.iters)
+    rng = random.Random(sandbox_index)
+    checkpoint_ms_values: list[float] = []
+    restore_ms_values: list[float] = []
+    recovery_ms_values: list[float] = []
+    readiness_ms_values: list[float] = []
+    end_to_end_recovery_ms_values: list[float] = []
+    migration_ms_values: list[float] = []
+    budget_slack_ms_values: list[float] = []
+    iterations_executed = 0
+    preemptions_injected = 0
+    recoveries_succeeded = 0
+    task_error = ""
+
+    try:
+        if sandbox.task_run is None:
+            raise RuntimeError("replay spot benchmark expected sandbox.task_run")
+        for iteration, checkpoint_target in enumerate(replay_points, start=1):
+            iterations_executed += 1
+            sandbox.task_run.wait_for_progress(minimum_actions=checkpoint_target)
+            injected = should_inject_preemption(
+                iteration=iteration,
+                sandbox_index=sandbox_index,
+                rate=args.preemption_rate,
+                first_forced_iteration=args.first_preempt_iteration,
+                rng=rng,
+            )
+            if not injected:
+                continue
+            preemptions_injected += 1
+            event_started = time.perf_counter()
+            if args.auto_cr:
+                observed_after = utc_now()
+                harness.notify_preemption(
+                    sandbox,
+                    grace_remaining_seconds=args.grace_period_seconds,
+                )
+                migration_started = time.perf_counter()
+                record = harness.wait_for_recovery(
+                    sandbox,
+                    event_type="preemption",
+                    observed_after=observed_after,
+                )
+                recovery_finished = time.perf_counter()
+                ready_at = recovery_finished
+                if record.status in {"restored", "relaunched"}:
+                    sandbox.last_status = sandbox.task_run.poll_status()
+                    ready_at = time.perf_counter()
+                    recoveries_succeeded += 1
+                recovery_ms_values.append((recovery_finished - migration_started) * 1000.0)
+                readiness_ms_values.append((ready_at - recovery_finished) * 1000.0)
+                end_to_end_recovery_ms_values.append((ready_at - event_started) * 1000.0)
+                migration_ms_values.append((ready_at - event_started) * 1000.0)
+                budget_slack_ms_values.append(args.grace_period_seconds * 1000.0 - (ready_at - event_started) * 1000.0)
+                if record.status not in {"restored", "relaunched"}:
+                    raise RuntimeError(f"preemption recovery failed with status={record.status}")
+                continue
+
+            harness.set_snapshot_metadata(
+                sandbox,
+                preemption_notice=True,
+                preemption_grace_remaining_seconds=args.grace_period_seconds,
+            )
+            recovery_started = time.perf_counter()
+            checkpoint_result = harness.checkpoint_manual(sandbox, leave_running=True)
+            checkpoint_finished = time.perf_counter()
+            if checkpoint_result.status.value != "succeeded":
+                raise RuntimeError(
+                    f"checkpoint failed for sandbox {sandbox.sandbox_id}: "
+                    f"{checkpoint_result.status.value} {checkpoint_result.message}"
+                )
+            restore_result = harness.restore_once(sandbox, checkpoint_result.checkpoint_id)
+            recovery_finished = time.perf_counter()
+            sandbox.task_run.poll_status()
+            ready_at = time.perf_counter()
+            harness.clear_snapshot_metadata(
+                sandbox,
+                "preemption_notice",
+                "preemption_grace_remaining_seconds",
+            )
+            checkpoint_ms_values.append((checkpoint_finished - recovery_started) * 1000.0)
+            restore_ms_values.append(
+                (restore_result.finished_at - restore_result.started_at).total_seconds() * 1000.0
+            )
+            recovery_ms_values.append((recovery_finished - recovery_started) * 1000.0)
+            readiness_ms_values.append((ready_at - recovery_finished) * 1000.0)
+            end_to_end_recovery_ms_values.append((ready_at - event_started) * 1000.0)
+            migration_ms_values.append((ready_at - event_started) * 1000.0)
+            budget_slack_ms_values.append(args.grace_period_seconds * 1000.0 - (ready_at - event_started) * 1000.0)
+            recoveries_succeeded += 1
+    except Exception as exc:
+        task_error = str(exc)
+
+    return _finalize_replay_row(
+        args,
+        harness,
+        sandbox,
+        row={
+            "iterations_planned": len(replay_points),
+            "iterations_executed": iterations_executed,
+            "preemptions_injected": preemptions_injected,
+            "recoveries_succeeded": recoveries_succeeded,
+            "grace_period_ms": args.grace_period_seconds * 1000.0,
+            "checkpoint_ms_avg": average(checkpoint_ms_values),
+            "restore_ms_avg": average(restore_ms_values),
+            "recovery_ms_avg": average(recovery_ms_values),
+            "readiness_ms_avg": average(readiness_ms_values),
+            "end_to_end_recovery_ms_avg": average(end_to_end_recovery_ms_values),
+            "migration_ms_avg": average(migration_ms_values),
+            "budget_slack_ms_avg": average(budget_slack_ms_values),
+            "retained_checkpoints": len(harness.storage.list_checkpoints(sandbox.sandbox_id)),
+            "skipped_no_replay_checkpoint": 1 if not replay_points else 0,
+        },
+        task_error=task_error,
+    )
+
+
 def run_spot_agent_benchmark(
     args: argparse.Namespace,
     harness: RealHostScenarioHarness,
@@ -235,6 +455,20 @@ def run_spot_agent_benchmark(
                 range(args.sandboxes),
             )
         )
+    if sandboxes and any(is_replay_llm_service_type(sandbox.llm_service_type) for sandbox in sandboxes):
+        with ThreadPoolExecutor(max_workers=max(1, args.sandboxes)) as executor:
+            rows = list(
+                executor.map(
+                    lambda item: run_replay_spot_agent_sandbox(
+                        args,
+                        harness,
+                        sandbox_index=item[0],
+                        sandbox=item[1],
+                    ),
+                    enumerate(sandboxes),
+                )
+            )
+        return sorted(rows, key=lambda row: str(row["sandbox_id"]))
     with ThreadPoolExecutor(max_workers=max(1, args.sandboxes)) as executor:
         row_groups = list(
             executor.map(
@@ -271,6 +505,23 @@ def main() -> None:
     ) as harness:
         rows = run_spot_agent_benchmark(args, harness)
     write_rows(args.out, rows)
+    if rows and "verification_status" in rows[0]:
+        summary = compute_summary(
+            rows,
+            [
+                "checkpoint_ms_avg",
+                "restore_ms_avg",
+                "recovery_ms_avg",
+                "readiness_ms_avg",
+                "end_to_end_recovery_ms_avg",
+                "migration_ms_avg",
+                "budget_slack_ms_avg",
+                "success_ratio",
+            ],
+        )
+        for key, value in summary.items():
+            print(f"{key}_avg: {value:.3f}")
+        return
     if args.auto_cr:
         event_rows = [row for row in rows if int(row["event_injected"]) == 1]
         summary = (

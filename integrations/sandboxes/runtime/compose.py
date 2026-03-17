@@ -50,10 +50,15 @@ def interpolate_compose_value(value: Any, env: dict[str, str]) -> Any:
 def load_compose_service(
     *,
     compose_file: Path,
-    env_file: Path,
+    env_file: Path | None = None,
+    extra_env: dict[str, str] | None = None,
     service_name: str | None = None,
 ) -> tuple[str, dict[str, object]]:
-    compose_env = {**os.environ, **parse_env_file(env_file)}
+    compose_env = dict(os.environ)
+    if env_file is not None:
+        compose_env.update(parse_env_file(env_file))
+    if extra_env is not None:
+        compose_env.update({str(key): str(value) for key, value in extra_env.items()})
     payload = yaml.safe_load(compose_file.read_text(encoding="utf-8")) or {}
     payload = interpolate_compose_value(payload, compose_env)
     services = payload.get("services")
@@ -97,16 +102,18 @@ def resolve_compose_image_ref(
 ) -> str:
     image_ref = service.get("image")
     build_spec = service.get("build")
-    if image_ref and build_spec:
-        raise ValueError(f"compose service {service_name} cannot specify both image and build")
-    if isinstance(image_ref, str) and image_ref:
+    if isinstance(image_ref, str) and image_ref and build_spec is None:
         return image_ref
     if build_spec is None:
         raise ValueError(f"compose service {service_name} requires image or build")
-    tag = compose_build_tag(
-        compose_file=compose_file,
-        service_name=service_name,
-        build_spec=build_spec,
+    tag = (
+        str(image_ref)
+        if isinstance(image_ref, str) and image_ref
+        else compose_build_tag(
+            compose_file=compose_file,
+            service_name=service_name,
+            build_spec=build_spec,
+        )
     )
     if compose_image_tags is not None:
         compose_image_tags.add(tag)

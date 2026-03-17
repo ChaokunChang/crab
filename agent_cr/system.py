@@ -75,6 +75,8 @@ class AgentCRSystem:
     request_state_store: InMemoryRequestStateStore | None = None
     response_gate_registry: SandboxResponseGateRegistry | None = None
     relaunch_handler: Callable[[SandboxId, str], None] | None = None
+    extra_checkpoint_metadata_provider: Callable[[SandboxId], dict[str, object]] | None = None
+    restore_metadata_handler: Callable[[SandboxId, CheckpointManifest], None] | None = None
     recovery_delay_seconds: float = 0.0
     enforce_restore_checkpoint_validation: bool = False
     _interceptor_lock: Lock = field(init=False, repr=False)
@@ -146,6 +148,7 @@ class AgentCRSystem:
                 requested_at=utc_now(),
                 reason="manual",
                 leave_running=leave_running,
+                metadata=self._build_checkpoint_metadata(sandbox_id),
             )
             result = self.executor.run_checkpoint(job)
             if result.status.value == "succeeded":
@@ -224,6 +227,9 @@ class AgentCRSystem:
         if result.status.value == "succeeded":
             self.sandbox_manager.mark_restored(sandbox_id)
             self.storage.handle_restore_complete(sandbox_id, result.checkpoint_id)
+            if self.restore_metadata_handler is not None:
+                manifest = self._resolve_restore_manifest(sandbox_id, restore_checkpoint_id)
+                self.restore_metadata_handler(sandbox_id, manifest)
         logger.info(
             "Manual restore for sandbox %s checkpoint=%s finished with status=%s",
             sandbox_id,
@@ -574,6 +580,11 @@ class AgentCRSystem:
 
     def _build_checkpoint_metadata(self, sandbox_id: SandboxId) -> dict[str, object]:
         metadata: dict[str, object] = {_CAPTURES_INFLIGHT_LLM: False}
+        if self.extra_checkpoint_metadata_provider is not None:
+            try:
+                metadata.update(self.extra_checkpoint_metadata_provider(sandbox_id))
+            except Exception:
+                logger.exception("Failed to collect extra checkpoint metadata for sandbox=%s", sandbox_id)
         if self.request_state_store is None or self.response_gate_registry is None:
             return metadata
         request_state = self.request_state_store.get(sandbox_id)

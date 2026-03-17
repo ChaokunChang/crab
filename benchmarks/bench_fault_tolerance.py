@@ -19,9 +19,14 @@ from agent_cr.models import utc_now
 from integrations.agents import SandboxHandle, TaskConfig, TaskDescription
 from benchmarks.support import (
     add_common_args,
+    average,
     bounded_probability,
+    choose_replay_points,
     compute_summary,
+    is_replay_llm_service_type,
+    task_timeout_seconds,
     total_actions,
+    verification_timeout_seconds,
     wait_for,
     write_rows,
 )
@@ -39,6 +44,90 @@ def benchmark_task_description() -> TaskDescription:
 
 def default_task_config() -> TaskConfig:
     return TaskConfig()
+
+
+def _sandbox_benchmark_metadata(sandbox: SandboxHandle) -> dict[str, object]:
+    metadata = sandbox.launch_metadata.get("benchmark", {})
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _task_id_for_sandbox(sandbox: SandboxHandle) -> str:
+    metadata = _sandbox_benchmark_metadata(sandbox)
+    raw_task_id = metadata.get("task_id")
+    if isinstance(raw_task_id, str) and raw_task_id:
+        return raw_task_id
+    if sandbox.task_config is not None:
+        raw_task_id = sandbox.task_config.options.get("task_id")
+        if isinstance(raw_task_id, str) and raw_task_id:
+            return raw_task_id
+    return str(sandbox.sandbox_id)
+
+
+def _trace_response_count_for_sandbox(sandbox: SandboxHandle) -> int:
+    metadata = _sandbox_benchmark_metadata(sandbox)
+    raw_value = metadata.get("trace_response_count")
+    try:
+        return max(0, int(raw_value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _finalize_replay_row(
+    args: argparse.Namespace,
+    harness: RealHostScenarioHarness,
+    sandbox: SandboxHandle,
+    *,
+    row: dict[str, object],
+    task_error: str = "",
+) -> dict[str, object]:
+    verification = {
+        "verification_status": "task_failed" if task_error else "verification_skipped",
+        "verification_exit_code": -1,
+        "verification_ms": 0.0,
+    }
+    if not task_error:
+        try:
+            harness.wait_for_task_completion(
+                sandbox,
+                timeout_s=task_timeout_seconds(sandbox.task_config or TaskConfig()),
+            )
+        except Exception as exc:
+            task_error = str(exc)
+            verification["verification_status"] = "task_failed"
+        else:
+            try:
+                verification = harness.verify_task_accuracy(
+                    sandbox,
+                    timeout_s=verification_timeout_seconds(sandbox.task_config or TaskConfig()),
+                )
+            except Exception as exc:
+                verification = {
+                    "verification_status": "verification_error",
+                    "verification_exit_code": -1,
+                    "verification_ms": 0.0,
+                    "verification_stdout": "",
+                    "verification_stderr": str(exc),
+                    "verification_command": "",
+                }
+    status = dict(sandbox.last_status)
+    if sandbox.task_run is not None:
+        try:
+            status = sandbox.task_run.poll_status()
+        except Exception:
+            status = dict(sandbox.last_status)
+    sandbox.last_status = dict(status)
+    return {
+        **row,
+        "provider": args.provider,
+        "agent_type": sandbox.agent_type,
+        "sandbox_id": str(sandbox.sandbox_id),
+        "task_id": _task_id_for_sandbox(sandbox),
+        "trace_response_count": _trace_response_count_for_sandbox(sandbox),
+        "replay_final_index": int(status.get("replay_next_response_index", status.get("total_actions", 0))),
+        "task_error": task_error,
+        "success_ratio": 1.0 if verification["verification_status"] == "passed" else 0.0,
+        **verification,
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -206,6 +295,119 @@ def run_fault_tolerance_sandbox(
     return rows
 
 
+def run_replay_fault_tolerance_sandbox(
+    args: argparse.Namespace,
+    harness: RealHostScenarioHarness,
+    *,
+    sandbox_index: int,
+    sandbox: SandboxHandle,
+) -> dict[str, object]:
+    trace_response_count = _trace_response_count_for_sandbox(sandbox)
+    replay_points = choose_replay_points(trace_response_count, args.iters)
+    rng = random.Random(sandbox_index)
+    checkpoint_ms_values: list[float] = []
+    restore_ms_values: list[float] = []
+    recovery_ms_values: list[float] = []
+    readiness_ms_values: list[float] = []
+    end_to_end_recovery_ms_values: list[float] = []
+    lost_actions_values: list[float] = []
+    iterations_executed = 0
+    faults_injected = 0
+    recoveries_succeeded = 0
+    task_error = ""
+
+    try:
+        if sandbox.task_run is None:
+            raise RuntimeError("replay fault-tolerance benchmark expected sandbox.task_run")
+        for iteration, checkpoint_target in enumerate(replay_points, start=1):
+            iterations_executed += 1
+            sandbox.task_run.wait_for_progress(minimum_actions=checkpoint_target)
+            injected = should_inject_fault(
+                iteration=iteration,
+                sandbox_index=sandbox_index,
+                rate=args.fault_rate,
+                first_forced_iteration=args.first_fault_iteration,
+                rng=rng,
+            )
+            if not injected:
+                continue
+            faults_injected += 1
+            if args.auto_cr:
+                pre_fault = sandbox.task_run.wait_for_action_delta(delta=1)
+                event_started = time.perf_counter()
+                harness.inject_fault(sandbox)
+                observed_after = utc_now()
+                harness.notify_fault(sandbox)
+                recovery_started = time.perf_counter()
+                record = harness.wait_for_recovery(
+                    sandbox,
+                    event_type="fault",
+                    observed_after=observed_after,
+                )
+                recovery_finished = time.perf_counter()
+                post_recovery = sandbox.task_run.poll_status()
+                ready_at = time.perf_counter()
+                if record.status in {"restored", "relaunched"}:
+                    recoveries_succeeded += 1
+                recovery_ms_values.append((recovery_finished - recovery_started) * 1000.0)
+                readiness_ms_values.append((ready_at - recovery_finished) * 1000.0)
+                end_to_end_recovery_ms_values.append((ready_at - event_started) * 1000.0)
+                lost_actions_values.append(max(0, total_actions(pre_fault) - total_actions(post_recovery)))
+                sandbox.last_status = post_recovery
+                continue
+
+            checkpoint_started = time.perf_counter()
+            checkpoint_result = harness.checkpoint_manual(sandbox, leave_running=True)
+            checkpoint_finished = time.perf_counter()
+            checkpoint_ms_values.append((checkpoint_finished - checkpoint_started) * 1000.0)
+            if checkpoint_result.status != JobStatus.SUCCEEDED:
+                raise RuntimeError(
+                    f"checkpoint failed for sandbox {sandbox.sandbox_id}: "
+                    f"{checkpoint_result.status.value} {checkpoint_result.message}"
+                )
+            pre_fault = sandbox.task_run.wait_for_action_delta(delta=1)
+            event_started = time.perf_counter()
+            harness.inject_fault(sandbox)
+            recovery_started = time.perf_counter()
+            restore_result = harness.restore_once(sandbox, checkpoint_result.checkpoint_id)
+            recovery_finished = time.perf_counter()
+            post_recovery = sandbox.task_run.poll_status()
+            ready_at = time.perf_counter()
+            if restore_result.status.value == "succeeded":
+                recoveries_succeeded += 1
+            restore_ms_values.append(
+                (restore_result.finished_at - restore_result.started_at).total_seconds() * 1000.0
+            )
+            recovery_ms_values.append((recovery_finished - recovery_started) * 1000.0)
+            readiness_ms_values.append((ready_at - recovery_finished) * 1000.0)
+            end_to_end_recovery_ms_values.append((ready_at - event_started) * 1000.0)
+            lost_actions_values.append(max(0, total_actions(pre_fault) - checkpoint_target))
+            sandbox.last_status = post_recovery
+    except Exception as exc:
+        task_error = str(exc)
+
+    return _finalize_replay_row(
+        args,
+        harness,
+        sandbox,
+        row={
+            "iterations_planned": len(replay_points),
+            "iterations_executed": iterations_executed,
+            "faults_injected": faults_injected,
+            "recoveries_succeeded": recoveries_succeeded,
+            "checkpoint_ms_avg": average(checkpoint_ms_values),
+            "restore_ms_avg": average(restore_ms_values),
+            "recovery_ms_avg": average(recovery_ms_values),
+            "readiness_ms_avg": average(readiness_ms_values),
+            "end_to_end_recovery_ms_avg": average(end_to_end_recovery_ms_values),
+            "lost_actions_avg": average(lost_actions_values),
+            "retained_checkpoints": len(harness.storage.list_checkpoints(sandbox.sandbox_id)),
+            "skipped_no_replay_checkpoint": 1 if not replay_points else 0,
+        },
+        task_error=task_error,
+    )
+
+
 def run_fault_tolerance_benchmark(
     args: argparse.Namespace,
     harness: RealHostScenarioHarness,
@@ -229,6 +431,20 @@ def run_fault_tolerance_benchmark(
                 range(args.sandboxes),
             )
         )
+    if sandboxes and any(is_replay_llm_service_type(sandbox.llm_service_type) for sandbox in sandboxes):
+        with ThreadPoolExecutor(max_workers=max(1, args.sandboxes)) as executor:
+            rows = list(
+                executor.map(
+                    lambda item: run_replay_fault_tolerance_sandbox(
+                        args,
+                        harness,
+                        sandbox_index=item[0],
+                        sandbox=item[1],
+                    ),
+                    enumerate(sandboxes),
+                )
+            )
+        return sorted(rows, key=lambda row: str(row["sandbox_id"]))
     with ThreadPoolExecutor(max_workers=max(1, args.sandboxes)) as executor:
         row_groups = list(
             executor.map(
@@ -267,6 +483,22 @@ def main() -> None:
     ) as harness:
         rows = run_fault_tolerance_benchmark(args, harness)
     write_rows(args.out, rows)
+    if rows and "verification_status" in rows[0]:
+        summary = compute_summary(
+            rows,
+            [
+                "checkpoint_ms_avg",
+                "restore_ms_avg",
+                "recovery_ms_avg",
+                "readiness_ms_avg",
+                "end_to_end_recovery_ms_avg",
+                "lost_actions_avg",
+                "success_ratio",
+            ],
+        )
+        for key, value in summary.items():
+            print(f"{key}_avg: {value:.3f}")
+        return
     if args.auto_cr:
         event_rows = [row for row in rows if int(row["event_injected"]) == 1]
         summary = (

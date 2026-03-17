@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from integrations.llm_services.router import BenchmarkLLMRouter
 
@@ -79,6 +82,72 @@ class BenchmarkLLMRouterTests(unittest.TestCase):
             response["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
             "run_shell_command",
         )
+
+    def test_router_dispatches_to_iflow_trace_replay_and_rewinds_from_checkpoint_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.log"
+            trace_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "response",
+                                "data": {
+                                    "choices": [
+                                        {"message": {"role": "assistant", "content": "first"}}
+                                    ]
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "response",
+                                "data": {
+                                    "choices": [
+                                        {"message": {"role": "assistant", "content": "second"}}
+                                    ]
+                                },
+                            }
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            router = BenchmarkLLMRouter()
+            router.register_sandbox(
+                sandbox_id="sbx-replay",
+                llm_service_type="iflow_trace_replay",
+                llm_service_config={"trace_path": str(trace_path)},
+            )
+
+            first = router.handle_request(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx-replay"},
+                payload={},
+            )
+            checkpoint_metadata = router.checkpoint_metadata("sbx-replay")
+            second = router.handle_request(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx-replay"},
+                payload={},
+            )
+            router.restore_from_checkpoint_metadata("sbx-replay", checkpoint_metadata)
+            replayed_second = router.handle_request(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx-replay"},
+                payload={},
+            )
+            router.reset_sandbox("sbx-replay")
+            replayed_first = router.handle_request(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx-replay"},
+                payload={},
+            )
+
+        self.assertEqual(first["choices"][0]["message"]["content"], "first")
+        self.assertEqual(second["choices"][0]["message"]["content"], "second")
+        self.assertEqual(replayed_second["choices"][0]["message"]["content"], "second")
+        self.assertEqual(replayed_first["choices"][0]["message"]["content"], "first")
 
 
 if __name__ == "__main__":

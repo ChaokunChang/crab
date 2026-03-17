@@ -21,6 +21,7 @@ class SandboxHandle:
     agent_type: str = "simulated"
     llm_service_type: str = "simulated"
     llm_base_url: str | None = None
+    llm_control_base_url: str | None = None
     task_description: TaskDescription | None = None
     task_config: TaskConfig | None = None
     launch_source: str = "runc"

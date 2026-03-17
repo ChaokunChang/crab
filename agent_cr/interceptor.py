@@ -431,6 +431,7 @@ class AgentCRRequestInterceptor:
                 response[0],
                 len(response[2]),
             )
+            logger.debug(f"Intercepted request response of request_id={context.request_id}: {response}")
             return response
         finally:
             self._request_state_store.mark_request_end(context)

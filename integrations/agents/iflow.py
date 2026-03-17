@@ -33,6 +33,8 @@ const entrypoint = process.env.AGENT_CR_IFLOW_ENTRYPOINT;
 const task = process.env.AGENT_CR_IFLOW_TASK || "";
 const donePath = process.env.AGENT_CR_IFLOW_DONE_PATH;
 const exitPath = process.env.AGENT_CR_IFLOW_EXIT_PATH;
+const taskCwd = process.env.AGENT_CR_IFLOW_CWD || "/work";
+const keepAliveAfterTask = /^(1|true|yes)$/i.test(process.env.AGENT_CR_IFLOW_KEEPALIVE_AFTER_TASK || "");
 
 let settled = false;
 
@@ -48,7 +50,7 @@ function finish(code) {
 }
 
 const child = spawn(process.execPath, [entrypoint, "-p", task], {
-  cwd: "/work",
+  cwd: taskCwd,
   env: process.env,
   stdio: "inherit",
 });
@@ -62,6 +64,10 @@ child.once("error", (error) => {
 child.once("exit", (code, signal) => {
   const exitCode = code === null ? 1 : code;
   finish(exitCode);
+  if (keepAliveAfterTask) {
+    setInterval(() => {}, 1 << 30);
+    return;
+  }
   if (signal) {
     process.kill(process.pid, signal);
     return;
@@ -107,6 +113,12 @@ class IFlowAgent(BaseAgent):
         self._started_at_monotonic: float | None = None
         self._finished_at_monotonic: float | None = None
 
+    def _is_replay_mode(self) -> bool:
+        return self.sandbox.llm_service_type == "iflow_trace_replay"
+
+    def _is_compose_replay_mode(self) -> bool:
+        return self.sandbox.launch_source == "compose" and self._is_replay_mode()
+
     def survives_fault_relaunch(self) -> bool:
         return True
 
@@ -151,41 +163,6 @@ class IFlowAgent(BaseAgent):
         linux_cfg = cfg.get("linux", {})
         linux_cfg["seccomp"] = _IO_URING_SECCOMP
         cfg["linux"] = linux_cfg
-
-        cfg["process"]["terminal"] = False
-        cfg["process"]["cwd"] = "/work"
-        command = ";\n".join(
-            [
-                "export HOME=/root",
-                "export IFLOW_NON_INTERACTIVE=true",
-                f"export AGENT_CR_IFLOW_ENTRYPOINT={shlex.quote(entrypoint)}",
-                f"export AGENT_CR_IFLOW_TASK={escaped_task}",
-                f"export AGENT_CR_IFLOW_DONE_PATH={shlex.quote(marker_mount_paths['done'])}",
-                f"export AGENT_CR_IFLOW_EXIT_PATH={shlex.quote(marker_mount_paths['exit'])}",
-                "cd /work",
-                f"mkdir -p {shlex.quote(str(SANDBOX_TASK_OUTPUT_DIR))}",
-                (
-                    "rm -f "
-                    f"{shlex.quote(str(output_paths['stdout']))} "
-                    f"{shlex.quote(str(output_paths['stderr']))} "
-                    f"{shlex.quote(marker_mount_paths['exit'])} "
-                    f"{shlex.quote(marker_mount_paths['done'])}"
-                ),
-                f"touch {shlex.quote(marker_mount_paths['done'])}",
-                f"touch {shlex.quote(marker_mount_paths['exit'])}",
-                (
-                    f"exec {RUNTIME_MOUNT_PATH}/node/bin/node -e {shlex.quote(_IFLOW_INLINE_WRAPPER)} "
-                    f"-- {shlex.quote(IFLOW_WRAPPER_ARG)} "
-                    f">{shlex.quote(str(output_paths['stdout']))} "
-                    f"2>{shlex.quote(str(output_paths['stderr']))}"
-                ),
-            ]
-        )
-        cfg["process"]["args"] = [
-            "/bin/sh",
-            "-lc",
-            command,
-        ]
         current_env = cfg["process"].get("env", [])
         if not isinstance(current_env, list):
             raise ValueError(f"unsupported process env in {config_path}: {current_env!r}")
@@ -234,6 +211,80 @@ class IFlowAgent(BaseAgent):
             ]
         )
         cfg["mounts"] = mounts
+        if self._is_compose_replay_mode():
+            cfg["process"]["terminal"] = False
+            compose_cwd = self._compose_replay_cwd()
+            command = ";\n".join(
+                [
+                    "export HOME=/root",
+                    "export IFLOW_NON_INTERACTIVE=true",
+                    f"export AGENT_CR_IFLOW_ENTRYPOINT={shlex.quote(entrypoint)}",
+                    f"export AGENT_CR_IFLOW_TASK={escaped_task}",
+                    f"export AGENT_CR_IFLOW_CWD={shlex.quote(compose_cwd)}",
+                    "export AGENT_CR_IFLOW_KEEPALIVE_AFTER_TASK=true",
+                    f"export AGENT_CR_IFLOW_DONE_PATH={shlex.quote(marker_mount_paths['done'])}",
+                    f"export AGENT_CR_IFLOW_EXIT_PATH={shlex.quote(marker_mount_paths['exit'])}",
+                    f"cd {shlex.quote(compose_cwd)}",
+                    f"mkdir -p {shlex.quote(str(SANDBOX_TASK_OUTPUT_DIR))}",
+                    (
+                        "rm -f "
+                        f"{shlex.quote(str(output_paths['stdout']))} "
+                        f"{shlex.quote(str(output_paths['stderr']))} "
+                        f"{shlex.quote(marker_mount_paths['exit'])} "
+                        f"{shlex.quote(marker_mount_paths['done'])}"
+                    ),
+                    f"touch {shlex.quote(marker_mount_paths['done'])}",
+                    f"touch {shlex.quote(marker_mount_paths['exit'])}",
+                    (
+                        f"exec {RUNTIME_MOUNT_PATH}/node/bin/node -e {shlex.quote(_IFLOW_INLINE_WRAPPER)} "
+                        f"-- {shlex.quote(IFLOW_WRAPPER_ARG)} "
+                        f">{shlex.quote(str(output_paths['stdout']))} "
+                        f"2>{shlex.quote(str(output_paths['stderr']))}"
+                    ),
+                ]
+            )
+            cfg["process"]["cwd"] = compose_cwd
+            cfg["process"]["args"] = [
+                "/bin/sh",
+                "-lc",
+                command,
+            ]
+        else:
+            cfg["process"]["terminal"] = False
+            cfg["process"]["cwd"] = "/work"
+            command = ";\n".join(
+                [
+                    "export HOME=/root",
+                    "export IFLOW_NON_INTERACTIVE=true",
+                    f"export AGENT_CR_IFLOW_ENTRYPOINT={shlex.quote(entrypoint)}",
+                    f"export AGENT_CR_IFLOW_TASK={escaped_task}",
+                    "export AGENT_CR_IFLOW_CWD=/work",
+                    f"export AGENT_CR_IFLOW_DONE_PATH={shlex.quote(marker_mount_paths['done'])}",
+                    f"export AGENT_CR_IFLOW_EXIT_PATH={shlex.quote(marker_mount_paths['exit'])}",
+                    "cd /work",
+                    f"mkdir -p {shlex.quote(str(SANDBOX_TASK_OUTPUT_DIR))}",
+                    (
+                        "rm -f "
+                        f"{shlex.quote(str(output_paths['stdout']))} "
+                        f"{shlex.quote(str(output_paths['stderr']))} "
+                        f"{shlex.quote(marker_mount_paths['exit'])} "
+                        f"{shlex.quote(marker_mount_paths['done'])}"
+                    ),
+                    f"touch {shlex.quote(marker_mount_paths['done'])}",
+                    f"touch {shlex.quote(marker_mount_paths['exit'])}",
+                    (
+                        f"exec {RUNTIME_MOUNT_PATH}/node/bin/node -e {shlex.quote(_IFLOW_INLINE_WRAPPER)} "
+                        f"-- {shlex.quote(IFLOW_WRAPPER_ARG)} "
+                        f">{shlex.quote(str(output_paths['stdout']))} "
+                        f"2>{shlex.quote(str(output_paths['stderr']))}"
+                    ),
+                ]
+            )
+            cfg["process"]["args"] = [
+                "/bin/sh",
+                "-lc",
+                command,
+            ]
         config_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
 
     def extra_launch_metadata(self) -> dict[str, object]:
@@ -288,6 +339,8 @@ class IFlowAgent(BaseAgent):
             self.post_task_finish()
 
     def poll_status(self) -> dict[str, object]:
+        if self._is_compose_replay_mode():
+            return self._replay_progress_payload()
         actions = self._synthetic_action_count()
         return {
             "agent_type": self.agent_type,
@@ -318,6 +371,11 @@ class IFlowAgent(BaseAgent):
         logger.info("Stop requested for iflow task sandbox=%s", self.sandbox.sandbox_id)
 
     def on_restore_complete(self) -> None:
+        if self._is_compose_replay_mode():
+            self._clear_host_task_markers()
+            self._restore_complete_event.set()
+            logger.info("Observed restore completion for replay iflow task sandbox=%s", self.sandbox.sandbox_id)
+            return
         with self._state_lock:
             started_at = self._started_at_monotonic
             if started_at is None:
@@ -356,6 +414,9 @@ class IFlowAgent(BaseAgent):
         return "finished"
 
     def _wait_for_action_count(self, target_actions: int) -> None:
+        if self._is_compose_replay_mode():
+            self._wait_for_replay_action_count(target_actions)
+            return
         deadline = time.monotonic() + max(45.0, target_actions * self._tick_seconds * 4.0)
         while time.monotonic() < deadline:
             current_actions = self._synthetic_action_count()
@@ -519,3 +580,90 @@ class IFlowAgent(BaseAgent):
                     time.monotonic() - wait_started,
                 )
                 return True
+
+    def post_task_finish(self) -> None:
+        if self._is_compose_replay_mode():
+            return
+        super().post_task_finish()
+
+    def _bundle_process_config(self) -> dict[str, object]:
+        config_path = self.sandbox.bundle_dir / "config.json"
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        process = payload.get("process", {})
+        if not isinstance(process, dict):
+            raise RuntimeError(f"unsupported process config for sandbox {self.sandbox.sandbox_id}")
+        return process
+
+    def _compose_replay_cwd(self) -> str:
+        process = self._bundle_process_config()
+        cwd = process.get("cwd")
+        return str(cwd) if isinstance(cwd, str) and cwd else "/app"
+
+    def _clear_host_task_markers(self) -> None:
+        metadata = self.sandbox.launch_metadata.get("iflow", {})
+        logs_dir = self._resolve_logs_dir(metadata)
+        marker_paths = self._task_marker_paths(logs_dir)
+        for path in marker_paths.values():
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+
+    def _replay_router_state(self) -> dict[str, object]:
+        base_url = self.sandbox.llm_control_base_url
+        if not base_url:
+            raise RuntimeError(f"missing llm control base url for sandbox {self.sandbox.sandbox_id}")
+        payload = self.wait_for_http_json(
+            f"{base_url}/control/state?sandbox_id={self.sandbox.sandbox_id}",
+            timeout_s=10.0,
+        )
+        state = payload.get("state")
+        if not isinstance(state, dict):
+            return {}
+        nested_state = state.get("state")
+        if not isinstance(nested_state, dict):
+            return {}
+        return nested_state
+
+    def _replay_action_count(self) -> int:
+        state = self._replay_router_state()
+        raw_value = state.get("next_response_index", state.get("responses_served", 0))
+        try:
+            return max(0, int(raw_value))
+        except (TypeError, ValueError):
+            return 0
+
+    def _replay_progress_payload(self) -> dict[str, object]:
+        state = self._replay_router_state()
+        raw_value = state.get("next_response_index", state.get("responses_served", 0))
+        try:
+            actions = max(0, int(raw_value))
+        except (TypeError, ValueError):
+            actions = 0
+        return {
+            "agent_type": self.agent_type,
+            "state": self._task_state(),
+            "total_actions": actions,
+            "filesystem_actions": actions,
+            "process_actions": actions,
+            "network_actions": actions,
+            "stateful_actions": actions,
+            "replay_total_responses": state.get("total_responses"),
+            "replay_is_complete": bool(state.get("is_complete", False)),
+            "replay_next_response_index": actions,
+        }
+
+    def _wait_for_replay_action_count(self, target_actions: int) -> None:
+        deadline = time.monotonic() + max(45.0, target_actions * 10.0)
+        while time.monotonic() < deadline:
+            current_actions = self._replay_action_count()
+            if current_actions >= target_actions:
+                return
+            if self.sandbox.task_future is not None and self.sandbox.task_future.done():
+                self.sandbox.task_future.result()
+                raise RuntimeError(
+                    f"iflow replay task finished before reaching replay action count {target_actions}; "
+                    f"last observed count was {current_actions}"
+                )
+            time.sleep(min(0.2, self.TASK_POLL_INTERVAL_SECONDS))
+        raise RuntimeError(f"timed out waiting for iflow replay action count {target_actions}")
