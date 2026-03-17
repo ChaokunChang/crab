@@ -9,7 +9,6 @@ import logging
 import sys
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -17,28 +16,42 @@ if str(ROOT) not in sys.path:
 
 from agent_cr import KeepAllCheckpointManager, RequestContext, RequestInterceptorHook, SchedulerConfig, TreeSearchCheckpointingPolicy
 
+from integrations.agents import SandboxHandle, TaskConfig, TaskDescription
+from benchmarks.support import TreeSearchCheckpointRecord, add_common_args, compute_summary, configure_logging, write_rows
 from benchmarks.real_host_scenario_base import (
     RealHostScenarioHarness,
-    TreeSearchCheckpointRecord,
-    add_common_args,
-    compute_summary,
-    configure_logging,
-    write_rows,
 )
-
-if TYPE_CHECKING:
-    from benchmarks.real_host_scenario_base import SandboxHandle
 
 
 logger = logging.getLogger(__name__)
+_TASK_STOP_REQUEST_GRACE_SECONDS = 1.0
+_TASK_FORCE_STOP_GRACE_SECONDS = 5.0
+
+
+def benchmark_task_description() -> TaskDescription:
+    return TaskDescription("Continuously explore the search tree and make forward progress.")
+
+
+def default_task_config() -> TaskConfig:
+    return TaskConfig()
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Agent-CR tree-search real-host benchmark")
     parser.add_argument("--sandboxes", type=int, default=1)
-    parser.add_argument("--initial-steps", type=int, default=6)
+    parser.add_argument(
+        "--initial-steps",
+        type=int,
+        default=6,
+        help="Initial rollout action budget and max source-task completion wait before replay fan-out",
+    )
     parser.add_argument("--replay-points", type=int, default=2)
-    parser.add_argument("--fork-steps", type=int, default=3)
+    parser.add_argument(
+        "--fork-steps",
+        type=int,
+        default=3,
+        help="Replay action budget and max fork-task completion wait after restore",
+    )
     parser.add_argument("--auto-cr", action="store_true")
     parser.add_argument("--replay-mode", choices=["sequential", "concurrent"], default="sequential")
     add_common_args(parser)
@@ -99,8 +112,9 @@ def collect_manual_checkpoint_indexes(
     source_index: int,
 ) -> dict[int, TreeSearchCheckpointRecord]:
     checkpoints_by_step: dict[int, TreeSearchCheckpointRecord] = {}
+    assert source.task_run is not None
     for step in range(1, initial_steps + 1):
-        harness.wait_for_action_delta(source, delta=1)
+        source.task_run.wait_for_action_delta(delta=1)
         harness.set_snapshot_metadata(source, tree_search_step=step)
         checkpoint_started = time.perf_counter()
         checkpoint_result = harness.checkpoint_manual(source, leave_running=True)
@@ -130,7 +144,8 @@ def collect_auto_checkpoint_indexes(
     initial_steps: int,
     source_index: int,
 ) -> dict[int, TreeSearchCheckpointRecord]:
-    harness.wait_for_action_delta(source, delta=initial_steps)
+    assert source.task_run is not None
+    source.task_run.wait_for_action_delta(delta=initial_steps)
     checkpoints_by_step = harness.wait_for_tree_search_checkpoints(
         source.sandbox_id,
         initial_steps=initial_steps,
@@ -141,6 +156,110 @@ def collect_auto_checkpoint_indexes(
         sorted(checkpoints_by_step.keys()),
     )
     return checkpoints_by_step
+
+
+def task_is_running(sandbox: SandboxHandle) -> bool:
+    return sandbox.task_future is not None and not sandbox.task_future.done()
+
+
+def wait_for_task_future(
+    sandbox: SandboxHandle,
+    *,
+    timeout_s: float,
+) -> bool:
+    task_future = sandbox.task_future
+    if task_future is None:
+        return True
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if task_future.done():
+            task_future.result()
+            return True
+        time.sleep(0.05)
+    if task_future.done():
+        task_future.result()
+        return True
+    return False
+
+
+def wait_for_task_completion_or_stop(
+    harness: RealHostScenarioHarness,
+    sandbox: SandboxHandle,
+    *,
+    action_budget: int,
+    task_label: str,
+) -> None:
+    if sandbox.task_run is None or sandbox.task_future is None:
+        logger.debug(
+            "TreeSearch skipping %s wait sandbox=%s task_run=%s task_future=%s",
+            task_label,
+            sandbox.sandbox_id,
+            sandbox.task_run is not None,
+            sandbox.task_future is not None,
+        )
+        return
+
+    budget_actions = max(0, int(action_budget))
+    logger.info(
+        "TreeSearch waiting for %s sandbox=%s budget_actions=%d",
+        task_label,
+        sandbox.sandbox_id,
+        budget_actions,
+    )
+    waited_actions = 0
+    while waited_actions < budget_actions:
+        if sandbox.task_future.done():
+            sandbox.task_future.result()
+            logger.info(
+                "TreeSearch %s finished naturally sandbox=%s waited_actions=%d",
+                task_label,
+                sandbox.sandbox_id,
+                waited_actions,
+            )
+            return
+        try:
+            sandbox.task_run.wait_for_action_delta(delta=1)
+        except RuntimeError:
+            if sandbox.task_future.done():
+                sandbox.task_future.result()
+                logger.info(
+                    "TreeSearch %s finished during action wait sandbox=%s waited_actions=%d",
+                    task_label,
+                    sandbox.sandbox_id,
+                    waited_actions,
+                )
+                return
+            raise
+        waited_actions += 1
+
+    if sandbox.task_future.done():
+        sandbox.task_future.result()
+        logger.info(
+            "TreeSearch %s finished at wait budget sandbox=%s waited_actions=%d",
+            task_label,
+            sandbox.sandbox_id,
+            waited_actions,
+        )
+        return
+
+    logger.info(
+        "TreeSearch %s exceeded wait budget sandbox=%s waited_actions=%d; requesting stop",
+        task_label,
+        sandbox.sandbox_id,
+        waited_actions,
+    )
+    sandbox.task_run.request_stop()
+    if wait_for_task_future(sandbox, timeout_s=_TASK_STOP_REQUEST_GRACE_SECONDS):
+        return
+
+    logger.info(
+        "TreeSearch %s did not stop after request sandbox=%s; forcing runtime shutdown",
+        task_label,
+        sandbox.sandbox_id,
+    )
+    harness.deactivate_sandbox_runtime(sandbox)
+    if not wait_for_task_future(sandbox, timeout_s=_TASK_FORCE_STOP_GRACE_SECONDS):
+        raise RuntimeError(f"tree-search {task_label} did not stop for sandbox {sandbox.sandbox_id}")
 
 
 def prepare_replay_fork(
@@ -190,7 +309,8 @@ def restore_prepared_replay_fork(
             f"tree-search restore failed for step {prepared.replay_step}: {restore_result.message}"
         )
     recovery_finished = time.perf_counter()
-    prepared.fork.last_status = harness.poll_status(prepared.fork)
+    assert prepared.fork.task_run is not None
+    prepared.fork.last_status = prepared.fork.task_run.poll_status()
     ready_at = time.perf_counter()
     logger.info(
         "TreeSearch fork ready source_index=%d fork=%s replay_step=%d recovery_ms=%.3f readiness_ms=%.3f end_to_end_recovery_ms=%.3f",
@@ -221,8 +341,25 @@ def run_replay_progress(
     retained_source_checkpoints: int,
     fork_steps: int,
 ) -> dict[str, object]:
-    for _ in range(fork_steps):
-        harness.wait_for_action_delta(restored.prepared.fork, delta=1)
+    fork = restored.prepared.fork
+    if (
+        fork.task_description is None
+        or fork.task_config is None
+        or fork.agent_type is None
+    ):
+        raise RuntimeError(f"tree-search fork {fork.sandbox_id} is missing task launch metadata")
+    harness.launch_task(
+        fork.agent_type,
+        fork.task_description,
+        fork.task_config,
+        str(fork.sandbox_id),
+    )
+    wait_for_task_completion_or_stop(
+        harness,
+        fork,
+        action_budget=fork_steps,
+        task_label=f"fork replay task replay_step={restored.prepared.replay_step}",
+    )
     progress_finished = time.perf_counter()
     return {
         "source_index": restored.prepared.source_index,
@@ -260,7 +397,14 @@ def run_source_replays(
     retained_source_checkpoints = len(checkpoints_by_step)
     rows: list[dict[str, object]] = []
     prepared_forks: list[PreparedReplayFork] = []
-    harness.deactivate_sandbox_runtime(source)
+    wait_for_task_completion_or_stop(
+        harness,
+        source,
+        action_budget=args.initial_steps,
+        task_label="source task before replay",
+    )
+    if task_is_running(source):
+        harness.deactivate_sandbox_runtime(source)
     try:
         if args.replay_mode == "concurrent":
             prepared_forks = [
@@ -401,7 +545,25 @@ def run_tree_search_benchmark(
         args.replay_mode,
         replay_steps,
     )
-    sources = [harness.launch_tree_search_sandbox(f"tree-source-{source_index}") for source_index in range(args.sandboxes)]
+    dataset_path = getattr(args, "dataset", None)
+    dataset = harness.load_dataset(dataset_path) if dataset_path is not None else None
+    with ThreadPoolExecutor(max_workers=max(1, args.sandboxes)) as launcher:
+        sources = list(
+            launcher.map(
+                lambda source_index: harness.launch_task_record(
+                    f"tree-source-{source_index}",
+                    harness.select_task_record(
+                        dataset,
+                        sandbox_index=source_index,
+                        default_agent_type=args.agent_type,
+                        default_llm_service_type=args.llm_service_type,
+                        default_task_description=benchmark_task_description(),
+                        default_task_config=default_task_config(),
+                    ),
+                ),
+                range(args.sandboxes),
+            )
+        )
     indexed_sources = list(enumerate(sources))
 
     if args.auto_cr:

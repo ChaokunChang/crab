@@ -117,7 +117,7 @@ This is useful when you want strict coupling between restore eligibility and a s
 - `agent_cr/`: library code
 - `tests/`: unit and integration tests
 - `benchmarks/`: real-host and microbenchmark entrypoints
-- `simulated_agent/`: simulated LLM service, agent CLI, and image helpers
+- `integrations/`: benchmark agents, LLM services, and sandbox integrations
 - `docs/`: architecture notes
 - `legacy/`: older scripts kept outside the current implementation path
 
@@ -152,18 +152,53 @@ python3 benchmarks/bench_agent_cr_sandbox_e2e.py --sandboxes 2 --iters 5 --provi
 Real-host recovery benchmarks:
 
 ```bash
-python3 benchmarks/bench_fault_tolerance.py --sandboxes 1 --iters 3 --fault-rate 0.0 --first-fault-iteration 2
-python3 benchmarks/bench_fault_tolerance.py --auto-cr --sandboxes 1 --iters 3 --fault-rate 0.0 --first-fault-iteration 2
+python3 benchmarks/bench_fault_tolerance.py --sandboxes 1 --iters 5 --fault-rate 0.0 --first-fault-iteration 2
+python3 benchmarks/bench_fault_tolerance.py --auto-cr --sandboxes 1 --iters 5 --fault-rate 0.0 --first-fault-iteration 2
+python3 benchmarks/bench_fault_tolerance.py --auto-cr --sandboxes 1 --iters 10 --fault-rate 0.3 --first-fault-iteration 2
 python3 benchmarks/bench_fault_tolerance.py --auto-cr --sandboxes 10 --iters 10 --fault-rate 0.3 --first-fault-iteration 2
 
-python3 benchmarks/bench_spot_agent.py --sandboxes 1 --iters 3 --preemption-rate 0.0 --first-preempt-iteration 2
-python3 benchmarks/bench_spot_agent.py --auto-cr --sandboxes 1 --iters 3 --preemption-rate 0.0 --first-preempt-iteration 2
+python3 benchmarks/bench_spot_agent.py --sandboxes 1 --iters 5 --preemption-rate 0.0 --first-preempt-iteration 2
+python3 benchmarks/bench_spot_agent.py --auto-cr --sandboxes 1 --iters 5 --preemption-rate 0.0 --first-preempt-iteration 2
+python3 benchmarks/bench_spot_agent.py --auto-cr --sandboxes 1 --iters 10 --preemption-rate 0.3 --first-preempt-iteration 2
 python3 benchmarks/bench_spot_agent.py --auto-cr --sandboxes 10 --iters 10 --preemption-rate 0.3 --first-preempt-iteration 2
 
-python3 benchmarks/bench_tree_search.py --sandboxes 1 --initial-steps 3 --replay-points 1 --fork-steps 2 --replay-mode sequential
-python3 benchmarks/bench_tree_search.py --sandboxes 1 --initial-steps 3 --replay-points 2 --fork-steps 2 --replay-mode concurrent
+python3 benchmarks/bench_tree_search.py --sandboxes 1 --initial-steps 5 --replay-points 1 --fork-steps 2 --replay-mode sequential
+python3 benchmarks/bench_tree_search.py --sandboxes 1 --initial-steps 5 --replay-points 2 --fork-steps 2 --replay-mode concurrent
 python3 benchmarks/bench_tree_search.py --auto-cr --sandboxes 1 --initial-steps 10 --replay-points 3 --fork-steps 2 --replay-mode concurrent
 python3 benchmarks/bench_tree_search.py --auto-cr --sandboxes 3 --initial-steps 10 --replay-points 3 --fork-steps 2 --replay-mode concurrent
+```
+
+ 
+```bash
+rm -rf logs/tmp/* && clear && python3 benchmarks/bench_fault_tolerance.py --agent-type simulated --sandboxes 1 --iters 5 --fault-rate 0.0 --first-fault-iteration 2 --log-level debug --work-dir-host-root logs/tmp --out logs/tmp/out.csv 2>&1 | tee logs/tmp/debug.log
+rm -rf logs/tmp/* && clear && python3 benchmarks/bench_fault_tolerance.py --agent-type simulated --auto-cr --sandboxes 1 --iters 5 --fault-rate 0.0 --first-fault-iteration 2 --log-level debug --work-dir-host-root logs/tmp --out logs/tmp/out.csv 2>&1 | tee logs/tmp/debug.log
+rm -rf logs/tmp/* && clear && python3 benchmarks/bench_fault_tolerance.py --agent-type simulated --auto-cr --sandboxes 10 --iters 10 --fault-rate 0.3 --first-fault-iteration 2 --log-level debug --work-dir-host-root logs/tmp --out logs/tmp/out.csv 2>&1 | tee logs/tmp/debug.log
+
+rm -rf logs/tmp/* && clear && python3 benchmarks/bench_spot_agent.py --agent-type simulated --sandboxes 1 --iters 5 --preemption-rate 0.0 --first-preempt-iteration 2 --log-level debug --work-dir-host-root logs/tmp --out logs/tmp/out.csv 2>&1 | tee logs/tmp/debug.log
+rm -rf logs/tmp/* && clear && python3 benchmarks/bench_spot_agent.py --agent-type simulated --auto-cr --sandboxes 1 --iters 5 --preemption-rate 0.0 --first-preempt-iteration 2 --log-level debug --work-dir-host-root logs/tmp --out logs/tmp/out.csv 2>&1 | tee logs/tmp/debug.log
+rm -rf logs/tmp/* && clear && python3 benchmarks/bench_spot_agent.py --agent-type simulated --auto-cr --sandboxes 10 --iters 10 --preemption-rate 0.3 --first-preempt-iteration 2 --log-level debug --work-dir-host-root logs/tmp --out logs/tmp/out.csv 2>&1 | tee logs/tmp/debug.log
+
+rm -rf logs/tmp/* && clear && python3 benchmarks/bench_tree_search.py --agent-type simulated --sandboxes 1 --initial-steps 5 --replay-points 1 --fork-steps 2 --replay-mode sequential --log-level debug --work-dir-host-root logs/tmp --out logs/tmp/out.csv 2>&1 | tee logs/tmp/debug.log
+rm -rf logs/tmp/* && clear && python3 benchmarks/**bench_tree_search**.py --agent-type simulated --sandboxes 1 --initial-steps 5 --replay-points 2 --fork-steps 2 --replay-mode concurrent --log-level debug --work-dir-host-root logs/tmp --out logs/tmp/out.csv 2>&1 | tee logs/tmp/debug.log
+rm -rf logs/tmp/* && clear && python3 benchmarks/bench_tree_search.py --agent-type simulated --auto-cr --sandboxes 1 --initial-steps 10 --replay-points 3 --fork-steps 7 --replay-mode concurrent --log-level debug --work-dir-host-root logs/tmp --out logs/tmp/out.csv 2>&1 | tee logs/tmp/debug.log
+rm -rf logs/tmp/* && clear && python3 benchmarks/bench_tree_search.py --agent-type simulated --auto-cr --sandboxes 3 --initial-steps 10 --replay-points 3 --fork-steps 7 --replay-mode concurrent --log-level debug --work-dir-host-root logs/tmp --out logs/tmp/out.csv 2>&1 | tee logs/tmp/debug.log
+```
+
+```bash
+rm -rf logs/tmp/* && clear && python3 benchmarks/bench_fault_tolerance.py --agent-type iflow --sandboxes 1 --iters 5 --fault-rate 0.0 --first-fault-iteration 2 --log-level debug --work-dir-host-root logs/tmp --out logs/tmp/out.csv 2>&1 | tee logs/tmp/debug.log
+rm -rf logs/tmp/* && clear && python3 benchmarks/bench_fault_tolerance.py --agent-type iflow --auto-cr --sandboxes 1 --iters 5 --fault-rate 0.0 --first-fault-iteration 2 --log-level debug --work-dir-host-root logs/tmp --out logs/tmp/out.csv 2>&1 | tee logs/tmp/debug.log
+rm -rf logs/tmp/* && clear && python3 benchmarks/bench_fault_tolerance.py --agent-type iflow --auto-cr --sandboxes 1 --iters 10 --fault-rate 0.3 --first-fault-iteration 2 --log-level debug --work-dir-host-root logs/tmp --out logs/tmp/out.csv 2>&1 | tee logs/tmp/debug.log
+rm -rf logs/tmp/* && clear && python3 benchmarks/bench_fault_tolerance.py --agent-type iflow --auto-cr --sandboxes 10 --iters 10 --fault-rate 0.3 --first-fault-iteration 2 --log-level debug --work-dir-host-root logs/tmp --out logs/tmp/out.csv 2>&1 | tee logs/tmp/debug.log
+
+rm -rf logs/tmp/* && clear && python3 benchmarks/bench_spot_agent.py --agent-type iflow --sandboxes 1 --iters 5 --preemption-rate 0.0 --first-preempt-iteration 2 --log-level debug --work-dir-host-root logs/tmp --out logs/tmp/out.csv 2>&1 | tee logs/tmp/debug.log
+rm -rf logs/tmp/* && clear && python3 benchmarks/bench_spot_agent.py --agent-type iflow --auto-cr --sandboxes 1 --iters 5 --preemption-rate 0.0 --first-preempt-iteration 2 --log-level debug --work-dir-host-root logs/tmp --out logs/tmp/out.csv 2>&1 | tee logs/tmp/debug.log
+rm -rf logs/tmp/* && clear && python3 benchmarks/bench_spot_agent.py --agent-type iflow --auto-cr --sandboxes 1 --iters 10 --preemption-rate 0.3 --first-preempt-iteration 2 --log-level debug --work-dir-host-root logs/tmp --out logs/tmp/out.csv 2>&1 | tee logs/tmp/debug.log
+rm -rf logs/tmp/* && clear && python3 benchmarks/bench_spot_agent.py --agent-type iflow --auto-cr --sandboxes 10 --iters 10 --preemption-rate 0.3 --first-preempt-iteration 2 --log-level debug --work-dir-host-root logs/tmp --out logs/tmp/out.csv 2>&1 | tee logs/tmp/debug.log
+
+rm -rf logs/tmp/* && clear && python3 benchmarks/bench_tree_search.py --agent-type iflow --sandboxes 1 --initial-steps 5 --replay-points 1 --fork-steps 2 --replay-mode sequential --log-level debug --work-dir-host-root logs/tmp --out logs/tmp/out.csv 2>&1 | tee logs/tmp/debug.log
+rm -rf logs/tmp/* && clear && python3 benchmarks/bench_tree_search.py --agent-type iflow --sandboxes 1 --initial-steps 5 --replay-points 2 --fork-steps 2 --replay-mode concurrent --log-level debug --work-dir-host-root logs/tmp --out logs/tmp/out.csv 2>&1 | tee logs/tmp/debug.log
+rm -rf logs/tmp/* && clear && python3 benchmarks/bench_tree_search.py --agent-type iflow --auto-cr --sandboxes 1 --initial-steps 10 --replay-points 3 --fork-steps 7 --replay-mode concurrent --log-level debug --work-dir-host-root logs/tmp --out logs/tmp/out.csv 2>&1 | tee logs/tmp/debug.log
+rm -rf logs/tmp/* && clear && python3 benchmarks/bench_tree_search.py --agent-type iflow --auto-cr --sandboxes 3 --initial-steps 10 --replay-points 3 --fork-steps 7 --replay-mode concurrent --log-level debug --work-dir-host-root logs/tmp --out logs/tmp/out.csv 2>&1 | tee logs/tmp/debug.log
 ```
 
 The real-host benchmarks allocate temporary runtime state, create a ZFS pool, build the simulated agent image, and launch `runc` sandboxes through the shared harness in [benchmarks/real_host_scenario_base.py](/root/workspace/agent-cr/benchmarks/real_host_scenario_base.py).

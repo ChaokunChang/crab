@@ -4,8 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from simulated_agent.agent_cli import AgentRuntime, parse_anthropic_tool_calls, parse_openai_tool_calls
-from simulated_agent.service import (
+from integrations.sandboxes.simulated.agent_cli import AgentRuntime, parse_anthropic_tool_calls, parse_openai_tool_calls
+from integrations.llm_services.simulated.service import (
     SimulatedLLMState,
     build_anthropic_response,
     build_openai_response,
@@ -76,7 +76,7 @@ class SimulatedAgentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="sim_agent_") as tmp:
             runtime = AgentRuntime(
                 provider="openai",
-                interceptor_url="http://127.0.0.1:1",
+                llm_base_url="http://127.0.0.1:1",
                 sandbox_id="sbx-1",
                 work_dir=Path(tmp),
                 poll_interval_s=0.0,
@@ -113,7 +113,7 @@ class SimulatedAgentTests(unittest.TestCase):
             work_dir = Path(tmp)
             runtime = AgentRuntime(
                 provider="openai",
-                interceptor_url="http://127.0.0.1:1",
+                llm_base_url="http://127.0.0.1:1",
                 sandbox_id="sbx-1",
                 work_dir=work_dir,
                 poll_interval_s=0.0,
@@ -127,7 +127,7 @@ class SimulatedAgentTests(unittest.TestCase):
 
             reloaded = AgentRuntime(
                 provider="openai",
-                interceptor_url="http://127.0.0.1:1",
+                llm_base_url="http://127.0.0.1:1",
                 sandbox_id="sbx-1",
                 work_dir=work_dir,
                 poll_interval_s=0.0,
@@ -143,7 +143,7 @@ class SimulatedAgentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="sim_agent_") as tmp:
             runtime = AgentRuntime(
                 provider="openai",
-                interceptor_url="http://127.0.0.1:1",
+                llm_base_url="http://127.0.0.1:1",
                 sandbox_id="sbx-logs",
                 work_dir=Path(tmp),
                 poll_interval_s=0.0,
@@ -176,6 +176,38 @@ class SimulatedAgentTests(unittest.TestCase):
             self.assertIn("WARNING runtime error stage=fetch_tool_calls", log_text)
             self.assertIn("INFO running tool name=show_pwd", log_text)
             self.assertIn("DEBUG tool result name=show_pwd", log_text)
+
+    def test_runtime_normalizes_v1_llm_base_for_chat_requests(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sim_agent_") as tmp:
+            runtime = AgentRuntime(
+                provider="openai",
+                llm_base_url="http://127.0.0.1:9000/v1",
+                sandbox_id="sbx-v1",
+                work_dir=Path(tmp),
+                poll_interval_s=0.0,
+                status_port=0,
+            )
+
+            self.assertEqual(
+                runtime._build_url("/v1/chat/completions"),
+                "http://127.0.0.1:9000/v1/chat/completions",
+            )
+
+    def test_runtime_normalizes_v1_llm_base_for_proxy_health_requests(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sim_agent_") as tmp:
+            runtime = AgentRuntime(
+                provider="openai",
+                llm_base_url="http://127.0.0.1:9000/v1",
+                sandbox_id="sbx-v1",
+                work_dir=Path(tmp),
+                poll_interval_s=0.0,
+                status_port=0,
+            )
+
+            self.assertEqual(
+                runtime._build_url("/healthz"),
+                "http://127.0.0.1:9000/healthz",
+            )
 
 
 if __name__ == "__main__":

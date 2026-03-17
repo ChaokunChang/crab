@@ -94,40 +94,40 @@ def main() -> None:
             storage_config=StorageConfig(root_dir=Path(tmp)),
         )
         sandbox_id = SandboxId("bench-sandbox")
+        try:
+            eval_ms = bench_scheduler_eval(system, sandbox_id, args.iters)
+            storage_ms = bench_storage(system, sandbox_id, args.storage_iters)
+            executor_ms = bench_executor(system, sandbox_id, args.executor_jobs)
 
-        eval_ms = bench_scheduler_eval(system, sandbox_id, args.iters)
-        storage_ms = bench_storage(system, sandbox_id, args.storage_iters)
-        executor_ms = bench_executor(system, sandbox_id, args.executor_jobs)
+            rows = [
+                {
+                    "metric": "scheduler_eval_ms_total",
+                    "value": eval_ms,
+                    "iters": args.iters,
+                },
+                {
+                    "metric": "storage_put_get_ms_total",
+                    "value": storage_ms,
+                    "iters": args.storage_iters,
+                },
+                {
+                    "metric": "executor_run_checkpoints_ms_total",
+                    "value": executor_ms,
+                    "iters": args.executor_jobs,
+                },
+            ]
 
-        rows = [
-            {
-                "metric": "scheduler_eval_ms_total",
-                "value": eval_ms,
-                "iters": args.iters,
-            },
-            {
-                "metric": "storage_put_get_ms_total",
-                "value": storage_ms,
-                "iters": args.storage_iters,
-            },
-            {
-                "metric": "executor_run_checkpoints_ms_total",
-                "value": executor_ms,
-                "iters": args.executor_jobs,
-            },
-        ]
+            if args.out:
+                with open(args.out, "w", newline="") as f:
+                    w = csv.DictWriter(f, fieldnames=["metric", "value", "iters"])
+                    w.writeheader()
+                    for row in rows:
+                        w.writerow(row)
 
-        if args.out:
-            with open(args.out, "w", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=["metric", "value", "iters"])
-                w.writeheader()
-                for row in rows:
-                    w.writerow(row)
-
-        for row in rows:
-            print(f"{row['metric']}: {row['value']:.3f} (n={row['iters']})")
-
-        system.executor.shutdown()
+            for row in rows:
+                print(f"{row['metric']}: {row['value']:.3f} (n={row['iters']})")
+        finally:
+            system.executor.shutdown()
 
 
 if __name__ == "__main__":

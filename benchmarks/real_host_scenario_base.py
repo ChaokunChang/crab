@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import argparse
-import csv
-import ipaddress
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
-import random
 import shutil
-import socket
 import subprocess
+import os
 import sys
 import tempfile
 import threading
@@ -18,7 +15,7 @@ import urllib.request
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterable
+from datetime import datetime
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -39,18 +36,14 @@ from agent_cr import (
     CompositeRequestInterceptorHook,
     DefaultCWorker,
     DefaultRWorker,
-    EBPFEvent,
-    EBPFEventKind,
     EBPFSandboxInspector,
     HostInspectorServiceClient,
     RemoteSandboxInspector,
     ExecutorConfig,
-    InMemoryEBPFEventCollector,
     InMemoryRequestStateStore,
     InMemorySchedulerStateStore,
     InMemoryTelemetrySink,
     LocalCheckpointManager,
-    RequestContext,
     RequestInterceptorHook,
     RequestAwareSandboxInspector,
     RuncRuntimeAdapter,
@@ -68,8 +61,20 @@ from agent_cr.models import ArtifactPayload, utc_now
 from agent_cr.host_inspector.fs_helper import LibbpfFilesystemMonitor
 from agent_cr.host_inspector.runtime_resolver import RuntimeResolver
 from agent_cr.host_inspector.server import HostInspectorDaemon, HostInspectorServer
-from simulated_agent.image import build_image, export_image_rootfs
-from simulated_agent.service import serve
+from integrations.agents import BaseAgent, SandboxHandle, TaskConfig, TaskDescription, build_agent_registry
+from integrations.llm_services import (
+    default_llm_service_type_for_agent,
+    serve_benchmark_llm_router,
+    validate_llm_service_type,
+)
+from integrations.sandboxes.runtime import launcher as sandbox_launcher
+from integrations.sandboxes.runtime import network as sandbox_network
+from integrations.sandboxes.runtime import bundle as sandbox_bundle
+from integrations.sandboxes.runtime import compose as sandbox_compose
+from integrations.sandboxes.runtime import image as sandbox_image
+from integrations.sandboxes.iflow import DOCKERFILE_PATH as IFLOW_DOCKERFILE_PATH
+from integrations.sandboxes.simulated import DOCKERFILE_PATH as SIMULATED_DOCKERFILE_PATH
+from benchmarks import support as benchmark_support
 
 logger = logging.getLogger(__name__)
 
@@ -90,48 +95,11 @@ def checkpoint_guard_from_inspector(inspector):
     return guard
 
 
-def configure_logging(level_name: str) -> None:
-    logging.basicConfig(
-        level=getattr(logging, level_name.upper()),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-
-
-def bounded_probability(raw: str) -> float:
-    value = float(raw)
-    if value < 0.0 or value > 1.0:
-        raise argparse.ArgumentTypeError(f"expected probability in [0.0, 1.0], got {raw}")
-    return value
-
-
-def add_common_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--provider", choices=["openai", "anthropic"], default="openai")
-    parser.add_argument("--out", default="")
-    parser.add_argument("--transfer-delay-ms", type=float, default=0.0)
-    parser.add_argument(
-        "--work-dir-host-root",
-        type=Path,
-        default=None,
-        help="Host directory root for per-sandbox /work bind mounts",
-    )
-    parser.add_argument(
-        "--log-level",
-        choices=["debug", "info", "warning", "error", "critical"],
-        default="info",
-    )
-
-
 def require_binaries() -> None:
     required = ["docker", "runc", "criu", "zfs", "zpool", "ip"]
     missing = [name for name in required if shutil.which(name) is None]
     if missing:
         raise SystemExit(f"missing required binaries: {', '.join(missing)}")
-
-
-def find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def wait_for_http_json(url: str, *, timeout_s: float = 30.0) -> dict[str, object]:
@@ -146,272 +114,12 @@ def wait_for_http_json(url: str, *, timeout_s: float = 30.0) -> dict[str, object
             time.sleep(0.2)
     raise RuntimeError(f"timed out waiting for {url}: {last_exc}")
 
-
-def wait_for(
-    predicate,
-    *,
-    timeout_s: float = 30.0,
-    interval_s: float = 0.2,
-    raise_on_timeout: bool = True,
-):
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        if predicate():
-            return True
-        time.sleep(interval_s)
-    if raise_on_timeout:
-        raise RuntimeError("timed out waiting for predicate")
-    return False
-
-
-def enough_progress(payload: dict[str, object], *, total_actions: int = 6) -> bool:
-    return (
-        int(payload["total_actions"]) >= total_actions
-        and int(payload["filesystem_actions"]) >= 1
-        and int(payload["process_actions"]) >= 1
-        and int(payload["network_actions"]) >= 1
-        and int(payload["stateful_actions"]) >= 1
-    )
-
-
-def write_bundle_config(
-    *,
-    bundle_dir: Path,
-    interceptor_port: int,
-    interceptor_host: str,
-    provider: str,
-    sandbox_name: str,
-    status_port: int,
-    cgroup_path: str,
-    work_dir_host_path: Path | None = None,
-    network_namespace_path: Path | None = None,
-) -> None:
-    config_path = bundle_dir / "config.json"
-    cfg = json.loads(config_path.read_text())
-    linux_cfg = cfg.get("linux", {})
-    namespaces = []
-    network_namespace_found = False
-    for namespace in linux_cfg.get("namespaces", []):
-        ns_type = namespace.get("type")
-        if ns_type == "cgroup":
-            continue
-        if ns_type == "network":
-            network_namespace_found = True
-            if network_namespace_path is None:
-                continue
-            namespace = {**namespace, "path": str(network_namespace_path)}
-        namespaces.append(namespace)
-    if network_namespace_path is not None and not network_namespace_found:
-        namespaces.append({"type": "network", "path": str(network_namespace_path)})
-    linux_cfg["namespaces"] = namespaces
-    linux_cfg["cgroupsPath"] = cgroup_path
-    linux_cfg.pop("seccomp", None)
-    cfg["linux"] = linux_cfg
-    mounts = [mount for mount in cfg.get("mounts", []) if mount.get("destination") != "/work"]
-    if work_dir_host_path is not None:
-        work_dir_host_path.mkdir(parents=True, exist_ok=True)
-        mounts.append(
-            {
-                "destination": "/work",
-                "source": str(work_dir_host_path),
-                "type": "bind",
-                "options": ["rbind", "rw"],
-            }
-        )
-    cfg["mounts"] = mounts
-    cfg["process"]["terminal"] = False
-    cfg["process"]["cwd"] = "/work"
-    cfg["process"]["args"] = [
-        "/bin/sh",
-        "-lc",
-        f"exec /usr/local/bin/agent-cli run --provider {provider} >/dev/null 2>/dev/null",
-    ]
-    cfg["process"]["env"] = [
-        "PATH=/usr/local/bin:/usr/bin:/bin",
-        "PYTHONUNBUFFERED=1",
-        f"INTERCEPTOR_URL=http://{interceptor_host}:{interceptor_port}",
-        f"STATUS_PORT={status_port}",
-        "POLL_INTERVAL_S=0.2",
-        "AGENT_WORK_DIR=/work",
-        f"AGENT_SANDBOX_ID={sandbox_name}",
-        f"AGENT_PROVIDER={provider}",
-    ]
-    cfg["root"]["path"] = "rootfs"
-    cfg["root"]["readonly"] = False
-    config_path.write_text(json.dumps(cfg, indent=2))
-
-
-def record_activity_events(
-    *,
-    collector: InMemoryEBPFEventCollector,
-    sandbox_id: SandboxId,
-    previous: dict[str, object],
-    current: dict[str, object],
-) -> None:
-    mappings = [
-        ("filesystem_actions", EBPFEventKind.FILE_WRITE, {"path": "/work/tool_artifact.txt"}),
-        ("process_actions", EBPFEventKind.PROCESS_EXEC, {"command": "/bin/sh"}),
-        ("network_actions", EBPFEventKind.NETWORK_EGRESS, {"address": "127.0.0.1"}),
-    ]
-    for field, kind, metadata in mappings:
-        if int(current.get(field, 0)) > int(previous.get(field, 0)):
-            collector.record(
-                EBPFEvent(
-                    sandbox_id=sandbox_id,
-                    kind=kind,
-                    observed_at=utc_now(),
-                    metadata=metadata,
-                )
-            )
-
-
-def total_actions(payload: dict[str, object]) -> int:
-    return int(payload.get("total_actions", 0))
-
-
-def resolve_work_dir_host_path(work_dir_host_root: Path | None, sandbox_name: str) -> Path | None:
-    if work_dir_host_root is None:
-        return None
-    return work_dir_host_root.expanduser().resolve() / sandbox_name
-
-
-def compute_summary(rows: list[dict[str, object]], metric_keys: Iterable[str]) -> dict[str, float]:
-    summary: dict[str, float] = {}
-    if not rows:
-        return summary
-    for key in metric_keys:
-        summary[key] = sum(float(row[key]) for row in rows) / len(rows)
-    return summary
-
-
-def select_injected_indices(
-    population_size: int,
-    *,
-    iteration: int,
-    rate: float,
-    first_forced_iteration: int,
-    rng: random.Random,
-) -> list[int]:
-    if population_size <= 0:
-        return []
-    if first_forced_iteration > 0 and iteration < first_forced_iteration:
-        return []
-    selected = [index for index in range(population_size) if rng.random() < rate]
-    if first_forced_iteration > 0 and iteration == first_forced_iteration and 0 not in selected:
-        selected.insert(0, 0)
-    return sorted(set(selected))
-
-
-def resolve_checkpoint_copy_plan(
-    checkpoint_order: list[CheckpointId],
-    manifests: dict[CheckpointId, CheckpointManifest],
-    checkpoint_id: CheckpointId,
-) -> list[tuple[CheckpointId, bool, bool]]:
-    manifest = manifests[checkpoint_id]
-    plan: list[tuple[CheckpointId, bool, bool]] = [
-        (checkpoint_id, bool(manifest.process_artifacts), bool(manifest.filesystem_artifacts))
-    ]
-    need_process = not bool(manifest.process_artifacts)
-    need_filesystem = not bool(manifest.filesystem_artifacts)
-    if not need_process and not need_filesystem:
-        return plan
-
-    try:
-        current_index = checkpoint_order.index(checkpoint_id)
-        candidates = list(reversed(checkpoint_order[:current_index]))
-    except ValueError:
-        candidates = list(reversed(checkpoint_order))
-
-    for candidate_id in candidates:
-        if not need_process and not need_filesystem:
-            break
-        candidate = manifests[candidate_id]
-        copy_process = need_process and bool(candidate.process_artifacts)
-        copy_filesystem = need_filesystem and bool(candidate.filesystem_artifacts)
-        if not copy_process and not copy_filesystem:
-            continue
-        plan.insert(0, (candidate_id, copy_process, copy_filesystem))
-        if copy_process:
-            need_process = False
-        if copy_filesystem:
-            need_filesystem = False
-
-    if need_process or need_filesystem:
-        raise ValueError(f"unable to resolve restore dependencies for checkpoint {checkpoint_id}")
-    return plan
-
-
 @dataclass(frozen=True)
-class TreeSearchCheckpointRecord:
-    checkpoint_id: CheckpointId
-    replay_actions: int
-    checkpoint_ms: float = 0.0
-
-
-def build_tree_search_checkpoint_index(
-    manifests: Iterable[CheckpointManifest],
-    *,
-    initial_steps: int | None = None,
-    require_complete: bool = False,
-) -> dict[int, TreeSearchCheckpointRecord]:
-    indexed: dict[int, TreeSearchCheckpointRecord] = {}
-    for manifest in manifests:
-        raw_step = manifest.metadata.get("tree_search_step")
-        if raw_step is None:
-            continue
-        try:
-            step = int(raw_step)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"invalid tree_search_step={raw_step!r} for checkpoint {manifest.checkpoint_id}"
-            ) from exc
-        if step <= 0:
-            continue
-        if initial_steps is not None and step > initial_steps:
-            continue
-        if step in indexed:
-            raise ValueError(f"duplicate tree-search checkpoint for step {step}")
-        indexed[step] = TreeSearchCheckpointRecord(
-            checkpoint_id=manifest.checkpoint_id,
-            replay_actions=step,
-        )
-
-    if require_complete and initial_steps is not None:
-        missing = [step for step in range(1, initial_steps + 1) if step not in indexed]
-        if missing:
-            raise ValueError(f"missing tree-search checkpoints for steps {missing}")
-    return dict(sorted(indexed.items()))
-
-
-class NoopRequestInterceptorHook(RequestInterceptorHook):
-    def on_request_start(self, context: RequestContext) -> None:
-        _ = context
-
-    def on_request_end(self, context: RequestContext) -> None:
-        _ = context
-
-
-@dataclass
-class SandboxHandle:
-    sandbox_id: SandboxId
-    bundle_dir: Path
-    status_port: int
-    last_status: dict[str, object]
-    status_host: str = "127.0.0.1"
-
-    @property
-    def status_url(self) -> str:
-        return f"http://{self.status_host}:{self.status_port}/status"
-
-
-@dataclass(frozen=True)
-class TreeSearchNetworkLease:
-    sandbox_id: SandboxId
-    namespace_name: str
-    namespace_path: Path
-    host_veth_name: str
-    guest_veth_name: str
-    guest_ip: str
+class AgentSandboxImage:
+    agent_type: str
+    image_tag: str
+    exported_rootfs: Path
+    image_defaults: sandbox_image.ImageRuntimeDefaults
 
 
 class RealHostScenarioHarness:
@@ -438,11 +146,11 @@ class RealHostScenarioHarness:
         self._tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self.root: Path | None = None
         self.pool_name = ""
-        self.image_tag = ""
         self.runtime_state_root: Path | None = None
+        self.host_inspector_url: str = ""
         self._host_inspector_server: HostInspectorServer | None = None
+        self.host_inspector_client: HostInspectorServiceClient = None
         self.telemetry: InMemoryTelemetrySink | None = None
-        self.collector: InMemoryEBPFEventCollector | None = None
         self.request_state_store: InMemoryRequestStateStore | None = None
         self.base_inspector: EBPFSandboxInspector | None = None
         self.inspector: RequestAwareSandboxInspector | None = None
@@ -457,12 +165,16 @@ class RealHostScenarioHarness:
         self.llm_thread: threading.Thread | None = None
         self.sandboxes: list[SandboxHandle] = []
         self._sandbox_by_id: dict[SandboxId, SandboxHandle] = {}
-        self._tree_search_bridge_name: str | None = None
-        self._tree_search_bridge_ip = "10.250.0.1"
-        self._tree_search_network_cidr = "10.250.0.0/24"
-        self._tree_search_ip_cursor = 2
-        self._tree_search_network_leases: dict[SandboxId, TreeSearchNetworkLease] = {}
-        self._tree_search_ip_to_sandbox: dict[str, SandboxId] = {}
+        self.network_manager = sandbox_network.BenchmarkNetworkManager()
+        self._compose_image_tags: set[str] = set()
+        self._agent_registry = build_agent_registry()
+        self._sandbox_images: dict[str, AgentSandboxImage] = {}
+        self._sandbox_image_lock = threading.Lock()
+        self._task_executor = ThreadPoolExecutor(max_workers=max(1, self.max_workers))
+
+    @property
+    def benchmark_bridge_ip(self) -> str:
+        return self.network_manager.bridge_ip
 
     def _start_host_inspector_server(self) -> str:
         assert self.runtime_state_root is not None
@@ -502,29 +214,37 @@ class RealHostScenarioHarness:
 
     def __enter__(self) -> "RealHostScenarioHarness":
         require_binaries()
+        self.network_manager.configure()
+        logger.info(
+            "Selected benchmark network cidr=%s bridge_ip=%s",
+            self.network_manager.network_cidr,
+            self.network_manager.bridge_ip,
+        )
         self._tmpdir = tempfile.TemporaryDirectory(prefix="agent_cr_scenario_bench_")
-        self.root = Path(self._tmpdir.name)
+        # self.root = Path("/root/workspace/agent-cr/logs/tmp/agent_cr_bench")
+        bench_dir = os.environ.get("AGENTCR_BENCH_DIR", None)
+        if bench_dir and bench_dir.lower() not in ['tmpdir', 'tmp']:
+            suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.root = Path(bench_dir) / suffix
+        else:
+            self.root = Path(self._tmpdir.name)
         unique_suffix = uuid.uuid4().hex[:10]
         self.pool_name = f"agentcrbench{unique_suffix}"
-        self.image_tag = f"agent-cr-scenario-bench:{unique_suffix}"
         self.runtime_state_root = self.root / "runtime-state"
-        host_inspector_url = self._start_host_inspector_server()
-        self.llm_server = serve(host="127.0.0.1", port=0, response_delay_ms=250)
+        self.host_inspector_url = self._start_host_inspector_server()
+        self.llm_server = serve_benchmark_llm_router(host="127.0.0.1", port=0)
         self.llm_thread = threading.Thread(target=self.llm_server.serve_forever, daemon=True)
         self.llm_thread.start()
-
-        build_image(tag=self.image_tag)
-        exported_rootfs = export_image_rootfs(tag=self.image_tag, output_dir=self.root / "image")
+        wait_for_http_json(f"http://127.0.0.1:{self.llm_server.server_address[1]}/healthz")
         subprocess.run(["truncate", "-s", "10G", str(self.root / "zpool.img")], check=True)
         subprocess.run(["zpool", "create", "-f", self.pool_name, str(self.root / "zpool.img")], check=True)
         subprocess.run(["zfs", "create", f"{self.pool_name}/agent-cr"], check=True)
 
         self.telemetry = InMemoryTelemetrySink()
-        self.collector = InMemoryEBPFEventCollector()
         self.request_state_store = InMemoryRequestStateStore()
 
-        host_inspector_client = HostInspectorServiceClient(host_inspector_url)
-        self.base_inspector = RemoteSandboxInspector(host_inspector_client)
+        self.host_inspector_client = HostInspectorServiceClient(self.host_inspector_url)
+        self.base_inspector = RemoteSandboxInspector(self.host_inspector_client)
         self.inspector = RequestAwareSandboxInspector(self.base_inspector, self.request_state_store)
         self.runtime = RuncRuntimeAdapter(
             paths=RuncRuntimePaths(
@@ -559,7 +279,7 @@ class RealHostScenarioHarness:
                 metadata_root=self.root / "sandbox-meta",
                 zfs_dataset_prefix=f"{self.pool_name}/agent-cr",
             ),
-            host_inspector_client=host_inspector_client
+            host_inspector_client=self.host_inspector_client,
         )
         self.system = AgentCRSystem(
             scheduler=CRScheduler(
@@ -594,14 +314,18 @@ class RealHostScenarioHarness:
         wait_for_http_json(f"http://127.0.0.1:{self.interceptor.port}/healthz")
         if self.auto_cr:
             self.system.start()
-        self.exported_rootfs = exported_rootfs
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        # input("wait for signal to cleanup")
+        for sandbox in self.sandboxes:
+            if sandbox.task_run is not None:
+                sandbox.task_run.request_stop()
         if self.system is not None and self.auto_cr:
             self.system.stop()
         if self.interceptor is not None:
             self.interceptor.stop()
+        self._task_executor.shutdown(wait=True, cancel_futures=True)
         if self.executor is not None:
             self.executor.shutdown()
         if self.runtime_state_root is not None:
@@ -612,23 +336,24 @@ class RealHostScenarioHarness:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-        for sandbox_id in list(self._tree_search_network_leases):
-            self._release_tree_search_network_lease(sandbox_id)
-        if self._tree_search_bridge_name is not None:
-            subprocess.run(
-                ["ip", "link", "delete", self._tree_search_bridge_name],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            self._tree_search_bridge_name = None
-        if self.image_tag:
-            subprocess.run(
-                ["docker", "rmi", "-f", self.image_tag],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+        self.network_manager.cleanup()
+        for sandbox in self.sandboxes:
+            if self.llm_server is not None:
+                self.llm_server.benchmark_llm_router.unregister_sandbox(str(sandbox.sandbox_id))  # type: ignore[attr-defined]
+        # for image in self._sandbox_images.values():
+            # subprocess.run(
+            #     ["docker", "rmi", "-f", image.image_tag],
+            #     check=False,
+            #     stdout=subprocess.DEVNULL,
+            #     stderr=subprocess.DEVNULL,
+            # )
+        # for image_tag in sorted(self._compose_image_tags):
+            # subprocess.run(
+            #     ["docker", "rmi", "-f", image_tag],
+            #     check=False,
+            #     stdout=subprocess.DEVNULL,
+            #     stderr=subprocess.DEVNULL,
+            # )
         if self.pool_name:
             subprocess.run(
                 ["zfs", "destroy", "-r", f"{self.pool_name}/agent-cr"],
@@ -651,17 +376,165 @@ class RealHostScenarioHarness:
         if self._tmpdir is not None:
             self._tmpdir.cleanup()
 
-    def launch_sandbox(self, sandbox_name: str) -> SandboxHandle:
+    def get_agent_class(self, agent_type: str) -> type[BaseAgent]:
+        try:
+            return self._agent_registry[agent_type]
+        except KeyError as exc:
+            raise ValueError(f"unsupported benchmark agent type: {agent_type}") from exc
+
+    def build_task_run(
+        self,
+        agent_type: str,
+        sandbox: SandboxHandle,
+        task_description: TaskDescription,
+        task_config: TaskConfig,
+    ) -> BaseAgent:
         assert self.root is not None
-        assert self.inspector is not None
+        return self.get_agent_class(agent_type)(
+            sandbox,
+            task_description,
+            task_config,
+            runtime_state_root=self.runtime_state_root,
+            agent_host_dir=self.root / agent_type / str(sandbox.sandbox_id),
+            llm_base_url=sandbox.llm_base_url,
+        )
+
+    def _agent_requires_benchmark_network(self, agent_type: str) -> bool:
+        return bool(self.get_agent_class(agent_type).requires_network_namespace)
+
+    def resolve_llm_service_type(self, *, agent_type: str, llm_service_type: str | None) -> str:
+        resolved = llm_service_type or default_llm_service_type_for_agent(agent_type)
+        validate_llm_service_type(provider=self.provider, llm_service_type=resolved)
+        return resolved
+
+    def _sandbox_dockerfile_path(self, agent_type: str) -> Path:
+        if agent_type == "iflow":
+            return IFLOW_DOCKERFILE_PATH
+        if agent_type == "simulated":
+            return SIMULATED_DOCKERFILE_PATH
+        raise ValueError(f"unsupported benchmark agent type for sandbox image: {agent_type}")
+
+    def _sandbox_build_context_path(self, agent_type: str) -> Path:
+        if agent_type == "iflow":
+            return IFLOW_DOCKERFILE_PATH.parent
+        if agent_type == "simulated":
+            return SIMULATED_DOCKERFILE_PATH.parent
+        raise ValueError(f"unsupported benchmark agent type for sandbox image: {agent_type}")
+
+    def _sandbox_image_tag(self, agent_type: str) -> str:
+        return f"agent-cr-{sandbox_image.docker_tag_component(agent_type)}-bench:workspace"
+
+    def ensure_sandbox_image(self, agent_type: str) -> AgentSandboxImage:
+        assert self.root is not None
+        with self._sandbox_image_lock:
+            cached = self._sandbox_images.get(agent_type)
+            if cached is not None:
+                return cached
+            image_tag = self._sandbox_image_tag(agent_type)
+            sandbox_image.build_image(
+                tag=image_tag,
+                build_context=self._sandbox_build_context_path(agent_type),
+                dockerfile_path=self._sandbox_dockerfile_path(agent_type),
+            )
+            image_defaults = sandbox_image.inspect_image_runtime_defaults(tag=image_tag)
+            exported_rootfs = sandbox_image.export_image_rootfs(tag=image_tag, output_dir=self.root / "image" / agent_type)
+            built = AgentSandboxImage(
+                agent_type=agent_type,
+                image_tag=image_tag,
+                exported_rootfs=exported_rootfs,
+                image_defaults=image_defaults,
+            )
+            self._sandbox_images[agent_type] = built
+            return built
+
+    def get_sandbox_handle(self, sandbox_id: str | SandboxId) -> SandboxHandle:
+        target = SandboxId(str(sandbox_id))
+        return self._sandbox_by_id[target]
+
+    def load_dataset(self, path: Path) -> list[benchmark_support.BenchmarkTaskRecord]:
+        dataset_root = path.expanduser().resolve().parent
+        records: list[benchmark_support.BenchmarkTaskRecord] = []
+        for line_number, raw_line in enumerate(path.expanduser().resolve().read_text(encoding="utf-8").splitlines(), start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            payload = json.loads(line)
+            if not isinstance(payload, dict):
+                raise ValueError(f"dataset row {line_number} in {path} must be an object")
+            compose_file = payload.get("docker_compose_file")
+            env_file = payload.get("env_file")
+            records.append(
+                benchmark_support.BenchmarkTaskRecord(
+                    agent_type=str(payload.get("agent_type", "simulated")),
+                    task_description=TaskDescription.from_json_value(payload.get("task_description", "")),
+                    task_config=TaskConfig.from_json_value(payload.get("task_config")),
+                    llm_service_type=None if payload.get("llm_service_type") is None else str(payload["llm_service_type"]),
+                    docker_compose_file=None if compose_file is None else (dataset_root / str(compose_file)).resolve(),
+                    env_file=None if env_file is None else (dataset_root / str(env_file)).resolve(),
+                    service_name=None if payload.get("service_name") is None else str(payload["service_name"]),
+                )
+            )
+        if not records:
+            raise ValueError(f"dataset {path} did not contain any task rows")
+        return records
+
+    def select_task_record(
+        self,
+        dataset: list[benchmark_support.BenchmarkTaskRecord] | None,
+        *,
+        sandbox_index: int,
+        default_agent_type: str,
+        default_llm_service_type: str | None,
+        default_task_description: TaskDescription,
+        default_task_config: TaskConfig,
+    ) -> benchmark_support.BenchmarkTaskRecord:
+        if dataset:
+            return dataset[sandbox_index % len(dataset)]
+        return benchmark_support.BenchmarkTaskRecord(
+            agent_type=default_agent_type,
+            task_description=default_task_description,
+            task_config=default_task_config,
+            llm_service_type=default_llm_service_type,
+        )
+
+    def launch_sandbox(
+        self,
+        sandbox_name: str,
+        *,
+        agent_type: str = "simulated",
+        llm_service_type: str | None = None,
+        task_description: TaskDescription | None = None,
+        task_config: TaskConfig | None = None,
+    ) -> SandboxHandle:
+        assert self.root is not None
         assert self.base_inspector is not None
         assert self.system is not None
         assert self.interceptor is not None
 
+        if (task_description is None) != (task_config is None):
+            raise ValueError("task_description and task_config must be provided together")
+
+        resolved_task_description = task_description or TaskDescription("")
+        resolved_task_config = task_config or TaskConfig()
+        resolved_llm_service_type = self.resolve_llm_service_type(agent_type=agent_type, llm_service_type=llm_service_type)
+        sandbox_image = self.ensure_sandbox_image(agent_type)
+        network_lease = (
+            self.network_manager.allocate_lease(SandboxId(sandbox_name))
+            if self._agent_requires_benchmark_network(agent_type)
+            else None
+        )
         handle, work_dir_host_path = self._prepare_sandbox_handle(
             sandbox_name,
-            interceptor_host="127.0.0.1",
+            interceptor_host=self.network_manager.bridge_ip if network_lease is not None else "127.0.0.1",
+            network_lease=network_lease,
+            agent_type=agent_type,
+            llm_service_type=resolved_llm_service_type,
+            image_defaults=sandbox_image.image_defaults,
+            image_rootfs_dir=sandbox_image.exported_rootfs,
         )
+        task_run = self.build_task_run(agent_type, handle, resolved_task_description, resolved_task_config)
+        task_run.prepare_sandbox()
+        task_run.configure_bundle()
         sandbox_id = handle.sandbox_id
         self.base_inspector.upsert_snapshot(
             SandboxSnapshot(
@@ -673,56 +546,143 @@ class RealHostScenarioHarness:
                 observed_at=utc_now(),
             )
         )
-        self.system.sandbox_manager.launch(
-            "runc",
-            {
-                "sandbox_id": sandbox_name,
-                "bundle_path": str(handle.bundle_dir),
-                "work_dir_host_path": None if work_dir_host_path is None else str(work_dir_host_path),
-                "rootfs_init_dirs": [
-                    "work",
-                    "tmp",
-                    "proc",
-                    "dev",
-                    "dev/pts",
-                    "dev/shm",
-                    "dev/mqueue",
-                    "sys",
-                    "run",
-                    "var",
-                ],
-                "rootfs_copy_paths": [{"source": str(self.exported_rootfs), "destination": "/"}],
-            },
-        )
-        payload = wait_for_http_json(f"http://127.0.0.1:{handle.status_port}/status")
-        handle.last_status = payload
+        if network_lease is not None:
+            self.network_manager.register_guest_ip(network_lease.guest_ip, sandbox_id)
+        launch_metadata = {
+            "sandbox_id": sandbox_name,
+            "bundle_path": str(handle.bundle_dir),
+            "work_dir_host_path": None if work_dir_host_path is None else str(work_dir_host_path),
+            "rootfs_init_dirs": task_run.rootfs_init_dirs(),
+            "rootfs_copy_paths": [{"source": str(sandbox_image.exported_rootfs), "destination": "/"}],
+            **task_run.extra_launch_metadata(),
+            **handle.launch_metadata.get("runtime", {}),
+        }
+        self.system.sandbox_manager.launch("runc", launch_metadata)
+        task_run.wait_for_task_ready()
         logger.info(
-            "Launched benchmark sandbox name=%s sandbox_id=%s status_port=%d auto_cr=%s",
+            "Launched benchmark sandbox name=%s sandbox_id=%s status_host=%s status_port=%d auto_cr=%s agent_type=%s",
             sandbox_name,
             sandbox_id,
+            handle.status_host,
             handle.status_port,
             self.auto_cr,
+            agent_type,
         )
         return handle
 
-    def launch_tree_search_sandbox(self, sandbox_name: str) -> SandboxHandle:
-        assert self.root is not None
-        assert self.inspector is not None
-        assert self.base_inspector is not None
-        assert self.system is not None
-        assert self.interceptor is not None
+    def launch_task(
+        self,
+        agent_type: str,
+        task_description: TaskDescription,
+        task_config: TaskConfig,
+        sandbox_id: str,
+    ) -> BaseAgent:
+        handle = self.get_sandbox_handle(sandbox_id)
+        if handle.task_future is not None and not handle.task_future.done():
+            if handle.task_run is not None:
+                handle.task_run.request_stop()
+            handle.task_future.cancel()
+        handle.agent_type = agent_type
+        handle.task_description = task_description
+        handle.task_config = task_config
+        task_run = self.build_task_run(agent_type, handle, task_description, task_config)
+        handle.task_run = task_run
+        handle.task_future = self._task_executor.submit(task_run.perform_task)
+        return task_run
 
-        network_lease = self._allocate_tree_search_network_lease(SandboxId(sandbox_name))
+    def launch_sandbox_and_task(
+        self,
+        sandbox_name: str,
+        *,
+        agent_type: str,
+        llm_service_type: str | None = None,
+        task_description: TaskDescription,
+        task_config: TaskConfig,
+    ) -> SandboxHandle:
+        handle = self.launch_sandbox(
+            sandbox_name,
+            agent_type=agent_type,
+            llm_service_type=llm_service_type,
+            task_description=task_description,
+            task_config=task_config,
+        )
+        self.launch_task(agent_type, task_description, task_config, str(handle.sandbox_id))
+        return handle
+
+    def launch_task_record(
+        self,
+        sandbox_name: str,
+        task_record: benchmark_support.BenchmarkTaskRecord,
+    ) -> SandboxHandle:
+        if task_record.docker_compose_file is not None:
+            if task_record.env_file is None:
+                raise ValueError("compose-backed dataset rows must include env_file")
+            return self.launch_sandbox_from_docker_compose_file(
+                task_record.docker_compose_file,
+                task_record.env_file,
+                sandbox_name=sandbox_name,
+                service_name=task_record.service_name,
+                agent_type=task_record.agent_type,
+                llm_service_type=task_record.llm_service_type,
+                task_description=task_record.task_description,
+                task_config=task_record.task_config,
+            )
+        return self.launch_sandbox_and_task(
+            sandbox_name,
+            agent_type=task_record.agent_type,
+            llm_service_type=task_record.llm_service_type,
+            task_description=task_record.task_description,
+            task_config=task_record.task_config,
+        )
+
+    def launch_sandbox_from_docker_compose_file(
+        self,
+        compose_file: Path,
+        env_file: Path,
+        *,
+        sandbox_name: str,
+        service_name: str | None = None,
+        status_host: str | None = None,
+        status_port: int | None = None,
+        agent_type: str | None = None,
+        llm_service_type: str | None = None,
+        task_description: TaskDescription | None = None,
+        task_config: TaskConfig | None = None,
+    ) -> SandboxHandle:
+        service_name, service = sandbox_compose.load_compose_service(
+            compose_file=compose_file,
+            env_file=env_file,
+            service_name=service_name,
+        )
+        network_lease = self.network_manager.allocate_lease(SandboxId(sandbox_name))
         handle, work_dir_host_path = self._prepare_sandbox_handle(
             sandbox_name,
-            interceptor_host=self._tree_search_bridge_ip,
+            interceptor_host=self.network_manager.bridge_ip,
             network_lease=network_lease,
+            agent_type=agent_type or "simulated",
+            llm_service_type=self.resolve_llm_service_type(
+                agent_type=agent_type or "simulated",
+                llm_service_type=llm_service_type,
+            ),
+            status_port=status_port,
+            status_host=status_host if status_host is not None else network_lease.guest_ip,
         )
-        sandbox_id = handle.sandbox_id
-        self._tree_search_ip_to_sandbox[network_lease.guest_ip] = sandbox_id
+        translation = sandbox_compose.translate_compose_service(
+            compose_file=compose_file,
+            service_name=service_name,
+            service=service,
+            bundle_dir=handle.bundle_dir,
+            sandbox_id=str(handle.sandbox_id),
+            work_dir_host_path=work_dir_host_path,
+            compose_image_root=self.root / "compose-images",
+            compose_image_tags=self._compose_image_tags,
+        )
+        assert self.base_inspector is not None
+        assert self.system is not None
+        self.network_manager.register_guest_ip(network_lease.guest_ip, handle.sandbox_id)
         self.base_inspector.upsert_snapshot(
             SandboxSnapshot(
-                sandbox_id=sandbox_id,
+                sandbox_id=handle.sandbox_id,
                 runtime_name="runc",
                 is_running=True,
                 process_changed=False,
@@ -730,37 +690,18 @@ class RealHostScenarioHarness:
                 observed_at=utc_now(),
             )
         )
-        self.system.sandbox_manager.launch(
-            "runc",
-            {
-                "sandbox_id": sandbox_name,
-                "bundle_path": str(handle.bundle_dir),
-                "work_dir_host_path": None if work_dir_host_path is None else str(work_dir_host_path),
-                "rootfs_init_dirs": [
-                    "work",
-                    "tmp",
-                    "proc",
-                    "dev",
-                    "dev/pts",
-                    "dev/shm",
-                    "dev/mqueue",
-                    "sys",
-                    "run",
-                    "var",
-                ],
-                "rootfs_copy_paths": [{"source": str(self.exported_rootfs), "destination": "/"}],
-            },
-        )
-        payload = wait_for_http_json(handle.status_url)
-        handle.last_status = payload
-        logger.info(
-            "Launched tree-search sandbox name=%s sandbox_id=%s guest_ip=%s status_port=%d auto_cr=%s",
-            sandbox_name,
-            sandbox_id,
-            network_lease.guest_ip,
-            handle.status_port,
-            self.auto_cr,
-        )
+        self.system.sandbox_manager.launch("runc", translation.runtime_launch_metadata)
+        handle.launch_source = "compose"
+        handle.launch_metadata["runtime"] = dict(translation.runtime_launch_metadata)
+        handle.launch_metadata["compose"] = dict(translation.compose_launch_metadata)
+        handle.last_status = {}
+        if agent_type is not None and task_description is not None and task_config is not None:
+            self.launch_task(agent_type, task_description, task_config, str(handle.sandbox_id))
+            if handle.task_run is not None:
+                try:
+                    handle.task_run.wait_for_task_ready()
+                except RuntimeError:
+                    pass
         return handle
 
     def add_interceptor_hook(self, hook: RequestInterceptorHook) -> None:
@@ -773,10 +714,11 @@ class RealHostScenarioHarness:
         headers: dict[str, str],
         body: bytes,
     ) -> str | None:
-        _ = (headers, body)
-        if client_host is None:
-            return None
-        sandbox_id = self._tree_search_ip_to_sandbox.get(client_host)
+        _ = body
+        sandbox_id_from_header = str(headers.get("X-Agent-Sandbox-Id", "")).strip()
+        if sandbox_id_from_header:
+            return sandbox_id_from_header
+        sandbox_id = self.network_manager.resolve_sandbox_id(client_host)
         if sandbox_id is None:
             return None
         return str(sandbox_id)
@@ -790,32 +732,6 @@ class RealHostScenarioHarness:
         if drained:
             logger.info("Drained %d queued request-state changes", drained)
         return drained
-
-    def poll_status(self, sandbox: SandboxHandle) -> dict[str, object]:
-        return wait_for_http_json(sandbox.status_url)
-
-    def wait_for_progress(self, sandbox: SandboxHandle, *, minimum_actions: int) -> dict[str, object]:
-        wait_for(lambda: enough_progress(self.poll_status(sandbox), total_actions=minimum_actions), timeout_s=45.0)
-        payload = self.poll_status(sandbox)
-        self.record_activity(sandbox, payload)
-        return payload
-
-    def wait_for_action_delta(self, sandbox: SandboxHandle, *, delta: int) -> dict[str, object]:
-        baseline = total_actions(sandbox.last_status)
-        wait_for(lambda: total_actions(self.poll_status(sandbox)) >= baseline + delta, timeout_s=45.0)
-        payload = self.poll_status(sandbox)
-        self.record_activity(sandbox, payload)
-        return payload
-
-    def record_activity(self, sandbox: SandboxHandle, current: dict[str, object]) -> None:
-        assert self.collector is not None
-        record_activity_events(
-            collector=self.collector,
-            sandbox_id=sandbox.sandbox_id,
-            previous=sandbox.last_status,
-            current=current,
-        )
-        sandbox.last_status = current
 
     def set_snapshot_metadata(self, sandbox: SandboxHandle, **metadata: object) -> None:
         self.set_snapshot_metadata_by_id(sandbox.sandbox_id, **metadata)
@@ -851,17 +767,22 @@ class RealHostScenarioHarness:
 
     def checkpoint_manual(self, sandbox: SandboxHandle, leave_running: bool=False):
         assert self.system is not None
+        if sandbox.launch_source != "runc":
+            raise RuntimeError(f"checkpoint_manual unsupported for launch_source={sandbox.launch_source}")
         logger.debug("Benchmark requesting checkpoint_manual for sandbox=%s", sandbox.sandbox_id)
         return self.system.checkpoint_once(sandbox.sandbox_id, leave_running=leave_running)
-        
-        
+
     def checkpoint_if_due(self, sandbox: SandboxHandle):
         assert self.system is not None
+        if sandbox.launch_source != "runc":
+            raise RuntimeError(f"checkpoint_if_due unsupported for launch_source={sandbox.launch_source}")
         logger.debug("Benchmark requesting checkpoint_if_due for sandbox=%s", sandbox.sandbox_id)
         return self.system.checkpoint_if_due(sandbox.sandbox_id)
 
     def restore_once(self, sandbox: SandboxHandle, checkpoint_id: CheckpointId):
         assert self.system is not None
+        if sandbox.launch_source != "runc":
+            raise RuntimeError(f"restore_once unsupported for launch_source={sandbox.launch_source}")
         logger.info(
             "Benchmark requesting restore sandbox=%s checkpoint=%s transfer_delay_ms=%.1f",
             sandbox.sandbox_id,
@@ -870,7 +791,10 @@ class RealHostScenarioHarness:
         )
         if self.transfer_delay_ms > 0:
             time.sleep(self.transfer_delay_ms / 1000.0)
-        return self.system.restore_once(sandbox.sandbox_id, checkpoint_id)
+        result = self.system.restore_once(sandbox.sandbox_id, checkpoint_id)
+        if result.status.value == "succeeded" and sandbox.task_run is not None:
+            sandbox.task_run.on_restore_complete()
+        return result
 
     def notify_fault(self, sandbox: SandboxHandle, *, reason: str = "fault") -> None:
         assert self.system is not None
@@ -906,8 +830,10 @@ class RealHostScenarioHarness:
                 return None
             return record
 
-        wait_for(lambda: _matching_record() is not None, timeout_s=timeout_s)
+        benchmark_support.wait_for(lambda: _matching_record() is not None, timeout_s=timeout_s)
         record = _matching_record()
+        if record is not None and record.status == "restored" and sandbox.task_run is not None:
+            sandbox.task_run.on_restore_complete()
         logger.info(
             "Observed recovery record sandbox=%s event_type=%s status=%s checkpoint=%s",
             sandbox.sandbox_id,
@@ -927,8 +853,8 @@ class RealHostScenarioHarness:
         *,
         initial_steps: int | None = None,
         require_complete: bool = False,
-    ) -> dict[int, TreeSearchCheckpointRecord]:
-        return build_tree_search_checkpoint_index(
+    ) -> dict[int, benchmark_support.TreeSearchCheckpointRecord]:
+        return benchmark_support.build_tree_search_checkpoint_index(
             self.list_checkpoint_manifests(sandbox_id),
             initial_steps=initial_steps,
             require_complete=require_complete,
@@ -940,8 +866,8 @@ class RealHostScenarioHarness:
         *,
         initial_steps: int,
         timeout_s: float = 45.0,
-    ) -> dict[int, TreeSearchCheckpointRecord]:
-        collected: dict[int, TreeSearchCheckpointRecord] = {}
+    ) -> dict[int, benchmark_support.TreeSearchCheckpointRecord]:
+        collected: dict[int, benchmark_support.TreeSearchCheckpointRecord] = {}
         last_error = f"missing tree-search checkpoints for steps {list(range(1, initial_steps + 1))}"
 
         def _ready() -> bool:
@@ -961,7 +887,7 @@ class RealHostScenarioHarness:
                 raise
             return True
 
-        if not wait_for(_ready, timeout_s=timeout_s, interval_s=0.2, raise_on_timeout=False):
+        if not benchmark_support.wait_for(_ready, timeout_s=timeout_s, interval_s=0.2, raise_on_timeout=False):
             raise RuntimeError(f"timed out waiting for tree-search checkpoints for sandbox {sandbox_id}: {last_error}")
         logger.info(
             "Collected tree-search checkpoints sandbox=%s steps=%s",
@@ -978,7 +904,7 @@ class RealHostScenarioHarness:
         timeout_s: float = 45.0,
     ) -> int:
         assert self.storage is not None
-        wait_for(lambda: len(self.storage.list_checkpoints(sandbox_id)) >= minimum, timeout_s=timeout_s)
+        benchmark_support.wait_for(lambda: len(self.storage.list_checkpoints(sandbox_id)) >= minimum, timeout_s=timeout_s)
         return len(self.storage.list_checkpoints(sandbox_id))
 
     def wait_for_checkpoint_count_stable(
@@ -1049,7 +975,9 @@ class RealHostScenarioHarness:
         try:
             description = self.sandbox_manager.describe(sandbox.sandbox_id)
         except KeyError:
-            self._release_tree_search_network_lease(sandbox.sandbox_id)
+            if self.llm_server is not None:
+                self.llm_server.benchmark_llm_router.unregister_sandbox(str(sandbox.sandbox_id))  # type: ignore[attr-defined]
+            self.network_manager.release_lease(sandbox.sandbox_id)
             self._sandbox_by_id.pop(sandbox.sandbox_id, None)
             return
         dataset = str(description.metadata.get("zfs_dataset", ""))
@@ -1060,7 +988,9 @@ class RealHostScenarioHarness:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-        self._release_tree_search_network_lease(sandbox.sandbox_id)
+        if self.llm_server is not None:
+            self.llm_server.benchmark_llm_router.unregister_sandbox(str(sandbox.sandbox_id))  # type: ignore[attr-defined]
+        self.network_manager.release_lease(sandbox.sandbox_id)
         self._sandbox_by_id.pop(sandbox.sandbox_id, None)
 
     def _relaunch_sandbox(self, sandbox_id: SandboxId, event_type: str) -> None:
@@ -1091,7 +1021,6 @@ class RealHostScenarioHarness:
                 stderr=subprocess.DEVNULL,
             )
         self.sandbox_manager.launch("runc", metadata)
-        payload = wait_for_http_json(sandbox.status_url)
         self.base_inspector.upsert_snapshot(
             SandboxSnapshot(
                 sandbox_id=sandbox.sandbox_id,
@@ -1103,6 +1032,31 @@ class RealHostScenarioHarness:
                 metadata={},
             )
         )
+        payload = sandbox.last_status
+        preserve_task_run = (
+            sandbox.task_run is not None
+            and sandbox.task_future is not None
+            and not sandbox.task_future.done()
+            and sandbox.task_run.survives_fault_relaunch()
+        )
+        if sandbox.task_run is not None and not preserve_task_run:
+            sandbox.task_run.request_stop()
+        if sandbox.task_description is not None and sandbox.task_config is not None:
+            if not preserve_task_run:
+                self.launch_task(
+                    sandbox.agent_type,
+                    sandbox.task_description,
+                    sandbox.task_config,
+                    str(sandbox.sandbox_id),
+                )
+            assert sandbox.task_run is not None
+            sandbox.task_run.wait_for_task_ready()
+            if preserve_task_run:
+                sandbox.task_run.on_restore_complete()
+            try:
+                payload = sandbox.task_run.poll_status()
+            except RuntimeError:
+                payload = sandbox.last_status
         sandbox.last_status = payload
         logger.info("Relaunched sandbox=%s and recovered status endpoint", sandbox.sandbox_id)
         return payload
@@ -1119,10 +1073,21 @@ class RealHostScenarioHarness:
         assert self.sandbox_manager is not None
         assert self.base_inspector is not None
 
+        network_lease = (
+            self.network_manager.allocate_lease(SandboxId(fork_name))
+            if self._agent_requires_benchmark_network(source.agent_type)
+            else None
+        )
         target, work_dir_host_path = self._prepare_sandbox_handle(
             fork_name,
-            interceptor_host="127.0.0.1",
+            interceptor_host=self.network_manager.bridge_ip if network_lease is not None else "127.0.0.1",
+            network_lease=network_lease,
+            agent_type=source.agent_type,
+            llm_service_type=source.llm_service_type,
         )
+        if network_lease is not None:
+            self.network_manager.register_guest_ip(network_lease.guest_ip, target.sandbox_id)
+        self._clone_host_work_dir(source.sandbox_id, target.sandbox_id)
 
         source_dataset = f"{self.pool_name}/agent-cr/{source.sandbox_id}"
         target_dataset = f"{self.pool_name}/agent-cr/{target.sandbox_id}"
@@ -1131,7 +1096,7 @@ class RealHostScenarioHarness:
         subprocess.run(["zfs", "destroy", "-r", target_dataset], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         manifests = {manifest.checkpoint_id: manifest for manifest in self.list_checkpoint_manifests(source.sandbox_id)}
         checkpoint_order = list(manifests.keys())
-        copy_plan = resolve_checkpoint_copy_plan(checkpoint_order, manifests, checkpoint_id)
+        copy_plan = benchmark_support.resolve_checkpoint_copy_plan(checkpoint_order, manifests, checkpoint_id)
         filesystem_checkpoint_id = next(copy_id for copy_id, _, copy_filesystem in reversed(copy_plan) if copy_filesystem)
         logger.info(
             "Cloning checkpoint to fork source=%s target=%s selected_checkpoint=%s filesystem_checkpoint=%s copy_plan=%s",
@@ -1235,7 +1200,56 @@ class RealHostScenarioHarness:
                 observed_at=utc_now(),
             )
         )
+        target.agent_type = source.agent_type
+        target.llm_service_type = source.llm_service_type
+        target.llm_base_url = source.llm_base_url
+        target.task_description = source.task_description
+        target.task_config = source.task_config
+        target.launch_source = source.launch_source
+        target.launch_metadata = dict(source.launch_metadata)
+        target.task_run = None
+        target.task_future = None
+        if target.task_description is not None and target.task_config is not None:
+            target.task_run = self.build_task_run(
+                target.agent_type,
+                target,
+                target.task_description,
+                target.task_config,
+            )
+            target.task_run.prepare_sandbox()
+            extra_launch_metadata = dict(target.task_run.extra_launch_metadata())
+            if extra_launch_metadata:
+                description = replace(
+                    description,
+                    metadata={**description.metadata, **extra_launch_metadata},
+                )
+                self.sandbox_manager._items[target.sandbox_id] = description
+                self.sandbox_manager._persist(description)
         return target
+
+    def _clone_host_work_dir(self, source_sandbox_id: SandboxId, target_sandbox_id: SandboxId) -> None:
+        source_work_dir = benchmark_support.resolve_work_dir_host_path(self.work_dir_host_root, str(source_sandbox_id))
+        target_work_dir = benchmark_support.resolve_work_dir_host_path(self.work_dir_host_root, str(target_sandbox_id))
+        if source_work_dir is None or target_work_dir is None:
+            return
+        if target_work_dir.exists():
+            shutil.rmtree(target_work_dir, ignore_errors=True)
+        if not source_work_dir.exists():
+            target_work_dir.mkdir(parents=True, exist_ok=True)
+            logger.debug(
+                "Prepared empty fork work dir because source work dir is missing source=%s target=%s",
+                source_work_dir,
+                target_work_dir,
+            )
+            return
+        shutil.copytree(source_work_dir, target_work_dir)
+        logger.debug(
+            "Cloned host work dir for fork source_sandbox=%s target_sandbox=%s source=%s target=%s",
+            source_sandbox_id,
+            target_sandbox_id,
+            source_work_dir,
+            target_work_dir,
+        )
 
     def clone_tree_search_checkpoint_to_fork(
         self,
@@ -1244,26 +1258,31 @@ class RealHostScenarioHarness:
         fork_name: str,
     ) -> SandboxHandle:
         target = self.clone_checkpoint_to_fork(source, checkpoint_id, fork_name)
-        network_lease = self._allocate_tree_search_network_lease(target.sandbox_id)
-        work_dir_host_path = resolve_work_dir_host_path(self.work_dir_host_root, str(target.sandbox_id))
-        write_bundle_config(
+        network_lease = self.network_manager.lease_for(target.sandbox_id)
+        work_dir_host_path = benchmark_support.resolve_work_dir_host_path(self.work_dir_host_root, str(target.sandbox_id))
+        sandbox_image = self.ensure_sandbox_image(target.agent_type) if target.agent_type is not None else None
+        sandbox_bundle.write_bundle_config(
             bundle_dir=target.bundle_dir,
-            interceptor_port=self.interceptor.port if self.interceptor is not None else 0,
-            interceptor_host=self._tree_search_bridge_ip,
+            llm_base_url=target.llm_base_url or "",
             provider=self.provider,
             sandbox_name=str(target.sandbox_id),
             status_port=source.status_port,
             cgroup_path=f"agent-cr-bench/{self.pool_name}/{target.sandbox_id}",
             work_dir_host_path=work_dir_host_path,
-            network_namespace_path=network_lease.namespace_path,
+            network_namespace_path=None if network_lease is None else network_lease.namespace_path,
+            image_defaults=None if sandbox_image is None else sandbox_image.image_defaults,
+            image_rootfs_dir=None if sandbox_image is None else sandbox_image.exported_rootfs,
         )
-        target.status_host = network_lease.guest_ip
+        if target.task_run is not None and target.agent_type != "simulated":
+            target.task_run.configure_bundle()
+        target.status_host = "127.0.0.1" if network_lease is None else network_lease.guest_ip
         target.status_port = source.status_port
-        self._tree_search_ip_to_sandbox[network_lease.guest_ip] = target.sandbox_id
+        if network_lease is not None:
+            self.network_manager.register_guest_ip(network_lease.guest_ip, target.sandbox_id)
         logger.info(
-            "Prepared tree-search fork sandbox=%s guest_ip=%s status_port=%d source=%s checkpoint=%s",
+            "Prepared tree-search fork sandbox=%s status_host=%s status_port=%d source=%s checkpoint=%s",
             target.sandbox_id,
-            network_lease.guest_ip,
+            target.status_host,
             target.status_port,
             source.sandbox_id,
             checkpoint_id,
@@ -1275,140 +1294,49 @@ class RealHostScenarioHarness:
         sandbox_name: str,
         *,
         interceptor_host: str,
-        network_lease: TreeSearchNetworkLease | None = None,
+        network_lease: sandbox_network.BenchmarkNetworkLease | None = None,
+        agent_type: str = "simulated",
+        llm_service_type: str = "simulated",
+        status_port: int | None = None,
+        status_host: str | None = None,
+        image_defaults: sandbox_image.ImageRuntimeDefaults | None = None,
+        image_rootfs_dir: Path | None = None,
     ) -> tuple[SandboxHandle, Path | None]:
         assert self.root is not None
         assert self.interceptor is not None
-        status_port = find_free_port()
-        bundle_dir = self.root / "bundles" / sandbox_name
-        work_dir_host_path = resolve_work_dir_host_path(self.work_dir_host_root, sandbox_name)
-        bundle_dir.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["runc", "spec"], cwd=bundle_dir, check=True)
-        write_bundle_config(
-            bundle_dir=bundle_dir,
-            interceptor_port=self.interceptor.port,
-            interceptor_host=interceptor_host,
-            provider=self.provider,
+        assert self.llm_server is not None
+        work_dir_host_path = benchmark_support.resolve_work_dir_host_path(self.work_dir_host_root, sandbox_name)
+        prepared = sandbox_launcher.prepare_bundle_launch(
+            bundle_root=self.root / "bundles",
             sandbox_name=sandbox_name,
+            provider=self.provider,
+            pool_name=self.pool_name,
+            interceptor_host=interceptor_host,
+            interceptor_port=self.interceptor.port,
+            status_host=status_host if status_host is not None else ("127.0.0.1" if network_lease is None else network_lease.guest_ip),
             status_port=status_port,
-            cgroup_path=f"agent-cr-bench/{self.pool_name}/{sandbox_name}",
             work_dir_host_path=work_dir_host_path,
             network_namespace_path=None if network_lease is None else network_lease.namespace_path,
+            image_defaults=image_defaults,
+            image_rootfs_dir=image_rootfs_dir,
         )
         handle = SandboxHandle(
             sandbox_id=SandboxId(sandbox_name),
-            bundle_dir=bundle_dir,
-            status_port=status_port,
+            bundle_dir=prepared.bundle_dir,
+            status_port=prepared.status_port,
             last_status={},
-            status_host="127.0.0.1" if network_lease is None else network_lease.guest_ip,
+            status_host=prepared.status_host,
+            agent_type=agent_type,
+            llm_service_type=llm_service_type,
+            llm_base_url=prepared.llm_base_url,
         )
         self.sandboxes.append(handle)
         self._sandbox_by_id[handle.sandbox_id] = handle
-        return handle, work_dir_host_path
-
-    def _ensure_tree_search_bridge(self) -> None:
-        if self._tree_search_bridge_name is not None:
-            return
-        assert self.root is not None
-        bridge_name = f"acb{uuid.uuid4().hex[:8]}"
-        subprocess.run(["ip", "link", "add", bridge_name, "type", "bridge"], check=True)
-        subprocess.run(
-            ["ip", "addr", "add", f"{self._tree_search_bridge_ip}/24", "dev", bridge_name],
-            check=True,
+        self.llm_server.benchmark_llm_router.register_sandbox(  # type: ignore[attr-defined]
+            sandbox_id=str(handle.sandbox_id),
+            llm_service_type=llm_service_type,
         )
-        subprocess.run(["ip", "link", "set", bridge_name, "up"], check=True)
-        self._tree_search_bridge_name = bridge_name
-        logger.info(
-            "Created tree-search bridge name=%s bridge_ip=%s",
-            bridge_name,
-            self._tree_search_bridge_ip,
-        )
-
-    def _allocate_tree_search_network_lease(self, sandbox_id: SandboxId) -> TreeSearchNetworkLease:
-        self._ensure_tree_search_bridge()
-        assert self._tree_search_bridge_name is not None
-        network = ipaddress.ip_network(self._tree_search_network_cidr)
-        if self._tree_search_ip_cursor >= network.num_addresses - 1:
-            raise RuntimeError("tree-search network exhausted guest IP capacity")
-        guest_ip = str(network[self._tree_search_ip_cursor])
-        self._tree_search_ip_cursor += 1
-        suffix = uuid.uuid4().hex[:8]
-        namespace_name = f"ts-{suffix}"
-        host_veth_name = f"vh{suffix[:6]}"
-        guest_veth_name = f"vg{suffix[:6]}"
-        subprocess.run(["ip", "netns", "add", namespace_name], check=True)
-        subprocess.run(
-            ["ip", "link", "add", host_veth_name, "type", "veth", "peer", "name", guest_veth_name],
-            check=True,
-        )
-        subprocess.run(["ip", "link", "set", host_veth_name, "master", self._tree_search_bridge_name], check=True)
-        subprocess.run(["ip", "link", "set", host_veth_name, "up"], check=True)
-        subprocess.run(["ip", "link", "set", guest_veth_name, "netns", namespace_name], check=True)
-        subprocess.run(["ip", "netns", "exec", namespace_name, "ip", "link", "set", "lo", "up"], check=True)
-        subprocess.run(
-            ["ip", "netns", "exec", namespace_name, "ip", "link", "set", guest_veth_name, "name", "eth0"],
-            check=True,
-        )
-        subprocess.run(
-            ["ip", "netns", "exec", namespace_name, "ip", "addr", "add", f"{guest_ip}/24", "dev", "eth0"],
-            check=True,
-        )
-        subprocess.run(["ip", "netns", "exec", namespace_name, "ip", "link", "set", "eth0", "up"], check=True)
-        subprocess.run(
-            [
-                "ip",
-                "netns",
-                "exec",
-                namespace_name,
-                "ip",
-                "route",
-                "replace",
-                "default",
-                "via",
-                self._tree_search_bridge_ip,
-            ],
-            check=True,
-        )
-        lease = TreeSearchNetworkLease(
-            sandbox_id=sandbox_id,
-            namespace_name=namespace_name,
-            namespace_path=Path("/var/run/netns") / namespace_name,
-            host_veth_name=host_veth_name,
-            guest_veth_name=guest_veth_name,
-            guest_ip=guest_ip,
-        )
-        self._tree_search_network_leases[sandbox_id] = lease
-        logger.info(
-            "Allocated tree-search network lease sandbox=%s guest_ip=%s namespace=%s",
-            sandbox_id,
-            guest_ip,
-            namespace_name,
-        )
-        return lease
-
-    def _release_tree_search_network_lease(self, sandbox_id: SandboxId) -> None:
-        lease = self._tree_search_network_leases.pop(sandbox_id, None)
-        if lease is None:
-            return
-        self._tree_search_ip_to_sandbox.pop(lease.guest_ip, None)
-        subprocess.run(
-            ["ip", "netns", "del", lease.namespace_name],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        subprocess.run(
-            ["ip", "link", "delete", lease.host_veth_name],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        logger.info(
-            "Released tree-search network lease sandbox=%s guest_ip=%s namespace=%s",
-            sandbox_id,
-            lease.guest_ip,
-            lease.namespace_name,
-        )
+        return handle, prepared.work_dir_host_path
 
     def _set_sandbox_running_state(self, sandbox_id: SandboxId, *, is_running: bool) -> None:
         assert self.base_inspector is not None
@@ -1474,13 +1402,3 @@ class RealHostScenarioHarness:
                 metadata["mountpoint"] = str(self.root / "bundles" / str(target_sandbox_id) / "rootfs")
         data["sandbox_id"] = str(target_sandbox_id)
         return json.dumps(data, sort_keys=True, indent=2).encode("utf-8")
-
-
-def write_rows(path: str, rows: list[dict[str, object]]) -> None:
-    if not path or not rows:
-        return
-    with open(path, "w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)

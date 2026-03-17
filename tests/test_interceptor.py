@@ -19,7 +19,7 @@ from agent_cr import (
     build_default_system,
 )
 from agent_cr.models import utc_now
-from simulated_agent.service import SimulatedLLMState, handle_request
+from integrations.llm_services.simulated.service import SimulatedLLMState, handle_request
 
 
 class InterceptorTests(unittest.TestCase):
@@ -219,7 +219,7 @@ class InterceptorTests(unittest.TestCase):
             self.assertIn("interceptor.state_changed", event_names)
             system.executor.shutdown()
 
-    def test_interceptor_can_use_default_sandbox_id_when_header_missing(self) -> None:
+    def test_interceptor_rejects_request_when_sandbox_identity_is_missing(self) -> None:
         request_state_store = InMemoryRequestStateStore()
         interceptor = AgentCRRequestInterceptor(
             upstream_transport=lambda path, headers, body: (
@@ -236,26 +236,62 @@ class InterceptorTests(unittest.TestCase):
                 ).encode("utf-8"),
             ),
             request_state_store=request_state_store,
-            default_sandbox_id=SandboxId("sbx-default"),
         )
 
-        _, _, body = interceptor.intercept(
+        with self.assertRaisesRegex(ValueError, "missing sandbox identity"):
+            interceptor.intercept(
+                path="/v1/chat/completions",
+                headers={"Content-Type": "application/json"},
+                body=json.dumps(
+                    {
+                        "model": "simulated-openai",
+                        "messages": [{"role": "user", "content": "continue"}],
+                    }
+                ).encode("utf-8"),
+            )
+
+    def test_interceptor_resolver_maps_distinct_client_hosts_to_distinct_sandboxes(self) -> None:
+        request_state_store = InMemoryRequestStateStore()
+        interceptor = AgentCRRequestInterceptor(
+            upstream_transport=lambda path, headers, body: (
+                200,
+                [("Content-Type", "application/json")],
+                json.dumps(
+                    handle_request(
+                        path=path,
+                        headers=headers,
+                        payload=json.loads(body.decode("utf-8")),
+                        state=SimulatedLLMState(),
+                    ),
+                    sort_keys=True,
+                ).encode("utf-8"),
+            ),
+            request_state_store=request_state_store,
+            sandbox_id_resolver=lambda client_host, headers, body: {
+                "172.17.0.240": "sbx-iflow-a",
+                "172.17.0.241": "sbx-iflow-b",
+            }.get("" if client_host is None else client_host),
+        )
+
+        interceptor.intercept(
             path="/v1/chat/completions",
             headers={"Content-Type": "application/json"},
-            body=json.dumps(
-                {
-                    "model": "simulated-openai",
-                    "messages": [{"role": "user", "content": "continue"}],
-                }
-            ).encode("utf-8"),
+            body=json.dumps({"model": "simulated-openai", "messages": [{"role": "user", "content": "continue"}]}).encode(
+                "utf-8"
+            ),
+            client_host="172.17.0.240",
+        )
+        interceptor.intercept(
+            path="/v1/chat/completions",
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"model": "simulated-openai", "messages": [{"role": "user", "content": "continue"}]}).encode(
+                "utf-8"
+            ),
+            client_host="172.17.0.241",
         )
 
-        payload = json.loads(body.decode("utf-8"))
-        self.assertIn("choices", payload)
-        state = request_state_store.get(SandboxId("sbx-default"))
-        self.assertEqual(state.total_llm_requests, 1)
-        self.assertEqual(state.completed_llm_requests, 1)
-        self.assertEqual(state.active_llm_requests, 0)
+        self.assertEqual(request_state_store.get(SandboxId("sbx-iflow-a")).total_llm_requests, 1)
+        self.assertEqual(request_state_store.get(SandboxId("sbx-iflow-b")).total_llm_requests, 1)
 
     def test_interceptor_waits_for_system_checkpoint_flow(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_interceptor_system_") as tmp:

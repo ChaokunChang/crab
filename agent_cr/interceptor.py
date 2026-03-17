@@ -10,11 +10,14 @@ from dataclasses import dataclass
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
+import logging
 
 from .contracts import RequestInterceptorHook, SandboxInspector, TelemetrySink
 from .ids import SandboxId
 from .models import RequestContext, RequestState, RequestStateChange, SandboxSnapshot, utc_now
 
+
+logger = logging.getLogger(__name__)
 
 class CompositeRequestInterceptorHook(RequestInterceptorHook):
     def __init__(self, hooks: list[RequestInterceptorHook] | None = None):
@@ -88,6 +91,14 @@ class InMemoryRequestStateStore:
                 )
             )
             self._condition.notify_all()
+            logger.debug(
+                "Marked request start: sandbox_id=%s request_id=%s provider=%s active=%s total=%s",
+                context.sandbox_id,
+                context.request_id,
+                provider,
+                updated.active_llm_requests,
+                updated.total_llm_requests,
+            )
             return updated
 
     def mark_request_end(self, context: RequestContext) -> RequestState:
@@ -113,6 +124,14 @@ class InMemoryRequestStateStore:
                 )
             )
             self._condition.notify_all()
+            logger.debug(
+                "Marked request end: sandbox_id=%s request_id=%s provider=%s active=%s completed=%s",
+                context.sandbox_id,
+                context.request_id,
+                provider,
+                updated.active_llm_requests,
+                updated.completed_llm_requests,
+            )
             return updated
 
     def get(self, sandbox_id: SandboxId) -> RequestState:
@@ -148,6 +167,7 @@ class SandboxResponseGateRegistry:
     def enable(self) -> None:
         with self._lock:
             self._enabled = True
+            logger.debug("Enabled sandbox response gate registry")
 
     def disable(self) -> None:
         with self._lock:
@@ -157,6 +177,7 @@ class SandboxResponseGateRegistry:
                 state["active"] = False
                 state["released_generation"] = state["generation"]
                 state["request_id"] = None
+            logger.debug("Disabled sandbox response gate registry and released %s sandbox states", len(conditions))
         for condition in conditions:
             assert isinstance(condition, threading.Condition)
             with condition:
@@ -165,6 +186,11 @@ class SandboxResponseGateRegistry:
     def arm(self, sandbox_id: SandboxId, request_id: str) -> int | None:
         with self._lock:
             if not self._enabled:
+                logger.debug(
+                    "Skipped arming response gate because registry is disabled: sandbox_id=%s request_id=%s",
+                    sandbox_id,
+                    request_id,
+                )
                 return None
             state = self._states.get(sandbox_id)
             if state is None:
@@ -180,6 +206,12 @@ class SandboxResponseGateRegistry:
             state["generation"] = int(state["generation"]) + 1
             state["active"] = True
             state["request_id"] = request_id
+            logger.debug(
+                "Armed response gate: sandbox_id=%s request_id=%s generation=%s",
+                sandbox_id,
+                request_id,
+                state["generation"],
+            )
             return int(state["generation"])
 
     def wait_for_release(self, sandbox_id: SandboxId, generation: int | None, timeout: float | None = None) -> None:
@@ -191,11 +223,23 @@ class SandboxResponseGateRegistry:
                 return
             condition = state["condition"]
             assert isinstance(condition, threading.Condition)
+        logger.debug(
+            "Waiting for response gate release: sandbox_id=%s generation=%s timeout=%s",
+            sandbox_id,
+            generation,
+            timeout,
+        )
         with condition:
-            condition.wait_for(
+            released = condition.wait_for(
                 lambda: self._is_generation_released(sandbox_id, generation),
                 timeout=timeout,
             )
+        logger.debug(
+            "Finished waiting for response gate: sandbox_id=%s generation=%s released=%s",
+            sandbox_id,
+            generation,
+            released,
+        )
 
     def get_pending(self, sandbox_id: SandboxId) -> PendingSandboxResponse | None:
         with self._lock:
@@ -215,12 +259,30 @@ class SandboxResponseGateRegistry:
         with self._lock:
             state = self._states.get(sandbox_id)
             if state is None or not bool(state["active"]):
+                logger.debug(
+                    "No pending response gate to release: sandbox_id=%s request_id=%s generation=%s",
+                    sandbox_id,
+                    request_id,
+                    generation,
+                )
                 return False
             current_request_id = state.get("request_id")
             current_generation = int(state["generation"])
             if current_request_id != request_id:
+                logger.debug(
+                    "Skipped releasing response gate due to request_id mismatch: sandbox_id=%s expected=%s actual=%s",
+                    sandbox_id,
+                    current_request_id,
+                    request_id,
+                )
                 return False
             if generation is not None and current_generation != generation:
+                logger.debug(
+                    "Skipped releasing response gate due to generation mismatch: sandbox_id=%s expected=%s actual=%s",
+                    sandbox_id,
+                    current_generation,
+                    generation,
+                )
                 return False
             state["active"] = False
             state["released_generation"] = current_generation
@@ -229,12 +291,19 @@ class SandboxResponseGateRegistry:
             assert isinstance(condition, threading.Condition)
         with condition:
             condition.notify_all()
+        logger.debug(
+            "Released pending response gate: sandbox_id=%s request_id=%s generation=%s",
+            sandbox_id,
+            request_id,
+            current_generation,
+        )
         return True
 
     def release(self, sandbox_id: SandboxId) -> None:
         with self._lock:
             state = self._states.get(sandbox_id)
             if state is None:
+                logger.debug("No response gate state found to release: sandbox_id=%s", sandbox_id)
                 return
             state["active"] = False
             state["released_generation"] = int(state["generation"])
@@ -243,6 +312,7 @@ class SandboxResponseGateRegistry:
             assert isinstance(condition, threading.Condition)
         with condition:
             condition.notify_all()
+        logger.debug("Released response gate: sandbox_id=%s generation=%s", sandbox_id, state["released_generation"])
 
     def _is_generation_released(self, sandbox_id: SandboxId, generation: int) -> bool:
         with self._lock:
@@ -301,7 +371,6 @@ class AgentCRRequestInterceptor:
         hook: RequestInterceptorHook | None = None,
         on_state_change: Callable[[SandboxId], None] | None = None,
         response_gate_registry: SandboxResponseGateRegistry | None = None,
-        default_sandbox_id: SandboxId | str | None = None,
         sandbox_id_resolver: Callable[[str | None, dict[str, str], bytes], str | None] | None = None,
     ) -> None:
         self._upstream_transport = upstream_transport
@@ -309,9 +378,6 @@ class AgentCRRequestInterceptor:
         self._hook = hook or CompositeRequestInterceptorHook()
         self._on_state_change = on_state_change
         self._response_gate_registry = response_gate_registry
-        self._default_sandbox_id = (
-            None if default_sandbox_id is None else SandboxId(str(default_sandbox_id))
-        )
         self._sandbox_id_resolver = sandbox_id_resolver
 
     def intercept(
@@ -327,10 +393,9 @@ class AgentCRRequestInterceptor:
             resolved = self._sandbox_id_resolver(client_host, headers, body)
             if resolved is not None and resolved.strip():
                 sandbox_id_raw = resolved.strip()
-        if not sandbox_id_raw and self._default_sandbox_id is not None:
-            sandbox_id_raw = str(self._default_sandbox_id)
         if not sandbox_id_raw:
-            raise ValueError("missing X-Agent-Sandbox-Id")
+            logger.debug("Rejecting request without sandbox identity: path=%s client_host=%s", path, client_host)
+            raise ValueError("missing sandbox identity")
         upstream_headers = dict(headers)
         upstream_headers["X-Agent-Sandbox-Id"] = sandbox_id_raw
         provider = "openai" if path == "/v1/chat/completions" else "anthropic"
@@ -339,6 +404,15 @@ class AgentCRRequestInterceptor:
             sandbox_id=SandboxId(sandbox_id_raw),
             started_at=utc_now(),
             metadata={"provider": provider, "path": path},
+        )
+        logger.debug(
+            "Intercepting request start: request_id=%s sandbox_id=%s provider=%s path=%s client_host=%s body_bytes=%s",
+            context.request_id,
+            context.sandbox_id,
+            provider,
+            path,
+            client_host,
+            len(body),
         )
         self._hook.on_request_start(context)
         self._request_state_store.mark_request_start(context)
@@ -350,6 +424,13 @@ class AgentCRRequestInterceptor:
             response = self._upstream_transport(path, upstream_headers, body)
             if self._response_gate_registry is not None:
                 self._response_gate_registry.wait_for_release(context.sandbox_id, gate_generation)
+            logger.debug(
+                "Intercepting request complete: request_id=%s sandbox_id=%s status_code=%s response_bytes=%s",
+                context.request_id,
+                context.sandbox_id,
+                response[0],
+                len(response[2]),
+            )
             return response
         finally:
             self._request_state_store.mark_request_end(context)
@@ -361,6 +442,7 @@ class AgentCRRequestInterceptor:
             try:
                 self._on_state_change(sandbox_id)
             except Exception:
+                logger.exception("State change callback failed: sandbox_id=%s", sandbox_id)
                 return
 
 
@@ -373,7 +455,6 @@ class AgentCRRequestInterceptorServer:
         hook: RequestInterceptorHook | None = None,
         on_state_change: Callable[[SandboxId], None] | None = None,
         response_gate_registry: SandboxResponseGateRegistry | None = None,
-        default_sandbox_id: SandboxId | str | None = None,
         sandbox_id_resolver: Callable[[str | None, dict[str, str], bytes], str | None] | None = None,
         host: str = "127.0.0.1",
         port: int = 0,
@@ -385,7 +466,6 @@ class AgentCRRequestInterceptorServer:
             hook=hook,
             on_state_change=on_state_change,
             response_gate_registry=response_gate_registry,
-            default_sandbox_id=default_sandbox_id,
             sandbox_id_resolver=sandbox_id_resolver,
         )
         self._server = ThreadingHTTPServer((host, port), self._build_handler())
@@ -405,9 +485,11 @@ class AgentCRRequestInterceptorServer:
 
     def start(self) -> None:
         if self._thread is not None:
+            logger.debug("Interceptor server already running: base_url=%s", self.base_url)
             return
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
+        logger.debug("Started interceptor server: base_url=%s upstream_url=%s", self.base_url, self._upstream_url)
 
     def stop(self) -> None:
         self._server.shutdown()
@@ -415,6 +497,7 @@ class AgentCRRequestInterceptorServer:
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             self._thread = None
+        logger.debug("Stopped interceptor server: base_url=%s", self.base_url)
 
     def _build_handler(self):
         outer = self
@@ -458,11 +541,19 @@ class AgentCRRequestInterceptorServer:
                     try:
                         self.wfile.write(body)
                     except BrokenPipeError:
+                        logger.debug("Client disconnected while writing response body: path=%s", self.path)
                         return
                 except ValueError as exc:
+                    logger.debug("Rejecting invalid intercepted request: path=%s error=%s", self.path, exc)
                     self.send_error(400, str(exc))
                 except urllib.error.HTTPError as exc:
                     body = exc.read()
+                    logger.debug(
+                        "Upstream returned HTTP error: path=%s status_code=%s response_bytes=%s",
+                        self.path,
+                        exc.code,
+                        len(body),
+                    )
                     self.send_response(exc.code)
                     for key, value in exc.headers.items():
                         if key.lower() == "transfer-encoding":
@@ -472,6 +563,7 @@ class AgentCRRequestInterceptorServer:
                     try:
                         self.wfile.write(body)
                     except BrokenPipeError:
+                        logger.debug("Client disconnected while writing upstream error body: path=%s", self.path)
                         return
 
             def log_message(self, format: str, *args) -> None:
@@ -491,6 +583,13 @@ class AgentCRRequestInterceptorServer:
             for key, value in headers.items()
             if key.lower() not in {"host", "content-length"}
         }
+        logger.debug(
+            "Forwarding request upstream: path=%s header_count=%s payload_bytes=%s upstream_url=%s",
+            path,
+            len(headers),
+            len(payload),
+            self._upstream_url,
+        )
         req = urllib.request.Request(
             self._upstream_url + path,
             data=payload,
@@ -498,4 +597,11 @@ class AgentCRRequestInterceptorServer:
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=30.0) as resp:
-            return int(resp.status), list(resp.headers.items()), resp.read()
+            response_body = resp.read()
+            logger.debug(
+                "Received upstream response: path=%s status_code=%s response_bytes=%s",
+                path,
+                resp.status,
+                len(response_body),
+            )
+            return int(resp.status), list(resp.headers.items()), response_body

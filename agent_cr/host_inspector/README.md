@@ -13,7 +13,7 @@ This package contains the host-side inspector server for sandbox process/filesys
 Build the image if needed:
 
 ```bash
-docker build -t agent-sandbox-bench:latest -f simulated_agent/Dockerfile simulated_agent
+docker build -t agent-sandbox-bench:latest -f integrations/sandboxes/simulated/Dockerfile .
 ```
 
 Build the eBPF helper:

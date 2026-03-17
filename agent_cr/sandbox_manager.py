@@ -153,17 +153,7 @@ class RuncSandboxManager(SandboxManager):
         with self._lock:
             self._items[sandbox_id] = description
         self._persist(description)
-        if self._host_inspector_client is not None:
-            try:
-                ignore_process_rules = md.get("host_inspector_ignore_process_rules")
-                self._host_inspector_client.register_sandbox(
-                    sandbox_id,
-                    "runc",
-                    str(sandbox_id),
-                    ignore_process_rules=None if ignore_process_rules is None else list(ignore_process_rules),
-                )
-            except Exception:
-                logger.exception("Failed to register sandbox %s with host inspector", sandbox_id)
+        self._register_with_host_inspector(description)
         logger.info("Sandbox %s is running with rootfs=%s", sandbox_id, rootfs_path)
         return sandbox_id
 
@@ -228,6 +218,7 @@ class RuncSandboxManager(SandboxManager):
         with self._lock:
             self._items[sandbox_id] = updated
         self._persist(updated)
+        self._register_with_host_inspector(updated)
         logger.info("Sandbox %s marked running after restore", sandbox_id)
 
     def delete(self, sandbox_id: SandboxId) -> None:
@@ -287,6 +278,20 @@ class RuncSandboxManager(SandboxManager):
         )
         tmp.replace(path)
         logger.debug("Persisted sandbox %s metadata to %s", description.sandbox_id, path)
+
+    def _register_with_host_inspector(self, description: SandboxDescription) -> None:
+        if self._host_inspector_client is None:
+            return
+        try:
+            ignore_process_rules = description.metadata.get("host_inspector_ignore_process_rules")
+            self._host_inspector_client.register_sandbox(
+                description.sandbox_id,
+                "runc",
+                str(description.sandbox_id),
+                ignore_process_rules=None if ignore_process_rules is None else list(ignore_process_rules),
+            )
+        except Exception:
+            logger.exception("Failed to register sandbox %s with host inspector", description.sandbox_id)
 
     def _metadata_path(self, sandbox_id: SandboxId) -> Path:
         return self._paths.metadata_root / f"{sandbox_id}.json"

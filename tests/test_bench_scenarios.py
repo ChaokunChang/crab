@@ -8,15 +8,57 @@ import time
 from types import SimpleNamespace
 import unittest
 
-from agent_cr import CheckpointId, SandboxId
+from agent_cr import CheckpointId, JobStatus, SandboxId
+from integrations.agents import SandboxHandle
 from benchmarks.bench_fault_tolerance import run_fault_tolerance_benchmark
 from benchmarks.bench_spot_agent import run_spot_agent_benchmark
-from benchmarks.real_host_scenario_base import SandboxHandle
+from benchmarks.support import BenchmarkTaskRecord
 
 
 class _FakeStorage:
     def list_checkpoints(self, sandbox_id) -> list[str]:
         return [f"ckpt-{sandbox_id}"]
+
+
+class _FakeTaskRun:
+    def __init__(self, harness: "_BaseScenarioHarness", sandbox: SandboxHandle) -> None:
+        self._harness = harness
+        self._sandbox = sandbox
+
+    def wait_for_progress(self, *, minimum_actions: int) -> dict[str, object]:
+        sandbox_id = str(self._sandbox.sandbox_id)
+        self._harness.wait_for_progress_calls.append(sandbox_id)
+        if self._harness.progress_delay_s > 0:
+            with self._harness._progress_lock:
+                self._harness._active_progress += 1
+                self._harness.max_concurrent_progress = max(
+                    self._harness.max_concurrent_progress,
+                    self._harness._active_progress,
+                )
+            try:
+                time.sleep(self._harness.progress_delay_s)
+            finally:
+                with self._harness._progress_lock:
+                    self._harness._active_progress -= 1
+        payload = {"total_actions": max(int(self._harness._statuses[sandbox_id]["total_actions"]), minimum_actions)}
+        self._harness._statuses[sandbox_id] = payload
+        self._harness._progress_actions[sandbox_id] = int(payload["total_actions"])
+        self._sandbox.last_status = payload
+        return payload
+
+    def wait_for_action_delta(self, *, delta: int) -> dict[str, object]:
+        sandbox_id = str(self._sandbox.sandbox_id)
+        self._harness.wait_for_action_delta_calls.append((sandbox_id, delta))
+        payload = {"total_actions": int(self._sandbox.last_status["total_actions"]) + delta}
+        self._harness._statuses[sandbox_id] = payload
+        self._sandbox.last_status = payload
+        return payload
+
+    def poll_status(self) -> dict[str, object]:
+        sandbox_id = str(self._sandbox.sandbox_id)
+        if sandbox_id in self._harness._unreachable_sandboxes:
+            raise AssertionError(f"poll_status should not be called for unreachable sandbox {sandbox_id}")
+        return dict(self._harness._statuses[sandbox_id])
 
 
 class _BaseScenarioHarness:
@@ -55,39 +97,54 @@ class _BaseScenarioHarness:
         self.launched.append(sandbox_name)
         self._statuses[str(sandbox_id)] = {"total_actions": 0}
         self._checkpoint_counts[str(sandbox_id)] = 0
+        handle.task_run = _FakeTaskRun(self, handle)
         return handle
 
-    def wait_for_progress(self, sandbox: SandboxHandle, *, minimum_actions: int) -> dict[str, object]:
-        sandbox_id = str(sandbox.sandbox_id)
-        self.wait_for_progress_calls.append(sandbox_id)
-        if self.progress_delay_s > 0:
-            with self._progress_lock:
-                self._active_progress += 1
-                self.max_concurrent_progress = max(self.max_concurrent_progress, self._active_progress)
-            try:
-                time.sleep(self.progress_delay_s)
-            finally:
-                with self._progress_lock:
-                    self._active_progress -= 1
-        payload = {"total_actions": max(int(self._statuses[sandbox_id]["total_actions"]), minimum_actions)}
-        self._statuses[sandbox_id] = payload
-        self._progress_actions[sandbox_id] = int(payload["total_actions"])
-        sandbox.last_status = payload
-        return payload
+    def load_dataset(self, path):
+        raise AssertionError(f"dataset should not be loaded in this test: {path}")
 
-    def wait_for_action_delta(self, sandbox: SandboxHandle, *, delta: int) -> dict[str, object]:
-        sandbox_id = str(sandbox.sandbox_id)
-        self.wait_for_action_delta_calls.append((sandbox_id, delta))
-        payload = {"total_actions": int(sandbox.last_status["total_actions"]) + delta}
-        self._statuses[sandbox_id] = payload
-        sandbox.last_status = payload
-        return payload
+    def select_task_record(
+        self,
+        dataset,
+        *,
+        sandbox_index: int,
+        default_agent_type: str,
+        default_llm_service_type: str | None,
+        default_task_description,
+        default_task_config,
+    ) -> BenchmarkTaskRecord:
+        _ = (dataset, sandbox_index, default_llm_service_type)
+        return BenchmarkTaskRecord(
+            agent_type=default_agent_type,
+            task_description=default_task_description,
+            task_config=default_task_config,
+        )
+
+    def launch_sandbox_and_task(
+        self,
+        sandbox_name: str,
+        *,
+        agent_type,
+        llm_service_type=None,
+        task_description,
+        task_config,
+    ) -> SandboxHandle:
+        _ = (agent_type, llm_service_type, task_description, task_config)
+        return self.launch_sandbox(sandbox_name)
+
+    def launch_task_record(self, sandbox_name: str, record: BenchmarkTaskRecord) -> SandboxHandle:
+        _ = record
+        return self.launch_sandbox(sandbox_name)
 
     def checkpoint_if_due(self, sandbox: SandboxHandle):
         sandbox_id = str(sandbox.sandbox_id)
         self.checkpoint_if_due_calls.append(sandbox_id)
         self._checkpoint_counts[sandbox_id] += 1
-        return SimpleNamespace(checkpoint_id=CheckpointId(f"{sandbox_id}-ckpt-{self._checkpoint_counts[sandbox_id]}"))
+        return SimpleNamespace(
+            checkpoint_id=CheckpointId(f"{sandbox_id}-ckpt-{self._checkpoint_counts[sandbox_id]}"),
+            status=JobStatus.SUCCEEDED,
+            message="",
+        )
 
     def inject_fault(self, sandbox: SandboxHandle) -> None:
         self.inject_fault_calls.append(str(sandbox.sandbox_id))
@@ -106,12 +163,6 @@ class _BaseScenarioHarness:
             status=SimpleNamespace(value="succeeded"),
             message=None,
         )
-
-    def poll_status(self, sandbox: SandboxHandle) -> dict[str, object]:
-        sandbox_id = str(sandbox.sandbox_id)
-        if sandbox_id in self._unreachable_sandboxes:
-            raise AssertionError(f"poll_status should not be called for unreachable sandbox {sandbox_id}")
-        return dict(self._statuses[sandbox_id])
 
     def wait_for_recovery(self, sandbox: SandboxHandle, *, event_type: str, observed_after, timeout_s: float = 60.0):
         _ = observed_after
@@ -153,6 +204,8 @@ class FaultToleranceBenchmarkTests(unittest.TestCase):
             "auto_cr": False,
             "fault_rate": 0.5,
             "first_fault_iteration": 0,
+            "agent_type": "simulated",
+            "llm_service_type": "simulated",
         }
         values.update(overrides)
         return argparse.Namespace(**values)
@@ -200,6 +253,8 @@ class SpotAgentBenchmarkTests(unittest.TestCase):
             "auto_cr": False,
             "preemption_rate": 0.5,
             "first_preempt_iteration": 0,
+            "agent_type": "simulated",
+            "llm_service_type": "simulated",
         }
         values.update(overrides)
         return argparse.Namespace(**values)
