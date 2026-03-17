@@ -1721,7 +1721,7 @@ class RealHostScenarioHarness:
         config["process"]["cwd"] = str(service.get("working_dir", "/work"))
         config["process"]["terminal"] = bool(service.get("tty", False))
         config["process"]["env"] = self._compose_environment(service)
-        config["process"]["args"] = self._compose_process_args(service)
+        config["process"]["args"] = self._compose_process_args(service, image_ref=image_ref)
         mounts = [mount for mount in config.get("mounts", []) if mount.get("destination") != "/work"]
         if work_dir_host_path is not None:
             work_dir_host_path.mkdir(parents=True, exist_ok=True)
@@ -1733,7 +1733,7 @@ class RealHostScenarioHarness:
                     "options": ["rbind", "rw"],
                 }
             )
-        mounts.extend(self._compose_mounts(service))
+        mounts.extend(self._compose_mounts(service, compose_file=compose_file))
         config["mounts"] = mounts
         bundle_config.write_text(json.dumps(config, indent=2), encoding="utf-8")
         handle.launch_metadata["compose"] = {
@@ -1821,7 +1821,7 @@ class RealHostScenarioHarness:
             raise ValueError(f"unsupported compose environment: {environment!r}")
         return [f"{key}={value}" for key, value in items]
 
-    def _compose_process_args(self, service: dict[str, object]) -> list[str]:
+    def _compose_process_args(self, service: dict[str, object], *, image_ref: str) -> list[str]:
         entrypoint = service.get("entrypoint")
         command = service.get("command")
         segments: list[str] = []
@@ -1837,16 +1837,40 @@ class RealHostScenarioHarness:
                 # pragma: no cover
         if segments:
             return segments
+        defaults = self._compose_image_process_defaults(image_ref)
+        if defaults:
+            return defaults
         return ["/bin/sh"]
 
-    def _compose_mounts(self, service: dict[str, object]) -> list[dict[str, object]]:
+    def _compose_image_process_defaults(self, image_ref: str) -> list[str]:
+        raw_output = subprocess.run(
+            ["docker", "image", "inspect", image_ref, "--format", "{{json .Config}}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        image_config = json.loads(raw_output) if raw_output else {}
+        if not isinstance(image_config, dict):
+            raise ValueError(f"unexpected docker image config for {image_ref}: {image_config!r}")
+        defaults: list[str] = []
+        for key in ("Entrypoint", "Cmd"):
+            value = image_config.get(key)
+            if value is None:
+                continue
+            if isinstance(value, list):
+                defaults.extend(str(item) for item in value)
+                continue
+            raise ValueError(f"unsupported docker image config {key} for {image_ref}: {value!r}")
+        return defaults
+
+    def _compose_mounts(self, service: dict[str, object], *, compose_file: Path) -> list[dict[str, object]]:
         mounts: list[dict[str, object]] = []
         for item in service.get("volumes", []):
             if isinstance(item, str):
                 parts = item.split(":")
                 if len(parts) < 2:
                     raise ValueError(f"unsupported compose volume syntax: {item!r}")
-                source = Path(parts[0]).expanduser().resolve()
+                source = self._resolve_compose_bind_source(parts[0], compose_file=compose_file)
                 destination = parts[1]
                 options = ["rbind", "rw"]
                 if len(parts) > 2 and parts[2] == "ro":
@@ -1861,7 +1885,7 @@ class RealHostScenarioHarness:
                 )
                 continue
             if isinstance(item, dict) and item.get("type", "bind") == "bind":
-                source = Path(str(item["source"])).expanduser().resolve()
+                source = self._resolve_compose_bind_source(str(item["source"]), compose_file=compose_file)
                 read_only = bool(item.get("read_only", False))
                 mounts.append(
                     {
@@ -1874,6 +1898,12 @@ class RealHostScenarioHarness:
                 continue
             raise ValueError(f"unsupported compose volume definition: {item!r}")
         return mounts
+
+    def _resolve_compose_bind_source(self, source: str, *, compose_file: Path) -> Path:
+        path = Path(source).expanduser()
+        if not path.is_absolute():
+            path = compose_file.parent / path
+        return path.resolve()
 
     def _prepare_sandbox_handle(
         self,

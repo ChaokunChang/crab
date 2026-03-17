@@ -310,6 +310,71 @@ class BenchmarkHelperTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertNotEqual(first, changed)
 
+    def test_compose_process_args_use_image_defaults_when_service_omits_startup(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+
+        with patch.object(
+            harness,
+            "_compose_image_process_defaults",
+            return_value=["/docker-entrypoint.sh", "serve", "--port", "8080"],
+        ) as image_defaults:
+            result = harness._compose_process_args({}, image_ref="example:latest")
+
+        self.assertEqual(result, ["/docker-entrypoint.sh", "serve", "--port", "8080"])
+        image_defaults.assert_called_once_with("example:latest")
+
+    def test_compose_mounts_resolve_relative_bind_sources_from_compose_directory(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            compose_dir = root / "dataset" / "scenario"
+            compose_dir.mkdir(parents=True, exist_ok=True)
+            compose_file = compose_dir / "compose.yaml"
+            compose_file.write_text("services: {}\n", encoding="utf-8")
+
+            mounts = harness._compose_mounts(
+                {
+                    "volumes": [
+                        "./data:/app/data:ro",
+                        {"type": "bind", "source": "../shared", "target": "/mnt/shared"},
+                    ]
+                },
+                compose_file=compose_file,
+            )
+
+            self.assertEqual(
+                mounts,
+                [
+                    {
+                        "destination": "/app/data",
+                        "source": str((compose_dir / "data").resolve()),
+                        "type": "bind",
+                        "options": ["rbind", "ro"],
+                    },
+                    {
+                        "destination": "/mnt/shared",
+                        "source": str((compose_dir / "../shared").resolve()),
+                        "type": "bind",
+                        "options": ["rbind", "rw"],
+                    },
+                ],
+            )
+
     def test_clone_host_work_dir_copies_source_contents_for_fork(self) -> None:
         harness = RealHostScenarioHarness(
             provider="openai",
