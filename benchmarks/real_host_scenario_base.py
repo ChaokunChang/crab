@@ -1,16 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import argparse
 from concurrent.futures import ThreadPoolExecutor
-import csv
-import ipaddress
 import json
 import logging
-import os
-import random
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
@@ -20,7 +14,6 @@ import urllib.request
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterable
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -49,7 +42,6 @@ from agent_cr import (
     InMemorySchedulerStateStore,
     InMemoryTelemetrySink,
     LocalCheckpointManager,
-    RequestContext,
     RequestInterceptorHook,
     RequestAwareSandboxInspector,
     RuncRuntimeAdapter,
@@ -73,11 +65,14 @@ from integrations.llm_services import (
     serve_benchmark_llm_router,
     validate_llm_service_type,
 )
+from integrations.sandboxes.runtime import launcher as sandbox_launcher
+from integrations.sandboxes.runtime import network as sandbox_network
 from integrations.sandboxes.runtime import bundle as sandbox_bundle
 from integrations.sandboxes.runtime import compose as sandbox_compose
 from integrations.sandboxes.runtime import image as sandbox_image
 from integrations.sandboxes.iflow import DOCKERFILE_PATH as IFLOW_DOCKERFILE_PATH
 from integrations.sandboxes.simulated import DOCKERFILE_PATH as SIMULATED_DOCKERFILE_PATH
+from benchmarks import support as benchmark_support
 
 logger = logging.getLogger(__name__)
 
@@ -98,51 +93,11 @@ def checkpoint_guard_from_inspector(inspector):
     return guard
 
 
-def configure_logging(level_name: str) -> None:
-    logging.basicConfig(
-        level=getattr(logging, level_name.upper()),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-
-
-def bounded_probability(raw: str) -> float:
-    value = float(raw)
-    if value < 0.0 or value > 1.0:
-        raise argparse.ArgumentTypeError(f"expected probability in [0.0, 1.0], got {raw}")
-    return value
-
-
-def add_common_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--provider", choices=["openai", "anthropic"], default="openai")
-    parser.add_argument("--agent-type", choices=["simulated", "iflow"], default="simulated")
-    parser.add_argument("--llm-service-type", choices=["simulated", "manual", "simulated_for_iflow"], default=None)
-    parser.add_argument("--dataset", type=Path, default=None)
-    parser.add_argument("--out", default="")
-    parser.add_argument("--transfer-delay-ms", type=float, default=0.0)
-    parser.add_argument(
-        "--work-dir-host-root",
-        type=Path,
-        default=None,
-        help="Host directory root for per-sandbox /work bind mounts",
-    )
-    parser.add_argument(
-        "--log-level",
-        choices=["debug", "info", "warning", "error", "critical"],
-        default="info",
-    )
-
-
 def require_binaries() -> None:
     required = ["docker", "runc", "criu", "zfs", "zpool", "ip"]
     missing = [name for name in required if shutil.which(name) is None]
     if missing:
         raise SystemExit(f"missing required binaries: {', '.join(missing)}")
-
-
-def find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def wait_for_http_json(url: str, *, timeout_s: float = 30.0) -> dict[str, object]:
@@ -157,220 +112,12 @@ def wait_for_http_json(url: str, *, timeout_s: float = 30.0) -> dict[str, object
             time.sleep(0.2)
     raise RuntimeError(f"timed out waiting for {url}: {last_exc}")
 
-
-def wait_for(
-    predicate,
-    *,
-    timeout_s: float = 30.0,
-    interval_s: float = 0.2,
-    raise_on_timeout: bool = True,
-):
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        if predicate():
-            return True
-        time.sleep(interval_s)
-    if raise_on_timeout:
-        raise RuntimeError("timed out waiting for predicate")
-    return False
-
-
-def parse_ipv4_route_networks(raw_routes: str) -> list[ipaddress.IPv4Network]:
-    networks: list[ipaddress.IPv4Network] = []
-    for raw_line in raw_routes.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        destination = line.split()[0]
-        if destination == "default":
-            continue
-        try:
-            network = ipaddress.ip_network(destination, strict=False)
-        except ValueError:
-            continue
-        if isinstance(network, ipaddress.IPv4Network) and network.prefixlen < 32:
-            networks.append(network)
-    return networks
-
-
-def select_benchmark_network(*, existing_routes: str, candidate_pool: str = "10.250.0.0/16") -> tuple[str, str]:
-    pool = ipaddress.ip_network(candidate_pool, strict=False)
-    if not isinstance(pool, ipaddress.IPv4Network):
-        raise ValueError(f"candidate pool must be IPv4, got {candidate_pool}")
-    if pool.prefixlen > 24:
-        raise ValueError(f"candidate pool must be at most /24, got {candidate_pool}")
-    existing_networks = parse_ipv4_route_networks(existing_routes)
-    candidates = [pool] if pool.prefixlen == 24 else list(pool.subnets(new_prefix=24))
-    for network in candidates:
-        if any(network.overlaps(existing) for existing in existing_networks):
-            continue
-        return str(next(network.hosts())), str(network)
-    raise RuntimeError(f"unable to find an available benchmark /24 inside {candidate_pool}")
-
-
-def enough_progress(payload: dict[str, object], *, total_actions: int = 6) -> bool:
-    return (
-        int(payload["total_actions"]) >= total_actions
-        and int(payload["filesystem_actions"]) >= 1
-        and int(payload["process_actions"]) >= 1
-        and int(payload["network_actions"]) >= 1
-        and int(payload["stateful_actions"]) >= 1
-    )
-
-
-def total_actions(payload: dict[str, object]) -> int:
-    return int(payload.get("total_actions", 0))
-
-
-def resolve_work_dir_host_path(work_dir_host_root: Path | None, sandbox_name: str) -> Path | None:
-    if work_dir_host_root is None:
-        return None
-    return work_dir_host_root.expanduser().resolve() / sandbox_name
-
-
-def compute_summary(rows: list[dict[str, object]], metric_keys: Iterable[str]) -> dict[str, float]:
-    summary: dict[str, float] = {}
-    if not rows:
-        return summary
-    for key in metric_keys:
-        summary[key] = sum(float(row[key]) for row in rows) / len(rows)
-    return summary
-
-
-def select_injected_indices(
-    population_size: int,
-    *,
-    iteration: int,
-    rate: float,
-    first_forced_iteration: int,
-    rng: random.Random,
-) -> list[int]:
-    if population_size <= 0:
-        return []
-    if first_forced_iteration > 0 and iteration < first_forced_iteration:
-        return []
-    selected = [index for index in range(population_size) if rng.random() < rate]
-    if first_forced_iteration > 0 and iteration == first_forced_iteration and 0 not in selected:
-        selected.insert(0, 0)
-    return sorted(set(selected))
-
-
-def resolve_checkpoint_copy_plan(
-    checkpoint_order: list[CheckpointId],
-    manifests: dict[CheckpointId, CheckpointManifest],
-    checkpoint_id: CheckpointId,
-) -> list[tuple[CheckpointId, bool, bool]]:
-    manifest = manifests[checkpoint_id]
-    plan: list[tuple[CheckpointId, bool, bool]] = [
-        (checkpoint_id, bool(manifest.process_artifacts), bool(manifest.filesystem_artifacts))
-    ]
-    need_process = not bool(manifest.process_artifacts)
-    need_filesystem = not bool(manifest.filesystem_artifacts)
-    if not need_process and not need_filesystem:
-        return plan
-
-    try:
-        current_index = checkpoint_order.index(checkpoint_id)
-        candidates = list(reversed(checkpoint_order[:current_index]))
-    except ValueError:
-        candidates = list(reversed(checkpoint_order))
-
-    for candidate_id in candidates:
-        if not need_process and not need_filesystem:
-            break
-        candidate = manifests[candidate_id]
-        copy_process = need_process and bool(candidate.process_artifacts)
-        copy_filesystem = need_filesystem and bool(candidate.filesystem_artifacts)
-        if not copy_process and not copy_filesystem:
-            continue
-        plan.insert(0, (candidate_id, copy_process, copy_filesystem))
-        if copy_process:
-            need_process = False
-        if copy_filesystem:
-            need_filesystem = False
-
-    if need_process or need_filesystem:
-        raise ValueError(f"unable to resolve restore dependencies for checkpoint {checkpoint_id}")
-    return plan
-
-
-@dataclass(frozen=True)
-class TreeSearchCheckpointRecord:
-    checkpoint_id: CheckpointId
-    replay_actions: int
-    checkpoint_ms: float = 0.0
-
-
-def build_tree_search_checkpoint_index(
-    manifests: Iterable[CheckpointManifest],
-    *,
-    initial_steps: int | None = None,
-    require_complete: bool = False,
-) -> dict[int, TreeSearchCheckpointRecord]:
-    indexed: dict[int, TreeSearchCheckpointRecord] = {}
-    for manifest in manifests:
-        raw_step = manifest.metadata.get("tree_search_step")
-        if raw_step is None:
-            continue
-        try:
-            step = int(raw_step)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"invalid tree_search_step={raw_step!r} for checkpoint {manifest.checkpoint_id}"
-            ) from exc
-        if step <= 0:
-            continue
-        if initial_steps is not None and step > initial_steps:
-            continue
-        if step in indexed:
-            raise ValueError(f"duplicate tree-search checkpoint for step {step}")
-        indexed[step] = TreeSearchCheckpointRecord(
-            checkpoint_id=manifest.checkpoint_id,
-            replay_actions=step,
-        )
-
-    if require_complete and initial_steps is not None:
-        missing = [step for step in range(1, initial_steps + 1) if step not in indexed]
-        if missing:
-            raise ValueError(f"missing tree-search checkpoints for steps {missing}")
-    return dict(sorted(indexed.items()))
-
-
-class NoopRequestInterceptorHook(RequestInterceptorHook):
-    def on_request_start(self, context: RequestContext) -> None:
-        _ = context
-
-    def on_request_end(self, context: RequestContext) -> None:
-        _ = context
-
-
-@dataclass(frozen=True)
-class BenchmarkTaskRecord:
-    agent_type: str
-    task_description: TaskDescription
-    task_config: TaskConfig
-    llm_service_type: str | None = None
-    docker_compose_file: Path | None = None
-    env_file: Path | None = None
-    service_name: str | None = None
-
-
 @dataclass(frozen=True)
 class AgentSandboxImage:
     agent_type: str
     image_tag: str
     exported_rootfs: Path
     image_defaults: sandbox_image.ImageRuntimeDefaults
-
-
-@dataclass(frozen=True)
-class BenchmarkNetworkLease:
-    sandbox_id: SandboxId
-    namespace_name: str
-    namespace_path: Path
-    host_veth_name: str
-    guest_veth_name: str
-    guest_ip: str
 
 
 class RealHostScenarioHarness:
@@ -416,13 +163,7 @@ class RealHostScenarioHarness:
         self.llm_thread: threading.Thread | None = None
         self.sandboxes: list[SandboxHandle] = []
         self._sandbox_by_id: dict[SandboxId, SandboxHandle] = {}
-        self._benchmark_bridge_name: str | None = None
-        self._benchmark_bridge_ip = "10.250.0.1"
-        self._benchmark_network_cidr = "10.250.0.0/24"
-        self._benchmark_ip_cursor = 2
-        self._benchmark_network_leases: dict[SandboxId, BenchmarkNetworkLease] = {}
-        self._benchmark_ip_to_sandbox: dict[str, SandboxId] = {}
-        self._benchmark_network_lock = threading.Lock()
+        self.network_manager = sandbox_network.BenchmarkNetworkManager()
         self._compose_image_tags: set[str] = set()
         self._agent_registry = build_agent_registry()
         self._sandbox_images: dict[str, AgentSandboxImage] = {}
@@ -431,7 +172,7 @@ class RealHostScenarioHarness:
 
     @property
     def benchmark_bridge_ip(self) -> str:
-        return self._benchmark_bridge_ip
+        return self.network_manager.bridge_ip
 
     def _start_host_inspector_server(self) -> str:
         assert self.runtime_state_root is not None
@@ -469,34 +210,13 @@ class RealHostScenarioHarness:
             return
         server.stop()
 
-    def _configure_benchmark_network(self) -> None:
-        configured_cidr = os.environ.get("AGENT_CR_BENCHMARK_NETWORK_CIDR", "").strip()
-        if configured_cidr:
-            network = ipaddress.ip_network(configured_cidr, strict=False)
-            if not isinstance(network, ipaddress.IPv4Network):
-                raise ValueError(f"benchmark network must be IPv4, got {configured_cidr}")
-            if network.prefixlen != 24:
-                raise ValueError(f"benchmark network must be a /24, got {configured_cidr}")
-            self._benchmark_network_cidr = str(network)
-            self._benchmark_bridge_ip = str(next(network.hosts()))
-            return
-        route_result = subprocess.run(
-            ["ip", "-4", "route", "show", "table", "main"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        self._benchmark_bridge_ip, self._benchmark_network_cidr = select_benchmark_network(
-            existing_routes=route_result.stdout,
-        )
-
     def __enter__(self) -> "RealHostScenarioHarness":
         require_binaries()
-        self._configure_benchmark_network()
+        self.network_manager.configure()
         logger.info(
             "Selected benchmark network cidr=%s bridge_ip=%s",
-            self._benchmark_network_cidr,
-            self._benchmark_bridge_ip,
+            self.network_manager.network_cidr,
+            self.network_manager.bridge_ip,
         )
         self._tmpdir = tempfile.TemporaryDirectory(prefix="agent_cr_scenario_bench_")
         self.root = Path("/root/workspace/agent-cr/logs/tmp/agent_cr_bench")
@@ -608,16 +328,7 @@ class RealHostScenarioHarness:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-        for sandbox_id in list(self._benchmark_network_leases):
-            self._release_benchmark_network_lease(sandbox_id)
-        if self._benchmark_bridge_name is not None:
-            subprocess.run(
-                ["ip", "link", "delete", self._benchmark_bridge_name],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            self._benchmark_bridge_name = None
+        self.network_manager.cleanup()
         for sandbox in self.sandboxes:
             if self.llm_server is not None:
                 self.llm_server.benchmark_llm_router.unregister_sandbox(str(sandbox.sandbox_id))  # type: ignore[attr-defined]
@@ -732,9 +443,9 @@ class RealHostScenarioHarness:
         target = SandboxId(str(sandbox_id))
         return self._sandbox_by_id[target]
 
-    def load_dataset(self, path: Path) -> list[BenchmarkTaskRecord]:
+    def load_dataset(self, path: Path) -> list[benchmark_support.BenchmarkTaskRecord]:
         dataset_root = path.expanduser().resolve().parent
-        records: list[BenchmarkTaskRecord] = []
+        records: list[benchmark_support.BenchmarkTaskRecord] = []
         for line_number, raw_line in enumerate(path.expanduser().resolve().read_text(encoding="utf-8").splitlines(), start=1):
             line = raw_line.strip()
             if not line:
@@ -745,7 +456,7 @@ class RealHostScenarioHarness:
             compose_file = payload.get("docker_compose_file")
             env_file = payload.get("env_file")
             records.append(
-                BenchmarkTaskRecord(
+                benchmark_support.BenchmarkTaskRecord(
                     agent_type=str(payload.get("agent_type", "simulated")),
                     task_description=TaskDescription.from_json_value(payload.get("task_description", "")),
                     task_config=TaskConfig.from_json_value(payload.get("task_config")),
@@ -761,17 +472,17 @@ class RealHostScenarioHarness:
 
     def select_task_record(
         self,
-        dataset: list[BenchmarkTaskRecord] | None,
+        dataset: list[benchmark_support.BenchmarkTaskRecord] | None,
         *,
         sandbox_index: int,
         default_agent_type: str,
         default_llm_service_type: str | None,
         default_task_description: TaskDescription,
         default_task_config: TaskConfig,
-    ) -> BenchmarkTaskRecord:
+    ) -> benchmark_support.BenchmarkTaskRecord:
         if dataset:
             return dataset[sandbox_index % len(dataset)]
-        return BenchmarkTaskRecord(
+        return benchmark_support.BenchmarkTaskRecord(
             agent_type=default_agent_type,
             task_description=default_task_description,
             task_config=default_task_config,
@@ -800,13 +511,13 @@ class RealHostScenarioHarness:
         resolved_llm_service_type = self.resolve_llm_service_type(agent_type=agent_type, llm_service_type=llm_service_type)
         sandbox_image = self.ensure_sandbox_image(agent_type)
         network_lease = (
-            self._allocate_benchmark_network_lease(SandboxId(sandbox_name))
+            self.network_manager.allocate_lease(SandboxId(sandbox_name))
             if self._agent_requires_benchmark_network(agent_type)
             else None
         )
         handle, work_dir_host_path = self._prepare_sandbox_handle(
             sandbox_name,
-            interceptor_host=self._benchmark_bridge_ip if network_lease is not None else "127.0.0.1",
+            interceptor_host=self.network_manager.bridge_ip if network_lease is not None else "127.0.0.1",
             network_lease=network_lease,
             agent_type=agent_type,
             llm_service_type=resolved_llm_service_type,
@@ -828,7 +539,7 @@ class RealHostScenarioHarness:
             )
         )
         if network_lease is not None:
-            self._benchmark_ip_to_sandbox[network_lease.guest_ip] = sandbox_id
+            self.network_manager.register_guest_ip(network_lease.guest_ip, sandbox_id)
         launch_metadata = {
             "sandbox_id": sandbox_name,
             "bundle_path": str(handle.bundle_dir),
@@ -893,7 +604,7 @@ class RealHostScenarioHarness:
     def launch_task_record(
         self,
         sandbox_name: str,
-        task_record: BenchmarkTaskRecord,
+        task_record: benchmark_support.BenchmarkTaskRecord,
     ) -> SandboxHandle:
         if task_record.docker_compose_file is not None:
             if task_record.env_file is None:
@@ -935,10 +646,10 @@ class RealHostScenarioHarness:
             env_file=env_file,
             service_name=service_name,
         )
-        network_lease = self._allocate_benchmark_network_lease(SandboxId(sandbox_name))
+        network_lease = self.network_manager.allocate_lease(SandboxId(sandbox_name))
         handle, work_dir_host_path = self._prepare_sandbox_handle(
             sandbox_name,
-            interceptor_host=self._benchmark_bridge_ip,
+            interceptor_host=self.network_manager.bridge_ip,
             network_lease=network_lease,
             agent_type=agent_type or "simulated",
             llm_service_type=self.resolve_llm_service_type(
@@ -960,7 +671,7 @@ class RealHostScenarioHarness:
         )
         assert self.base_inspector is not None
         assert self.system is not None
-        self._benchmark_ip_to_sandbox[network_lease.guest_ip] = handle.sandbox_id
+        self.network_manager.register_guest_ip(network_lease.guest_ip, handle.sandbox_id)
         self.base_inspector.upsert_snapshot(
             SandboxSnapshot(
                 sandbox_id=handle.sandbox_id,
@@ -999,10 +710,7 @@ class RealHostScenarioHarness:
         sandbox_id_from_header = str(headers.get("X-Agent-Sandbox-Id", "")).strip()
         if sandbox_id_from_header:
             return sandbox_id_from_header
-        if client_host is None:
-            return None
-        with self._benchmark_network_lock:
-            sandbox_id = self._benchmark_ip_to_sandbox.get(client_host)
+        sandbox_id = self.network_manager.resolve_sandbox_id(client_host)
         if sandbox_id is None:
             return None
         return str(sandbox_id)
@@ -1114,7 +822,7 @@ class RealHostScenarioHarness:
                 return None
             return record
 
-        wait_for(lambda: _matching_record() is not None, timeout_s=timeout_s)
+        benchmark_support.wait_for(lambda: _matching_record() is not None, timeout_s=timeout_s)
         record = _matching_record()
         if record is not None and record.status == "restored" and sandbox.task_run is not None:
             sandbox.task_run.on_restore_complete()
@@ -1137,8 +845,8 @@ class RealHostScenarioHarness:
         *,
         initial_steps: int | None = None,
         require_complete: bool = False,
-    ) -> dict[int, TreeSearchCheckpointRecord]:
-        return build_tree_search_checkpoint_index(
+    ) -> dict[int, benchmark_support.TreeSearchCheckpointRecord]:
+        return benchmark_support.build_tree_search_checkpoint_index(
             self.list_checkpoint_manifests(sandbox_id),
             initial_steps=initial_steps,
             require_complete=require_complete,
@@ -1150,8 +858,8 @@ class RealHostScenarioHarness:
         *,
         initial_steps: int,
         timeout_s: float = 45.0,
-    ) -> dict[int, TreeSearchCheckpointRecord]:
-        collected: dict[int, TreeSearchCheckpointRecord] = {}
+    ) -> dict[int, benchmark_support.TreeSearchCheckpointRecord]:
+        collected: dict[int, benchmark_support.TreeSearchCheckpointRecord] = {}
         last_error = f"missing tree-search checkpoints for steps {list(range(1, initial_steps + 1))}"
 
         def _ready() -> bool:
@@ -1171,7 +879,7 @@ class RealHostScenarioHarness:
                 raise
             return True
 
-        if not wait_for(_ready, timeout_s=timeout_s, interval_s=0.2, raise_on_timeout=False):
+        if not benchmark_support.wait_for(_ready, timeout_s=timeout_s, interval_s=0.2, raise_on_timeout=False):
             raise RuntimeError(f"timed out waiting for tree-search checkpoints for sandbox {sandbox_id}: {last_error}")
         logger.info(
             "Collected tree-search checkpoints sandbox=%s steps=%s",
@@ -1188,7 +896,7 @@ class RealHostScenarioHarness:
         timeout_s: float = 45.0,
     ) -> int:
         assert self.storage is not None
-        wait_for(lambda: len(self.storage.list_checkpoints(sandbox_id)) >= minimum, timeout_s=timeout_s)
+        benchmark_support.wait_for(lambda: len(self.storage.list_checkpoints(sandbox_id)) >= minimum, timeout_s=timeout_s)
         return len(self.storage.list_checkpoints(sandbox_id))
 
     def wait_for_checkpoint_count_stable(
@@ -1261,7 +969,7 @@ class RealHostScenarioHarness:
         except KeyError:
             if self.llm_server is not None:
                 self.llm_server.benchmark_llm_router.unregister_sandbox(str(sandbox.sandbox_id))  # type: ignore[attr-defined]
-            self._release_benchmark_network_lease(sandbox.sandbox_id)
+            self.network_manager.release_lease(sandbox.sandbox_id)
             self._sandbox_by_id.pop(sandbox.sandbox_id, None)
             return
         dataset = str(description.metadata.get("zfs_dataset", ""))
@@ -1274,7 +982,7 @@ class RealHostScenarioHarness:
             )
         if self.llm_server is not None:
             self.llm_server.benchmark_llm_router.unregister_sandbox(str(sandbox.sandbox_id))  # type: ignore[attr-defined]
-        self._release_benchmark_network_lease(sandbox.sandbox_id)
+        self.network_manager.release_lease(sandbox.sandbox_id)
         self._sandbox_by_id.pop(sandbox.sandbox_id, None)
 
     def _relaunch_sandbox(self, sandbox_id: SandboxId, event_type: str) -> None:
@@ -1358,19 +1066,19 @@ class RealHostScenarioHarness:
         assert self.base_inspector is not None
 
         network_lease = (
-            self._allocate_benchmark_network_lease(SandboxId(fork_name))
+            self.network_manager.allocate_lease(SandboxId(fork_name))
             if self._agent_requires_benchmark_network(source.agent_type)
             else None
         )
         target, work_dir_host_path = self._prepare_sandbox_handle(
             fork_name,
-            interceptor_host=self._benchmark_bridge_ip if network_lease is not None else "127.0.0.1",
+            interceptor_host=self.network_manager.bridge_ip if network_lease is not None else "127.0.0.1",
             network_lease=network_lease,
             agent_type=source.agent_type,
             llm_service_type=source.llm_service_type,
         )
         if network_lease is not None:
-            self._benchmark_ip_to_sandbox[network_lease.guest_ip] = target.sandbox_id
+            self.network_manager.register_guest_ip(network_lease.guest_ip, target.sandbox_id)
         self._clone_host_work_dir(source.sandbox_id, target.sandbox_id)
 
         source_dataset = f"{self.pool_name}/agent-cr/{source.sandbox_id}"
@@ -1380,7 +1088,7 @@ class RealHostScenarioHarness:
         subprocess.run(["zfs", "destroy", "-r", target_dataset], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         manifests = {manifest.checkpoint_id: manifest for manifest in self.list_checkpoint_manifests(source.sandbox_id)}
         checkpoint_order = list(manifests.keys())
-        copy_plan = resolve_checkpoint_copy_plan(checkpoint_order, manifests, checkpoint_id)
+        copy_plan = benchmark_support.resolve_checkpoint_copy_plan(checkpoint_order, manifests, checkpoint_id)
         filesystem_checkpoint_id = next(copy_id for copy_id, _, copy_filesystem in reversed(copy_plan) if copy_filesystem)
         logger.info(
             "Cloning checkpoint to fork source=%s target=%s selected_checkpoint=%s filesystem_checkpoint=%s copy_plan=%s",
@@ -1503,8 +1211,8 @@ class RealHostScenarioHarness:
         return target
 
     def _clone_host_work_dir(self, source_sandbox_id: SandboxId, target_sandbox_id: SandboxId) -> None:
-        source_work_dir = resolve_work_dir_host_path(self.work_dir_host_root, str(source_sandbox_id))
-        target_work_dir = resolve_work_dir_host_path(self.work_dir_host_root, str(target_sandbox_id))
+        source_work_dir = benchmark_support.resolve_work_dir_host_path(self.work_dir_host_root, str(source_sandbox_id))
+        target_work_dir = benchmark_support.resolve_work_dir_host_path(self.work_dir_host_root, str(target_sandbox_id))
         if source_work_dir is None or target_work_dir is None:
             return
         if target_work_dir.exists():
@@ -1533,8 +1241,8 @@ class RealHostScenarioHarness:
         fork_name: str,
     ) -> SandboxHandle:
         target = self.clone_checkpoint_to_fork(source, checkpoint_id, fork_name)
-        network_lease = self._benchmark_network_leases.get(target.sandbox_id)
-        work_dir_host_path = resolve_work_dir_host_path(self.work_dir_host_root, str(target.sandbox_id))
+        network_lease = self.network_manager.lease_for(target.sandbox_id)
+        work_dir_host_path = benchmark_support.resolve_work_dir_host_path(self.work_dir_host_root, str(target.sandbox_id))
         sandbox_image = self.ensure_sandbox_image(target.agent_type) if target.agent_type is not None else None
         sandbox_bundle.write_bundle_config(
             bundle_dir=target.bundle_dir,
@@ -1553,7 +1261,7 @@ class RealHostScenarioHarness:
         target.status_host = "127.0.0.1" if network_lease is None else network_lease.guest_ip
         target.status_port = source.status_port
         if network_lease is not None:
-            self._benchmark_ip_to_sandbox[network_lease.guest_ip] = target.sandbox_id
+            self.network_manager.register_guest_ip(network_lease.guest_ip, target.sandbox_id)
         logger.info(
             "Prepared tree-search fork sandbox=%s status_host=%s status_port=%d source=%s checkpoint=%s",
             target.sandbox_id,
@@ -1569,7 +1277,7 @@ class RealHostScenarioHarness:
         sandbox_name: str,
         *,
         interceptor_host: str,
-        network_lease: BenchmarkNetworkLease | None = None,
+        network_lease: sandbox_network.BenchmarkNetworkLease | None = None,
         agent_type: str = "simulated",
         llm_service_type: str = "simulated",
         status_port: int | None = None,
@@ -1580,19 +1288,16 @@ class RealHostScenarioHarness:
         assert self.root is not None
         assert self.interceptor is not None
         assert self.llm_server is not None
-        resolved_status_port = find_free_port() if status_port is None else status_port
-        bundle_dir = self.root / "bundles" / sandbox_name
-        work_dir_host_path = resolve_work_dir_host_path(self.work_dir_host_root, sandbox_name)
-        bundle_dir.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["runc", "spec"], cwd=bundle_dir, check=True)
-        llm_base_url = f"http://{interceptor_host}:{self.interceptor.port}/v1"
-        sandbox_bundle.write_bundle_config(
-            bundle_dir=bundle_dir,
-            llm_base_url=llm_base_url,
-            provider=self.provider,
+        work_dir_host_path = benchmark_support.resolve_work_dir_host_path(self.work_dir_host_root, sandbox_name)
+        prepared = sandbox_launcher.prepare_bundle_launch(
+            bundle_root=self.root / "bundles",
             sandbox_name=sandbox_name,
-            status_port=resolved_status_port,
-            cgroup_path=f"agent-cr-bench/{self.pool_name}/{sandbox_name}",
+            provider=self.provider,
+            pool_name=self.pool_name,
+            interceptor_host=interceptor_host,
+            interceptor_port=self.interceptor.port,
+            status_host=status_host if status_host is not None else ("127.0.0.1" if network_lease is None else network_lease.guest_ip),
+            status_port=status_port,
             work_dir_host_path=work_dir_host_path,
             network_namespace_path=None if network_lease is None else network_lease.namespace_path,
             image_defaults=image_defaults,
@@ -1600,17 +1305,13 @@ class RealHostScenarioHarness:
         )
         handle = SandboxHandle(
             sandbox_id=SandboxId(sandbox_name),
-            bundle_dir=bundle_dir,
-            status_port=resolved_status_port,
+            bundle_dir=prepared.bundle_dir,
+            status_port=prepared.status_port,
             last_status={},
-            status_host=(
-                status_host
-                if status_host is not None
-                else ("127.0.0.1" if network_lease is None else network_lease.guest_ip)
-            ),
+            status_host=prepared.status_host,
             agent_type=agent_type,
             llm_service_type=llm_service_type,
-            llm_base_url=llm_base_url,
+            llm_base_url=prepared.llm_base_url,
         )
         self.sandboxes.append(handle)
         self._sandbox_by_id[handle.sandbox_id] = handle
@@ -1618,115 +1319,7 @@ class RealHostScenarioHarness:
             sandbox_id=str(handle.sandbox_id),
             llm_service_type=llm_service_type,
         )
-        return handle, work_dir_host_path
-
-    def _ensure_benchmark_bridge(self) -> None:
-        with self._benchmark_network_lock:
-            if self._benchmark_bridge_name is not None:
-                return
-            assert self.root is not None
-            bridge_name = f"acb{uuid.uuid4().hex[:8]}"
-            subprocess.run(["ip", "link", "add", bridge_name, "type", "bridge"], check=True)
-            subprocess.run(
-                ["ip", "addr", "add", f"{self._benchmark_bridge_ip}/24", "dev", bridge_name],
-                check=True,
-            )
-            subprocess.run(["ip", "link", "set", bridge_name, "up"], check=True)
-            self._benchmark_bridge_name = bridge_name
-            logger.info(
-                "Created benchmark bridge name=%s bridge_ip=%s",
-                bridge_name,
-                self._benchmark_bridge_ip,
-            )
-
-    def _allocate_benchmark_network_lease(self, sandbox_id: SandboxId) -> BenchmarkNetworkLease:
-        self._ensure_benchmark_bridge()
-        with self._benchmark_network_lock:
-            assert self._benchmark_bridge_name is not None
-            network = ipaddress.ip_network(self._benchmark_network_cidr)
-            if self._benchmark_ip_cursor >= network.num_addresses - 1:
-                raise RuntimeError("benchmark network exhausted guest IP capacity")
-            guest_ip = str(network[self._benchmark_ip_cursor])
-            self._benchmark_ip_cursor += 1
-            suffix = uuid.uuid4().hex[:8]
-            namespace_name = f"ts-{suffix}"
-            host_veth_name = f"vh{suffix[:6]}"
-            guest_veth_name = f"vg{suffix[:6]}"
-            subprocess.run(["ip", "netns", "add", namespace_name], check=True)
-            subprocess.run(
-                ["ip", "link", "add", host_veth_name, "type", "veth", "peer", "name", guest_veth_name],
-                check=True,
-            )
-            subprocess.run(["ip", "link", "set", host_veth_name, "master", self._benchmark_bridge_name], check=True)
-            subprocess.run(["ip", "link", "set", host_veth_name, "up"], check=True)
-            subprocess.run(["ip", "link", "set", guest_veth_name, "netns", namespace_name], check=True)
-            subprocess.run(["ip", "netns", "exec", namespace_name, "ip", "link", "set", "lo", "up"], check=True)
-            subprocess.run(
-                ["ip", "netns", "exec", namespace_name, "ip", "link", "set", guest_veth_name, "name", "eth0"],
-                check=True,
-            )
-            subprocess.run(
-                ["ip", "netns", "exec", namespace_name, "ip", "addr", "add", f"{guest_ip}/24", "dev", "eth0"],
-                check=True,
-            )
-            subprocess.run(["ip", "netns", "exec", namespace_name, "ip", "link", "set", "eth0", "up"], check=True)
-            subprocess.run(
-                [
-                    "ip",
-                    "netns",
-                    "exec",
-                    namespace_name,
-                    "ip",
-                    "route",
-                    "replace",
-                    "default",
-                    "via",
-                    self._benchmark_bridge_ip,
-                ],
-                check=True,
-            )
-            lease = BenchmarkNetworkLease(
-                sandbox_id=sandbox_id,
-                namespace_name=namespace_name,
-                namespace_path=Path("/var/run/netns") / namespace_name,
-                host_veth_name=host_veth_name,
-                guest_veth_name=guest_veth_name,
-                guest_ip=guest_ip,
-            )
-            self._benchmark_network_leases[sandbox_id] = lease
-            logger.info(
-                "Allocated benchmark network lease sandbox=%s guest_ip=%s namespace=%s",
-                sandbox_id,
-                guest_ip,
-                namespace_name,
-            )
-            return lease
-
-    def _release_benchmark_network_lease(self, sandbox_id: SandboxId) -> None:
-        with self._benchmark_network_lock:
-            lease = self._benchmark_network_leases.pop(sandbox_id, None)
-            if lease is not None:
-                self._benchmark_ip_to_sandbox.pop(lease.guest_ip, None)
-        if lease is None:
-            return
-        subprocess.run(
-            ["ip", "netns", "del", lease.namespace_name],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        subprocess.run(
-            ["ip", "link", "delete", lease.host_veth_name],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        logger.info(
-            "Released benchmark network lease sandbox=%s guest_ip=%s namespace=%s",
-            sandbox_id,
-            lease.guest_ip,
-            lease.namespace_name,
-        )
+        return handle, prepared.work_dir_host_path
 
     def _set_sandbox_running_state(self, sandbox_id: SandboxId, *, is_running: bool) -> None:
         assert self.base_inspector is not None
@@ -1792,13 +1385,3 @@ class RealHostScenarioHarness:
                 metadata["mountpoint"] = str(self.root / "bundles" / str(target_sandbox_id) / "rootfs")
         data["sandbox_id"] = str(target_sandbox_id)
         return json.dumps(data, sort_keys=True, indent=2).encode("utf-8")
-
-
-def write_rows(path: str, rows: list[dict[str, object]]) -> None:
-    if not path or not rows:
-        return
-    with open(path, "w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)

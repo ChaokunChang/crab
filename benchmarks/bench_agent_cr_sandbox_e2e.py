@@ -14,13 +14,9 @@ if str(ROOT) not in sys.path:
 
 from agent_cr import SchedulerConfig
 from integrations.agents import TaskConfig, TaskDescription
+from benchmarks.support import add_common_args, compute_summary, configure_logging, wait_for, write_rows
 from benchmarks.real_host_scenario_base import (
     RealHostScenarioHarness,
-    add_common_args,
-    compute_summary,
-    configure_logging,
-    wait_for,
-    write_rows,
 )
 
 

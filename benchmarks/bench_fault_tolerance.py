@@ -17,16 +17,18 @@ from agent_cr import FaultToleranceCheckpointingPolicy, JobStatus, LatestOnlyChe
 from agent_cr.models import utc_now
 
 from integrations.agents import SandboxHandle, TaskConfig, TaskDescription
-from benchmarks.real_host_scenario_base import (
-    RealHostScenarioHarness,
+from benchmarks.support import (
     add_common_args,
     bounded_probability,
     compute_summary,
-    configure_logging,
     total_actions,
     wait_for,
     write_rows,
 )
+from benchmarks.real_host_scenario_base import (
+    RealHostScenarioHarness,
+)
+from benchmarks.support import configure_logging
 
 logger = logging.getLogger(__name__)
 

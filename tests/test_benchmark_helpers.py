@@ -24,23 +24,26 @@ from integrations.agents import BaseAgent, IFlowAgent, SandboxHandle, TaskConfig
 from integrations.sandboxes.runtime import bundle as sandbox_bundle
 from integrations.sandboxes.runtime import compose as sandbox_compose
 from integrations.sandboxes.runtime import image as sandbox_image
+from integrations.sandboxes.runtime import launcher as sandbox_launcher
+from integrations.sandboxes.runtime import network as sandbox_network
 from benchmarks.bench_agent_cr_sandbox_e2e import run_benchmark
 from agent_cr.models import utc_now
 from benchmarks.bench_tree_search import choose_replay_steps
-from benchmarks.real_host_scenario_base import (
+from benchmarks.support import (
     BenchmarkTaskRecord,
-    RealHostScenarioHarness,
     TreeSearchCheckpointRecord,
-    build_tree_search_checkpoint_index,
     bounded_probability,
+    build_tree_search_checkpoint_index,
     compute_summary,
-    parse_ipv4_route_networks,
     resolve_checkpoint_copy_plan,
     resolve_work_dir_host_path,
-    select_benchmark_network,
     select_injected_indices,
     total_actions,
 )
+from benchmarks.real_host_scenario_base import (
+    RealHostScenarioHarness,
+)
+from integrations.sandboxes.runtime.network import parse_ipv4_route_networks, select_benchmark_network
 
 ImageRuntimeDefaults = sandbox_image.ImageRuntimeDefaults
 
@@ -478,23 +481,11 @@ class BenchmarkHelperTests(unittest.TestCase):
         self.assertEqual(handle.status_url, "http://10.250.0.22:8123/status")
 
     def test_allocate_benchmark_network_lease_assigns_unique_guest_ips(self) -> None:
-        harness = RealHostScenarioHarness(
-            provider="openai",
-            transfer_delay_ms=0.0,
-            scheduler_config=SchedulerConfig(
-                min_checkpoint_interval_seconds=0.0,
-                force_checkpoint_after_seconds=0.0,
-                require_change_signal=False,
-            ),
-            scheduler_policy=object(),
-            checkpoint_manager_factory=lambda base: base,
-            max_workers=1,
-        )
-        harness.root = Path("/tmp")
+        manager = sandbox_network.BenchmarkNetworkManager()
 
-        with patch("benchmarks.real_host_scenario_base.subprocess.run") as run:
-            first = harness._allocate_benchmark_network_lease(SandboxId("sbx-a"))
-            second = harness._allocate_benchmark_network_lease(SandboxId("sbx-b"))
+        with patch("integrations.sandboxes.runtime.network.subprocess.run") as run:
+            first = manager.allocate_lease(SandboxId("sbx-a"))
+            second = manager.allocate_lease(SandboxId("sbx-b"))
 
         self.assertNotEqual(first.guest_ip, second.guest_ip)
         self.assertEqual(first.namespace_path.name, first.namespace_name)
@@ -502,27 +493,15 @@ class BenchmarkHelperTests(unittest.TestCase):
         self.assertTrue(run.called)
 
     def test_release_benchmark_network_lease_cleans_up_ip_mapping(self) -> None:
-        harness = RealHostScenarioHarness(
-            provider="openai",
-            transfer_delay_ms=0.0,
-            scheduler_config=SchedulerConfig(
-                min_checkpoint_interval_seconds=0.0,
-                force_checkpoint_after_seconds=0.0,
-                require_change_signal=False,
-            ),
-            scheduler_policy=object(),
-            checkpoint_manager_factory=lambda base: base,
-            max_workers=1,
-        )
-        harness.root = Path("/tmp")
+        manager = sandbox_network.BenchmarkNetworkManager()
 
-        with patch("benchmarks.real_host_scenario_base.subprocess.run"):
-            lease = harness._allocate_benchmark_network_lease(SandboxId("sbx-a"))
-            harness._benchmark_ip_to_sandbox[lease.guest_ip] = SandboxId("sbx-a")
-            harness._release_benchmark_network_lease(SandboxId("sbx-a"))
+        with patch("integrations.sandboxes.runtime.network.subprocess.run"):
+            lease = manager.allocate_lease(SandboxId("sbx-a"))
+            manager.register_guest_ip(lease.guest_ip, SandboxId("sbx-a"))
+            manager.release_lease(SandboxId("sbx-a"))
 
-        self.assertNotIn(lease.guest_ip, harness._benchmark_ip_to_sandbox)
-        self.assertNotIn(SandboxId("sbx-a"), harness._benchmark_network_leases)
+        self.assertIsNone(manager.resolve_sandbox_id(lease.guest_ip))
+        self.assertIsNone(manager.lease_for(SandboxId("sbx-a")))
 
     def test_resolve_interceptor_sandbox_id_uses_registered_guest_ip_for_any_benchmark(self) -> None:
         harness = RealHostScenarioHarness(
@@ -537,7 +516,7 @@ class BenchmarkHelperTests(unittest.TestCase):
             checkpoint_manager_factory=lambda base: base,
             max_workers=1,
         )
-        harness._benchmark_ip_to_sandbox["10.250.0.42"] = SandboxId("spot-0")
+        harness.network_manager.register_guest_ip("10.250.0.42", SandboxId("spot-0"))
 
         self.assertEqual(
             harness.resolve_interceptor_sandbox_id("10.250.0.42", {}, b""),
@@ -558,7 +537,7 @@ class BenchmarkHelperTests(unittest.TestCase):
             checkpoint_manager_factory=lambda base: base,
             max_workers=1,
         )
-        harness._benchmark_ip_to_sandbox["10.250.0.42"] = SandboxId("spot-0")
+        harness.network_manager.register_guest_ip("10.250.0.42", SandboxId("spot-0"))
 
         self.assertEqual(
             harness.resolve_interceptor_sandbox_id(
@@ -570,19 +549,7 @@ class BenchmarkHelperTests(unittest.TestCase):
         )
 
     def test_allocate_benchmark_network_lease_creates_bridge_once_under_concurrency(self) -> None:
-        harness = RealHostScenarioHarness(
-            provider="openai",
-            transfer_delay_ms=0.0,
-            scheduler_config=SchedulerConfig(
-                min_checkpoint_interval_seconds=0.0,
-                force_checkpoint_after_seconds=0.0,
-                require_change_signal=False,
-            ),
-            scheduler_policy=object(),
-            checkpoint_manager_factory=lambda base: base,
-            max_workers=2,
-        )
-        harness.root = Path("/tmp")
+        manager = sandbox_network.BenchmarkNetworkManager()
 
         call_lock = threading.Lock()
         bridge_add_commands: list[list[str]] = []
@@ -593,10 +560,10 @@ class BenchmarkHelperTests(unittest.TestCase):
                     bridge_add_commands.append(list(cmd))
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-        with patch("benchmarks.real_host_scenario_base.subprocess.run", side_effect=fake_run):
+        with patch("integrations.sandboxes.runtime.network.subprocess.run", side_effect=fake_run):
             with ThreadPoolExecutor(max_workers=2) as executor:
-                first_future = executor.submit(harness._allocate_benchmark_network_lease, SandboxId("sbx-a"))
-                second_future = executor.submit(harness._allocate_benchmark_network_lease, SandboxId("sbx-b"))
+                first_future = executor.submit(manager.allocate_lease, SandboxId("sbx-a"))
+                second_future = executor.submit(manager.allocate_lease, SandboxId("sbx-b"))
                 first = first_future.result()
                 second = second_future.result()
 
@@ -849,13 +816,14 @@ class BenchmarkHelperTests(unittest.TestCase):
         harness.pool_name = None
         harness.llm_server = None
         harness.llm_thread = None
-        harness._benchmark_network_leases.clear()
+        harness.network_manager.cleanup = Mock()
         harness._stop_host_inspector_server = Mock()
         harness._task_executor.shutdown = Mock()
 
         harness.__exit__(None, None, None)
 
         sandbox.task_run.request_stop.assert_called_once()
+        harness.network_manager.cleanup.assert_called_once_with()
         harness._task_executor.shutdown.assert_called_once_with(wait=True, cancel_futures=True)
 
     def test_launch_sandbox_from_docker_compose_file_translates_supported_service(self) -> None:
@@ -907,13 +875,13 @@ services:
         env_file = harness.root / ".env"
         env_file.write_text("", encoding="utf-8")
 
-        with patch.object(harness, "_allocate_benchmark_network_lease", return_value=SimpleNamespace(guest_ip="10.250.0.2")):
+        with patch.object(harness.network_manager, "allocate_lease", return_value=SimpleNamespace(guest_ip="10.250.0.2")):
             with patch.object(harness, "_prepare_sandbox_handle", return_value=(handle, None)):
                 with patch(
-                    "benchmarks.real_host_scenario_base.sandbox_compose.inspect_image_runtime_defaults",
+                    "integrations.sandboxes.runtime.compose.inspect_image_runtime_defaults",
                     return_value=ImageRuntimeDefaults(),
                 ):
-                    with patch("benchmarks.real_host_scenario_base.sandbox_compose.export_image_rootfs", return_value=harness.root / "rootfs"):
+                    with patch("integrations.sandboxes.runtime.compose.export_image_rootfs", return_value=harness.root / "rootfs"):
                         result = harness.launch_sandbox_from_docker_compose_file(
                             compose_file,
                             env_file,
@@ -975,10 +943,10 @@ services:
         (rootfs_dir / "etc" / "passwd").write_text("app:x:1001:1002::/home/app:/bin/sh\n", encoding="utf-8")
         (rootfs_dir / "etc" / "group").write_text("app:x:1002:\n", encoding="utf-8")
 
-        with patch.object(harness, "_allocate_benchmark_network_lease", return_value=SimpleNamespace(guest_ip="10.250.0.2")):
+        with patch.object(harness.network_manager, "allocate_lease", return_value=SimpleNamespace(guest_ip="10.250.0.2")):
             with patch.object(harness, "_prepare_sandbox_handle", return_value=(handle, None)):
                 with patch(
-                    "benchmarks.real_host_scenario_base.sandbox_compose.inspect_image_runtime_defaults",
+                    "integrations.sandboxes.runtime.compose.inspect_image_runtime_defaults",
                     return_value=ImageRuntimeDefaults(
                         environment=("IMAGE_ONLY=1",),
                         working_dir="/srv/app",
@@ -987,7 +955,7 @@ services:
                         command=("-m", "http.server"),
                     ),
                 ):
-                    with patch("benchmarks.real_host_scenario_base.sandbox_compose.export_image_rootfs", return_value=rootfs_dir):
+                    with patch("integrations.sandboxes.runtime.compose.export_image_rootfs", return_value=rootfs_dir):
                         harness.launch_sandbox_from_docker_compose_file(
                             compose_file,
                             env_file,
@@ -1130,7 +1098,7 @@ services:
             wait_for_task_ready=Mock(),
         )
 
-        with patch.object(harness, "_allocate_benchmark_network_lease") as allocate_network:
+        with patch.object(harness.network_manager, "allocate_lease") as allocate_network:
             with patch.object(harness, "_prepare_sandbox_handle", return_value=(handle, None)) as prepare_handle:
                 with patch.object(harness, "build_task_run", return_value=task_run), patch.object(
                     harness,
@@ -1219,9 +1187,16 @@ services:
         register_sandbox = Mock()
         harness.llm_server = SimpleNamespace(benchmark_llm_router=SimpleNamespace(register_sandbox=register_sandbox))
 
-        with patch("benchmarks.real_host_scenario_base.subprocess.run"), patch(
-            "benchmarks.real_host_scenario_base.sandbox_bundle.write_bundle_config"
-        ), patch("benchmarks.real_host_scenario_base.find_free_port", return_value=8123):
+        with patch(
+            "integrations.sandboxes.runtime.launcher.prepare_bundle_launch",
+            return_value=sandbox_launcher.PreparedBundleLaunch(
+                bundle_dir=harness.root / "bundles" / "sbx-url",
+                work_dir_host_path=None,
+                status_host="127.0.0.1",
+                status_port=8123,
+                llm_base_url="http://10.250.0.1:43123/v1",
+            ),
+        ):
             handle, _ = harness._prepare_sandbox_handle(
                 "sbx-url",
                 interceptor_host="10.250.0.1",
@@ -1272,7 +1247,7 @@ services:
             wait_for_task_ready=Mock(),
         )
 
-        with patch.object(harness, "_allocate_benchmark_network_lease", return_value=lease) as allocate_network:
+        with patch.object(harness.network_manager, "allocate_lease", return_value=lease) as allocate_network:
             with patch.object(harness, "_prepare_sandbox_handle", return_value=(handle, None)) as prepare_handle:
                 with patch.object(harness, "build_task_run", return_value=task_run), patch.object(
                     harness,
@@ -1292,7 +1267,7 @@ services:
             image_defaults=ImageRuntimeDefaults(),
             image_rootfs_dir=sandbox_image.exported_rootfs,
         )
-        self.assertEqual(harness._benchmark_ip_to_sandbox[lease.guest_ip], SandboxId("sbx-iflow"))
+        self.assertEqual(harness.network_manager.resolve_sandbox_id(lease.guest_ip), SandboxId("sbx-iflow"))
 
     def test_launch_sandbox_from_docker_compose_file_rejects_unsupported_features(self) -> None:
         harness = RealHostScenarioHarness(
@@ -1758,7 +1733,7 @@ services:
             harness, "_prepare_sandbox_handle", return_value=(target, None)
         ), patch.object(harness, "list_checkpoint_manifests", return_value=[manifest]), patch.object(
             harness, "build_task_run", return_value=Mock()
-        ), patch("benchmarks.real_host_scenario_base.resolve_checkpoint_copy_plan", return_value=[(CheckpointId("ckpt-1"), False, True)]), patch(
+        ), patch("benchmarks.support.resolve_checkpoint_copy_plan", return_value=[(CheckpointId("ckpt-1"), False, True)]), patch(
             "benchmarks.real_host_scenario_base.subprocess.run"
         ):
             forked = harness.clone_checkpoint_to_fork(source, CheckpointId("ckpt-1"), "sbx-fork")

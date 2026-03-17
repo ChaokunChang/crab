@@ -10,9 +10,9 @@ import unittest
 
 from agent_cr import CheckpointId, JobStatus, SandboxId
 from integrations.agents import SandboxHandle
-from benchmarks.real_host_scenario_base import BenchmarkTaskRecord
 from benchmarks.bench_fault_tolerance import run_fault_tolerance_benchmark
 from benchmarks.bench_spot_agent import run_spot_agent_benchmark
+from benchmarks.support import BenchmarkTaskRecord
 
 
 class _FakeStorage:

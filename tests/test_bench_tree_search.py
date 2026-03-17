@@ -11,7 +11,7 @@ import unittest
 from agent_cr import CheckpointId, SandboxId
 from integrations.agents import SandboxHandle
 from benchmarks.bench_tree_search import run_tree_search_benchmark
-from benchmarks.real_host_scenario_base import BenchmarkTaskRecord, TreeSearchCheckpointRecord
+from benchmarks.support import BenchmarkTaskRecord, TreeSearchCheckpointRecord
 
 
 class _FakeStorage:
