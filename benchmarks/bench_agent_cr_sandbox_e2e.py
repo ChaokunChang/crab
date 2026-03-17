@@ -39,7 +39,7 @@ def benchmark_task_description() -> TaskDescription:
 
 
 def default_task_config() -> TaskConfig:
-    return TaskConfig(minimum_actions=0)
+    return TaskConfig()
 
 
 def run_benchmark(args: argparse.Namespace, harness: RealHostScenarioHarness) -> list[dict[str, object]]:

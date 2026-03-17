@@ -3,6 +3,9 @@ from __future__ import annotations
 from integrations.agents.base import BaseAgent
 
 
+SIMULATED_WARMUP_STEPS = 3
+
+
 class SimulatedAgent(BaseAgent):
     agent_type = "simulated"
     requires_manual_task_launch = False
@@ -11,8 +14,7 @@ class SimulatedAgent(BaseAgent):
         self._set_status(self.poll_status())
 
     def perform_task(self) -> None:
-        if self.task_config.minimum_actions > 0:
-            self.wait_for_progress(minimum_actions=self.task_config.minimum_actions)
+        self.wait_for_progress(minimum_actions=SIMULATED_WARMUP_STEPS)
         self.wait_for_sandbox_exit()
 
     def poll_status(self) -> dict[str, object]:

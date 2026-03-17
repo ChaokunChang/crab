@@ -586,7 +586,7 @@ class BenchmarkHelperTests(unittest.TestCase):
             last_status={},
         )
         task_description = TaskDescription("solve a task")
-        task_config = TaskConfig(minimum_actions=3)
+        task_config = TaskConfig()
 
         with patch.object(harness, "launch_sandbox", return_value=handle) as launch_sandbox:
             with patch.object(harness, "launch_task") as launch_task:
@@ -627,7 +627,7 @@ class BenchmarkHelperTests(unittest.TestCase):
         mock_task_run = Mock()
         mock_future = Mock()
         task_description = TaskDescription("progress")
-        task_config = TaskConfig(minimum_actions=2)
+        task_config = TaskConfig()
 
         with patch.object(harness, "build_task_run", return_value=mock_task_run) as build_task_run:
             with patch.object(harness._task_executor, "submit", return_value=mock_future) as submit:
@@ -727,7 +727,7 @@ class BenchmarkHelperTests(unittest.TestCase):
             agent_type="iflow",
             llm_base_url="http://10.250.0.1:43123/v1",
             task_description=TaskDescription("resume"),
-            task_config=TaskConfig(minimum_actions=0),
+            task_config=TaskConfig(),
         )
         harness.sandbox_manager = SimpleNamespace(
             describe=lambda sandbox_id: SimpleNamespace(metadata={"zfs_dataset": "", "bundle_path": "/tmp/bundle"}),
@@ -765,7 +765,7 @@ class BenchmarkHelperTests(unittest.TestCase):
             agent_type="iflow",
             llm_base_url="http://10.250.0.1:43123/v1",
             task_description=TaskDescription("resume"),
-            task_config=TaskConfig(minimum_actions=0),
+            task_config=TaskConfig(),
         )
         harness.sandbox_manager = SimpleNamespace(
             describe=lambda sandbox_id: SimpleNamespace(metadata={"zfs_dataset": "", "bundle_path": "/tmp/bundle"}),

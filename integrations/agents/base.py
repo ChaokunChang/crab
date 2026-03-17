@@ -33,7 +33,6 @@ class TaskDescription:
 
 @dataclass(frozen=True)
 class TaskConfig:
-    minimum_actions: int = 0
     options: dict[str, object] = field(default_factory=dict)
 
     @classmethod
@@ -44,11 +43,10 @@ class TaskConfig:
             return cls()
         if not isinstance(value, dict):
             raise ValueError(f"invalid task config: {value!r}")
-        minimum_actions = int(value.get("minimum_actions", 0))
         options = value.get("options", {})
         if not isinstance(options, dict):
             raise ValueError(f"task config options must be a dict, got {options!r}")
-        return cls(minimum_actions=minimum_actions, options=dict(options))
+        return cls(options=dict(options))
 
 
 class BaseAgent(ABC):
