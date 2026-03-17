@@ -6,6 +6,7 @@ import json
 import logging
 import shutil
 import subprocess
+import os
 import sys
 import tempfile
 import threading
@@ -14,6 +15,7 @@ import urllib.request
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
+from datetime import datetime
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -219,7 +221,13 @@ class RealHostScenarioHarness:
             self.network_manager.bridge_ip,
         )
         self._tmpdir = tempfile.TemporaryDirectory(prefix="agent_cr_scenario_bench_")
-        self.root = Path("/root/workspace/agent-cr/logs/tmp/agent_cr_bench")
+        # self.root = Path("/root/workspace/agent-cr/logs/tmp/agent_cr_bench")
+        bench_dir = os.environ.get("AGENTCR_BENCH_DIR", None)
+        if bench_dir and bench_dir.lower() not in ['tmpdir', 'tmp']:
+            suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.root = Path(bench_dir) / suffix
+        else:
+            self.root = Path(self._tmpdir.name)
         unique_suffix = uuid.uuid4().hex[:10]
         self.pool_name = f"agentcrbench{unique_suffix}"
         self.runtime_state_root = self.root / "runtime-state"
