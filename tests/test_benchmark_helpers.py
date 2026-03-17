@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import ipaddress
 import json
+import subprocess
 import tempfile
 import threading
 import time
@@ -20,7 +21,7 @@ from agent_cr import (
     SandboxId,
     SchedulerConfig,
 )
-from integrations.agents import BaseAgent, IFlowAgent, SandboxHandle, TaskConfig, TaskDescription
+from integrations.agents import BaseAgent, IFlowAgent, SandboxHandle, SimulatedAgent, TaskConfig, TaskDescription
 from integrations.sandboxes.runtime import bundle as sandbox_bundle
 from integrations.sandboxes.runtime import compose as sandbox_compose
 from integrations.sandboxes.runtime import image as sandbox_image
@@ -673,6 +674,59 @@ class BenchmarkHelperTests(unittest.TestCase):
         self.assertEqual(agent.runtime_state_root, Path("/tmp/runtime-root"))
         self.assertEqual(agent.agent_host_dir, Path("/tmp/harness-root/recording/sbx-explicit"))
         self.assertEqual(agent.llm_base_url, "http://127.0.0.1:43123/v1")
+
+    def test_base_agent_post_task_finish_deactivates_sandbox_runtime(self) -> None:
+        class _RecordingAgent(BaseAgent):
+            agent_type = "recording"
+
+            def perform_task(self) -> None:
+                return None
+
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-post-finish"),
+            bundle_dir=Path("/tmp/sbx-post-finish"),
+            status_port=8123,
+            last_status={},
+        )
+        agent = _RecordingAgent(
+            sandbox,
+            TaskDescription("go"),
+            TaskConfig(),
+            runtime_state_root=Path("/tmp/runtime-root"),
+        )
+
+        with patch("integrations.agents.base.subprocess.run") as run_mock:
+            agent.post_task_finish()
+
+        run_mock.assert_called_once_with(
+            ["runc", "--root", "/tmp/runtime-root", "delete", "-f", "sbx-post-finish"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def test_simulated_agent_calls_post_task_finish_after_task_completion(self) -> None:
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-simulated-post-finish"),
+            bundle_dir=Path("/tmp/sbx-simulated-post-finish"),
+            status_port=8123,
+            last_status={},
+        )
+        agent = SimulatedAgent(
+            sandbox,
+            TaskDescription("go"),
+            TaskConfig(),
+            runtime_state_root=Path("/tmp/runtime-root"),
+        )
+
+        with patch.object(agent, "wait_for_progress") as wait_for_progress, patch.object(
+            agent, "wait_for_sandbox_exit"
+        ) as wait_for_sandbox_exit, patch.object(agent, "post_task_finish") as post_task_finish:
+            agent.perform_task()
+
+        wait_for_progress.assert_called_once()
+        wait_for_sandbox_exit.assert_called_once_with()
+        post_task_finish.assert_called_once_with()
 
     def test_launch_task_requests_stop_before_replacing_running_task(self) -> None:
         harness = RealHostScenarioHarness(
@@ -1330,6 +1384,37 @@ services:
 
         sandbox_is_live.assert_not_called()
 
+    def test_iflow_agent_calls_post_task_finish_after_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            logs_dir = Path(tmp)
+            sandbox = SandboxHandle(
+                sandbox_id=SandboxId("sbx-iflow-post-finish"),
+                bundle_dir=Path("/tmp/sbx-iflow-post-finish"),
+                status_port=8123,
+                last_status={},
+                launch_metadata={
+                    "iflow": {
+                        "entrypoint": "/opt/iflow-runtime/global/lib/node_modules/@iflow-ai/iflow-cli/bundle/entry.js",
+                        "logs_dir": str(logs_dir),
+                    }
+                },
+            )
+            agent = IFlowAgent(
+                sandbox,
+                TaskDescription("do work"),
+                TaskConfig(),
+                runtime_state_root=Path("/tmp/runtime"),
+            )
+            (logs_dir / "iflow.task.done").write_text("done\n", encoding="utf-8")
+            (logs_dir / "iflow.task.exit").write_text("0\n", encoding="utf-8")
+
+            with patch.object(agent, "post_task_finish") as post_task_finish, patch.object(
+                agent, "_sandbox_is_live", return_value=False
+            ):
+                agent.perform_task()
+
+        post_task_finish.assert_called_once_with()
+
     def test_iflow_configure_bundle_runs_task_at_init(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bundle_dir = Path(tmp)
@@ -1729,10 +1814,12 @@ services:
             metadata={},
         ).with_integrity()
 
+        mock_task_run = Mock()
+        mock_task_run.extra_launch_metadata.return_value = {}
         with patch.object(harness, "_agent_requires_benchmark_network", return_value=False), patch.object(
             harness, "_prepare_sandbox_handle", return_value=(target, None)
         ), patch.object(harness, "list_checkpoint_manifests", return_value=[manifest]), patch.object(
-            harness, "build_task_run", return_value=Mock()
+            harness, "build_task_run", return_value=mock_task_run
         ), patch("benchmarks.support.resolve_checkpoint_copy_plan", return_value=[(CheckpointId("ckpt-1"), False, True)]), patch(
             "benchmarks.real_host_scenario_base.subprocess.run"
         ):
@@ -1740,6 +1827,82 @@ services:
 
         self.assertIs(forked, target)
         self.assertEqual(target.llm_base_url, "http://10.250.0.1:43123/v1")
+        mock_task_run.prepare_sandbox.assert_called_once_with()
+
+    def test_clone_checkpoint_to_fork_persists_extra_launch_metadata(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        source = SandboxHandle(
+            sandbox_id=SandboxId("sbx-source"),
+            bundle_dir=Path("/tmp/sbx-source"),
+            status_port=8123,
+            last_status={},
+            agent_type="iflow",
+            llm_service_type="simulated_for_iflow",
+            llm_base_url="http://10.250.0.1:43123/v1",
+            task_description=TaskDescription("resume"),
+            task_config=TaskConfig(),
+        )
+        target = SandboxHandle(
+            sandbox_id=SandboxId("sbx-fork"),
+            bundle_dir=Path("/tmp/sbx-fork"),
+            status_port=8124,
+            last_status={},
+        )
+        harness.root = Path("/tmp")
+        persisted_descriptions: list[object] = []
+        harness.runtime = object()
+        harness.sandbox_manager = SimpleNamespace(
+            _items={},
+            _persist=lambda description: persisted_descriptions.append(description),
+        )
+        harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())
+        harness.storage = SimpleNamespace(
+            put_manifest=Mock(),
+            get_artifact=Mock(),
+            put_artifact=Mock(),
+        )
+
+        manifest = CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=CheckpointId("ckpt-1"),
+            sandbox_id=source.sandbox_id,
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version=None,
+            process_artifacts=[],
+            filesystem_artifacts=[],
+            metadata={},
+        ).with_integrity()
+
+        mock_task_run = Mock()
+        mock_task_run.extra_launch_metadata.return_value = {
+            "host_inspector_ignore_process_rules": [{"executable_basename": "node"}]
+        }
+        with patch.object(harness, "_agent_requires_benchmark_network", return_value=False), patch.object(
+            harness, "_prepare_sandbox_handle", return_value=(target, None)
+        ), patch.object(harness, "list_checkpoint_manifests", return_value=[manifest]), patch.object(
+            harness, "build_task_run", return_value=mock_task_run
+        ), patch("benchmarks.support.resolve_checkpoint_copy_plan", return_value=[(CheckpointId("ckpt-1"), False, True)]), patch(
+            "benchmarks.real_host_scenario_base.subprocess.run"
+        ):
+            harness.clone_checkpoint_to_fork(source, CheckpointId("ckpt-1"), "sbx-fork")
+
+        persisted = harness.sandbox_manager._items[target.sandbox_id]
+        self.assertEqual(
+            persisted.metadata["host_inspector_ignore_process_rules"],
+            [{"executable_basename": "node"}],
+        )
+        self.assertEqual(
+            persisted_descriptions[-1].metadata["host_inspector_ignore_process_rules"],
+            [{"executable_basename": "node"}],
+        )
 
     def test_restore_once_notifies_task_run_after_successful_restore(self) -> None:
         harness = RealHostScenarioHarness(

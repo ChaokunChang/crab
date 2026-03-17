@@ -99,6 +99,48 @@ class SandboxManagerTests(unittest.TestCase):
                 ],
             )
 
+    def test_runc_sandbox_manager_registers_restored_sandbox_with_host_inspector(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_sandbox_mgr_") as tmp:
+            root = Path(tmp)
+            runner = FakeCommandRunner()
+            host_inspector = FakeHostInspectorClient()
+            manager = RuncSandboxManager(
+                command_runner=runner,
+                host_inspector_client=host_inspector,
+                paths=RuncSandboxManagerPaths(
+                    state_root=root / "state",
+                    bundle_root=root / "bundles",
+                    metadata_root=root / "metadata",
+                    zfs_dataset_prefix="pool/agent-cr",
+                ),
+            )
+
+            sandbox_id = manager.launch(
+                "runc",
+                {
+                    "sandbox_id": "sbx-restore",
+                    "bundle_path": str(root / "bundles" / "sbx-restore"),
+                    "host_inspector_ignore_process_rules": [{"executable_basename": "node"}],
+                },
+            )
+            host_inspector.register_calls.clear()
+
+            manager.prepare_for_restore(sandbox_id)
+            manager.mark_restored(sandbox_id)
+
+            self.assertEqual(manager.describe(sandbox_id).status, "running")
+            self.assertEqual(
+                host_inspector.register_calls,
+                [
+                    (
+                        SandboxId("sbx-restore"),
+                        "runc",
+                        "sbx-restore",
+                        [{"executable_basename": "node"}],
+                    )
+                ],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

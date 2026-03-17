@@ -97,8 +97,8 @@ def prepare_iflow_runtime(
 ) -> PreparedIFlowRuntime:
     cache_files = ensure_cache_files(cache_dir)
     runtime_root = work_root / "iflow-runtime"
-    if runtime_root.exists():
-        shutil.rmtree(runtime_root)
+    # if runtime_root.exists():
+    #     shutil.rmtree(runtime_root)
     runtime_root.mkdir(parents=True, exist_ok=True)
 
     node_root = runtime_root / "node"

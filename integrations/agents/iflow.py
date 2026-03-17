@@ -113,6 +113,7 @@ class IFlowAgent(BaseAgent):
     def prepare_sandbox(self) -> None:
         assert self.agent_host_dir is not None
         assert self.llm_base_url is not None
+        logger.debug(f"preparing sandbox in {self.agent_host_dir=}")
         sandbox_root = self.agent_host_dir
         prepared_runtime = prepare_iflow_runtime(work_root=sandbox_root)
         prepared_state = prepare_iflow_state(
@@ -284,6 +285,7 @@ class IFlowAgent(BaseAgent):
         finally:
             with self._state_lock:
                 self._finished_at_monotonic = time.monotonic()
+            self.post_task_finish()
 
     def poll_status(self) -> dict[str, object]:
         actions = self._synthetic_action_count()

@@ -1208,6 +1208,15 @@ class RealHostScenarioHarness:
                 target.task_description,
                 target.task_config,
             )
+            target.task_run.prepare_sandbox()
+            extra_launch_metadata = dict(target.task_run.extra_launch_metadata())
+            if extra_launch_metadata:
+                description = replace(
+                    description,
+                    metadata={**description.metadata, **extra_launch_metadata},
+                )
+                self.sandbox_manager._items[target.sandbox_id] = description
+                self.sandbox_manager._persist(description)
         return target
 
     def _clone_host_work_dir(self, source_sandbox_id: SandboxId, target_sandbox_id: SandboxId) -> None:

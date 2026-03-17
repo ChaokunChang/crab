@@ -14,8 +14,11 @@ class SimulatedAgent(BaseAgent):
         self._set_status(self.poll_status())
 
     def perform_task(self) -> None:
-        self.wait_for_progress(minimum_actions=SIMULATED_WARMUP_STEPS)
-        self.wait_for_sandbox_exit()
+        try:
+            self.wait_for_progress(minimum_actions=SIMULATED_WARMUP_STEPS)
+            self.wait_for_sandbox_exit()
+        finally:
+            self.post_task_finish()
 
     def poll_status(self) -> dict[str, object]:
         return self.wait_for_http_json(self.sandbox.status_url)

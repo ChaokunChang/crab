@@ -76,6 +76,23 @@ class BaseAgent(ABC):
     def perform_task(self) -> None:
         raise NotImplementedError
 
+    def post_task_finish(self) -> None:
+        if self.runtime_state_root is None:
+            return
+        subprocess.run(
+            [
+                "runc",
+                "--root",
+                str(self.runtime_state_root),
+                "delete",
+                "-f",
+                str(self.sandbox.sandbox_id),
+            ],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
     def prepare_sandbox(self) -> None:
         return None
 
