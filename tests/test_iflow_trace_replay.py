@@ -74,6 +74,30 @@ class IFlowTraceReplayTests(unittest.TestCase):
         self.assertEqual(replayed["choices"][0]["message"]["content"], "second")
         self.assertEqual(reset_response["choices"][0]["message"]["content"], "first")
 
+    def test_trace_replay_state_rewinds_when_restore_captures_inflight_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.log"
+            trace_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"type": "response", "data": {"choices": [{"message": {"content": "first"}}]}}),
+                        json.dumps({"type": "response", "data": {"choices": [{"message": {"content": "second"}}]}}),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            state = TraceReplayLLMState(llm_service_config={"trace_path": str(trace_path)})
+
+            first_index, first = state.next_response(headers={"X-Agent-Sandbox-Id": "sbx"}, payload={})
+            checkpoint = state.checkpoint_metadata()
+            state.restore_from_checkpoint_metadata({**checkpoint, "captures_inflight_llm": True})
+            replayed_index, replayed = state.next_response(headers={"X-Agent-Sandbox-Id": "sbx"}, payload={})
+
+        self.assertEqual(first_index, 0)
+        self.assertEqual(first["choices"][0]["message"]["content"], "first")
+        self.assertEqual(replayed_index, 0)
+        self.assertEqual(replayed["choices"][0]["message"]["content"], "first")
+
     def test_trace_replay_state_applies_default_response_delay(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "trace.log"
@@ -146,6 +170,123 @@ class IFlowTraceReplayTests(unittest.TestCase):
         self.assertEqual(len(parsed.responses), 2)
         self.assertEqual(parsed.responses[0]["choices"][0]["message"]["content"], "first")
         self.assertEqual(parsed.responses[1]["choices"][0]["message"]["content"], "real-final")
+
+    def test_parse_replay_trace_skips_unfenced_sidecar_evaluator_responses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.log"
+            trace_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "response",
+                                "data": {
+                                    "choices": [
+                                        {
+                                            "finish_reason": "tool_calls",
+                                            "message": {"content": "first", "tool_calls": [{"id": "1"}]},
+                                        }
+                                    ]
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "response",
+                                "data": {
+                                    "choices": [
+                                        {
+                                            "finish_reason": "stop",
+                                            "message": {
+                                                "content": json.dumps(
+                                                    {"reasoning": "meta", "confidence": 0.5}
+                                                )
+                                            },
+                                        }
+                                    ]
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "response",
+                                "data": {
+                                    "choices": [
+                                        {
+                                            "finish_reason": "stop",
+                                            "message": {"content": "real-final"},
+                                        }
+                                    ]
+                                },
+                            }
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            parsed = parse_replay_trace(trace_path)
+
+        self.assertEqual(len(parsed.responses), 2)
+        self.assertEqual(parsed.responses[0]["choices"][0]["message"]["content"], "first")
+        self.assertEqual(parsed.responses[1]["choices"][0]["message"]["content"], "real-final")
+
+    def test_parse_replay_trace_skips_string_escaping_correction_responses(self) -> None:
+        for key in ("corrected_string_escaping", "corrected_new_string_escaping"):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as tmp:
+                trace_path = Path(tmp) / "trace.log"
+                trace_path.write_text(
+                    "\n".join(
+                        [
+                            json.dumps(
+                                {
+                                    "type": "response",
+                                    "data": {
+                                        "choices": [
+                                            {
+                                                "finish_reason": "tool_calls",
+                                                "message": {"content": "first", "tool_calls": [{"id": "1"}]},
+                                            }
+                                        ]
+                                    },
+                                }
+                            ),
+                            json.dumps(
+                                {
+                                    "type": "response",
+                                    "data": {
+                                        "choices": [
+                                            {
+                                                "finish_reason": "stop",
+                                                "message": {"content": f"```json\n{json.dumps({key: 'print(1)'})}\n```"},
+                                            }
+                                        ]
+                                    },
+                                }
+                            ),
+                            json.dumps(
+                                {
+                                    "type": "response",
+                                    "data": {
+                                        "choices": [
+                                            {
+                                                "finish_reason": "tool_calls",
+                                                "message": {"content": "second", "tool_calls": [{"id": "2"}]},
+                                            }
+                                        ]
+                                    },
+                                }
+                            ),
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+
+                parsed = parse_replay_trace(trace_path)
+
+            self.assertEqual(len(parsed.responses), 2)
+            self.assertEqual(parsed.responses[0]["choices"][0]["message"]["content"], "first")
+            self.assertEqual(parsed.responses[1]["choices"][0]["message"]["content"], "second")
 
     def test_generate_dataset_builds_expected_replay_row(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

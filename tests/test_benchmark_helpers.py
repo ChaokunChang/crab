@@ -1989,6 +1989,34 @@ services:
                 with self.assertRaisesRegex(RuntimeError, "exit code 7"):
                     agent.perform_task()
 
+    def test_iflow_agent_treats_zero_exit_without_done_marker_as_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            logs_dir = Path(tmp)
+            sandbox = SandboxHandle(
+                sandbox_id=SandboxId("sbx-iflow-zero-exit"),
+                bundle_dir=Path("/tmp/sbx-iflow-zero-exit"),
+                status_port=8123,
+                last_status={},
+                launch_metadata={
+                    "iflow": {
+                        "entrypoint": "/opt/iflow-runtime/global/lib/node_modules/@iflow-ai/iflow-cli/bundle/entry.js",
+                        "logs_dir": str(logs_dir),
+                    }
+                },
+            )
+            agent = IFlowAgent(
+                sandbox,
+                TaskDescription("do work"),
+                TaskConfig(),
+                runtime_state_root=Path("/tmp/runtime"),
+            )
+
+            (logs_dir / "iflow.task.exit").write_text("0\n", encoding="utf-8")
+            with patch.object(agent, "_sandbox_is_live", return_value=True):
+                agent.perform_task()
+
+        self.assertEqual(agent.poll_status()["state"], "finished")
+
     def test_iflow_agent_uses_one_second_default_action_tick(self) -> None:
         sandbox = SandboxHandle(
             sandbox_id=SandboxId("sbx-iflow-default-tick"),

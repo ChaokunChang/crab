@@ -11,6 +11,7 @@ from typing import Any
 _STATE_METADATA_KEY = "llm_service_state"
 _STATE_SERVICE_TYPE = "iflow_trace_replay"
 _DEFAULT_RESPONSE_DELAY_MS = 250
+_CAPTURES_INFLIGHT_LLM = "captures_inflight_llm"
 
 
 @dataclass(frozen=True)
@@ -44,7 +45,18 @@ def _decode_json_payload(raw: object) -> dict[str, Any] | None:
     return parsed
 
 
-def _is_sidecar_evaluator_response(payload: dict[str, Any]) -> bool:
+def _is_non_replayable_stop_payload(parsed: dict[str, Any]) -> bool:
+    if "reasoning" in parsed and "confidence" in parsed:
+        return True
+    if len(parsed) != 1:
+        return False
+    [(key, value)] = parsed.items()
+    return isinstance(key, str) and key.startswith("corrected_") and key.endswith("string_escaping") and isinstance(
+        value, str
+    )
+
+
+def _is_non_replayable_stop_response(payload: dict[str, Any]) -> bool:
     choices = payload.get("choices")
     if not isinstance(choices, list) or not choices:
         return False
@@ -61,8 +73,16 @@ def _is_sidecar_evaluator_response(payload: dict[str, Any]) -> bool:
     content = message.get("content")
     if not isinstance(content, str):
         return False
-    normalized = content.strip().lower()
-    return normalized.startswith("```json") and '"reasoning"' in normalized and '"confidence"' in normalized
+    normalized = content.strip()
+    if normalized.startswith("```"):
+        lines = normalized.splitlines()
+        if len(lines) >= 3 and lines[0].strip().startswith("```") and lines[-1].strip() == "```":
+            normalized = "\n".join(lines[1:-1]).strip()
+    try:
+        parsed = json.loads(normalized)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(parsed, dict) and _is_non_replayable_stop_payload(parsed)
 
 
 def parse_replay_trace(trace_path: Path) -> ParsedReplayTrace:
@@ -84,7 +104,7 @@ def parse_replay_trace(trace_path: Path) -> ParsedReplayTrace:
         if payload is None:
             malformed_lines.append(line_number)
             continue
-        if _is_sidecar_evaluator_response(payload):
+        if _is_non_replayable_stop_response(payload):
             continue
         responses.append(payload)
     if not responses:
@@ -137,6 +157,11 @@ class TraceReplayLLMState:
             next_response_index = int(raw_index)
         except (TypeError, ValueError):
             next_response_index = 0
+        # The replay state is captured after the current response is selected.
+        # When the checkpoint also captured an in-flight request, the restored sandbox
+        # re-issues that request, so we need to rewind one turn and replay it again.
+        if bool(metadata.get(_CAPTURES_INFLIGHT_LLM, False)) and next_response_index > 0:
+            next_response_index -= 1
         with self._lock:
             self._next_response_index = max(0, min(next_response_index, len(self._trace.responses)))
 

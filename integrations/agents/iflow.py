@@ -553,15 +553,14 @@ class IFlowAgent(BaseAgent):
                 output_paths["stderr"],
             )
             raise RuntimeError(f"iflow task failed in sandbox {self.sandbox.sandbox_id} with exit code {exit_code}")
-        logger.error(
-            "Iflow task exited without completion marker sandbox=%s exit_path=%s done_path=%s",
+        logger.warning(
+            "Iflow task exited cleanly without completion marker; treating exit=0 as completion "
+            "sandbox=%s exit_path=%s done_path=%s",
             self.sandbox.sandbox_id,
             exit_path,
             done_path,
         )
-        raise RuntimeError(
-            f"iflow task in sandbox {self.sandbox.sandbox_id} exited without writing the completion marker"
-        )
+        return True
 
     def _read_marker_text(self, path: Path) -> str | None:
         try:
