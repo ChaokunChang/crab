@@ -634,7 +634,9 @@ class HostInspectorServer:
                     if self.path == "/get_proc_and_fs_status":
                         payload = self._read_json()
                         result = daemon.status(str(payload["sandbox_id"]))
-                        logger.debug(f"host-inspector: get_proc_and_fs_status {payload=} {result=}")
+                        def without_key(d, key):
+                            return {k: v for k, v in d.items() if k != key}
+                        logger.debug(f"host-inspector: get_proc_and_fs_status {payload=} result={without_key(result, 'metadata')}")
                         self._write_json(HTTPStatus.OK, {"ok": True, "status": result})
                         return
                     if self.path == "/reset":
