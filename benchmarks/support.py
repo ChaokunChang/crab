@@ -242,8 +242,16 @@ def verification_timeout_seconds(task_config: TaskConfig, *, default: float = 18
 def write_rows(path: str, rows: list[dict[str, object]]) -> None:
     if not path or not rows:
         return
+    fieldnames: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for key in row.keys():
+            if key in seen:
+                continue
+            seen.add(key)
+            fieldnames.append(key)
     with open(path, "w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
             writer.writerow(row)

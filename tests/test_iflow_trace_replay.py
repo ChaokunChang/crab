@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from benchmarks.generate_termnius_iflow_replay_dataset import generate_dataset
 from integrations.llm_services.iflow_trace_replay.service import TraceReplayLLMState, parse_replay_trace
@@ -72,6 +73,79 @@ class IFlowTraceReplayTests(unittest.TestCase):
         self.assertEqual(second["choices"][0]["message"]["content"], "second")
         self.assertEqual(replayed["choices"][0]["message"]["content"], "second")
         self.assertEqual(reset_response["choices"][0]["message"]["content"], "first")
+
+    def test_trace_replay_state_applies_default_response_delay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.log"
+            trace_path.write_text(
+                json.dumps({"type": "response", "data": {"choices": [{"message": {"content": "first"}}]}}) + "\n",
+                encoding="utf-8",
+            )
+            state = TraceReplayLLMState(llm_service_config={"trace_path": str(trace_path)})
+
+            with patch("integrations.llm_services.iflow_trace_replay.service.time.sleep") as sleep:
+                _, response = state.next_response(headers={"X-Agent-Sandbox-Id": "sbx"}, payload={})
+
+        sleep.assert_called_once_with(0.25)
+        self.assertEqual(response["choices"][0]["message"]["content"], "first")
+
+    def test_parse_replay_trace_skips_sidecar_evaluator_responses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.log"
+            trace_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "response",
+                                "data": {
+                                    "choices": [
+                                        {
+                                            "finish_reason": "tool_calls",
+                                            "message": {"content": "first", "tool_calls": [{"id": "1"}]},
+                                        }
+                                    ]
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "response",
+                                "data": {
+                                    "choices": [
+                                        {
+                                            "finish_reason": "stop",
+                                            "message": {
+                                                "content": "```json\n{\"reasoning\":\"meta\",\"confidence\":0.5}\n```"
+                                            },
+                                        }
+                                    ]
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "response",
+                                "data": {
+                                    "choices": [
+                                        {
+                                            "finish_reason": "stop",
+                                            "message": {"content": "real-final"},
+                                        }
+                                    ]
+                                },
+                            }
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            parsed = parse_replay_trace(trace_path)
+
+        self.assertEqual(len(parsed.responses), 2)
+        self.assertEqual(parsed.responses[0]["choices"][0]["message"]["content"], "first")
+        self.assertEqual(parsed.responses[1]["choices"][0]["message"]["content"], "real-final")
 
     def test_generate_dataset_builds_expected_replay_row(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

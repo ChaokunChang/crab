@@ -41,6 +41,7 @@ from benchmarks.support import (
     resolve_work_dir_host_path,
     select_injected_indices,
     total_actions,
+    write_rows,
 )
 from benchmarks.real_host_scenario_base import (
     RealHostScenarioHarness,
@@ -75,6 +76,32 @@ class BenchmarkHelperTests(unittest.TestCase):
     def test_choose_replay_steps_is_deterministic(self) -> None:
         self.assertEqual(choose_replay_steps(6, 2), [1, 3])
         self.assertEqual(choose_replay_steps(4, 10), [1, 2, 3])
+
+    def test_write_rows_supports_nonuniform_field_sets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "rows.csv"
+
+            write_rows(
+                str(output_path),
+                [
+                    {"sandbox_id": "fault-0", "success_ratio": 1.0, "verification_status": "passed"},
+                    {
+                        "sandbox_id": "fault-1",
+                        "success_ratio": 0.0,
+                        "verification_status": "failed",
+                        "verification_stderr": "boom",
+                    },
+                ],
+            )
+
+            self.assertEqual(
+                output_path.read_text(encoding="utf-8").splitlines(),
+                [
+                    "sandbox_id,success_ratio,verification_status,verification_stderr",
+                    "fault-0,1.0,passed,",
+                    "fault-1,0.0,failed,boom",
+                ],
+            )
 
     def test_build_tree_search_checkpoint_index_collects_steps(self) -> None:
         manifests = [
@@ -1609,6 +1636,11 @@ services:
             self.assertIn("export AGENT_CR_IFLOW_CWD=/app", payload["process"]["args"][2])
             self.assertIn("export AGENT_CR_IFLOW_KEEPALIVE_AFTER_TASK=true", payload["process"]["args"][2])
             self.assertIn("cd /app", payload["process"]["args"][2])
+            self.assertIn("if [ -f /installed-agent/setup-env.sh ]; then . /installed-agent/setup-env.sh; fi", payload["process"]["args"][2])
+            self.assertIn(
+                "elif command -v apt-get >/dev/null 2>&1; then export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y curl git wget xz-utils openssh-client patch xauth build-essential dpkg-dev procps net-tools psmisc; fi",
+                payload["process"]["args"][2],
+            )
             self.assertIn("mkdir -p /data/iflow-task-logs", payload["process"]["args"][2])
             self.assertIn("exec /opt/iflow-runtime/node/bin/node -e", payload["process"]["args"][2])
             self.assertIn(IFLOW_WRAPPER_ARG, payload["process"]["args"][2])
@@ -1971,6 +2003,30 @@ services:
         )
         agent = IFlowAgent(sandbox, TaskDescription("do work"), TaskConfig(), runtime_state_root=Path("/tmp/runtime"))
         self.assertEqual(agent._tick_seconds, 1.0)
+
+    def test_iflow_replay_action_wait_timeout_uses_task_budget(self) -> None:
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-iflow-replay-timeout"),
+            bundle_dir=Path("/tmp/sbx-iflow-replay-timeout"),
+            status_port=8123,
+            last_status={},
+            llm_service_type="iflow_trace_replay",
+            launch_source="compose",
+            launch_metadata={
+                "iflow": {
+                    "entrypoint": "/opt/iflow-runtime/global/lib/node_modules/@iflow-ai/iflow-cli/bundle/entry.js",
+                }
+            },
+        )
+        agent = IFlowAgent(
+            sandbox,
+            TaskDescription("do work"),
+            TaskConfig(options={"max_agent_timeout_sec": 360.0}),
+            runtime_state_root=Path("/tmp/runtime"),
+        )
+
+        self.assertEqual(agent._replay_action_wait_timeout_seconds(1), 360.0)
+        self.assertEqual(agent._replay_action_wait_timeout_seconds(50), 500.0)
 
     def test_iflow_agent_on_restore_complete_resumes_synthetic_progress(self) -> None:
         sandbox = SandboxHandle(

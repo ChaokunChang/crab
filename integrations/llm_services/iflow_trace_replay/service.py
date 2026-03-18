@@ -3,12 +3,14 @@ from __future__ import annotations
 import copy
 import json
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 _STATE_METADATA_KEY = "llm_service_state"
 _STATE_SERVICE_TYPE = "iflow_trace_replay"
+_DEFAULT_RESPONSE_DELAY_MS = 250
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,27 @@ def _decode_json_payload(raw: object) -> dict[str, Any] | None:
     return parsed
 
 
+def _is_sidecar_evaluator_response(payload: dict[str, Any]) -> bool:
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return False
+    first_choice = choices[0]
+    if not isinstance(first_choice, dict):
+        return False
+    if str(first_choice.get("finish_reason", "")).lower() != "stop":
+        return False
+    message = first_choice.get("message")
+    if not isinstance(message, dict):
+        return False
+    if message.get("tool_calls"):
+        return False
+    content = message.get("content")
+    if not isinstance(content, str):
+        return False
+    normalized = content.strip().lower()
+    return normalized.startswith("```json") and '"reasoning"' in normalized and '"confidence"' in normalized
+
+
 def parse_replay_trace(trace_path: Path) -> ParsedReplayTrace:
     resolved = trace_path.expanduser().resolve()
     responses: list[dict[str, Any]] = []
@@ -61,6 +84,8 @@ def parse_replay_trace(trace_path: Path) -> ParsedReplayTrace:
         if payload is None:
             malformed_lines.append(line_number)
             continue
+        if _is_sidecar_evaluator_response(payload):
+            continue
         responses.append(payload)
     if not responses:
         raise ValueError(f"trace {resolved} did not contain any replayable responses")
@@ -77,11 +102,17 @@ class TraceReplayLLMState:
         trace_path_value = config.get("trace_path")
         if not isinstance(trace_path_value, str) or not trace_path_value:
             raise ValueError("iflow_trace_replay requires llm_service_config.trace_path")
+        raw_delay_ms = config.get("response_delay_ms", _DEFAULT_RESPONSE_DELAY_MS)
+        try:
+            response_delay_ms = int(raw_delay_ms)
+        except (TypeError, ValueError):
+            response_delay_ms = _DEFAULT_RESPONSE_DELAY_MS
         parsed = parse_replay_trace(Path(trace_path_value))
         self._trace = parsed
         self._lock = threading.Lock()
         self._next_response_index = 0
         self._events: list[dict[str, Any]] = []
+        self._response_delay_ms = max(0, response_delay_ms)
 
     def handle_request(self, *, path: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
         return handle_request(path=path, headers=headers, payload=payload, state=self)
@@ -127,12 +158,16 @@ class TraceReplayLLMState:
                     "next_response_index": self._next_response_index,
                 }
             )
-            return response_index, copy.deepcopy(self._trace.responses[response_index])
+            response = copy.deepcopy(self._trace.responses[response_index])
+        if self._response_delay_ms > 0:
+            time.sleep(self._response_delay_ms / 1000.0)
+        return response_index, response
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return {
                 "trace_path": str(self._trace.trace_path),
+                "response_delay_ms": self._response_delay_ms,
                 "total_responses": len(self._trace.responses),
                 "next_response_index": self._next_response_index,
                 "responses_served": min(self._next_response_index, len(self._trace.responses)),

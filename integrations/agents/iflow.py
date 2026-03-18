@@ -75,6 +75,19 @@ child.once("exit", (code, signal) => {
   process.exit(exitCode);
 });
 """.strip()
+_INSTALL_AGENT_SETUP_COMMANDS = [
+    "if [ -f /installed-agent/setup-env.sh ]; then . /installed-agent/setup-env.sh; fi",
+    (
+        "if [ -f /installed-agent/install-agent.sh ]; then "
+        ". /installed-agent/install-agent.sh || echo 'INSTALL_FAIL_STATUS'; "
+        "elif command -v apt-get >/dev/null 2>&1; then "
+        "export DEBIAN_FRONTEND=noninteractive; "
+        "apt-get update && apt-get install -y "
+        "curl git wget xz-utils openssh-client patch xauth build-essential dpkg-dev "
+        "procps net-tools psmisc; "
+        "fi"
+    ),
+]
 
 
 class IFlowAgent(BaseAgent):
@@ -225,6 +238,7 @@ class IFlowAgent(BaseAgent):
                     f"export AGENT_CR_IFLOW_DONE_PATH={shlex.quote(marker_mount_paths['done'])}",
                     f"export AGENT_CR_IFLOW_EXIT_PATH={shlex.quote(marker_mount_paths['exit'])}",
                     f"cd {shlex.quote(compose_cwd)}",
+                    *_INSTALL_AGENT_SETUP_COMMANDS,
                     f"mkdir -p {shlex.quote(str(SANDBOX_TASK_OUTPUT_DIR))}",
                     (
                         "rm -f "
@@ -262,6 +276,7 @@ class IFlowAgent(BaseAgent):
                     f"export AGENT_CR_IFLOW_DONE_PATH={shlex.quote(marker_mount_paths['done'])}",
                     f"export AGENT_CR_IFLOW_EXIT_PATH={shlex.quote(marker_mount_paths['exit'])}",
                     "cd /work",
+                    *_INSTALL_AGENT_SETUP_COMMANDS,
                     f"mkdir -p {shlex.quote(str(SANDBOX_TASK_OUTPUT_DIR))}",
                     (
                         "rm -f "
@@ -653,8 +668,16 @@ class IFlowAgent(BaseAgent):
             "replay_next_response_index": actions,
         }
 
+    def _replay_action_wait_timeout_seconds(self, target_actions: int) -> float:
+        raw_task_timeout = self.task_config.options.get("max_agent_timeout_sec", 900.0)
+        try:
+            task_timeout = float(raw_task_timeout)
+        except (TypeError, ValueError):
+            task_timeout = 900.0
+        return max(45.0, task_timeout, target_actions * 10.0)
+
     def _wait_for_replay_action_count(self, target_actions: int) -> None:
-        deadline = time.monotonic() + max(45.0, target_actions * 10.0)
+        deadline = time.monotonic() + self._replay_action_wait_timeout_seconds(target_actions)
         while time.monotonic() < deadline:
             current_actions = self._replay_action_count()
             if current_actions >= target_actions:

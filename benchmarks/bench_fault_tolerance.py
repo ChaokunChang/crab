@@ -329,7 +329,23 @@ def run_replay_fault_tolerance_sandbox(
             raise RuntimeError("replay fault-tolerance benchmark expected sandbox.task_run")
         for iteration, checkpoint_target in enumerate(replay_points, start=1):
             iterations_executed += 1
-            current = sandbox.task_run.wait_for_progress(minimum_actions=checkpoint_target)
+            try:
+                current = sandbox.task_run.wait_for_progress(minimum_actions=checkpoint_target)
+            except RuntimeError as exc:
+                current = sandbox.task_run.poll_status()
+                if (
+                    "iflow replay task finished before reaching replay action count" in str(exc)
+                    and str(current.get("state", "")) == "finished"
+                ):
+                    logger.info(
+                        "Stopping replay fault injection because sandbox=%s finished before checkpoint target=%d at actions=%d",
+                        sandbox.sandbox_id,
+                        checkpoint_target,
+                        total_actions(current),
+                    )
+                    sandbox.last_status = dict(current)
+                    break
+                raise
             if _replay_status_is_complete(current, trace_response_count=trace_response_count):
                 logger.info(
                     "Skipping replay fault injection because sandbox=%s already completed trace at actions=%d",
@@ -430,37 +446,50 @@ def run_fault_tolerance_benchmark(
 ) -> list[dict[str, object]]:
     dataset_path = getattr(args, "dataset", None)
     dataset = harness.load_dataset(dataset_path) if dataset_path is not None else None
+    selected_records = [
+        harness.select_task_record(
+            dataset,
+            sandbox_index=index,
+            default_agent_type=args.agent_type,
+            default_llm_service_type=args.llm_service_type,
+            default_task_description=benchmark_task_description(),
+            default_task_config=default_task_config(),
+        )
+        for index in range(args.sandboxes)
+    ]
+    replay_mode = any(is_replay_llm_service_type(record.llm_service_type) for record in selected_records)
+    if replay_mode:
+        def launch_and_run(item: tuple[int, object]) -> dict[str, object]:
+            sandbox_index, task_record = item
+            sandbox = harness.launch_task_record(f"fault-{sandbox_index}", task_record)
+            if is_replay_llm_service_type(sandbox.llm_service_type):
+                return run_replay_fault_tolerance_sandbox(
+                    args,
+                    harness,
+                    sandbox_index=sandbox_index,
+                    sandbox=sandbox,
+                )
+            row_group = run_fault_tolerance_sandbox(
+                args,
+                harness,
+                sandbox_index=sandbox_index,
+                sandbox=sandbox,
+            )
+            if not row_group:
+                raise RuntimeError(f"fault-tolerance benchmark produced no rows for sandbox {sandbox.sandbox_id}")
+            return row_group[-1]
+
+        with ThreadPoolExecutor(max_workers=max(1, args.sandboxes)) as executor:
+            rows = list(executor.map(launch_and_run, enumerate(selected_records)))
+        return sorted(rows, key=lambda row: str(row["sandbox_id"]))
+
     with ThreadPoolExecutor(max_workers=max(1, args.sandboxes)) as launcher:
         sandboxes = list(
             launcher.map(
-                lambda index: harness.launch_task_record(
-                    f"fault-{index}",
-                    harness.select_task_record(
-                        dataset,
-                        sandbox_index=index,
-                        default_agent_type=args.agent_type,
-                        default_llm_service_type=args.llm_service_type,
-                        default_task_description=benchmark_task_description(),
-                        default_task_config=default_task_config(),
-                    ),
-                ),
-                range(args.sandboxes),
+                lambda item: harness.launch_task_record(f"fault-{item[0]}", item[1]),
+                enumerate(selected_records),
             )
         )
-    if sandboxes and any(is_replay_llm_service_type(sandbox.llm_service_type) for sandbox in sandboxes):
-        with ThreadPoolExecutor(max_workers=max(1, args.sandboxes)) as executor:
-            rows = list(
-                executor.map(
-                    lambda item: run_replay_fault_tolerance_sandbox(
-                        args,
-                        harness,
-                        sandbox_index=item[0],
-                        sandbox=item[1],
-                    ),
-                    enumerate(sandboxes),
-                )
-            )
-        return sorted(rows, key=lambda row: str(row["sandbox_id"]))
     with ThreadPoolExecutor(max_workers=max(1, args.sandboxes)) as executor:
         row_groups = list(
             executor.map(
