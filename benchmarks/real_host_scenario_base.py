@@ -41,9 +41,11 @@ from agent_cr import (
     HostInspectorServiceClient,
     RemoteSandboxInspector,
     ExecutorConfig,
+    CompositeTelemetrySink,
     InMemoryRequestStateStore,
     InMemorySchedulerStateStore,
     InMemoryTelemetrySink,
+    JsonlTelemetrySink,
     LocalCheckpointManager,
     RequestInterceptorHook,
     RequestAwareSandboxInspector,
@@ -52,10 +54,12 @@ from agent_cr import (
     RuncSandboxManager,
     RuncSandboxManagerPaths,
     SandboxDescription,
+    SandboxExecResult,
     SandboxId,
     SandboxSnapshot,
     SchedulerConfig,
     StorageConfig,
+    TelemetrySink,
     TelemetryRequestInterceptorHook,
 )
 from agent_cr.models import ArtifactPayload, utc_now
@@ -75,12 +79,14 @@ from integrations.sandboxes.runtime import compose as sandbox_compose
 from integrations.sandboxes.runtime import image as sandbox_image
 from integrations.sandboxes.iflow import DOCKERFILE_PATH as IFLOW_DOCKERFILE_PATH
 from integrations.sandboxes.simulated import DOCKERFILE_PATH as SIMULATED_DOCKERFILE_PATH
+from benchmarks import core as benchmark_core
 from benchmarks import support as benchmark_support
 
 logger = logging.getLogger(__name__)
 
 _HOST_INSPECTOR_HOST = "127.0.0.1"
 _HOST_INSPECTOR_PORT = 9782
+_DEFAULT_IMAGE_CACHE_ROOT = ROOT / ".cache" / "agent-cr" / "images"
 _TERMNIUS_PROCESS_CAPABILITIES = [
     "CAP_AUDIT_WRITE",
     "CAP_CHOWN",
@@ -139,14 +145,6 @@ class AgentSandboxImage:
     image_defaults: sandbox_image.ImageRuntimeDefaults
 
 
-@dataclass(frozen=True)
-class SandboxExecResult:
-    args: tuple[str, ...]
-    returncode: int
-    stdout: str
-    stderr: str
-
-
 class RealHostScenarioHarness:
     def __init__(
         self,
@@ -159,6 +157,8 @@ class RealHostScenarioHarness:
         max_workers: int,
         auto_cr: bool = False,
         work_dir_host_root: Path | None = None,
+        telemetry_output: Path | None = None,
+        image_cache_root: Path | None = None,
     ) -> None:
         self.provider = provider
         self.transfer_delay_ms = transfer_delay_ms
@@ -168,6 +168,8 @@ class RealHostScenarioHarness:
         self.max_workers = max_workers
         self.auto_cr = auto_cr
         self.work_dir_host_root = work_dir_host_root
+        self.telemetry_output = telemetry_output
+        self.image_cache_root = (image_cache_root or _DEFAULT_IMAGE_CACHE_ROOT).resolve()
         self._tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self.root: Path | None = None
         self.pool_name = ""
@@ -175,7 +177,7 @@ class RealHostScenarioHarness:
         self.host_inspector_url: str = ""
         self._host_inspector_server: HostInspectorServer | None = None
         self.host_inspector_client: HostInspectorServiceClient = None
-        self.telemetry: InMemoryTelemetrySink | None = None
+        self.telemetry: TelemetrySink | None = None
         self.request_state_store: InMemoryRequestStateStore | None = None
         self.base_inspector: EBPFSandboxInspector | None = None
         self.inspector: RequestAwareSandboxInspector | None = None
@@ -265,20 +267,27 @@ class RealHostScenarioHarness:
         subprocess.run(["zpool", "create", "-f", self.pool_name, str(self.root / "zpool.img")], check=True)
         subprocess.run(["zfs", "create", f"{self.pool_name}/agent-cr"], check=True)
 
-        self.telemetry = InMemoryTelemetrySink()
+        telemetry_sinks: list[TelemetrySink] = [InMemoryTelemetrySink()]
+        telemetry_path = self.telemetry_output or (self.root / "telemetry.jsonl")
+        telemetry_sinks.append(JsonlTelemetrySink(telemetry_path))
+        self.telemetry = CompositeTelemetrySink(telemetry_sinks)
         self.request_state_store = InMemoryRequestStateStore()
 
         self.host_inspector_client = HostInspectorServiceClient(self.host_inspector_url)
         self.base_inspector = RemoteSandboxInspector(self.host_inspector_client)
         self.inspector = RequestAwareSandboxInspector(self.base_inspector, self.request_state_store)
-        self.runtime = RuncRuntimeAdapter(
-            paths=RuncRuntimePaths(
+        self.sandbox_manager = RuncSandboxManager(
+            paths=RuncSandboxManagerPaths(
                 state_root=self.runtime_state_root,
                 bundle_root=self.root / "bundles",
                 checkpoint_root=self.root / "checkpoints",
+                metadata_root=self.root / "sandbox-meta",
                 zfs_dataset_prefix=f"{self.pool_name}/agent-cr",
-            )
+            ),
+            host_inspector_client=self.host_inspector_client,
+            telemetry=self.telemetry,
         )
+        self.runtime = RuncRuntimeAdapter(sandbox_manager=self.sandbox_manager)
         base_storage = LocalCheckpointManager(StorageConfig(root_dir=self.root / "storage"))
         self.storage = self.checkpoint_manager_factory(base_storage)
         self.executor = CRExecutor(
@@ -289,22 +298,15 @@ class RealHostScenarioHarness:
                 self.storage,
                 self.runtime,
                 checkpoint_guard=checkpoint_guard_from_inspector(self.inspector),
+                telemetry=self.telemetry,
             ),
             DefaultRWorker(
                 AdapterProcessRWorker(self.runtime),
                 AdapterFileSystemRWorker(self.runtime),
                 self.storage,
+                telemetry=self.telemetry,
             ),
             self.telemetry,
-        )
-        self.sandbox_manager = RuncSandboxManager(
-            paths=RuncSandboxManagerPaths(
-                state_root=self.runtime_state_root,
-                bundle_root=self.root / "bundles",
-                metadata_root=self.root / "sandbox-meta",
-                zfs_dataset_prefix=f"{self.pool_name}/agent-cr",
-            ),
-            host_inspector_client=self.host_inspector_client,
         )
         self.system = AgentCRSystem(
             scheduler=CRScheduler(
@@ -331,6 +333,7 @@ class RealHostScenarioHarness:
             upstream_url=f"http://127.0.0.1:{self.llm_server.server_address[1]}",
             request_state_store=self.request_state_store,
             hook=self.interceptor_hook,
+            telemetry=self.telemetry,
             on_state_change=self.system.notify_interceptor_state_change,
             response_gate_registry=self.system.response_gate_registry,
             sandbox_id_resolver=self.resolve_interceptor_sandbox_id,
@@ -355,14 +358,9 @@ class RealHostScenarioHarness:
         self._task_executor.shutdown(wait=True, cancel_futures=True)
         if self.executor is not None:
             self.executor.shutdown()
-        if self.runtime_state_root is not None:
+        if self.sandbox_manager is not None:
             for sandbox in self.sandboxes:
-                subprocess.run(
-                    ["runc", "--root", str(self.runtime_state_root), "delete", "-f", str(sandbox.sandbox_id)],
-                    check=False,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+                self.sandbox_manager.delete_runtime(sandbox.sandbox_id, force=True, ignore_missing=True)
         self.network_manager.cleanup()
         for sandbox in self.sandboxes:
             if self.llm_server is not None:
@@ -422,6 +420,7 @@ class RealHostScenarioHarness:
             task_description,
             task_config,
             runtime_state_root=self.runtime_state_root,
+            sandbox_manager=self.sandbox_manager,
             agent_host_dir=self.root / agent_type / str(sandbox.sandbox_id),
             llm_base_url=sandbox.llm_base_url,
         )
@@ -462,9 +461,19 @@ class RealHostScenarioHarness:
                 tag=image_tag,
                 build_context=self._sandbox_build_context_path(agent_type),
                 dockerfile_path=self._sandbox_dockerfile_path(agent_type),
+                telemetry=self.telemetry,
             )
-            image_defaults = sandbox_image.inspect_image_runtime_defaults(tag=image_tag)
-            exported_rootfs = sandbox_image.export_image_rootfs(tag=image_tag, output_dir=self.root / "image" / agent_type)
+            image_defaults = sandbox_image.inspect_image_runtime_defaults(
+                tag=image_tag,
+                cache_root=self.image_cache_root,
+                telemetry=self.telemetry,
+            )
+            exported_rootfs = sandbox_image.export_image_rootfs(
+                tag=image_tag,
+                output_dir=self.root / "image" / agent_type,
+                cache_root=self.image_cache_root,
+                telemetry=self.telemetry,
+            )
             built = AgentSandboxImage(
                 agent_type=agent_type,
                 image_tag=image_tag,
@@ -479,41 +488,7 @@ class RealHostScenarioHarness:
         return self._sandbox_by_id[target]
 
     def load_dataset(self, path: Path) -> list[benchmark_support.BenchmarkTaskRecord]:
-        dataset_root = path.expanduser().resolve().parent
-        records: list[benchmark_support.BenchmarkTaskRecord] = []
-        for line_number, raw_line in enumerate(path.expanduser().resolve().read_text(encoding="utf-8").splitlines(), start=1):
-            line = raw_line.strip()
-            if not line:
-                continue
-            payload = json.loads(line)
-            if not isinstance(payload, dict):
-                raise ValueError(f"dataset row {line_number} in {path} must be an object")
-            compose_file = payload.get("docker_compose_file")
-            env_file = payload.get("env_file")
-            task_root = payload.get("task_root")
-            records.append(
-                benchmark_support.BenchmarkTaskRecord(
-                    agent_type=str(payload.get("agent_type", "simulated")),
-                    task_description=TaskDescription.from_json_value(payload.get("task_description", "")),
-                    task_config=TaskConfig.from_json_value(payload.get("task_config")),
-                    task_id=None if payload.get("task_id") is None else str(payload["task_id"]),
-                    llm_service_type=None if payload.get("llm_service_type") is None else str(payload["llm_service_type"]),
-                    docker_compose_file=None if compose_file is None else (dataset_root / str(compose_file)).resolve(),
-                    env_file=None if env_file is None else (dataset_root / str(env_file)).resolve(),
-                    service_name=None if payload.get("service_name") is None else str(payload["service_name"]),
-                    task_root=None if task_root is None else (dataset_root / str(task_root)).resolve(),
-                    llm_service_config=self._resolve_dataset_service_config(dataset_root, payload.get("llm_service_config")),
-                    trace_response_count=None
-                    if payload.get("trace_response_count") is None
-                    else int(payload["trace_response_count"]),
-                    trace_malformed_line_count=None
-                    if payload.get("trace_malformed_line_count") is None
-                    else int(payload["trace_malformed_line_count"]),
-                )
-            )
-        if not records:
-            raise ValueError(f"dataset {path} did not contain any task rows")
-        return records
+        return benchmark_core.load_task_dataset(path)
 
     def _resolve_dataset_service_config(
         self,
@@ -540,16 +515,13 @@ class RealHostScenarioHarness:
         default_task_description: TaskDescription,
         default_task_config: TaskConfig,
     ) -> benchmark_support.BenchmarkTaskRecord:
-        if dataset:
-            return dataset[sandbox_index % len(dataset)]
-        return benchmark_support.BenchmarkTaskRecord(
-            agent_type=default_agent_type,
-            task_description=default_task_description,
-            task_config=default_task_config,
-            llm_service_type=default_llm_service_type,
-            task_id=None,
-            trace_response_count=None,
-            trace_malformed_line_count=None,
+        return benchmark_core.select_task_record(
+            dataset,
+            sandbox_index=sandbox_index,
+            default_agent_type=default_agent_type,
+            default_llm_service_type=default_llm_service_type,
+            default_task_description=default_task_description,
+            default_task_config=default_task_config,
         )
 
     def launch_sandbox(
@@ -756,8 +728,9 @@ class RealHostScenarioHarness:
             bundle_dir=handle.bundle_dir,
             sandbox_id=str(handle.sandbox_id),
             work_dir_host_path=work_dir_host_path,
-            compose_image_root=self.root / "compose-images",
+            compose_image_root=self.image_cache_root,
             compose_image_tags=self._compose_image_tags,
+            telemetry=self.telemetry,
         )
         assert self.base_inspector is not None
         assert self.system is not None
@@ -998,8 +971,11 @@ class RealHostScenarioHarness:
 
         benchmark_support.wait_for(lambda: _matching_record() is not None, timeout_s=timeout_s)
         record = _matching_record()
-        if record is not None and record.status == "restored" and sandbox.task_run is not None:
+        if record is not None and record.status in {"restored", "relaunched"} and sandbox.task_run is not None:
             sandbox.task_run.on_restore_complete()
+            wait_for_task_ready = getattr(sandbox.task_run, "wait_for_task_ready", None)
+            if callable(wait_for_task_ready):
+                wait_for_task_ready()
         logger.info(
             "Observed recovery record sandbox=%s event_type=%s status=%s checkpoint=%s",
             sandbox.sandbox_id,
@@ -1108,52 +1084,27 @@ class RealHostScenarioHarness:
         raise RuntimeError(f"checkpoint count did not stabilize for sandbox {sandbox_id}")
 
     def deactivate_sandbox_runtime(self, sandbox: SandboxHandle) -> None:
-        assert self.runtime_state_root is not None
         logger.info("Deactivating sandbox runtime sandbox=%s", sandbox.sandbox_id)
-        subprocess.run(
-            ["runc", "--root", str(self.runtime_state_root), "delete", "-f", str(sandbox.sandbox_id)],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        self._delete_runtime(sandbox.sandbox_id)
         self._set_sandbox_running_state(sandbox.sandbox_id, is_running=False)
 
     def inject_fault(self, sandbox: SandboxHandle) -> None:
-        assert self.runtime_state_root is not None
         logger.info("Injecting fault into sandbox=%s", sandbox.sandbox_id)
-        subprocess.run(
-            ["runc", "--root", str(self.runtime_state_root), "delete", "-f", str(sandbox.sandbox_id)],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        self._delete_runtime(sandbox.sandbox_id)
         self._set_sandbox_running_state(sandbox.sandbox_id, is_running=False)
 
     def destroy_sandbox_dataset(self, sandbox: SandboxHandle) -> None:
         assert self.sandbox_manager is not None
-        assert self.runtime_state_root is not None
-        subprocess.run(
-            ["runc", "--root", str(self.runtime_state_root), "delete", "-f", str(sandbox.sandbox_id)],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        self._delete_runtime(sandbox.sandbox_id)
         try:
-            description = self.sandbox_manager.describe(sandbox.sandbox_id)
+            self.sandbox_manager.describe(sandbox.sandbox_id)
         except KeyError:
             if self.llm_server is not None:
                 self.llm_server.benchmark_llm_router.unregister_sandbox(str(sandbox.sandbox_id))  # type: ignore[attr-defined]
             self.network_manager.release_lease(sandbox.sandbox_id)
             self._sandbox_by_id.pop(sandbox.sandbox_id, None)
             return
-        dataset = str(description.metadata.get("zfs_dataset", ""))
-        if dataset:
-            subprocess.run(
-                ["zfs", "destroy", "-r", dataset],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+        self._destroy_filesystem_dataset(sandbox.sandbox_id)
         if self.llm_server is not None:
             self.llm_server.benchmark_llm_router.unregister_sandbox(str(sandbox.sandbox_id))  # type: ignore[attr-defined]
         self.network_manager.release_lease(sandbox.sandbox_id)
@@ -1167,25 +1118,12 @@ class RealHostScenarioHarness:
     def relaunch_sandbox(self, sandbox: SandboxHandle) -> dict[str, object]:
         assert self.base_inspector is not None
         assert self.sandbox_manager is not None
-        assert self.runtime_state_root is not None
 
         description = self.sandbox_manager.describe(sandbox.sandbox_id)
         metadata = dict(description.metadata)
         logger.info("Relaunching sandbox=%s after recovery fallback", sandbox.sandbox_id)
-        subprocess.run(
-            ["runc", "--root", str(self.runtime_state_root), "delete", "-f", str(sandbox.sandbox_id)],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        dataset = str(metadata.get("zfs_dataset", ""))
-        if dataset:
-            subprocess.run(
-                ["zfs", "destroy", "-r", dataset],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+        self._delete_runtime(sandbox.sandbox_id)
+        self._destroy_filesystem_dataset(sandbox.sandbox_id)
         self.sandbox_manager.launch("runc", metadata)
         self._reset_llm_service_state(sandbox.sandbox_id)
         self.base_inspector.upsert_snapshot(
@@ -1258,15 +1196,19 @@ class RealHostScenarioHarness:
             self.network_manager.register_guest_ip(network_lease.guest_ip, target.sandbox_id)
         self._clone_host_work_dir(source.sandbox_id, target.sandbox_id)
 
-        source_dataset = f"{self.pool_name}/agent-cr/{source.sandbox_id}"
-        target_dataset = f"{self.pool_name}/agent-cr/{target.sandbox_id}"
         rootfs_path = target.bundle_dir / "rootfs"
         rootfs_path.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["zfs", "destroy", "-r", target_dataset], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         manifests = {manifest.checkpoint_id: manifest for manifest in self.list_checkpoint_manifests(source.sandbox_id)}
         checkpoint_order = list(manifests.keys())
         copy_plan = benchmark_support.resolve_checkpoint_copy_plan(checkpoint_order, manifests, checkpoint_id)
         filesystem_checkpoint_id = next(copy_id for copy_id, _, copy_filesystem in reversed(copy_plan) if copy_filesystem)
+        source_dataset = self._dataset_name_for(source.sandbox_id)
+        target_dataset = self._clone_filesystem_snapshot(
+            source.sandbox_id,
+            filesystem_checkpoint_id,
+            target.sandbox_id,
+            target_rootfs_path=rootfs_path,
+        )
         logger.info(
             "Cloning checkpoint to fork source=%s target=%s selected_checkpoint=%s filesystem_checkpoint=%s copy_plan=%s",
             source.sandbox_id,
@@ -1275,18 +1217,6 @@ class RealHostScenarioHarness:
             filesystem_checkpoint_id,
             [(str(copy_id), copy_process, copy_filesystem) for copy_id, copy_process, copy_filesystem in copy_plan],
         )
-        subprocess.run(
-            [
-                "zfs",
-                "clone",
-                "-o",
-                f"mountpoint={rootfs_path}",
-                f"{source_dataset}@{filesystem_checkpoint_id}",
-                target_dataset,
-            ],
-            check=True,
-        )
-        subprocess.run(["zfs", "snapshot", f"{target_dataset}@{filesystem_checkpoint_id}"], check=True)
 
         for copy_id, copy_process, copy_filesystem in copy_plan:
             source_manifest = manifests[copy_id]
@@ -1471,6 +1401,44 @@ class RealHostScenarioHarness:
         config_path = sandbox.bundle_dir / "config.json"
         return json.loads(config_path.read_text(encoding="utf-8"))
 
+    def _bundle_spec_writer(self):
+        manager = self.sandbox_manager or (None if self.system is None else getattr(self.system, "sandbox_manager", None))
+        if manager is None or not hasattr(manager, "write_bundle_spec"):
+            raise RuntimeError("sandbox manager with bundle spec support is required")
+        return manager.write_bundle_spec
+
+    def _delete_runtime(self, sandbox_id: SandboxId) -> None:
+        if self.sandbox_manager is None or not hasattr(self.sandbox_manager, "delete_runtime"):
+            return
+        self.sandbox_manager.delete_runtime(sandbox_id, force=True, ignore_missing=True)
+
+    def _destroy_filesystem_dataset(self, sandbox_id: SandboxId) -> None:
+        if self.sandbox_manager is None or not hasattr(self.sandbox_manager, "destroy_filesystem_dataset"):
+            return
+        self.sandbox_manager.destroy_filesystem_dataset(sandbox_id)
+
+    def _dataset_name_for(self, sandbox_id: SandboxId) -> str:
+        if self.sandbox_manager is not None and hasattr(self.sandbox_manager, "dataset_name_for"):
+            return self.sandbox_manager.dataset_name_for(sandbox_id)
+        return f"{self.pool_name}/agent-cr/{sandbox_id}"
+
+    def _clone_filesystem_snapshot(
+        self,
+        source_sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+        target_sandbox_id: SandboxId,
+        *,
+        target_rootfs_path: Path,
+    ) -> str:
+        if self.sandbox_manager is None or not hasattr(self.sandbox_manager, "clone_filesystem_snapshot"):
+            return f"{self.pool_name}/agent-cr/{target_sandbox_id}"
+        return self.sandbox_manager.clone_filesystem_snapshot(
+            source_sandbox_id,
+            checkpoint_id,
+            target_sandbox_id,
+            target_rootfs_path=target_rootfs_path,
+        )
+
     def sandbox_process_cwd(self, sandbox: SandboxHandle) -> str:
         process = self.sandbox_bundle_config(sandbox).get("process", {})
         if not isinstance(process, dict):
@@ -1510,34 +1478,25 @@ class RealHostScenarioHarness:
         timeout_s: float | None = None,
         capture_output: bool = True,
     ) -> SandboxExecResult:
-        assert self.runtime_state_root is not None
+        assert self.sandbox_manager is not None
         merged_env = sandbox_bundle.merge_environment_defaults(
             self._sandbox_process_env(sandbox),
             [] if env is None else [f"{key}={value}" for key, value in env.items()],
         )
-        args = ["runc", "--root", str(self.runtime_state_root), "exec"]
         resolved_cwd = cwd or self.sandbox_process_cwd(sandbox)
-        if resolved_cwd:
-            args.extend(["--cwd", resolved_cwd])
         user = self._sandbox_process_user(sandbox)
-        if user:
-            args.extend(["--user", user])
+        env_map: dict[str, object] = {}
         for item in merged_env:
-            args.extend(["--env", item])
-        args.append(str(sandbox.sandbox_id))
-        args.extend(command)
-        result = subprocess.run(
-            args,
-            check=False,
+            key, _, value = item.partition("=")
+            env_map[key] = value
+        return self.sandbox_manager.exec(
+            sandbox.sandbox_id,
+            command,
+            cwd=resolved_cwd,
+            env=env_map,
+            user=user,
+            timeout_s=timeout_s,
             capture_output=capture_output,
-            text=True,
-            timeout=timeout_s,
-        )
-        return SandboxExecResult(
-            args=tuple(args),
-            returncode=result.returncode,
-            stdout=result.stdout or "",
-            stderr=result.stderr or "",
         )
 
     def wait_for_task_completion(self, sandbox: SandboxHandle, *, timeout_s: float | None = None) -> None:
@@ -1600,6 +1559,7 @@ class RealHostScenarioHarness:
             network_namespace_path=None if network_lease is None else network_lease.namespace_path,
             image_defaults=image_defaults,
             image_rootfs_dir=image_rootfs_dir,
+            bundle_spec_writer=self._bundle_spec_writer(),
         )
         handle = SandboxHandle(
             sandbox_id=SandboxId(sandbox_name),

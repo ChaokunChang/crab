@@ -5,7 +5,6 @@ import logging
 import os
 from pathlib import Path
 import shlex
-import subprocess
 import threading
 import time
 
@@ -105,6 +104,7 @@ class IFlowAgent(BaseAgent):
         task_config,
         *,
         runtime_state_root=None,
+        sandbox_manager=None,
         agent_host_dir=None,
         llm_base_url=None,
     ) -> None:
@@ -113,6 +113,7 @@ class IFlowAgent(BaseAgent):
             task_description,
             task_config,
             runtime_state_root=runtime_state_root,
+            sandbox_manager=sandbox_manager,
             agent_host_dir=agent_host_dir,
             llm_base_url=llm_base_url,
         )
@@ -468,24 +469,11 @@ class IFlowAgent(BaseAgent):
             "stderr": SANDBOX_TASK_OUTPUT_DIR / "iflow.task.stderr",
         }
 
-    def _runc_state_command(self) -> list[str]:
-        assert self.runtime_state_root is not None
-        return ["runc", "--root", str(self.runtime_state_root), "state", str(self.sandbox.sandbox_id)]
-
     def _sandbox_is_live(self) -> bool:
-        result = subprocess.run(
-            self._runc_state_command(),
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
+        if self.sandbox_manager is None:
             return False
-        try:
-            payload = json.loads(result.stdout or "{}")
-        except json.JSONDecodeError:
-            return False
-        return str(payload.get("status", "")).lower() not in {"", "stopped", "missing"}
+        payload = self.sandbox_manager.inspect_runtime(self.sandbox.sandbox_id)
+        return payload.is_running
 
     def _read_marker_int(self, path: Path) -> int | None:
         try:

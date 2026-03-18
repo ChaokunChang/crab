@@ -43,9 +43,11 @@ from .models import (
     RequestStateChange,
     RestoreJob,
     RestoreResult,
-    RuntimeOperationStatus,
     RuntimeCapabilities,
+    RuntimeOperationStatus,
     SandboxDescription,
+    SandboxExecResult,
+    SandboxRuntimeState,
     SandboxSnapshot,
     SchedulerCheckpointDecision,
 )
@@ -74,7 +76,7 @@ from .storage import (
     LocalCheckpointManager,
 )
 from .system import AgentCRSystem, build_default_system
-from .telemetry import InMemoryTelemetrySink, NoopTelemetrySink
+from .telemetry import CompositeTelemetrySink, InMemoryTelemetrySink, JsonlTelemetrySink, NoopTelemetrySink
 from .workers import (
     AdapterFileSystemCWorker,
     AdapterFileSystemRWorker,
@@ -114,6 +116,7 @@ __all__ = [
     "InMemorySandboxManager",
     "InMemorySchedulerStateStore",
     "InMemoryTelemetrySink",
+    "JsonlTelemetrySink",
     "JobId",
     "JobRecord",
     "JobStatus",
@@ -141,10 +144,12 @@ __all__ = [
     "RuntimeCapabilities",
     "RuntimeOperationStatus",
     "SandboxDescription",
+    "SandboxExecResult",
     "SandboxId",
     "SandboxInspector",
     "SandboxManager",
     "SandboxRuntimeAdapter",
+    "SandboxRuntimeState",
     "SandboxSnapshot",
     "SchedulerCheckpointDecision",
     "SchedulerConfig",
@@ -153,6 +158,7 @@ __all__ = [
     "SubprocessCommandRunner",
     "TelemetryConfig",
     "TelemetrySink",
+    "CompositeTelemetrySink",
     "CommandRunner",
     "build_default_system",
     "AdapterProcessCWorker",

@@ -4,15 +4,23 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
+from agent_cr.contracts import TelemetrySink
+from agent_cr.telemetry import NoopTelemetrySink
 
 from integrations.sandboxes.runtime.bundle import merge_environment_defaults, resolve_process_user_from_rootfs
-from integrations.sandboxes.runtime.image import ImageRuntimeDefaults, docker_tag_component, export_image_rootfs, inspect_image_runtime_defaults
+from integrations.sandboxes.runtime.image import (
+    ImageRuntimeDefaults,
+    build_image,
+    docker_tag_component,
+    export_image_rootfs,
+    image_exists,
+    inspect_image_runtime_defaults,
+)
 
 _ENV_VAR_PATTERN = re.compile(r"\$\{([^}:]+)(?::-([^}]*))?\}")
 _UNSUPPORTED_COMPOSE_FEATURES = {"depends_on", "profiles", "networks", "configs", "secrets", "healthcheck"}
@@ -99,7 +107,9 @@ def resolve_compose_image_ref(
     service_name: str,
     service: dict[str, object],
     compose_image_tags: set[str] | None = None,
+    telemetry: TelemetrySink | None = None,
 ) -> str:
+    sink = telemetry or NoopTelemetrySink()
     image_ref = service.get("image")
     build_spec = service.get("build")
     if isinstance(image_ref, str) and image_ref and build_spec is None:
@@ -134,12 +144,17 @@ def resolve_compose_image_ref(
                 build_args.extend(["--build-arg", f"{key}={value}"])
     else:
         raise ValueError(f"unsupported compose build definition for service {service_name}: {build_spec!r}")
-    command = ["docker", "build", "-t", tag]
-    if dockerfile is not None:
-        command.extend(["-f", str(dockerfile)])
-    command.extend(build_args)
-    command.append(str(build_context))
-    subprocess.run(command, check=True)
+    if image_exists(tag=tag):
+        sink.emit_event("compose.build_cache_hit", {"tag": tag, "service_name": service_name})
+        return tag
+    build_target = dockerfile if dockerfile is not None else build_context / "Dockerfile"
+    build_image(
+        tag=tag,
+        build_context=build_context,
+        dockerfile_path=build_target,
+        telemetry=sink,
+        skip_if_exists=False,
+    )
     return tag
 
 
@@ -258,7 +273,9 @@ def translate_compose_service(
     work_dir_host_path: Path | None,
     compose_image_root: Path,
     compose_image_tags: set[str] | None = None,
+    telemetry: TelemetrySink | None = None,
 ) -> ComposeSandboxTranslation:
+    sink = telemetry or NoopTelemetrySink()
     bundle_config = bundle_dir / "config.json"
     config = json.loads(bundle_config.read_text(encoding="utf-8"))
     image_ref = resolve_compose_image_ref(
@@ -266,11 +283,14 @@ def translate_compose_service(
         service_name=service_name,
         service=service,
         compose_image_tags=compose_image_tags,
+        telemetry=sink,
     )
-    image_defaults = inspect_image_runtime_defaults(tag=image_ref)
+    image_defaults = inspect_image_runtime_defaults(tag=image_ref, cache_root=compose_image_root, telemetry=sink)
     rootfs_dir = export_image_rootfs(
         tag=image_ref,
         output_dir=compose_image_root / sandbox_id,
+        cache_root=compose_image_root,
+        telemetry=sink,
     )
     config["process"]["cwd"] = compose_working_dir(service, image_defaults=image_defaults)
     config["process"]["terminal"] = bool(service.get("tty", False))

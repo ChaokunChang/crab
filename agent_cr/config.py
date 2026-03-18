@@ -53,3 +53,5 @@ class StorageConfig:
 @dataclass(frozen=True)
 class TelemetryConfig:
     enabled: bool = True
+    jsonl_path: Path | None = None
+    keep_in_memory_copy: bool = True

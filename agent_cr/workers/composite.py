@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import logging
+import time
 from typing import Callable
 
 from ..contracts import (
@@ -14,6 +15,7 @@ from ..contracts import (
     ProcessCWorker,
     ProcessRWorker,
     SandboxRuntimeAdapter,
+    TelemetrySink,
 )
 from ..ids import CheckpointId
 from ..models import (
@@ -27,6 +29,7 @@ from ..models import (
     RestoreResult,
     utc_now,
 )
+from ..telemetry import NoopTelemetrySink
 
 logger = logging.getLogger(__name__)
 
@@ -106,12 +109,14 @@ class DefaultCWorker(CompositeCheckpointWorker):
         checkpoint_manager: CheckpointManager,
         runtime_adapter: SandboxRuntimeAdapter,
         checkpoint_guard: Callable[[CheckpointJob], tuple[bool, str | None]] | None = None,
+        telemetry: TelemetrySink | None = None,
     ):
         self._process_worker = process_worker
         self._filesystem_worker = filesystem_worker
         self._checkpoint_manager = checkpoint_manager
         self._runtime_adapter = runtime_adapter
         self._checkpoint_guard = checkpoint_guard
+        self._telemetry = telemetry or NoopTelemetrySink()
 
     def checkpoint(self, job: CheckpointJob) -> CheckpointResult:
         started = utc_now()
@@ -146,16 +151,18 @@ class DefaultCWorker(CompositeCheckpointWorker):
 
         process_step = None
         fs_step = None
+        process_duration_ms = 0.0
+        filesystem_duration_ms = 0.0
         if job.checkpoint_process and job.checkpoint_filesystem:
             with ThreadPoolExecutor(max_workers=2) as pool:
-                process_future = pool.submit(self._process_worker.checkpoint, job, checkpoint_id)
-                fs_future = pool.submit(self._filesystem_worker.checkpoint, job, checkpoint_id)
-                process_step = process_future.result()
-                fs_step = fs_future.result()
+                process_future = pool.submit(self._timed_checkpoint_process, job, checkpoint_id)
+                fs_future = pool.submit(self._timed_checkpoint_filesystem, job, checkpoint_id)
+                process_step, process_duration_ms = process_future.result()
+                fs_step, filesystem_duration_ms = fs_future.result()
         elif job.checkpoint_process:
-            process_step = self._process_worker.checkpoint(job, checkpoint_id)
+            process_step, process_duration_ms = self._timed_checkpoint_process(job, checkpoint_id)
         elif job.checkpoint_filesystem:
-            fs_step = self._filesystem_worker.checkpoint(job, checkpoint_id)
+            fs_step, filesystem_duration_ms = self._timed_checkpoint_filesystem(job, checkpoint_id)
 
         failed_step = None
         if process_step is not None and not process_step.success:
@@ -194,6 +201,7 @@ class DefaultCWorker(CompositeCheckpointWorker):
                 operation_statuses=operation_statuses,
             )
 
+        artifact_started = time.perf_counter()
         refs = []
         for artifact in [
             *(process_step.artifacts if process_step is not None else []),
@@ -206,6 +214,11 @@ class DefaultCWorker(CompositeCheckpointWorker):
                     artifact=artifact,
                 )
             )
+        self._telemetry.emit_metric(
+            "checkpoint.persist_artifacts_ms",
+            (time.perf_counter() - artifact_started) * 1000.0,
+            {"sandbox_id": str(job.sandbox_id), "checkpoint_id": str(checkpoint_id), "artifact_count": len(refs)},
+        )
         logger.debug(
             "Stored %d artifacts for job %s sandbox=%s checkpoint=%s",
             len(refs),
@@ -233,6 +246,7 @@ class DefaultCWorker(CompositeCheckpointWorker):
                 "leave_running": job.leave_running,
             },
         ).with_integrity()
+        manifest_started = time.perf_counter()
         try:
             self._checkpoint_manager.put_manifest(manifest)
             self._checkpoint_manager.handle_checkpoint_complete(manifest)
@@ -255,6 +269,28 @@ class DefaultCWorker(CompositeCheckpointWorker):
                 message=str(exc),
                 operation_statuses=operation_statuses,
             )
+        self._telemetry.emit_metric(
+            "checkpoint.persist_manifest_ms",
+            (time.perf_counter() - manifest_started) * 1000.0,
+            {"sandbox_id": str(job.sandbox_id), "checkpoint_id": str(checkpoint_id)},
+        )
+        if process_step is not None:
+            self._telemetry.emit_metric(
+                "checkpoint.process_ms",
+                process_duration_ms,
+                {"sandbox_id": str(job.sandbox_id), "checkpoint_id": str(checkpoint_id)},
+            )
+        if fs_step is not None:
+            self._telemetry.emit_metric(
+                "checkpoint.filesystem_ms",
+                filesystem_duration_ms,
+                {"sandbox_id": str(job.sandbox_id), "checkpoint_id": str(checkpoint_id)},
+            )
+        self._telemetry.emit_metric(
+            "checkpoint.total_ms",
+            (utc_now() - started).total_seconds() * 1000.0,
+            {"sandbox_id": str(job.sandbox_id), "checkpoint_id": str(checkpoint_id)},
+        )
 
         logger.info(
             "Composite checkpoint succeeded for job %s sandbox=%s checkpoint=%s",
@@ -273,6 +309,22 @@ class DefaultCWorker(CompositeCheckpointWorker):
             operation_statuses=operation_statuses,
         )
 
+    def _timed_checkpoint_process(
+        self,
+        job: CheckpointJob,
+        checkpoint_id: CheckpointId,
+    ) -> tuple[WorkerStepResult, float]:
+        started = time.perf_counter()
+        return self._process_worker.checkpoint(job, checkpoint_id), (time.perf_counter() - started) * 1000.0
+
+    def _timed_checkpoint_filesystem(
+        self,
+        job: CheckpointJob,
+        checkpoint_id: CheckpointId,
+    ) -> tuple[WorkerStepResult, float]:
+        started = time.perf_counter()
+        return self._filesystem_worker.checkpoint(job, checkpoint_id), (time.perf_counter() - started) * 1000.0
+
 
 class DefaultRWorker(CompositeRestoreWorker):
     def __init__(
@@ -280,10 +332,12 @@ class DefaultRWorker(CompositeRestoreWorker):
         process_worker: ProcessRWorker,
         filesystem_worker: FileSystemRWorker,
         checkpoint_manager: CheckpointManager,
+        telemetry: TelemetrySink | None = None,
     ):
         self._process_worker = process_worker
         self._filesystem_worker = filesystem_worker
         self._checkpoint_manager = checkpoint_manager
+        self._telemetry = telemetry or NoopTelemetrySink()
 
     def restore(self, job: RestoreJob) -> RestoreResult:
         started = utc_now()
@@ -293,6 +347,7 @@ class DefaultRWorker(CompositeRestoreWorker):
             job.sandbox_id,
             job.checkpoint_id,
         )
+        manifest_started = time.perf_counter()
         try:
             manifest = self._checkpoint_manager.get_manifest(
                 sandbox_id=job.sandbox_id,
@@ -316,12 +371,20 @@ class DefaultRWorker(CompositeRestoreWorker):
                 failure_code=FailureCode.STORAGE_ERROR,
                 message=str(exc),
             )
+        self._telemetry.emit_metric(
+            "restore.resolve_manifest_ms",
+            (time.perf_counter() - manifest_started) * 1000.0,
+            {"sandbox_id": str(job.sandbox_id), "checkpoint_id": str(job.checkpoint_id)},
+        )
 
         operation_statuses = []
 
         fs_step = None
+        filesystem_duration_ms = 0.0
         if manifest.filesystem_artifacts:
+            restore_started = time.perf_counter()
             fs_step = self._filesystem_worker.restore(job, manifest)
+            filesystem_duration_ms = (time.perf_counter() - restore_started) * 1000.0
         if fs_step is not None and not fs_step.success:
             logger.warning(
                 "Filesystem restore step failed for job %s sandbox=%s code=%s message=%s",
@@ -343,10 +406,18 @@ class DefaultRWorker(CompositeRestoreWorker):
             )
         if fs_step is not None:
             operation_statuses.append(fs_step.operation_status)
+            self._telemetry.emit_metric(
+                "restore.filesystem_ms",
+                filesystem_duration_ms,
+                {"sandbox_id": str(job.sandbox_id), "checkpoint_id": str(job.checkpoint_id)},
+            )
 
         process_step = None
+        process_duration_ms = 0.0
         if manifest.process_artifacts:
+            restore_started = time.perf_counter()
             process_step = self._process_worker.restore(job, manifest)
+            process_duration_ms = (time.perf_counter() - restore_started) * 1000.0
         if process_step is not None and not process_step.success:
             logger.warning(
                 "Process restore step failed for job %s sandbox=%s code=%s message=%s",
@@ -368,12 +439,22 @@ class DefaultRWorker(CompositeRestoreWorker):
             )
         if process_step is not None:
             operation_statuses.append(process_step.operation_status)
+            self._telemetry.emit_metric(
+                "restore.process_ms",
+                process_duration_ms,
+                {"sandbox_id": str(job.sandbox_id), "checkpoint_id": str(job.checkpoint_id)},
+            )
 
         logger.info(
             "Composite restore succeeded for job %s sandbox=%s checkpoint=%s",
             job.job_id,
             job.sandbox_id,
             job.checkpoint_id,
+        )
+        self._telemetry.emit_metric(
+            "restore.total_ms",
+            (utc_now() - started).total_seconds() * 1000.0,
+            {"sandbox_id": str(job.sandbox_id), "checkpoint_id": str(job.checkpoint_id)},
         )
         return RestoreResult(
             job_id=job.job_id,

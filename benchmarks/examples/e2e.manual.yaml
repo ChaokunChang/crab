@@ -1,0 +1,9 @@
+scenario: e2e
+mode: manual
+provider: openai
+agent: simulated
+llm_service: simulated
+sandboxes: 2
+iterations: 5
+output: ../../logs/tmp/e2e.manual.csv
+log_level: info

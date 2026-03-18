@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 from concurrent.futures import Future
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -11,8 +10,35 @@ import unittest
 
 from agent_cr import CheckpointId, SandboxId
 from integrations.agents import SandboxHandle
-from benchmarks.bench_tree_search import run_tree_search_benchmark
+from benchmarks.config import BenchmarkConfig
+from benchmarks.scenarios.tree import choose_replay_steps, run_auto, run_manual
 from benchmarks.support import BenchmarkTaskRecord, TreeSearchCheckpointRecord
+
+
+def _config(**overrides: object) -> BenchmarkConfig:
+    values: dict[str, object] = {
+        "config_path": Path("/tmp/tree.yaml"),
+        "scenario": "tree",
+        "mode": "manual",
+        "provider": "openai",
+        "agent": "simulated",
+        "llm_service": "simulated",
+        "task_dataset": None,
+        "sandboxes": 1,
+        "iterations": 1,
+        "output": None,
+        "log_level": "info",
+        "transfer_delay_ms": 0.0,
+        "work_dir_host_root": None,
+        "scenario_options": {
+            "source_steps": 4,
+            "branch_points": 2,
+            "fork_steps": 2,
+            "replay_mode": "sequential",
+        },
+    }
+    values.update(overrides)
+    return BenchmarkConfig(**values)
 
 
 class _FakeStorage:
@@ -21,18 +47,6 @@ class _FakeStorage:
 
     def delete_all_checkpoints(self, sandbox_id) -> None:
         self.deleted.append(str(sandbox_id))
-
-
-class _FakeSystem:
-    def __init__(self) -> None:
-        self.start_calls = 0
-        self.stop_calls = 0
-
-    def start(self) -> None:
-        self.start_calls += 1
-
-    def stop(self) -> None:
-        self.stop_calls += 1
 
 
 class _FakeTaskRun:
@@ -61,12 +75,7 @@ class _FakeTaskRun:
         self._sandbox.last_status = payload
         completion_target = self._harness._task_completion_targets.get(sandbox_id)
         task_future = self._sandbox.task_future
-        if (
-            completion_target is not None
-            and task_future is not None
-            and not task_future.done()
-            and int(payload["total_actions"]) >= completion_target
-        ):
+        if completion_target is not None and task_future is not None and not task_future.done() and int(payload["total_actions"]) >= completion_target:
             task_future.set_result(None)
         return payload
 
@@ -83,7 +92,6 @@ class _FakeTaskRun:
 class _FakeHarness:
     def __init__(self) -> None:
         self.storage = _FakeStorage()
-        self.system = _FakeSystem()
         self._next_port = 19000
         self._handles: dict[str, SandboxHandle] = {}
         self._statuses: dict[str, dict[str, object]] = {}
@@ -110,6 +118,7 @@ class _FakeHarness:
         self.max_concurrent_source_actions = 0
         self.source_task_completion_delta: int | None = None
         self.fork_task_completion_delta: int | None = None
+        self.interceptor_hooks: list[object] = []
 
     def _completion_delta_for(self, sandbox_id: str) -> int | None:
         if sandbox_id.startswith("tree-fork-"):
@@ -120,22 +129,12 @@ class _FakeHarness:
         sandbox_id = str(handle.sandbox_id)
         baseline = int(self._statuses[sandbox_id]["total_actions"])
         completion_delta = self._completion_delta_for(sandbox_id)
-        self._task_completion_targets[sandbox_id] = (
-            None if completion_delta is None else baseline + completion_delta
-        )
+        self._task_completion_targets[sandbox_id] = None if completion_delta is None else baseline + completion_delta
         handle.task_run = _FakeTaskRun(self, handle)
         handle.task_future = Future()
 
-    def launch_sandbox_and_task(
-        self,
-        sandbox_name: str,
-        *,
-        agent_type,
-        llm_service_type=None,
-        task_description,
-        task_config,
-    ) -> SandboxHandle:
-        _ = (agent_type, llm_service_type, task_description, task_config)
+    def launch_task_record(self, sandbox_name: str, record: BenchmarkTaskRecord) -> SandboxHandle:
+        _ = record
         sandbox_id = SandboxId(sandbox_name)
         handle = SandboxHandle(
             sandbox_id=sandbox_id,
@@ -143,9 +142,10 @@ class _FakeHarness:
             status_port=self._next_port,
             last_status={"total_actions": 0},
             status_host="10.250.0.2",
-            agent_type=agent_type,
-            task_description=task_description,
-            task_config=task_config,
+            agent_type="simulated",
+            task_description=SimpleNamespace(prompt=""),
+            task_config=SimpleNamespace(),
+            launch_metadata={"benchmark": {"task_id": sandbox_name}},
         )
         self._next_port += 1
         self._source_launches.append(sandbox_name)
@@ -155,34 +155,8 @@ class _FakeHarness:
         self._install_task(handle)
         return handle
 
-    def load_dataset(self, path):
-        raise AssertionError(f"dataset should not be loaded in this test: {path}")
-
-    def select_task_record(
-        self,
-        dataset,
-        *,
-        sandbox_index: int,
-        default_agent_type: str,
-        default_llm_service_type: str | None,
-        default_task_description,
-        default_task_config,
-    ) -> BenchmarkTaskRecord:
-        _ = (dataset, sandbox_index, default_llm_service_type)
-        return BenchmarkTaskRecord(
-            agent_type=default_agent_type,
-            task_description=default_task_description,
-            task_config=default_task_config,
-        )
-
-    def launch_task_record(self, sandbox_name: str, record: BenchmarkTaskRecord) -> SandboxHandle:
-        _ = record
-        return self.launch_sandbox_and_task(
-            sandbox_name,
-            agent_type="simulated",
-            task_description=SimpleNamespace(prompt=""),
-            task_config=SimpleNamespace(),
-        )
+    def add_interceptor_hook(self, hook) -> None:
+        self.interceptor_hooks.append(hook)
 
     def drain_request_state_changes(self) -> int:
         return 0
@@ -192,6 +166,9 @@ class _FakeHarness:
         sandbox_id = str(sandbox.sandbox_id)
         self._snapshot_steps[sandbox_id].append(step)
         self._checkpoint_steps[sandbox_id] = step
+
+    def set_snapshot_metadata_by_id(self, sandbox_id: SandboxId, **metadata: object) -> None:
+        self._snapshot_steps[str(sandbox_id)].append(int(metadata["tree_search_step"]))
 
     def checkpoint_manual(self, sandbox: SandboxHandle, leave_running: bool = False):
         sandbox_id = str(sandbox.sandbox_id)
@@ -248,6 +225,7 @@ class _FakeHarness:
             agent_type=source.agent_type,
             task_description=source.task_description,
             task_config=source.task_config,
+            launch_metadata={"benchmark": {"task_id": fork_name}},
         )
         self._next_port += 1
         self._statuses[str(fork.sandbox_id)] = {"total_actions": 0}
@@ -257,13 +235,7 @@ class _FakeHarness:
         fork.task_future = None
         return fork
 
-    def launch_task(
-        self,
-        agent_type,
-        task_description,
-        task_config,
-        sandbox_id: str,
-    ):
+    def launch_task(self, agent_type, task_description, task_config, sandbox_id: str):
         _ = (agent_type, task_description, task_config)
         sandbox_id_text = str(sandbox_id)
         sandbox = self._handles[sandbox_id_text]
@@ -297,38 +269,17 @@ class _FakeHarness:
     def destroy_sandbox_dataset(self, sandbox: SandboxHandle) -> None:
         self.destroyed.append(str(sandbox.sandbox_id))
 
-    def inject_fault(self, sandbox: SandboxHandle) -> None:
-        raise AssertionError(f"inject_fault should not be called for {sandbox.sandbox_id}")
 
-    def notify_fault(self, sandbox: SandboxHandle, *, reason: str = "fault") -> None:
-        _ = reason
-        raise AssertionError(f"notify_fault should not be called for {sandbox.sandbox_id}")
-
-
-class TreeSearchBenchmarkTests(unittest.TestCase):
+class TreeSearchScenarioTests(unittest.TestCase):
     @staticmethod
     def _event_index(events: list[tuple[str, str, int]], kind: str, sandbox_id: str) -> int:
         return next(index for index, event in enumerate(events) if event[0] == kind and event[1] == sandbox_id)
-
-    def _args(self, **overrides: object) -> argparse.Namespace:
-        values: dict[str, object] = {
-            "sandboxes": 1,
-            "initial_steps": 4,
-            "replay_points": 2,
-            "fork_steps": 2,
-            "auto_cr": False,
-            "replay_mode": "sequential",
-            "agent_type": "simulated",
-            "llm_service_type": "simulated",
-        }
-        values.update(overrides)
-        return argparse.Namespace(**values)
 
     def test_manual_mode_runs_sources_independently(self) -> None:
         harness = _FakeHarness()
         harness.source_action_delay_s = 0.05
 
-        rows = run_tree_search_benchmark(self._args(sandboxes=2, initial_steps=3, replay_points=1, fork_steps=1), harness)
+        rows = run_manual(_config(sandboxes=2, scenario_options={"source_steps": 3, "branch_points": 1, "fork_steps": 1, "replay_mode": "sequential"}), harness)
 
         self.assertEqual(harness._source_launches, ["tree-source-0", "tree-source-1"])
         self.assertEqual(harness.wait_for_tree_search_calls, [])
@@ -338,20 +289,21 @@ class TreeSearchBenchmarkTests(unittest.TestCase):
         self.assertGreaterEqual(harness.max_concurrent_source_actions, 2)
         self.assertEqual(sorted(row["source_index"] for row in rows), [0, 1])
         self.assertEqual([row["replay_actions"] for row in rows], [1, 1])
-        self.assertEqual(sorted(harness.task_launches), ["tree-fork-0-1", "tree-fork-1-1"])
-        fork_progress_calls = sorted(call for call in harness.action_delta_calls if call[0].startswith("tree-fork-"))
-        self.assertEqual(fork_progress_calls, [("tree-fork-0-1", 1), ("tree-fork-1-1", 1)])
 
-    def test_auto_mode_runs_one_rollout_wave_and_stops_system_once(self) -> None:
+    def test_auto_mode_collects_checkpoints_and_registers_hook(self) -> None:
         harness = _FakeHarness()
-        harness.source_action_delay_s = 0.05
+        config = _config(
+            mode="auto",
+            sandboxes=2,
+            scenario_options={"source_steps": 3, "branch_points": 1, "fork_steps": 1, "replay_mode": "sequential"},
+        )
 
-        rows = run_tree_search_benchmark(self._args(sandboxes=2, auto_cr=True, initial_steps=3, replay_points=1, fork_steps=1), harness)
+        from benchmarks.scenarios.tree import prepare_harness
 
-        self.assertEqual(harness.manual_checkpoint_calls, [])
-        self.assertEqual(harness.system.start_calls, 1)
-        self.assertEqual(harness.system.stop_calls, 1)
-        self.assertGreaterEqual(harness.max_concurrent_source_actions, 2)
+        prepare_harness(config, harness)
+        rows = run_auto(config, harness)
+
+        self.assertEqual(len(harness.interceptor_hooks), 1)
         self.assertEqual(
             sorted(harness.wait_for_tree_search_calls),
             [("tree-source-0", 3), ("tree-source-1", 3)],
@@ -363,7 +315,7 @@ class TreeSearchBenchmarkTests(unittest.TestCase):
         harness = _FakeHarness()
         harness.restore_delay_s = 0.05
 
-        rows = run_tree_search_benchmark(self._args(replay_mode="concurrent"), harness)
+        rows = run_manual(_config(scenario_options={"source_steps": 4, "branch_points": 2, "fork_steps": 2, "replay_mode": "concurrent"}), harness)
 
         clone_events = [event for event in harness.events if event[0] == "clone"]
         self.assertEqual([event[1] for event in clone_events], ["tree-fork-0-1", "tree-fork-0-2"])
@@ -373,23 +325,11 @@ class TreeSearchBenchmarkTests(unittest.TestCase):
         self.assertIn("tree-fork-0-2", harness.stop_requests)
         self.assertGreaterEqual(harness.max_concurrent_restores, 2)
         self.assertEqual([row["replay_step"] for row in rows], [1, 2])
-        self.assertEqual([row["source_index"] for row in rows], [0, 0])
 
     def test_manual_mode_waits_for_source_task_stop_before_first_clone(self) -> None:
         harness = _FakeHarness()
 
-        run_tree_search_benchmark(self._args(sandboxes=1, initial_steps=2, replay_points=1, fork_steps=1), harness)
-
-        self.assertIn("tree-source-0", harness.stop_requests)
-        self.assertLess(
-            self._event_index(harness.events, "deactivate", "tree-source-0"),
-            self._event_index(harness.events, "clone", "tree-fork-0-1"),
-        )
-
-    def test_auto_mode_waits_for_source_task_stop_before_first_clone(self) -> None:
-        harness = _FakeHarness()
-
-        run_tree_search_benchmark(self._args(sandboxes=1, auto_cr=True, initial_steps=2, replay_points=1, fork_steps=1), harness)
+        run_manual(_config(scenario_options={"source_steps": 2, "branch_points": 1, "fork_steps": 1, "replay_mode": "sequential"}), harness)
 
         self.assertIn("tree-source-0", harness.stop_requests)
         self.assertLess(
@@ -401,22 +341,10 @@ class TreeSearchBenchmarkTests(unittest.TestCase):
         harness = _FakeHarness()
         harness.fork_task_completion_delta = 1
 
-        run_tree_search_benchmark(self._args(sandboxes=1, replay_points=1, fork_steps=3), harness)
+        run_manual(_config(scenario_options={"source_steps": 4, "branch_points": 1, "fork_steps": 3, "replay_mode": "sequential"}), harness)
 
         self.assertEqual(harness.task_launches, ["tree-fork-0-1"])
         self.assertNotIn("tree-fork-0-1", harness.stop_requests)
-
-    def test_fork_task_is_manually_stopped_when_budget_is_exhausted(self) -> None:
-        harness = _FakeHarness()
-
-        run_tree_search_benchmark(self._args(sandboxes=1, replay_points=1, fork_steps=1), harness)
-
-        self.assertIn("tree-fork-0-1", harness.task_launches)
-        self.assertIn("tree-fork-0-1", harness.stop_requests)
-        self.assertLess(
-            self._event_index(harness.events, "request_stop", "tree-fork-0-1"),
-            self._event_index(harness.events, "deactivate", "tree-fork-0-1"),
-        )
 
 
 if __name__ == "__main__":

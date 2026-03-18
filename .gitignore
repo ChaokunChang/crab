@@ -21,3 +21,4 @@ logs/
 *.swo
 integrations/sandboxes/3rdparty/
 data/
+.cache/

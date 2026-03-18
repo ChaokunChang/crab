@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..ids import CheckpointId, SandboxId
+from ..sandbox_manager import RuncSandboxManager, RuncSandboxManagerPaths
 from .base import CommandRunner, CommandRuntimeAdapter
 
 
@@ -42,6 +43,7 @@ class RuncRuntimeAdapter(CommandRuntimeAdapter):
         self,
         version: str | None = None,
         *,
+        sandbox_manager: RuncSandboxManager | None = None,
         paths: RuncRuntimePaths | None = None,
         options: RuncRuntimeOptions | None = None,
         command_runner: CommandRunner | None = None,
@@ -49,10 +51,33 @@ class RuncRuntimeAdapter(CommandRuntimeAdapter):
         zfs_bin: str = "zfs",
     ):
         super().__init__(name="runc", version=version, command_runner=command_runner)
-        self._paths = paths or RuncRuntimePaths()
         self._options = options or RuncRuntimeOptions()
         self._runtime_bin = runtime_bin
         self._zfs_bin = zfs_bin
+        self._sandbox_manager = sandbox_manager
+        if self._sandbox_manager is None:
+            resolved_paths = paths or RuncRuntimePaths()
+            self._sandbox_manager = RuncSandboxManager(
+                paths=RuncSandboxManagerPaths(
+                    state_root=resolved_paths.state_root,
+                    bundle_root=resolved_paths.bundle_root,
+                    checkpoint_root=resolved_paths.checkpoint_root,
+                    zfs_dataset_prefix=resolved_paths.zfs_dataset_prefix,
+                ),
+                command_runner=command_runner,
+                runtime_bin=runtime_bin,
+                zfs_bin=zfs_bin,
+                checkpoint_options=self._options.checkpoint,
+                restore_options=self._options.restore,
+            )
+            self._paths = resolved_paths
+        else:
+            self._paths = paths or RuncRuntimePaths(
+                state_root=self._sandbox_manager.paths.state_root,
+                bundle_root=self._sandbox_manager.paths.bundle_root,
+                checkpoint_root=self._sandbox_manager.paths.checkpoint_root,
+                zfs_dataset_prefix=self._sandbox_manager.paths.zfs_dataset_prefix,
+            )
 
     def checkpoint_process(
         self,
@@ -67,9 +92,8 @@ class RuncRuntimeAdapter(CommandRuntimeAdapter):
             phase="process_checkpoint",
             leave_running=leave_running,
         )
-        self._ensure_dir(Path(str(meta["image_path"])))
-        self._ensure_dir(Path(str(meta["work_path"])))
-        return super().checkpoint_process(
+        _ = meta
+        return self._sandbox_manager.checkpoint_process(
             sandbox_id,
             checkpoint_id,
             leave_running=leave_running,
@@ -81,9 +105,22 @@ class RuncRuntimeAdapter(CommandRuntimeAdapter):
         checkpoint_id: CheckpointId,
     ):
         meta = self._process_metadata(sandbox_id, checkpoint_id, phase="process_restore")
-        self._ensure_dir(Path(str(meta["image_path"])))
-        self._ensure_dir(Path(str(meta["work_path"])))
-        return super().restore_process(sandbox_id, checkpoint_id)
+        _ = meta
+        return self._sandbox_manager.restore_process(sandbox_id, checkpoint_id)
+
+    def checkpoint_filesystem(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ):
+        return self._sandbox_manager.checkpoint_filesystem(sandbox_id, checkpoint_id)
+
+    def restore_filesystem(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ):
+        return self._sandbox_manager.restore_filesystem(sandbox_id, checkpoint_id)
 
     def _process_metadata(
         self,
@@ -135,63 +172,20 @@ class RuncRuntimeAdapter(CommandRuntimeAdapter):
         *,
         leave_running: bool,
     ) -> list[str]:
-        image_path = self._checkpoint_image_path(sandbox_id, checkpoint_id)
-        work_path = self._checkpoint_work_path(sandbox_id, checkpoint_id)
-        command = [
-            self._runtime_bin,
-            "--root",
-            str(self._paths.state_root),
-            "checkpoint",
-            "--image-path",
-            str(image_path),
-            "--work-path",
-            str(work_path),
-            f"--leave-running={'true' if leave_running else 'false'}",
-        ]
-        command.extend(self._optional_args(self._options.checkpoint))
-        command.append(str(sandbox_id))
-        return command
+        _ = (sandbox_id, checkpoint_id, leave_running)
+        raise NotImplementedError("RuncRuntimeAdapter delegates process checkpoint execution to RuncSandboxManager")
 
     def _restore_cmd(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> list[str]:
-        image_path = self._checkpoint_image_path(sandbox_id, checkpoint_id)
-        work_path = self._checkpoint_work_path(sandbox_id, checkpoint_id)
-        bundle_path = self._bundle_path(sandbox_id)
-        command = [
-            self._runtime_bin,
-            "--root",
-            str(self._paths.state_root),
-            "restore",
-        ]
-        if self._options.restore.detach:
-            command.append("-d")
-        command.extend(
-            [
-                "--bundle",
-                str(bundle_path),
-                "--image-path",
-                str(image_path),
-                "--work-path",
-                str(work_path),
-            ]
-        )
-        command.extend(self._restore_optional_args(self._options.restore))
-        command.append(str(sandbox_id))
-        return command
+        _ = (sandbox_id, checkpoint_id)
+        raise NotImplementedError("RuncRuntimeAdapter delegates process restore execution to RuncSandboxManager")
 
     def _filesystem_checkpoint_cmd(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> list[str]:
-        return [
-            self._zfs_bin,
-            "snapshot",
-            self._snapshot_name(sandbox_id, checkpoint_id),
-        ]
+        _ = (sandbox_id, checkpoint_id)
+        raise NotImplementedError("RuncRuntimeAdapter delegates filesystem checkpoint execution to RuncSandboxManager")
 
     def _filesystem_restore_cmd(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> list[str]:
-        return [
-            self._zfs_bin,
-            "rollback",
-            "-r",
-            self._snapshot_name(sandbox_id, checkpoint_id),
-        ]
+        _ = (sandbox_id, checkpoint_id)
+        raise NotImplementedError("RuncRuntimeAdapter delegates filesystem restore execution to RuncSandboxManager")
 
     def _bundle_path(self, sandbox_id: SandboxId) -> Path:
         return self._paths.bundle_root / str(sandbox_id)

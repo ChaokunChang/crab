@@ -7,8 +7,12 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
-from dataclasses import dataclass
+import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
+
+from agent_cr.contracts import TelemetrySink
+from agent_cr.telemetry import NoopTelemetrySink
 
 
 @dataclass(frozen=True)
@@ -25,7 +29,58 @@ def docker_tag_component(raw: str) -> str:
     return normalized or "image"
 
 
-def inspect_image_runtime_defaults(*, tag: str) -> ImageRuntimeDefaults:
+def image_exists(*, tag: str) -> bool:
+    result = subprocess.run(
+        ["docker", "image", "inspect", tag],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def inspect_image_id(*, tag: str, telemetry: TelemetrySink | None = None) -> str:
+    sink = telemetry or NoopTelemetrySink()
+    started = time.perf_counter()
+    raw_output = subprocess.run(
+        ["docker", "image", "inspect", tag, "--format", "{{.Id}}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    duration_ms = (time.perf_counter() - started) * 1000.0
+    image_id = raw_output.replace("sha256:", "")
+    sink.emit_metric(
+        "image.inspect_ms",
+        duration_ms,
+        {"tag": tag, "image_id": image_id},
+    )
+    sink.emit_event("image.inspect", {"tag": tag, "image_id": image_id})
+    return image_id
+
+
+def inspect_image_runtime_defaults(
+    *,
+    tag: str,
+    cache_root: Path | None = None,
+    telemetry: TelemetrySink | None = None,
+) -> ImageRuntimeDefaults:
+    sink = telemetry or NoopTelemetrySink()
+    image_id = inspect_image_id(tag=tag, telemetry=sink)
+    cache_dir = None if cache_root is None else cache_root / image_id
+    cache_path = None if cache_dir is None else cache_dir / "runtime_defaults.json"
+    if cache_path is not None and cache_path.is_file():
+        sink.emit_event("image.defaults_cache_hit", {"tag": tag, "image_id": image_id, "path": str(cache_path)})
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        return ImageRuntimeDefaults(
+            environment=tuple(payload.get("environment", [])),
+            working_dir=payload.get("working_dir"),
+            user=payload.get("user"),
+            entrypoint=tuple(payload.get("entrypoint", [])),
+            command=tuple(payload.get("command", [])),
+        )
+
+    started = time.perf_counter()
     raw_output = subprocess.run(
         ["docker", "image", "inspect", tag, "--format", "{{json .Config}}"],
         check=True,
@@ -51,47 +106,94 @@ def inspect_image_runtime_defaults(*, tag: str) -> ImageRuntimeDefaults:
     if user is not None and not isinstance(user, str):
         raise ValueError(f"unsupported docker image config User for {tag}: {user!r}")
 
-    return ImageRuntimeDefaults(
+    defaults = ImageRuntimeDefaults(
         environment=_string_list("Env"),
         working_dir=working_dir or None,
         user=user or None,
         entrypoint=_string_list("Entrypoint"),
         command=_string_list("Cmd"),
     )
+    if cache_path is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(asdict(defaults), sort_keys=True, indent=2), encoding="utf-8")
+    duration_ms = (time.perf_counter() - started) * 1000.0
+    sink.emit_metric(
+        "image.inspect_defaults_ms",
+        duration_ms,
+        {"tag": tag, "image_id": image_id, "cache_hit": False},
+    )
+    sink.emit_event("image.defaults_cache_miss", {"tag": tag, "image_id": image_id})
+    return defaults
 
 
-def build_image(*, tag: str, build_context: Path, dockerfile_path: Path) -> None:
+def build_image(
+    *,
+    tag: str,
+    build_context: Path,
+    dockerfile_path: Path,
+    telemetry: TelemetrySink | None = None,
+    skip_if_exists: bool = True,
+) -> None:
+    sink = telemetry or NoopTelemetrySink()
+    if skip_if_exists and image_exists(tag=tag):
+        sink.emit_event("image.build_cache_hit", {"tag": tag, "build_context": str(build_context)})
+        sink.emit_metric("image.build_ms", 0.0, {"tag": tag, "cache_hit": True})
+        return
+    started = time.perf_counter()
     subprocess.run(
         ["docker", "build", "-t", tag, "-f", str(dockerfile_path), str(build_context)],
         check=True,
     )
+    duration_ms = (time.perf_counter() - started) * 1000.0
+    sink.emit_metric("image.build_ms", duration_ms, {"tag": tag, "cache_hit": False})
+    sink.emit_event("image.build", {"tag": tag, "build_context": str(build_context), "dockerfile_path": str(dockerfile_path)})
 
 
-def export_image_rootfs(*, tag: str, output_dir: Path) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    container_id = (
-        subprocess.run(
-            ["docker", "create", tag],
-            check=True,
-            capture_output=True,
-            text=True,
+def export_image_rootfs(
+    *,
+    tag: str,
+    output_dir: Path,
+    cache_root: Path | None = None,
+    telemetry: TelemetrySink | None = None,
+) -> Path:
+    sink = telemetry or NoopTelemetrySink()
+    image_id = inspect_image_id(tag=tag, telemetry=sink)
+    resolved_output_dir = output_dir if cache_root is None else cache_root / image_id
+    rootfs_dir = resolved_output_dir / "rootfs"
+    lock_path = resolved_output_dir / ".export.lock"
+    resolved_output_dir.mkdir(parents=True, exist_ok=True)
+
+    lock_wait_started = time.perf_counter()
+    with lock_path.open("w", encoding="utf-8") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        lock_wait_ms = (time.perf_counter() - lock_wait_started) * 1000.0
+        sink.emit_metric("image.cache_lock_wait_ms", lock_wait_ms, {"tag": tag, "image_id": image_id})
+        if rootfs_dir.is_dir() and any(rootfs_dir.iterdir()):
+            sink.emit_event("image.export_cache_hit", {"tag": tag, "image_id": image_id, "rootfs_dir": str(rootfs_dir)})
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            return rootfs_dir
+
+        sink.emit_event("image.export_cache_miss", {"tag": tag, "image_id": image_id, "rootfs_dir": str(rootfs_dir)})
+        container_id = (
+            subprocess.run(
+                ["docker", "create", tag],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            .stdout.strip()
         )
-        .stdout.strip()
-    )
-    rootfs_dir = output_dir / "rootfs"
-    lock_path = output_dir / ".export.lock"
-    staging_dir = Path(tempfile.mkdtemp(prefix="rootfs-export-", dir=output_dir))
-    tar_path = staging_dir / "rootfs.tar"
-    staging_rootfs_dir = staging_dir / "rootfs"
-    try:
-        with tar_path.open("wb") as fh:
-            subprocess.run(["docker", "export", container_id], check=True, stdout=fh)
-        staging_rootfs_dir.mkdir(parents=True, exist_ok=True)
-        with tarfile.open(tar_path) as tf:
-            tf.extractall(staging_rootfs_dir)
-        with lock_path.open("w", encoding="utf-8") as lock_fh:
-            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
-            backup_dir = output_dir / "rootfs.previous"
+        staging_dir = Path(tempfile.mkdtemp(prefix="rootfs-export-", dir=resolved_output_dir))
+        tar_path = staging_dir / "rootfs.tar"
+        staging_rootfs_dir = staging_dir / "rootfs"
+        started = time.perf_counter()
+        try:
+            with tar_path.open("wb") as fh:
+                subprocess.run(["docker", "export", container_id], check=True, stdout=fh)
+            staging_rootfs_dir.mkdir(parents=True, exist_ok=True)
+            with tarfile.open(tar_path) as tf:
+                tf.extractall(staging_rootfs_dir)
+            backup_dir = resolved_output_dir / "rootfs.previous"
             try:
                 if backup_dir.exists():
                     shutil.rmtree(backup_dir, ignore_errors=True)
@@ -105,13 +207,15 @@ def export_image_rootfs(*, tag: str, output_dir: Path) -> Path:
             finally:
                 if backup_dir.exists():
                     shutil.rmtree(backup_dir, ignore_errors=True)
-                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
-    finally:
-        subprocess.run(
-            ["docker", "rm", "-f", container_id],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        shutil.rmtree(staging_dir, ignore_errors=True)
+        finally:
+            subprocess.run(
+                ["docker", "rm", "-f", container_id],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+        duration_ms = (time.perf_counter() - started) * 1000.0
+        sink.emit_metric("image.export_ms", duration_ms, {"tag": tag, "image_id": image_id, "cache_hit": False})
     return rootfs_dir

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -369,6 +370,7 @@ class AgentCRRequestInterceptor:
         upstream_transport: Callable[[str, dict[str, str], bytes], tuple[int, list[tuple[str, str]], bytes]],
         request_state_store: InMemoryRequestStateStore,
         hook: RequestInterceptorHook | None = None,
+        telemetry: TelemetrySink | None = None,
         on_state_change: Callable[[SandboxId], None] | None = None,
         response_gate_registry: SandboxResponseGateRegistry | None = None,
         sandbox_id_resolver: Callable[[str | None, dict[str, str], bytes], str | None] | None = None,
@@ -376,6 +378,7 @@ class AgentCRRequestInterceptor:
         self._upstream_transport = upstream_transport
         self._request_state_store = request_state_store
         self._hook = hook or CompositeRequestInterceptorHook()
+        self._telemetry = telemetry
         self._on_state_change = on_state_change
         self._response_gate_registry = response_gate_registry
         self._sandbox_id_resolver = sandbox_id_resolver
@@ -417,6 +420,7 @@ class AgentCRRequestInterceptor:
         self._hook.on_request_start(context)
         self._request_state_store.mark_request_start(context)
         gate_generation = None
+        request_started = time.perf_counter()
         if self._response_gate_registry is not None:
             gate_generation = self._response_gate_registry.arm(context.sandbox_id, context.request_id)
         self._notify(context.sandbox_id)
@@ -434,6 +438,17 @@ class AgentCRRequestInterceptor:
             logger.debug(f"Intercepted request response of request_id={context.request_id}: {response}")
             return response
         finally:
+            if self._telemetry is not None:
+                self._telemetry.emit_metric(
+                    "llm.request_total_ms",
+                    (time.perf_counter() - request_started) * 1000.0,
+                    {
+                        "request_id": context.request_id,
+                        "sandbox_id": str(context.sandbox_id),
+                        "provider": provider,
+                        "path": path,
+                    },
+                )
             self._request_state_store.mark_request_end(context)
             self._hook.on_request_end(context)
             self._notify(context.sandbox_id)
@@ -454,6 +469,7 @@ class AgentCRRequestInterceptorServer:
         upstream_url: str,
         request_state_store: InMemoryRequestStateStore,
         hook: RequestInterceptorHook | None = None,
+        telemetry: TelemetrySink | None = None,
         on_state_change: Callable[[SandboxId], None] | None = None,
         response_gate_registry: SandboxResponseGateRegistry | None = None,
         sandbox_id_resolver: Callable[[str | None, dict[str, str], bytes], str | None] | None = None,
@@ -465,10 +481,12 @@ class AgentCRRequestInterceptorServer:
             upstream_transport=self._forward,
             request_state_store=request_state_store,
             hook=hook,
+            telemetry=telemetry,
             on_state_change=on_state_change,
             response_gate_registry=response_gate_registry,
             sandbox_id_resolver=sandbox_id_resolver,
         )
+        self._telemetry = telemetry
         self._server = ThreadingHTTPServer((host, port), self._build_handler())
         self._thread: threading.Thread | None = None
 
@@ -597,8 +615,18 @@ class AgentCRRequestInterceptorServer:
             headers=headers,
             method="POST",
         )
+        started = time.perf_counter()
         with urllib.request.urlopen(req, timeout=30.0) as resp:
             response_body = resp.read()
+            if self._telemetry is not None:
+                self._telemetry.emit_metric(
+                    "llm.upstream_latency_ms",
+                    (time.perf_counter() - started) * 1000.0,
+                    {
+                        "path": path,
+                        "status_code": int(resp.status),
+                    },
+                )
             logger.debug(
                 "Received upstream response: path=%s status_code=%s response_bytes=%s",
                 path,

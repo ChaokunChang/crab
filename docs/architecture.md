@@ -162,9 +162,11 @@ That harness:
 - Wires `AgentCRSystem` with policy-specific retention and recovery settings
 - Exposes helpers for checkpoint, restore, fault injection, preemption injection, and checkpoint cloning for tree-search fan-out
 
-The main benchmark entrypoints are:
+The main benchmark entrypoints and configuration surface are:
 
-- [benchmarks/bench_fault_tolerance.py](/root/workspace/agent-cr/benchmarks/bench_fault_tolerance.py)
-- [benchmarks/bench_spot_agent.py](/root/workspace/agent-cr/benchmarks/bench_spot_agent.py)
-- [benchmarks/bench_tree_search.py](/root/workspace/agent-cr/benchmarks/bench_tree_search.py)
-- [benchmarks/bench_agent_cr_sandbox_e2e.py](/root/workspace/agent-cr/benchmarks/bench_agent_cr_sandbox_e2e.py)
+- [benchmarks/run.py](/root/workspace/agent-cr/benchmarks/run.py)
+- [benchmarks/config.py](/root/workspace/agent-cr/benchmarks/config.py)
+- [benchmarks/scenarios/fault.py](/root/workspace/agent-cr/benchmarks/scenarios/fault.py)
+- [benchmarks/scenarios/spot.py](/root/workspace/agent-cr/benchmarks/scenarios/spot.py)
+- [benchmarks/scenarios/tree.py](/root/workspace/agent-cr/benchmarks/scenarios/tree.py)
+- [benchmarks/scenarios/e2e.py](/root/workspace/agent-cr/benchmarks/scenarios/e2e.py)

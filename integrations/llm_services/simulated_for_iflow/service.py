@@ -33,15 +33,7 @@ _DEFAULT_RESPONSE_STEPS: tuple[dict[str, Any], ...] = (
         "content": None,
         "tool_name": "run_shell_command",
         "tool_input": {
-            "command": _shell_command("printf transient-process && (sleep 1 & wait $!)"),
-        },
-    },
-    {
-        "phase": "sleep_1_second",
-        "content": None,
-        "tool_name": "run_shell_command",
-        "tool_input": {
-            "command": _shell_command("sleep 1"),
+            "command": 'sh -lc "printf transient-process && (sleep 1 & wait $!)"',
         },
     },
     {
@@ -49,100 +41,87 @@ _DEFAULT_RESPONSE_STEPS: tuple[dict[str, Any], ...] = (
         "content": None,
         "tool_name": "run_shell_command",
         "tool_input": {
-            "command": _shell_command("mkdir -p /data/debug/tmp && echo 'data' > /data/debug/tmp/data.txt "),
+            "command": """sh -lc "mkdir -p /work/iflow-probe && cat <<'EOF' >/work/iflow-probe/artifact.txt
+iflow artifact
+phase=filesystem_write
+EOF"
+""".strip(),
         },
     },
     {
-        "phase": "sleep_10_second_bg",
+        "phase": "detached_daemon",
         "content": None,
         "tool_name": "run_shell_command",
         "tool_input": {
-            "command": _shell_command("sleep 10 &"),
+            "command": 'sh -lc "mkdir -p /work/iflow-probe/site && printf simulator-http >/work/iflow-probe/site/index.txt && python3 -m http.server 8123 -d /work/iflow-probe/site >/work/iflow-probe/http.log 2>&1 & echo $! >/work/iflow-probe/http.pid"',
         },
     },
-#     {
-#         "phase": "detached_daemon",
-#         "content": None,
-#         "tool_name": "run_shell_command",
-#         "tool_input": {
-#             "command": _shell_command(
-#                 "mkdir -p /work/iflow-probe/site && "
-#                 "printf simulator-http >/work/iflow-probe/site/index.txt && "
-#                 "python3 -m http.server 8123 -d /work/iflow-probe/site >/work/iflow-probe/http.log 2>&1 & "
-#                 "echo $! >/work/iflow-probe/http.pid"
-#             ),
-#         },
-#     },
-#     {
-#         "phase": "workspace_inventory",
-#         "content": None,
-#         "tool_name": "run_shell_command",
-#         "tool_input": {
-#             "command": _shell_command('printf workdir=%s\\n "$PWD" && find /work -maxdepth 2 -mindepth 1 | sort'),
-#         },
-#     },
-#     {
-#         "phase": "environment_probe",
-#         "content": None,
-#         "tool_name": "run_shell_command",
-#         "tool_input": {
-#             "command": _shell_command('printf shell=%s\\n "${SHELL:-unknown}" && env | sort | sed -n \'1,12p\''),
-#         },
-#     },
-#     {
-#         "phase": "stateful_counter_update",
-#         "content": None,
-#         "tool_name": "run_shell_command",
-#         "tool_input": {
-#             "command": _shell_command(
-#                 """mkdir -p /work/iflow-probe
-# counter=/work/iflow-probe/counter.txt
-# value=$(cat \"$counter\" 2>/dev/null || printf 0)
-# printf '%s\\n' \"$((value + 1))\" >\"$counter\"
-# printf counter-updated=%s\\n \"$((value + 1))\"""".strip()
-#             ),
-#         },
-#     },
-#     {
-#         "phase": "append_journal",
-#         "content": None,
-#         "tool_name": "run_shell_command",
-#         "tool_input": {
-#             "command": _shell_command(
-#                 """mkdir -p /work/iflow-probe
-# printf 'journal-entry %s\\n' \"$(date -u +%Y%m%dT%H%M%SZ)\" >>/work/iflow-probe/journal.log
-# tail -n 3 /work/iflow-probe/journal.log""".strip()
-#             ),
-#         },
-#     },
-#     {
-#         "phase": "expensive_digest_scan",
-#         "content": None,
-#         "tool_name": "run_shell_command",
-#         "tool_input": {
-#             "command": _shell_command(
-#                 """find /app /work -maxdepth 4 -type f 2>/dev/null | sort | head -n 200 >/tmp/iflow-scan-files.txt
-# if [ -s /tmp/iflow-scan-files.txt ]; then
-#   xargs -r sha256sum </tmp/iflow-scan-files.txt | sha256sum
-# else
-#   printf 'no-files\\n'
-# fi""".strip()
-#             ),
-#         },
-#     },
-#     {
-#         "phase": "expensive_stateful_blob",
-#         "content": None,
-#         "tool_name": "run_shell_command",
-#         "tool_input": {
-#             "command": _shell_command(
-#                 """mkdir -p /work/iflow-probe
-# dd if=/dev/zero of=/work/iflow-probe/heavy-blob.bin bs=262144 count=8 status=none
-# sha256sum /work/iflow-probe/heavy-blob.bin >/work/iflow-probe/heavy-blob.bin.sha256
-# wc -c /work/iflow-probe/heavy-blob.bin""".strip()
-#             ),
-#         },
-#     },
+    {
+        "phase": "workspace_inventory",
+        "content": None,
+        "tool_name": "run_shell_command",
+        "tool_input": {
+            "command": 'sh -lc "printf workdir=%s\\\\n \\"$PWD\\" && find /work -maxdepth 2 -mindepth 1 | sort"',
+        },
+    },
+    {
+        "phase": "environment_probe",
+        "content": None,
+        "tool_name": "run_shell_command",
+        "tool_input": {
+            "command": 'sh -lc "printf shell=%s\\\\n \\"${SHELL:-unknown}\\" && env | sort | sed -n \'1,12p\'"',
+        },
+    },
+    {
+        "phase": "stateful_counter_update",
+        "content": None,
+        "tool_name": "run_shell_command",
+        "tool_input": {
+            "command": """sh -lc "mkdir -p /work/iflow-probe
+counter=/work/iflow-probe/counter.txt
+value=$(cat \"$counter\" 2>/dev/null || printf 0)
+printf '%s\\n' \"$((value + 1))\" >\"$counter\"
+printf counter-updated=%s\\n \"$((value + 1))\""
+""".strip(),
+        },
+    },
+    {
+        "phase": "append_journal",
+        "content": None,
+        "tool_name": "run_shell_command",
+        "tool_input": {
+            "command": """sh -lc "mkdir -p /work/iflow-probe
+printf 'journal-entry %s\\n' \"$(date -u +%Y%m%dT%H%M%SZ)\" >>/work/iflow-probe/journal.log
+tail -n 3 /work/iflow-probe/journal.log"
+""".strip(),
+        },
+    },
+    {
+        "phase": "expensive_digest_scan",
+        "content": None,
+        "tool_name": "run_shell_command",
+        "tool_input": {
+            "command": """sh -lc "find /app /work -maxdepth 4 -type f 2>/dev/null | sort | head -n 200 >/tmp/iflow-scan-files.txt
+if [ -s /tmp/iflow-scan-files.txt ]; then
+  xargs -r sha256sum </tmp/iflow-scan-files.txt | sha256sum
+else
+  printf 'no-files\\n'
+fi"
+""".strip(),
+        },
+    },
+    {
+        "phase": "expensive_stateful_blob",
+        "content": None,
+        "tool_name": "run_shell_command",
+        "tool_input": {
+            "command": """sh -lc "mkdir -p /work/iflow-probe
+dd if=/dev/zero of=/work/iflow-probe/heavy-blob.bin bs=262144 count=8 status=none
+sha256sum /work/iflow-probe/heavy-blob.bin >/work/iflow-probe/heavy-blob.bin.sha256
+wc -c /work/iflow-probe/heavy-blob.bin"
+""".strip(),
+        },
+    },
 )
 
 

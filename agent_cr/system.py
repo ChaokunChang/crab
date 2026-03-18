@@ -8,8 +8,8 @@ from threading import Event, Lock, Thread
 import time
 from typing import Callable
 
-from .config import ExecutorConfig, SchedulerConfig, StorageConfig
-from .contracts import CheckpointManager, SandboxInspector
+from .config import ExecutorConfig, SchedulerConfig, StorageConfig, TelemetryConfig
+from .contracts import CheckpointManager, SandboxInspector, TelemetrySink
 from .executor import CRExecutor
 from .ids import CheckpointId, JobId
 from .inspector import EBPFSandboxInspector
@@ -32,7 +32,7 @@ from .runtime import DockerRuntimeAdapter, RuncRuntimeAdapter, RuncRuntimeOption
 from .sandbox_manager import InMemorySandboxManager, RuncSandboxManager
 from .scheduler import CRScheduler, InMemorySchedulerStateStore, SchedulerPolicy
 from .storage import LocalCheckpointManager
-from .telemetry import InMemoryTelemetrySink, NoopTelemetrySink
+from .telemetry import CompositeTelemetrySink, InMemoryTelemetrySink, JsonlTelemetrySink, NoopTelemetrySink
 from .workers import (
     AdapterFileSystemCWorker,
     AdapterFileSystemRWorker,
@@ -71,7 +71,7 @@ class AgentCRSystem:
     storage: CheckpointManager
     inspector: SandboxInspector
     sandbox_manager: InMemorySandboxManager | RuncSandboxManager
-    telemetry: InMemoryTelemetrySink | NoopTelemetrySink
+    telemetry: TelemetrySink
     request_state_store: InMemoryRequestStateStore | None = None
     response_gate_registry: SandboxResponseGateRegistry | None = None
     relaunch_handler: Callable[[SandboxId, str], None] | None = None
@@ -225,11 +225,13 @@ class AgentCRSystem:
         )
         result = self.executor.run_restore(job)
         if result.status.value == "succeeded":
+            restore_manifest = None
+            if self.restore_metadata_handler is not None:
+                restore_manifest = self._resolve_restore_manifest(sandbox_id, restore_checkpoint_id)
             self.sandbox_manager.mark_restored(sandbox_id)
             self.storage.handle_restore_complete(sandbox_id, result.checkpoint_id)
-            if self.restore_metadata_handler is not None:
-                manifest = self._resolve_restore_manifest(sandbox_id, restore_checkpoint_id)
-                self.restore_metadata_handler(sandbox_id, manifest)
+            if self.restore_metadata_handler is not None and restore_manifest is not None:
+                self.restore_metadata_handler(sandbox_id, restore_manifest)
         logger.info(
             "Manual restore for sandbox %s checkpoint=%s finished with status=%s",
             sandbox_id,
@@ -869,6 +871,7 @@ def build_default_system(
     storage_config: StorageConfig | None = None,
     runc_runtime_options: RuncRuntimeOptions | None = None,
     use_in_memory_telemetry: bool = True,
+    telemetry_config: TelemetryConfig | None = None,
     request_state_store: InMemoryRequestStateStore | None = None,
     host_inspector_url: str | None = None,
     scheduler_policy: SchedulerPolicy | None = None,
@@ -885,16 +888,35 @@ def build_default_system(
         HostInspectorServiceClient(host_inspector_url) if host_inspector_url is not None else None
     )
 
+    telemetry_cfg = telemetry_config or TelemetryConfig(enabled=True, keep_in_memory_copy=use_in_memory_telemetry)
+    if not telemetry_cfg.enabled:
+        telemetry = NoopTelemetrySink()
+    else:
+        sinks: list[TelemetrySink] = []
+        if telemetry_cfg.keep_in_memory_copy:
+            sinks.append(InMemoryTelemetrySink())
+        if telemetry_cfg.jsonl_path is not None:
+            sinks.append(JsonlTelemetrySink(Path(telemetry_cfg.jsonl_path)))
+        if not sinks:
+            sinks.append(NoopTelemetrySink())
+        telemetry = sinks[0] if len(sinks) == 1 else CompositeTelemetrySink(sinks)
+
     if runtime == "docker":
         adapter = DockerRuntimeAdapter()
         sandbox_manager = InMemorySandboxManager(host_inspector_client=host_inspector_client)
     elif runtime == "runc":
-        adapter = RuncRuntimeAdapter(options=runc_runtime_options)
-        sandbox_manager = RuncSandboxManager(host_inspector_client=host_inspector_client)
+        sandbox_manager = RuncSandboxManager(
+            host_inspector_client=host_inspector_client,
+            telemetry=telemetry,
+            checkpoint_options=(runc_runtime_options or RuncRuntimeOptions()).checkpoint,
+            restore_options=(runc_runtime_options or RuncRuntimeOptions()).restore,
+        )
+        adapter = RuncRuntimeAdapter(
+            sandbox_manager=sandbox_manager,
+            options=runc_runtime_options,
+        )
     else:
         raise ValueError(f"unsupported runtime adapter: {runtime}")
-
-    telemetry = InMemoryTelemetrySink() if use_in_memory_telemetry else NoopTelemetrySink()
     storage = checkpoint_manager or LocalCheckpointManager(store_cfg)
     request_store = request_state_store or InMemoryRequestStateStore()
     response_gate_registry = SandboxResponseGateRegistry()
@@ -916,8 +938,9 @@ def build_default_system(
         storage,
         adapter,
         checkpoint_guard=_checkpoint_guard_from_inspector(inspector),
+        telemetry=telemetry,
     )
-    r_worker = DefaultRWorker(process_r, fs_r, storage)
+    r_worker = DefaultRWorker(process_r, fs_r, storage, telemetry=telemetry)
 
     executor = CRExecutor(executor_cfg, c_worker, r_worker, telemetry)
     scheduler = CRScheduler(

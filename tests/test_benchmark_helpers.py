@@ -28,9 +28,10 @@ from integrations.sandboxes.runtime import compose as sandbox_compose
 from integrations.sandboxes.runtime import image as sandbox_image
 from integrations.sandboxes.runtime import launcher as sandbox_launcher
 from integrations.sandboxes.runtime import network as sandbox_network
-from benchmarks.bench_agent_cr_sandbox_e2e import run_benchmark
+from benchmarks.config import BenchmarkConfig
+from benchmarks.scenarios.e2e import run_manual as run_e2e_manual
 from agent_cr.models import utc_now
-from benchmarks.bench_tree_search import choose_replay_steps
+from benchmarks.scenarios.tree import choose_replay_steps
 from benchmarks.support import (
     BenchmarkTaskRecord,
     TreeSearchCheckpointRecord,
@@ -722,16 +723,15 @@ class BenchmarkHelperTests(unittest.TestCase):
             TaskDescription("go"),
             TaskConfig(),
             runtime_state_root=Path("/tmp/runtime-root"),
+            sandbox_manager=SimpleNamespace(delete_runtime=Mock()),
         )
 
-        with patch("integrations.agents.base.subprocess.run") as run_mock:
-            agent.post_task_finish()
+        agent.post_task_finish()
 
-        run_mock.assert_called_once_with(
-            ["runc", "--root", "/tmp/runtime-root", "delete", "-f", "sbx-post-finish"],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        agent.sandbox_manager.delete_runtime.assert_called_once_with(
+            SandboxId("sbx-post-finish"),
+            force=True,
+            ignore_missing=True,
         )
 
     def test_simulated_agent_calls_post_task_finish_after_task_completion(self) -> None:
@@ -814,6 +814,8 @@ class BenchmarkHelperTests(unittest.TestCase):
         )
         harness.sandbox_manager = SimpleNamespace(
             describe=lambda sandbox_id: SimpleNamespace(metadata={"zfs_dataset": "", "bundle_path": "/tmp/bundle"}),
+            delete_runtime=Mock(),
+            destroy_filesystem_dataset=Mock(),
             launch=Mock(),
         )
         harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())
@@ -852,6 +854,8 @@ class BenchmarkHelperTests(unittest.TestCase):
         )
         harness.sandbox_manager = SimpleNamespace(
             describe=lambda sandbox_id: SimpleNamespace(metadata={"zfs_dataset": "", "bundle_path": "/tmp/bundle"}),
+            delete_runtime=Mock(),
+            destroy_filesystem_dataset=Mock(),
             launch=Mock(),
         )
         harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())
@@ -1295,14 +1299,16 @@ services:
             exported_rootfs = harness.root / "image" / "simulated" / "rootfs"
             exported_rootfs.mkdir(parents=True, exist_ok=True)
 
-            def fake_build_image(*, tag: str, build_context: Path, dockerfile_path: Path) -> None:
+            def fake_build_image(*, tag: str, build_context: Path, dockerfile_path: Path, **kwargs) -> None:
                 del tag, build_context, dockerfile_path
+                del kwargs
                 with count_lock:
                     call_counts["build"] += 1
                 time.sleep(0.05)
 
-            def fake_export_image_rootfs(*, tag: str, output_dir: Path) -> Path:
+            def fake_export_image_rootfs(*, tag: str, output_dir: Path, **kwargs) -> Path:
                 del tag, output_dir
+                del kwargs
                 with count_lock:
                     call_counts["export"] += 1
                 time.sleep(0.05)
@@ -1341,6 +1347,7 @@ services:
         )
         harness.root = Path(tempfile.mkdtemp(prefix="agent_cr_handle_test_"))
         harness.interceptor = SimpleNamespace(port=43123)
+        harness.sandbox_manager = SimpleNamespace(write_bundle_spec=Mock())
         register_sandbox = Mock()
         harness.llm_server = SimpleNamespace(
             server_address=("127.0.0.1", 45678),
@@ -1470,7 +1477,8 @@ services:
             compose_file = root / "compose.yaml"
             build_dir = root / "context"
             build_dir.mkdir(parents=True, exist_ok=True)
-            with patch("integrations.sandboxes.runtime.compose.subprocess.run") as run_build:
+            with patch("integrations.sandboxes.runtime.image.subprocess.run") as run_build:
+                run_build.return_value = SimpleNamespace(returncode=1, stdout="", stderr="")
                 image_ref = sandbox_compose.resolve_compose_image_ref(
                     compose_file=compose_file,
                     service_name="client",
@@ -1479,7 +1487,6 @@ services:
                 )
 
         self.assertEqual(image_ref, "example/client:latest")
-        run_build.assert_called_once()
         self.assertEqual(run_build.call_args.args[0][:4], ["docker", "build", "-t", "example/client:latest"])
 
     def test_iflow_agent_completes_from_existing_markers_without_live_sandbox(self) -> None:
@@ -2178,7 +2185,12 @@ services:
         )
         harness.root = Path("/tmp")
         harness.runtime = object()
-        harness.sandbox_manager = SimpleNamespace(_items={}, _persist=Mock())
+        harness.sandbox_manager = SimpleNamespace(
+            _items={},
+            _persist=Mock(),
+            dataset_name_for=lambda sandbox_id: f"pool/agent-cr/{sandbox_id}",
+            clone_filesystem_snapshot=Mock(return_value="pool/agent-cr/sbx-fork"),
+        )
         harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())
         harness.storage = SimpleNamespace(
             put_manifest=Mock(),
@@ -2242,9 +2254,12 @@ services:
         harness.root = Path("/tmp")
         persisted_descriptions: list[object] = []
         harness.runtime = object()
+        clone_snapshot = Mock(return_value="pool/agent-cr/sbx-fork")
         harness.sandbox_manager = SimpleNamespace(
             _items={},
             _persist=lambda description: persisted_descriptions.append(description),
+            dataset_name_for=lambda sandbox_id: f"pool/agent-cr/{sandbox_id}",
+            clone_filesystem_snapshot=clone_snapshot,
         )
         harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())
         harness.storage = SimpleNamespace(
@@ -2487,12 +2502,6 @@ services:
             wait_for_progress=Mock(return_value={"total_actions": 6}),
         )
         harness = SimpleNamespace(
-            load_dataset=lambda path: [],
-            select_task_record=lambda *args, **kwargs: BenchmarkTaskRecord(
-                agent_type="simulated",
-                task_description=TaskDescription("task"),
-                task_config=TaskConfig(),
-            ),
             launch_task_record=Mock(
                 side_effect=lambda name, record: SandboxHandle(
                     sandbox_id=SandboxId(name),
@@ -2518,14 +2527,22 @@ services:
             ),
             set_snapshot_metadata=Mock(),
         )
-        rows = run_benchmark(
-            SimpleNamespace(
-                sandboxes=1,
-                iters=1,
+        rows = run_e2e_manual(
+            BenchmarkConfig(
+                config_path=Path("/tmp/bench.yaml"),
+                scenario="e2e",
+                mode="manual",
                 provider="openai",
-                agent_type="simulated",
-                llm_service_type="simulated",
-                dataset=None,
+                agent="simulated",
+                llm_service="simulated",
+                task_dataset=None,
+                sandboxes=1,
+                iterations=1,
+                output=None,
+                log_level="info",
+                transfer_delay_ms=0.0,
+                work_dir_host_root=None,
+                scenario_options={},
             ),
             harness,
         )

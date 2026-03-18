@@ -19,6 +19,8 @@ from .models import (
     RuntimeOperationStatus,
     RuntimeCapabilities,
     SandboxDescription,
+    SandboxExecResult,
+    SandboxRuntimeState,
     SandboxSnapshot,
     SchedulerCheckpointDecision,
     WorkerStepResult,
@@ -306,6 +308,87 @@ class SandboxManager(ABC):
 
     @abstractmethod
     def describe(self, sandbox_id: SandboxId) -> SandboxDescription:
+        raise NotImplementedError
+
+    @abstractmethod
+    def write_bundle_spec(self, bundle_dir) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def inspect_runtime(self, sandbox_id: SandboxId) -> SandboxRuntimeState:
+        raise NotImplementedError
+
+    @abstractmethod
+    def exec(
+        self,
+        sandbox_id: SandboxId,
+        argv: list[str],
+        *,
+        cwd: str | None = None,
+        env: dict[str, object] | None = None,
+        user: str | None = None,
+        timeout_s: float | None = None,
+        capture_output: bool = True,
+    ) -> SandboxExecResult:
+        raise NotImplementedError
+
+    @abstractmethod
+    def checkpoint_process(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+        *,
+        leave_running: bool,
+    ) -> RuntimeOperationStatus:
+        raise NotImplementedError
+
+    @abstractmethod
+    def restore_process(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> RuntimeOperationStatus:
+        raise NotImplementedError
+
+    @abstractmethod
+    def checkpoint_filesystem(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> RuntimeOperationStatus:
+        raise NotImplementedError
+
+    @abstractmethod
+    def restore_filesystem(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> RuntimeOperationStatus:
+        raise NotImplementedError
+
+    @abstractmethod
+    def delete_runtime(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        force: bool = True,
+        ignore_missing: bool = True,
+    ) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def destroy_filesystem_dataset(self, sandbox_id: SandboxId) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def clone_filesystem_snapshot(
+        self,
+        source_sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+        target_sandbox_id: SandboxId,
+        *,
+        target_rootfs_path,
+    ) -> str:
         raise NotImplementedError
 
 
