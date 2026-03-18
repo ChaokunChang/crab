@@ -10,7 +10,11 @@ import unittest
 
 from agent_cr import CheckpointId, JobStatus, SandboxId
 from integrations.agents import SandboxHandle
-from benchmarks.bench_fault_tolerance import run_fault_tolerance_benchmark, run_replay_fault_tolerance_sandbox
+from benchmarks.bench_fault_tolerance import (
+    _wait_for_auto_replay_checkpoint,
+    run_fault_tolerance_benchmark,
+    run_replay_fault_tolerance_sandbox,
+)
 from benchmarks.bench_spot_agent import run_spot_agent_benchmark
 from benchmarks.support import BenchmarkTaskRecord
 
@@ -580,6 +584,161 @@ class FaultToleranceBenchmarkTests(unittest.TestCase):
         self.assertEqual(row["faults_injected"], 1)
         self.assertEqual(row["recoveries_succeeded"], 1)
         self.assertEqual(row["success_ratio"], 1.0)
+
+    def test_replay_auto_cr_waits_for_checkpoint_and_faults_immediately(self) -> None:
+        class _ReplayAutoCRTaskRun:
+            def __init__(self, sandbox: SandboxHandle) -> None:
+                self._sandbox = sandbox
+
+            def wait_for_progress(self, *, minimum_actions: int) -> dict[str, object]:
+                payload = {
+                    "state": "running",
+                    "total_actions": minimum_actions,
+                    "replay_next_response_index": minimum_actions,
+                    "replay_is_complete": False,
+                }
+                self._sandbox.last_status = dict(payload)
+                return payload
+
+            def wait_for_action_delta(self, *, delta: int) -> dict[str, object]:
+                raise AssertionError("auto replay recovery should fault at checkpoint time without waiting for another action")
+
+            def poll_status(self) -> dict[str, object]:
+                return dict(self._sandbox.last_status)
+
+        class _ReplayAutoCRHarness:
+            def __init__(self) -> None:
+                self.storage = _FakeStorage()
+                self.manifest_calls = 0
+                self.inject_fault_calls: list[str] = []
+                self.notify_fault_calls: list[str] = []
+
+            def list_checkpoint_manifests(self, sandbox_id: SandboxId):
+                self.manifest_calls += 1
+                if self.manifest_calls < 2:
+                    return []
+                return [
+                    SimpleNamespace(
+                        checkpoint_id=CheckpointId(f"{sandbox_id}-ckpt"),
+                        metadata={
+                            "llm_service_state": {
+                                "service_type": "iflow_trace_replay",
+                                "next_response_index": 1,
+                            }
+                        },
+                    )
+                ]
+
+            def inject_fault(self, sandbox: SandboxHandle) -> None:
+                if self.manifest_calls < 2:
+                    raise AssertionError("fault injected before a usable replay checkpoint existed")
+                self.inject_fault_calls.append(str(sandbox.sandbox_id))
+
+            def notify_fault(self, sandbox: SandboxHandle, *, reason: str = "fault") -> None:
+                _ = reason
+                self.notify_fault_calls.append(str(sandbox.sandbox_id))
+
+            def wait_for_recovery(self, sandbox: SandboxHandle, *, event_type: str, observed_after, timeout_s: float = 60.0):
+                _ = (event_type, observed_after, timeout_s)
+                sandbox.last_status = {
+                    "state": "running",
+                    "total_actions": 1,
+                    "replay_next_response_index": 1,
+                    "replay_is_complete": False,
+                }
+                return SimpleNamespace(status="restored")
+
+            def wait_for_task_completion(self, sandbox: SandboxHandle, timeout_s: float | None = None) -> None:
+                _ = (sandbox, timeout_s)
+
+            def verify_task_accuracy(self, sandbox: SandboxHandle, timeout_s: float | None = None) -> dict[str, object]:
+                _ = (sandbox, timeout_s)
+                return {
+                    "verification_status": "passed",
+                    "verification_exit_code": 0,
+                    "verification_ms": 0.0,
+                }
+
+        harness = _ReplayAutoCRHarness()
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("fault-0"),
+            bundle_dir=Path("/tmp/fault-0"),
+            status_port=20000,
+            last_status={"total_actions": 0},
+            agent_type="iflow",
+            llm_service_type="iflow_trace_replay",
+            launch_metadata={"benchmark": {"task_id": "assign-seats", "trace_response_count": 12}},
+        )
+        sandbox.task_run = _ReplayAutoCRTaskRun(sandbox)
+
+        row = run_replay_fault_tolerance_sandbox(
+            argparse.Namespace(
+                provider="openai",
+                auto_cr=True,
+                fault_rate=1.0,
+                first_fault_iteration=1,
+                iters=1,
+            ),
+            harness,
+            sandbox_index=0,
+            sandbox=sandbox,
+        )
+
+        self.assertEqual(harness.inject_fault_calls, ["fault-0"])
+        self.assertEqual(harness.notify_fault_calls, ["fault-0"])
+        self.assertEqual(row["faults_injected"], 1)
+        self.assertEqual(row["recoveries_succeeded"], 1)
+        self.assertEqual(row["success_ratio"], 1.0)
+
+    def test_wait_for_auto_replay_checkpoint_stops_when_task_finishes(self) -> None:
+        class _FinishedReplayTaskRun:
+            def __init__(self, sandbox: SandboxHandle) -> None:
+                self._sandbox = sandbox
+
+            def poll_status(self) -> dict[str, object]:
+                payload = {
+                    "state": "finished",
+                    "total_actions": 80,
+                    "replay_next_response_index": 80,
+                    "replay_is_complete": True,
+                }
+                self._sandbox.last_status = dict(payload)
+                return payload
+
+        class _StaleCheckpointHarness:
+            def list_checkpoint_manifests(self, sandbox_id: SandboxId):
+                return [
+                    SimpleNamespace(
+                        checkpoint_id=CheckpointId(f"{sandbox_id}-ckpt"),
+                        metadata={
+                            "llm_service_state": {
+                                "service_type": "iflow_trace_replay",
+                                "next_response_index": 3,
+                            }
+                        },
+                    )
+                ]
+
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("fault-6"),
+            bundle_dir=Path("/tmp/fault-6"),
+            status_port=20000,
+            last_status={"total_actions": 3},
+            agent_type="iflow",
+            llm_service_type="iflow_trace_replay",
+            launch_metadata={"benchmark": {"task_id": "catch-me-if-you-can", "trace_response_count": 80}},
+        )
+        sandbox.task_run = _FinishedReplayTaskRun(sandbox)
+
+        manifest, actions = _wait_for_auto_replay_checkpoint(
+            _StaleCheckpointHarness(),
+            sandbox,
+            minimum_actions=40,
+            trace_response_count=80,
+        )
+
+        self.assertIsNone(manifest)
+        self.assertEqual(actions, 80)
 
 
 class SpotAgentBenchmarkTests(unittest.TestCase):

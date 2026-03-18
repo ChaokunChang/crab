@@ -80,6 +80,63 @@ def _replay_status_is_complete(status: dict[str, object], *, trace_response_coun
     return total_actions(status) >= trace_response_count
 
 
+def _manifest_replay_next_response_index(manifest) -> int:
+    metadata = getattr(manifest, "metadata", {})
+    if not isinstance(metadata, dict):
+        return 0
+    llm_state = metadata.get("llm_service_state")
+    if not isinstance(llm_state, dict):
+        return 0
+    raw_value = llm_state.get("next_response_index", 0)
+    try:
+        return max(0, int(raw_value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _wait_for_auto_replay_checkpoint(
+    harness: RealHostScenarioHarness,
+    sandbox: SandboxHandle,
+    *,
+    minimum_actions: int,
+    trace_response_count: int,
+) -> tuple[object | None, int]:
+    timeout_s = max(30.0, task_timeout_seconds(sandbox.task_config or TaskConfig()))
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        manifests = harness.list_checkpoint_manifests(sandbox.sandbox_id)
+        for manifest in reversed(manifests):
+            checkpoint_actions = _manifest_replay_next_response_index(manifest)
+            if checkpoint_actions < minimum_actions:
+                continue
+            return manifest, checkpoint_actions
+
+        current = dict(sandbox.last_status)
+        if sandbox.task_run is not None:
+            try:
+                current = sandbox.task_run.poll_status()
+            except Exception:
+                current = dict(sandbox.last_status)
+        sandbox.last_status = dict(current)
+        if _replay_status_is_complete(current, trace_response_count=trace_response_count):
+            return None, total_actions(current)
+        if str(current.get("state", "")) == "finished":
+            return None, total_actions(current)
+        time.sleep(0.2)
+
+    current = dict(sandbox.last_status)
+    if sandbox.task_run is not None:
+        try:
+            current = sandbox.task_run.poll_status()
+        except Exception:
+            current = dict(sandbox.last_status)
+    if _replay_status_is_complete(current, trace_response_count=trace_response_count):
+        return None, total_actions(current)
+    raise RuntimeError(
+        f"timed out waiting for auto replay checkpoint at action count {minimum_actions}"
+    )
+
+
 def _finalize_replay_row(
     args: argparse.Namespace,
     harness: RealHostScenarioHarness,
@@ -365,7 +422,22 @@ def run_replay_fault_tolerance_sandbox(
                 continue
             faults_injected += 1
             if args.auto_cr:
-                pre_fault = sandbox.task_run.wait_for_action_delta(delta=1)
+                checkpoint_manifest, checkpoint_actions = _wait_for_auto_replay_checkpoint(
+                    harness,
+                    sandbox,
+                    minimum_actions=checkpoint_target,
+                    trace_response_count=trace_response_count,
+                )
+                if checkpoint_manifest is None:
+                    logger.info(
+                        "Skipping replay fault injection because sandbox=%s completed before auto checkpoint target=%d became available",
+                        sandbox.sandbox_id,
+                        checkpoint_target,
+                    )
+                    sandbox.last_status = dict(sandbox.task_run.poll_status())
+                    faults_injected -= 1
+                    break
+                pre_fault = sandbox.task_run.poll_status()
                 event_started = time.perf_counter()
                 harness.inject_fault(sandbox)
                 observed_after = utc_now()
