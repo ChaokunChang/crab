@@ -10,7 +10,7 @@ import unittest
 
 from agent_cr import CheckpointId, JobStatus, SandboxId
 from integrations.agents import SandboxHandle
-from benchmarks.bench_fault_tolerance import run_fault_tolerance_benchmark
+from benchmarks.bench_fault_tolerance import run_fault_tolerance_benchmark, run_replay_fault_tolerance_sandbox
 from benchmarks.bench_spot_agent import run_spot_agent_benchmark
 from benchmarks.support import BenchmarkTaskRecord
 
@@ -242,6 +242,81 @@ class FaultToleranceBenchmarkTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "restore failed for fault-1"):
             run_fault_tolerance_benchmark(self._args(iters=1), harness)
+
+    def test_replay_mode_skips_fault_injection_when_task_is_already_complete(self) -> None:
+        class _ReplayCompleteTaskRun:
+            def __init__(self, sandbox: SandboxHandle) -> None:
+                self._sandbox = sandbox
+
+            def wait_for_progress(self, *, minimum_actions: int) -> dict[str, object]:
+                payload = {
+                    "total_actions": 10,
+                    "replay_next_response_index": 10,
+                    "replay_is_complete": True,
+                }
+                self._sandbox.last_status = dict(payload)
+                return payload
+
+            def poll_status(self) -> dict[str, object]:
+                return dict(self._sandbox.last_status)
+
+        class _ReplayCompletionHarness:
+            def __init__(self) -> None:
+                self.storage = _FakeStorage()
+
+            def checkpoint_manual(self, sandbox: SandboxHandle, leave_running: bool = True):
+                _ = (sandbox, leave_running)
+                raise AssertionError("checkpoint should not run once replay is already complete")
+
+            def inject_fault(self, sandbox: SandboxHandle) -> None:
+                _ = sandbox
+                raise AssertionError("fault injection should not run once replay is already complete")
+
+            def restore_once(self, sandbox: SandboxHandle, checkpoint_id: CheckpointId):
+                _ = (sandbox, checkpoint_id)
+                raise AssertionError("restore should not run once replay is already complete")
+
+            def wait_for_task_completion(self, sandbox: SandboxHandle, timeout_s: float | None = None) -> None:
+                _ = (sandbox, timeout_s)
+
+            def verify_task_accuracy(self, sandbox: SandboxHandle, timeout_s: float | None = None) -> dict[str, object]:
+                _ = (sandbox, timeout_s)
+                return {
+                    "verification_status": "passed",
+                    "verification_exit_code": 0,
+                    "verification_ms": 0.0,
+                }
+
+        harness = _ReplayCompletionHarness()
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("fault-0"),
+            bundle_dir=Path("/tmp/fault-0"),
+            status_port=20000,
+            last_status={"total_actions": 0},
+            agent_type="iflow",
+            llm_service_type="iflow_trace_replay",
+            launch_metadata={"benchmark": {"task_id": "jsonl-aggregator", "trace_response_count": 10}},
+        )
+        sandbox.task_run = _ReplayCompleteTaskRun(sandbox)
+
+        row = run_replay_fault_tolerance_sandbox(
+            argparse.Namespace(
+                provider="openai",
+                auto_cr=False,
+                fault_rate=1.0,
+                first_fault_iteration=1,
+                iters=2,
+            ),
+            harness,
+            sandbox_index=0,
+            sandbox=sandbox,
+        )
+
+        self.assertEqual(row["task_error"], "")
+        self.assertEqual(row["faults_injected"], 0)
+        self.assertEqual(row["recoveries_succeeded"], 0)
+        self.assertEqual(row["success_ratio"], 1.0)
+        self.assertEqual(row["verification_status"], "passed")
 
 
 class SpotAgentBenchmarkTests(unittest.TestCase):

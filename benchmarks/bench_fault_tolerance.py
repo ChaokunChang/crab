@@ -72,6 +72,14 @@ def _trace_response_count_for_sandbox(sandbox: SandboxHandle) -> int:
         return 0
 
 
+def _replay_status_is_complete(status: dict[str, object], *, trace_response_count: int) -> bool:
+    if bool(status.get("replay_is_complete", False)):
+        return True
+    if trace_response_count <= 0:
+        return False
+    return total_actions(status) >= trace_response_count
+
+
 def _finalize_replay_row(
     args: argparse.Namespace,
     harness: RealHostScenarioHarness,
@@ -321,7 +329,15 @@ def run_replay_fault_tolerance_sandbox(
             raise RuntimeError("replay fault-tolerance benchmark expected sandbox.task_run")
         for iteration, checkpoint_target in enumerate(replay_points, start=1):
             iterations_executed += 1
-            sandbox.task_run.wait_for_progress(minimum_actions=checkpoint_target)
+            current = sandbox.task_run.wait_for_progress(minimum_actions=checkpoint_target)
+            if _replay_status_is_complete(current, trace_response_count=trace_response_count):
+                logger.info(
+                    "Skipping replay fault injection because sandbox=%s already completed trace at actions=%d",
+                    sandbox.sandbox_id,
+                    total_actions(current),
+                )
+                sandbox.last_status = dict(current)
+                break
             injected = should_inject_fault(
                 iteration=iteration,
                 sandbox_index=sandbox_index,
