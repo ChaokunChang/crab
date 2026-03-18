@@ -20,3 +20,4 @@ logs/
 *.swp
 *.swo
 integrations/sandboxes/3rdparty/
+data/
