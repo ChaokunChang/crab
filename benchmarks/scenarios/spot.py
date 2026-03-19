@@ -309,6 +309,8 @@ def run_replay_manual_sandbox(
             "skipped_no_replay_checkpoint": 1 if not replay_points else 0,
         },
         task_error=task_error,
+        verify_task_accuracy_result=False,
+        success_ratio=1.0 if not task_error and recoveries_succeeded == events_injected else 0.0,
     )
 
 
@@ -400,6 +402,8 @@ def run_replay_auto_sandbox(
             "skipped_no_replay_checkpoint": 1 if not replay_points else 0,
         },
         task_error=task_error,
+        verify_task_accuracy_result=False,
+        success_ratio=1.0 if not task_error and recoveries_succeeded == events_injected else 0.0,
     )
 
 
@@ -457,7 +461,7 @@ def run_auto(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
 
 
 def summarize(config: BenchmarkConfig, rows: list[dict[str, object]]) -> dict[str, float]:
-    if rows and "verification_status" in rows[0]:
+    if rows and ("verification_status" in rows[0] or "iterations_planned" in rows[0]):
         return compute_summary(
             rows,
             [

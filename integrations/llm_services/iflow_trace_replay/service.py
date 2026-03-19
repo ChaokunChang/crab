@@ -52,6 +52,7 @@ class ReplayExchange:
     request: dict[str, Any]
     response: dict[str, Any]
     lookup_key: tuple[str, int, int, int, int]
+    counts_toward_progress: bool = True
 
 
 @dataclass(frozen=True)
@@ -270,12 +271,14 @@ def parse_replay_trace(trace_path: Path) -> ParsedReplayTrace:
         if payload is None:
             malformed_lines.append(line_number)
             continue
-        if _is_non_replayable_stop_response(payload):
-            continue
-        responses.append(payload)
         if pending_request is None:
+            if not _is_non_replayable_stop_response(payload):
+                responses.append(payload)
             continue
         path, request = pending_request
+        counts_toward_progress = not _is_non_replayable_stop_response(payload)
+        if counts_toward_progress:
+            responses.append(payload)
         lookup_key = _lookup_stats(path, request)
         fingerprint = _response_fingerprint(payload)
         previous = fingerprints_by_key.get(lookup_key)
@@ -290,6 +293,7 @@ def parse_replay_trace(trace_path: Path) -> ParsedReplayTrace:
                 request=request,
                 response=payload,
                 lookup_key=lookup_key,
+                counts_toward_progress=counts_toward_progress,
             )
         )
         pending_request = None
@@ -322,7 +326,8 @@ class TraceReplayLLMState:
         self._response_delay_ms = max(0, response_delay_ms)
         self._events: list[dict[str, Any]] = []
         self._matched_response_count = 0
-        self._responses_by_key = {exchange.lookup_key: exchange.response for exchange in parsed.exchanges}
+        self._total_progress_responses = sum(1 for exchange in parsed.exchanges if exchange.counts_toward_progress)
+        self._responses_by_key = {exchange.lookup_key: exchange for exchange in parsed.exchanges}
         self._hashes_by_shape: dict[tuple[int, int, int, int], list[str]] = {}
         for exchange in parsed.exchanges:
             self._hashes_by_shape.setdefault(exchange.lookup_key[1:], []).append(exchange.lookup_key[0])
@@ -346,7 +351,7 @@ class TraceReplayLLMState:
         sandbox_id = _sandbox_id_from_request(headers, payload)
         lookup_key = _lookup_stats(path, payload)
         try:
-            response = self._responses_by_key[lookup_key]
+            exchange = self._responses_by_key[lookup_key]
         except KeyError as exc:
             matching_hashes = self._hashes_by_shape.get(lookup_key[1:], [])
             logger.warning(
@@ -364,7 +369,8 @@ class TraceReplayLLMState:
                 f"hash={lookup_key[0][:12]} messages={lookup_key[1]} tool_messages={lookup_key[3]}"
             ) from exc
         with self._lock:
-            self._matched_response_count += 1
+            if exchange.counts_toward_progress:
+                self._matched_response_count += 1
             matched_response_count = self._matched_response_count
             self._events.append(
                 {
@@ -372,11 +378,12 @@ class TraceReplayLLMState:
                     "sandbox_id": sandbox_id,
                     "request_hash": lookup_key[0],
                     "matched_response_count": matched_response_count,
+                    "counts_toward_progress": exchange.counts_toward_progress,
                 }
             )
         if self._response_delay_ms > 0:
             time.sleep(self._response_delay_ms / 1000.0)
-        return matched_response_count, copy.deepcopy(response)
+        return matched_response_count, copy.deepcopy(exchange.response)
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -384,11 +391,11 @@ class TraceReplayLLMState:
             return {
                 "trace_path": str(self._trace.trace_path),
                 "response_delay_ms": self._response_delay_ms,
-                "total_responses": len(self._trace.exchanges),
+                "total_responses": self._total_progress_responses,
                 "matched_response_count": matched_response_count,
                 "next_response_index": matched_response_count,
                 "responses_served": matched_response_count,
-                "is_complete": matched_response_count >= len(self._trace.exchanges),
+                "is_complete": matched_response_count >= self._total_progress_responses,
                 "malformed_line_count": len(self._trace.malformed_lines),
                 "malformed_lines": list(self._trace.malformed_lines),
                 "events": list(self._events),

@@ -96,28 +96,41 @@ def finalize_replay_row(
     row: dict[str, object],
     task_error: str = "",
     iteration: int = 1,
+    verify_task_accuracy_result: bool = True,
+    success_ratio: float | None = None,
 ) -> dict[str, object]:
-    verification = {
-        "verification_status": "task_failed" if task_error else "verification_skipped",
-        "verification_exit_code": -1,
-        "verification_ms": 0.0,
-    }
-    if not task_error:
-        task_error, verification = verify_task_accuracy(harness, sandbox)
     status = poll_sandbox_status(sandbox)
-    success_ratio = 1.0 if verification["verification_status"] == "passed" else 0.0
+    row_payload = {
+        **row,
+        "trace_response_count": trace_response_count_for_sandbox(sandbox),
+        "replay_final_index": int(status.get("replay_next_response_index", status.get("total_actions", 0))),
+        "replay_is_complete": replay_status_is_complete(
+            status,
+            trace_response_count=trace_response_count_for_sandbox(sandbox),
+        ),
+    }
+    if verify_task_accuracy_result:
+        verification = {
+            "verification_status": "task_failed" if task_error else "verification_skipped",
+            "verification_exit_code": -1,
+            "verification_ms": 0.0,
+        }
+        if not task_error:
+            task_error, verification = verify_task_accuracy(harness, sandbox)
+        resolved_success_ratio = 1.0 if verification["verification_status"] == "passed" else 0.0
+        row_payload = {
+            **row_payload,
+            **verification,
+        }
+    else:
+        resolved_success_ratio = 0.0 if task_error else (1.0 if success_ratio is None else float(success_ratio))
     return annotate_row(
         config,
         sandbox,
         iteration=iteration,
-        success_ratio=success_ratio,
+        success_ratio=resolved_success_ratio,
         task_error=task_error,
-        row={
-            **row,
-            "trace_response_count": trace_response_count_for_sandbox(sandbox),
-            "replay_final_index": int(status.get("replay_next_response_index", status.get("total_actions", 0))),
-            **verification,
-        },
+        row=row_payload,
     )
 
 

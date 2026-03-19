@@ -10,6 +10,7 @@ _SCENARIOS = {"e2e", "fault", "spot", "tree"}
 _MODES = {"manual", "auto"}
 _PROVIDERS = {"openai", "anthropic"}
 _LOG_LEVELS = {"debug", "info", "warning", "error", "critical"}
+_LOG_FILE_MODES = {"append": "a", "write": "w"}
 _SUPPORTED_MODES = {
     "e2e": {"manual"},
     "fault": {"manual", "auto"},
@@ -38,6 +39,7 @@ class BenchmarkConfig:
     output: Path | None = None
     telemetry_output: Path | None = None
     log_file: Path | None = None
+    log_file_mode: str = "append"
     image_cache_root: Path | None = None
     log_level: str = "info"
     transfer_delay_ms: float = 0.0
@@ -89,6 +91,10 @@ def load_config(path: Path) -> BenchmarkConfig:
     if log_level not in _LOG_LEVELS:
         raise ValueError(f"log_level must be one of {sorted(_LOG_LEVELS)}, got {log_level!r}")
 
+    log_file_mode = str(data.get("log_file_mode", "append")).strip().lower()
+    if log_file_mode not in _LOG_FILE_MODES:
+        raise ValueError(f"log_file_mode must be one of {sorted(_LOG_FILE_MODES)}, got {log_file_mode!r}")
+
     sandboxes = int(data.get("sandboxes", 1))
     if sandboxes <= 0:
         raise ValueError(f"sandboxes must be positive, got {sandboxes}")
@@ -116,6 +122,7 @@ def load_config(path: Path) -> BenchmarkConfig:
         output=_resolve_optional_path(base_dir, data.get("output")),
         telemetry_output=_resolve_optional_path(base_dir, data.get("telemetry_output")),
         log_file=_resolve_optional_path(base_dir, data.get("log_file")),
+        log_file_mode=log_file_mode,
         image_cache_root=_resolve_optional_path(base_dir, data.get("image_cache_root")),
         log_level=log_level,
         transfer_delay_ms=float(data.get("transfer_delay_ms", 0.0)),

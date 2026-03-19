@@ -536,6 +536,104 @@ class IFlowTraceReplayTests(unittest.TestCase):
             self.assertEqual(parsed.responses[0]["choices"][0]["message"]["content"], "first")
             self.assertEqual(parsed.responses[1]["choices"][0]["message"]["content"], "second")
 
+    def test_trace_replay_state_replays_non_progress_stop_responses_without_advancing_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.log"
+            trace_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "request",
+                                "data": {
+                                    "model": "trace-model",
+                                    "messages": [
+                                        {"role": "system", "content": "You are iFlow CLI, an interactive CLI agent with old instructions"},
+                                        {
+                                            "role": "user",
+                                            "content": [
+                                                {
+                                                    "type": "text",
+                                                    "text": "Context: An LLM has just generated potentially_problematic_string and the text might have been improperly escaped.",
+                                                }
+                                            ],
+                                        },
+                                    ],
+                                    "tools": [],
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "response",
+                                "data": {
+                                    "choices": [
+                                        {
+                                            "finish_reason": "stop",
+                                            "message": {
+                                                "content": "```json\n{\"corrected_string_escaping\": \"print(1)\"}\n```"
+                                            },
+                                        }
+                                    ]
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "request",
+                                "data": {
+                                    "model": "trace-model",
+                                    "messages": [{"role": "user", "content": "real"}],
+                                    "tools": [],
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "response",
+                                "data": {"choices": [{"message": {"content": "real-final"}}]},
+                            }
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            state = TraceReplayLLMState(llm_service_config={"trace_path": str(trace_path), "response_delay_ms": 0})
+
+            first_index, first = state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={
+                    "model": "trace-model",
+                    "messages": [
+                        {"role": "system", "content": "You are iFlow CLI, an interactive CLI agent with new instructions"},
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Context: An LLM has just generated potentially_problematic_string and the text might have been improperly escaped.",
+                                }
+                            ],
+                        },
+                    ],
+                    "tools": [],
+                },
+            )
+            second_index, second = state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={"model": "trace-model", "messages": [{"role": "user", "content": "real"}], "tools": []},
+            )
+            snapshot = state.snapshot()
+
+        self.assertEqual(first_index, 0)
+        self.assertEqual(first["choices"][0]["message"]["content"], "```json\n{\"corrected_string_escaping\": \"print(1)\"}\n```")
+        self.assertEqual(second_index, 1)
+        self.assertEqual(second["choices"][0]["message"]["content"], "real-final")
+        self.assertEqual(snapshot["total_responses"], 1)
+        self.assertEqual(snapshot["matched_response_count"], 1)
+
     def test_generate_dataset_builds_expected_replay_row(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

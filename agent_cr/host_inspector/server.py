@@ -596,6 +596,9 @@ class HostInspectorServer:
     def _build_handler(self):
         daemon = self._daemon
 
+        class _ClientDisconnectedError(Exception):
+            pass
+
         class Handler(BaseHTTPRequestHandler):
             def _read_json(self) -> dict[str, Any]:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -606,17 +609,23 @@ class HostInspectorServer:
 
             def _write_json(self, code: int, payload: dict[str, Any]) -> None:
                 body = json.dumps(payload, sort_keys=True).encode("utf-8")
-                self.send_response(code)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.send_response(code)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError) as exc:
+                    raise _ClientDisconnectedError from exc
 
             def do_GET(self) -> None:  # noqa: N802
-                if self.path == "/healthz":
-                    self._write_json(HTTPStatus.OK, {"ok": True})
-                    return
-                self._write_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
+                try:
+                    if self.path == "/healthz":
+                        self._write_json(HTTPStatus.OK, {"ok": True})
+                        return
+                    self._write_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
+                except _ClientDisconnectedError:
+                    logger.debug("Host inspector client disconnected during GET response")
 
             def do_POST(self) -> None:  # noqa: N802
                 try:
@@ -654,9 +663,14 @@ class HostInspectorServer:
                     self._write_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
                 except KeyError as exc:
                     self._write_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": f"unknown sandbox: {exc.args[0]}"})
+                except _ClientDisconnectedError:
+                    logger.debug("Host inspector client disconnected during POST response")
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("Host inspector request failed")
-                    self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+                    try:
+                        self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+                    except _ClientDisconnectedError:
+                        logger.debug("Host inspector client disconnected while sending POST error response")
 
             def log_message(self, fmt: str, *args) -> None:
                 logger.debug("host-inspector: " + fmt, *args)

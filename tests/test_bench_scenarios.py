@@ -15,7 +15,9 @@ from benchmarks.scenarios.fault import (
     parse_fault_options,
     run_auto as run_fault_auto,
     run_manual as run_fault_manual,
+    run_replay_auto_sandbox,
     run_replay_manual_sandbox,
+    summarize as summarize_fault,
 )
 from benchmarks.scenarios.spot import run_auto as run_spot_auto, run_manual as run_spot_manual
 from benchmarks.support import BenchmarkTaskRecord
@@ -111,6 +113,8 @@ class _BaseScenarioHarness:
         self.fail_on_restore_sandbox: str | None = None
         self.fail_recovery_record_sandbox: str | None = None
         self._unreachable_sandboxes: set[str] = set()
+        self.wait_for_task_completion_calls: list[str] = []
+        self.verify_task_accuracy_calls: list[str] = []
 
     def _record_for_config(self, config: BenchmarkConfig, sandbox_index: int) -> BenchmarkTaskRecord:
         return BenchmarkTaskRecord(
@@ -214,9 +218,11 @@ class _BaseScenarioHarness:
 
     def wait_for_task_completion(self, sandbox: SandboxHandle, timeout_s: float | None = None) -> None:
         _ = (sandbox, timeout_s)
+        self.wait_for_task_completion_calls.append(str(sandbox.sandbox_id))
 
     def verify_task_accuracy(self, sandbox: SandboxHandle, timeout_s: float | None = None) -> dict[str, object]:
         _ = (sandbox, timeout_s)
+        self.verify_task_accuracy_calls.append(str(sandbox.sandbox_id))
         return {
             "verification_status": "passed",
             "verification_exit_code": 0,
@@ -359,6 +365,67 @@ class FaultScenarioTests(unittest.TestCase):
 
         self.assertIsNotNone(manifest)
         self.assertEqual(checkpoint_actions, 4)
+
+    def test_replay_auto_mode_skips_final_task_verification(self) -> None:
+        harness = _BaseScenarioHarness()
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("fault-0"),
+            bundle_dir=Path("/tmp/fault-0"),
+            status_port=20000,
+            last_status={"total_actions": 0},
+            agent_type="iflow",
+            llm_service_type="iflow_trace_replay",
+            launch_metadata={"benchmark": {"task_id": "amuse-install", "trace_response_count": 10}},
+        )
+        sandbox.task_run = _FakeTaskRun(harness, sandbox)
+        harness._statuses[str(sandbox.sandbox_id)] = {"total_actions": 0}
+        harness._progress_actions[str(sandbox.sandbox_id)] = 0
+        config = _config(
+            "fault",
+            "auto",
+            sandboxes=1,
+            iterations=2,
+            agent="iflow",
+            llm_service="iflow_trace_replay",
+            scenario_options={"injection_rate": 0.0, "first_injection_iteration": 2},
+        )
+
+        with unittest.mock.patch(
+            "benchmarks.scenarios.fault.wait_for_auto_replay_checkpoint",
+            return_value=(SimpleNamespace(metadata={"benchmark_replay_action_count": 2}), 2),
+        ):
+            row = run_replay_auto_sandbox(
+                config,
+                harness,
+                sandbox_index=0,
+                sandbox=sandbox,
+                options=parse_fault_options(config),
+            )
+
+        self.assertEqual(row["task_error"], "")
+        self.assertEqual(row["success_ratio"], 1.0)
+        self.assertNotIn("verification_status", row)
+        self.assertEqual(harness.wait_for_task_completion_calls, [])
+        self.assertEqual(harness.verify_task_accuracy_calls, [])
+
+    def test_replay_auto_summary_uses_aggregate_metrics(self) -> None:
+        rows = [
+            {
+                "iterations_planned": 5,
+                "checkpoint_ms_avg": 0.0,
+                "restore_ms_avg": 0.0,
+                "recovery_ms_avg": 12.0,
+                "readiness_ms_avg": 3.0,
+                "end_to_end_recovery_ms_avg": 15.0,
+                "lost_actions_avg": 0.5,
+                "success_ratio": 1.0,
+            }
+        ]
+
+        summary = summarize_fault(_config("fault", "auto", agent="iflow", llm_service="iflow_trace_replay"), rows)
+
+        self.assertEqual(summary["recovery_ms_avg"], 12.0)
+        self.assertEqual(summary["success_ratio"], 1.0)
 
 
 class SpotScenarioTests(unittest.TestCase):

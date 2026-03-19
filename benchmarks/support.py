@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+import os
 import random
 import time
 from dataclasses import dataclass
@@ -13,11 +14,11 @@ from agent_cr import CheckpointId, CheckpointManifest
 from integrations.agents import TaskConfig, TaskDescription
 
 
-def configure_logging(level_name: str, *, log_file: Path | None = None) -> None:
+def configure_logging(level_name: str, *, log_file: Path | None = None, log_file_mode: str = "a") -> None:
     handlers: list[logging.Handler]
     if log_file is not None:
         log_file.parent.mkdir(parents=True, exist_ok=True)
-        handlers = [logging.FileHandler(log_file, encoding="utf-8")]
+        handlers = [logging.FileHandler(log_file, mode=log_file_mode, encoding="utf-8")]
     else:
         handlers = [logging.StreamHandler()]
     logging.basicConfig(
@@ -26,6 +27,21 @@ def configure_logging(level_name: str, *, log_file: Path | None = None) -> None:
         handlers=handlers,
         force=True,
     )
+
+
+def benchmark_run_context(config_path: Path) -> dict[str, object]:
+    return {
+        "pid": os.getpid(),
+        "started_at_monotonic": time.perf_counter(),
+        "config_path": str(config_path.resolve()),
+    }
+
+
+def benchmark_run_duration_seconds(run_context: dict[str, object]) -> float:
+    started_at = run_context.get("started_at_monotonic")
+    if not isinstance(started_at, (int, float)):
+        return 0.0
+    return max(0.0, time.perf_counter() - float(started_at))
 
 
 def bounded_probability(raw: str) -> float:

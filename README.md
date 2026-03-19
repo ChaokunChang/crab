@@ -170,11 +170,21 @@ task_dataset: path/to/tasks.jsonl
 sandboxes: 1
 iterations: 5
 output: logs/tmp/out.csv
+log_file: logs/tmp/out.log
+log_file_mode: append | write
 log_level: info
 transfer_delay_ms: 0.0
 work_dir_host_root: logs/tmp
 scenario_options: {}
 ```
+
+Logging notes:
+
+- `log_file` sends benchmark logs to a file instead of stderr/stdout.
+- `log_file_mode` controls the Python `FileHandler` mode.
+- Default `log_file_mode: append` preserves existing log history.
+- Use `log_file_mode: write` when you want each benchmark run to start with a fresh log file.
+- `benchmark.run` now logs an explicit start marker and end marker for each run, and the final summary/artifact paths are logged as well as printed.
 
 The per-scenario knobs live under `scenario_options`:
 
