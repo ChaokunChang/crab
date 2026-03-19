@@ -135,6 +135,26 @@ def wait_for_http_json(url: str, *, timeout_s: float = 30.0) -> dict[str, object
             time.sleep(0.2)
     raise RuntimeError(f"timed out waiting for {url}: {last_exc}")
 
+
+def _zpool_exists(pool_name: str) -> bool:
+    result = subprocess.run(
+        ["zpool", "list", "-H", "-o", "name", pool_name],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def _zfs_dataset_exists(dataset: str) -> bool:
+    result = subprocess.run(
+        ["zfs", "list", "-H", "-o", "name", dataset],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
 @dataclass(frozen=True)
 class AgentSandboxImage:
     agent_type: str
@@ -175,6 +195,10 @@ class RealHostScenarioHarness:
         auto_cr: bool = False,
         work_dir_host_root: Path | None = None,
         telemetry_output: Path | None = None,
+        zpool_size: str = "10G",
+        zpool_name: str | None = None,
+        zpool_image: Path | None = None,
+        reuse_zpool: bool = False,
         image_cache_root: Path | None = None,
     ) -> None:
         self.provider = provider
@@ -186,6 +210,10 @@ class RealHostScenarioHarness:
         self.auto_cr = auto_cr
         self.work_dir_host_root = work_dir_host_root
         self.telemetry_output = telemetry_output
+        self.zpool_size = zpool_size
+        self.configured_zpool_name = zpool_name
+        self.configured_zpool_image = zpool_image
+        self.reuse_zpool = reuse_zpool
         self.image_cache_root = (image_cache_root or _DEFAULT_IMAGE_CACHE_ROOT).resolve()
         self._tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self.root: Path | None = None
@@ -214,6 +242,7 @@ class RealHostScenarioHarness:
         self._sandbox_images: dict[str, AgentSandboxImage] = {}
         self._sandbox_image_lock = threading.Lock()
         self._task_executor = ThreadPoolExecutor(max_workers=max(1, self.max_workers))
+        self._zpool_image_path: Path | None = None
 
     @property
     def benchmark_bridge_ip(self) -> str:
@@ -272,16 +301,14 @@ class RealHostScenarioHarness:
         else:
             self.root = Path(self._tmpdir.name)
         unique_suffix = uuid.uuid4().hex[:10]
-        self.pool_name = f"agentcrbench{unique_suffix}"
+        self.pool_name = self.configured_zpool_name or f"agentcrbench{unique_suffix}"
         self.runtime_state_root = self.root / "runtime-state"
         self.host_inspector_url = self._start_host_inspector_server()
         self.llm_server = serve_benchmark_llm_router(host="127.0.0.1", port=0)
         self.llm_thread = threading.Thread(target=self.llm_server.serve_forever, daemon=True)
         self.llm_thread.start()
         wait_for_http_json(f"http://127.0.0.1:{self.llm_server.server_address[1]}/healthz")
-        subprocess.run(["truncate", "-s", "10G", str(self.root / "zpool.img")], check=True)
-        subprocess.run(["zpool", "create", "-f", self.pool_name, str(self.root / "zpool.img")], check=True)
-        subprocess.run(["zfs", "create", f"{self.pool_name}/agent-cr"], check=True)
+        self._ensure_zpool()
 
         telemetry_sinks: list[TelemetrySink] = [InMemoryTelemetrySink()]
         telemetry_path = self.telemetry_output or (self.root / "telemetry.jsonl")
@@ -395,18 +422,20 @@ class RealHostScenarioHarness:
             #     stderr=subprocess.DEVNULL,
             # )
         if self.pool_name:
+            dataset = f"{self.pool_name}/agent-cr"
             subprocess.run(
-                ["zfs", "destroy", "-r", f"{self.pool_name}/agent-cr"],
+                ["zfs", "destroy", "-r", dataset],
                 check=False,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            subprocess.run(
-                ["zpool", "destroy", "-f", self.pool_name],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            if not self.reuse_zpool:
+                subprocess.run(
+                    ["zpool", "destroy", "-f", self.pool_name],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
         if self.llm_server is not None:
             self.llm_server.shutdown()
             self.llm_server.server_close()
@@ -415,6 +444,39 @@ class RealHostScenarioHarness:
         self._stop_host_inspector_server()
         if self._tmpdir is not None:
             self._tmpdir.cleanup()
+
+    def _ensure_zpool(self) -> None:
+        assert self.root is not None
+        dataset = f"{self.pool_name}/agent-cr"
+        zpool_image_path = self.configured_zpool_image or (self.root / "zpool.img")
+        self._zpool_image_path = zpool_image_path
+        if self.reuse_zpool:
+            if _zpool_exists(self.pool_name):
+                logger.info("Reusing existing benchmark zpool name=%s", self.pool_name)
+            else:
+                zpool_image_path.parent.mkdir(parents=True, exist_ok=True)
+                if not zpool_image_path.exists():
+                    logger.info(
+                        "Creating reusable benchmark zpool image path=%s size=%s",
+                        zpool_image_path,
+                        self.zpool_size,
+                    )
+                    subprocess.run(["truncate", "-s", self.zpool_size, str(zpool_image_path)], check=True)
+                logger.info("Creating reusable benchmark zpool name=%s image=%s", self.pool_name, zpool_image_path)
+                subprocess.run(["zpool", "create", "-f", self.pool_name, str(zpool_image_path)], check=True)
+            if _zfs_dataset_exists(dataset):
+                subprocess.run(
+                    ["zfs", "destroy", "-r", dataset],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            subprocess.run(["zfs", "create", dataset], check=True)
+            return
+
+        subprocess.run(["truncate", "-s", self.zpool_size, str(zpool_image_path)], check=True)
+        subprocess.run(["zpool", "create", "-f", self.pool_name, str(zpool_image_path)], check=True)
+        subprocess.run(["zfs", "create", dataset], check=True)
 
     def get_agent_class(self, agent_type: str) -> type[BaseAgent]:
         try:

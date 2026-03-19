@@ -172,6 +172,10 @@ iterations: 5
 output: logs/tmp/out.csv
 log_file: logs/tmp/out.log
 log_file_mode: append | write
+zpool_size: 10G
+zpool_name: agentcrbench-cache
+zpool_image: logs/tmp/bench.zpool.img
+reuse_zpool: false
 log_level: info
 transfer_delay_ms: 0.0
 work_dir_host_root: logs/tmp
@@ -185,6 +189,9 @@ Logging notes:
 - Default `log_file_mode: append` preserves existing log history.
 - Use `log_file_mode: write` when you want each benchmark run to start with a fresh log file.
 - `benchmark.run` now logs an explicit start marker and end marker for each run, and the final summary/artifact paths are logged as well as printed.
+- `zpool_size` controls the backing file size for ephemeral benchmark zpools.
+- `reuse_zpool: true` keeps the zpool across runs instead of recreating it every time.
+- When reusing a pool, set both `zpool_name` and `zpool_image` to stable values. Each run still destroys and recreates the `pool/agent-cr` dataset so the benchmark starts clean.
 
 The per-scenario knobs live under `scenario_options`:
 

@@ -26,6 +26,10 @@ class BenchmarkConfigTests(unittest.TestCase):
                         "output: results/out.csv",
                         "log_file: results/out.log",
                         "log_file_mode: write",
+                        "zpool_size: 32G",
+                        "zpool_name: benchcache",
+                        "zpool_image: cache/bench.zpool.img",
+                        "reuse_zpool: true",
                         "telemetry_output: results/out.telemetry.jsonl",
                         "image_cache_root: cache/images",
                         "work_dir_host_root: workdirs",
@@ -44,6 +48,10 @@ class BenchmarkConfigTests(unittest.TestCase):
             self.assertEqual(config.output, (root / "results" / "out.csv").resolve())
             self.assertEqual(config.log_file, (root / "results" / "out.log").resolve())
             self.assertEqual(config.log_file_mode, "write")
+            self.assertEqual(config.zpool_size, "32G")
+            self.assertEqual(config.zpool_name, "benchcache")
+            self.assertEqual(config.zpool_image, (root / "cache" / "bench.zpool.img").resolve())
+            self.assertTrue(config.reuse_zpool)
             self.assertEqual(config.telemetry_output, (root / "results" / "out.telemetry.jsonl").resolve())
             self.assertEqual(config.image_cache_root, (root / "cache" / "images").resolve())
             self.assertEqual(config.work_dir_host_root, (root / "workdirs").resolve())
@@ -99,6 +107,10 @@ class BenchmarkRunDispatchTests(unittest.TestCase):
             telemetry_output=None,
             log_file=None,
             log_file_mode="append",
+            zpool_size="10G",
+            zpool_name=None,
+            zpool_image=None,
+            reuse_zpool=False,
             image_cache_root=None,
             log_level="info",
             transfer_delay_ms=0.0,
@@ -183,6 +195,10 @@ class BenchmarkRunDispatchTests(unittest.TestCase):
             telemetry_output=None,
             log_file=Path("/tmp/out.log"),
             log_file_mode="append",
+            zpool_size="10G",
+            zpool_name=None,
+            zpool_image=None,
+            reuse_zpool=False,
             image_cache_root=None,
         )
 
@@ -236,6 +252,10 @@ class BenchmarkRunDispatchTests(unittest.TestCase):
                 telemetry_output=telemetry_output,
                 log_file=log_file,
                 log_file_mode="write",
+                zpool_size="10G",
+                zpool_name=None,
+                zpool_image=None,
+                reuse_zpool=False,
                 image_cache_root=None,
             )
 

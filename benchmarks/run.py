@@ -93,11 +93,15 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
             scheduler_policy=settings.scheduler_policy,
             checkpoint_manager_factory=settings.checkpoint_manager_factory,
             max_workers=settings.max_workers,
-            auto_cr=config.mode == "auto",
-            work_dir_host_root=config.work_dir_host_root,
-            telemetry_output=telemetry_output,
-            image_cache_root=config.image_cache_root,
-        ) as harness:
+        auto_cr=config.mode == "auto",
+        work_dir_host_root=config.work_dir_host_root,
+        telemetry_output=telemetry_output,
+        zpool_size=config.zpool_size,
+        zpool_name=config.zpool_name,
+        zpool_image=config.zpool_image,
+        reuse_zpool=config.reuse_zpool,
+        image_cache_root=config.image_cache_root,
+    ) as harness:
             if scenario.prepare_harness is not None:
                 scenario.prepare_harness(config, harness)
             rows = scenario.runner_for_mode(config.mode)(config, harness)
