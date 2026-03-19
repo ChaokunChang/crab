@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from datetime import datetime
+from pathlib import Path
 from typing import Iterable
 
 from .ids import CheckpointId, JobId, SandboxId
@@ -78,7 +79,7 @@ class Runtime(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def write_bundle_spec(self, bundle_dir) -> None:
+    def write_bundle_spec(self, bundle_dir: Path) -> None:
         raise NotImplementedError
 
     @abstractmethod
@@ -170,7 +171,7 @@ class Runtime(ABC):
         checkpoint_id: CheckpointId,
         target_sandbox_id: SandboxId,
         *,
-        target_rootfs_path,
+        target_rootfs_path: Path,
     ) -> str:
         raise NotImplementedError
 

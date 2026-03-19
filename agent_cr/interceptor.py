@@ -475,8 +475,10 @@ class AgentCRRequestInterceptorServer:
         sandbox_id_resolver: Callable[[str | None, dict[str, str], bytes], str | None] | None = None,
         host: str = "127.0.0.1",
         port: int = 0,
+        upstream_timeout_seconds: float = 3600.0,
     ) -> None:
         self._upstream_url = upstream_url.rstrip("/")
+        self._upstream_timeout_seconds = upstream_timeout_seconds
         self._interceptor = AgentCRRequestInterceptor(
             upstream_transport=self._forward,
             request_state_store=request_state_store,
@@ -616,7 +618,7 @@ class AgentCRRequestInterceptorServer:
             method="POST",
         )
         started = time.perf_counter()
-        with urllib.request.urlopen(req, timeout=30.0) as resp:
+        with urllib.request.urlopen(req, timeout=self._upstream_timeout_seconds) as resp:
             response_body = resp.read()
             if self._telemetry is not None:
                 self._telemetry.emit_metric(
