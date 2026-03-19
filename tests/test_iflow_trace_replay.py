@@ -361,7 +361,7 @@ class IFlowTraceReplayTests(unittest.TestCase):
                     payload={"model": "trace-model", "messages": [{"role": "user", "content": "second"}], "tools": []},
                 )
 
-    def test_parse_replay_trace_skips_sidecar_evaluator_responses(self) -> None:
+    def test_parse_replay_trace_includes_sidecar_evaluator_responses(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "trace.log"
             trace_path.write_text(
@@ -415,11 +415,12 @@ class IFlowTraceReplayTests(unittest.TestCase):
 
             parsed = parse_replay_trace(trace_path)
 
-        self.assertEqual(len(parsed.responses), 2)
+        self.assertEqual(len(parsed.responses), 3)
         self.assertEqual(parsed.responses[0]["choices"][0]["message"]["content"], "first")
-        self.assertEqual(parsed.responses[1]["choices"][0]["message"]["content"], "real-final")
+        self.assertEqual(parsed.responses[1]["choices"][0]["message"]["content"], "```json\n{\"reasoning\":\"meta\",\"confidence\":0.5}\n```")
+        self.assertEqual(parsed.responses[2]["choices"][0]["message"]["content"], "real-final")
 
-    def test_parse_replay_trace_skips_unfenced_sidecar_evaluator_responses(self) -> None:
+    def test_parse_replay_trace_includes_unfenced_sidecar_evaluator_responses(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "trace.log"
             trace_path.write_text(
@@ -475,11 +476,12 @@ class IFlowTraceReplayTests(unittest.TestCase):
 
             parsed = parse_replay_trace(trace_path)
 
-        self.assertEqual(len(parsed.responses), 2)
+        self.assertEqual(len(parsed.responses), 3)
         self.assertEqual(parsed.responses[0]["choices"][0]["message"]["content"], "first")
-        self.assertEqual(parsed.responses[1]["choices"][0]["message"]["content"], "real-final")
+        self.assertEqual(parsed.responses[1]["choices"][0]["message"]["content"], json.dumps({"reasoning": "meta", "confidence": 0.5}))
+        self.assertEqual(parsed.responses[2]["choices"][0]["message"]["content"], "real-final")
 
-    def test_parse_replay_trace_skips_string_escaping_correction_responses(self) -> None:
+    def test_parse_replay_trace_includes_string_escaping_correction_responses(self) -> None:
         for key in ("corrected_string_escaping", "corrected_new_string_escaping"):
             with self.subTest(key=key), tempfile.TemporaryDirectory() as tmp:
                 trace_path = Path(tmp) / "trace.log"
@@ -532,11 +534,12 @@ class IFlowTraceReplayTests(unittest.TestCase):
 
                 parsed = parse_replay_trace(trace_path)
 
-            self.assertEqual(len(parsed.responses), 2)
+            self.assertEqual(len(parsed.responses), 3)
             self.assertEqual(parsed.responses[0]["choices"][0]["message"]["content"], "first")
-            self.assertEqual(parsed.responses[1]["choices"][0]["message"]["content"], "second")
+            self.assertEqual(parsed.responses[1]["choices"][0]["message"]["content"], f"```json\n{json.dumps({key: 'print(1)'})}\n```")
+            self.assertEqual(parsed.responses[2]["choices"][0]["message"]["content"], "second")
 
-    def test_trace_replay_state_replays_non_progress_stop_responses_without_advancing_progress(self) -> None:
+    def test_trace_replay_state_counts_stop_responses_as_replay_progress(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "trace.log"
             trace_path.write_text(
@@ -627,12 +630,12 @@ class IFlowTraceReplayTests(unittest.TestCase):
             )
             snapshot = state.snapshot()
 
-        self.assertEqual(first_index, 0)
+        self.assertEqual(first_index, 1)
         self.assertEqual(first["choices"][0]["message"]["content"], "```json\n{\"corrected_string_escaping\": \"print(1)\"}\n```")
-        self.assertEqual(second_index, 1)
+        self.assertEqual(second_index, 2)
         self.assertEqual(second["choices"][0]["message"]["content"], "real-final")
-        self.assertEqual(snapshot["total_responses"], 1)
-        self.assertEqual(snapshot["matched_response_count"], 1)
+        self.assertEqual(snapshot["total_responses"], 2)
+        self.assertEqual(snapshot["matched_response_count"], 2)
 
     def test_generate_dataset_builds_expected_replay_row(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -686,6 +689,136 @@ class IFlowTraceReplayTests(unittest.TestCase):
         self.assertEqual(rows[0]["trace_response_count"], 1)
         self.assertEqual(rows[0]["trace_malformed_line_count"], 0)
         self.assertEqual(rows[0]["task_description"]["prompt"], "Create /app/hello.txt")
+
+    def test_generate_dataset_preserves_raw_response_count_for_sidecar_stops(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tasks_root = root / "tasks"
+            traces_root = root / "traces"
+            output_path = root / "datasets" / "termnius_iflow_replay.jsonl"
+            task_root = tasks_root / "hello-world"
+            trace_root = traces_root / "hello-world" / "hello-world.1-of-1.2026-02-24__20-20-40"
+            (task_root / "tests").mkdir(parents=True, exist_ok=True)
+            (trace_root / "agent-logs").mkdir(parents=True, exist_ok=True)
+            (task_root / "task.yaml").write_text(
+                "\n".join(
+                    [
+                        "instruction: |-",
+                        "  Create /app/hello.txt",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (task_root / "docker-compose.yaml").write_text(
+                "\n".join(
+                    [
+                        "services:",
+                        "  client:",
+                        "    image: example:latest",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (task_root / "run-tests.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (trace_root / "agent-logs" / "proxy_server_trajectory.log").write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "response",
+                                "data": {
+                                    "choices": [
+                                        {
+                                            "finish_reason": "tool_calls",
+                                            "message": {"content": "first", "tool_calls": [{"id": "1"}]},
+                                        }
+                                    ]
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "response",
+                                "data": {
+                                    "choices": [
+                                        {
+                                            "finish_reason": "stop",
+                                            "message": {
+                                                "content": "```json\n{\"reasoning\":\"meta\",\"confidence\":0.5}\n```"
+                                            },
+                                        }
+                                    ]
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "response",
+                                "data": {
+                                    "choices": [
+                                        {
+                                            "finish_reason": "stop",
+                                            "message": {"content": "real-final"},
+                                        }
+                                    ]
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            rows = generate_dataset(
+                tasks_root=tasks_root,
+                traces_root=traces_root,
+                output_path=output_path,
+            )
+
+        self.assertEqual(rows[0]["trace_response_count"], 3)
+
+    def test_generate_dataset_counts_malformed_response_lines_in_raw_total(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tasks_root = root / "tasks"
+            traces_root = root / "traces"
+            output_path = root / "datasets" / "termnius_iflow_replay.jsonl"
+            task_root = tasks_root / "hello-world"
+            trace_root = traces_root / "hello-world" / "hello-world.1-of-1.2026-02-24__20-20-40"
+            (task_root / "tests").mkdir(parents=True, exist_ok=True)
+            (trace_root / "agent-logs").mkdir(parents=True, exist_ok=True)
+            (task_root / "task.yaml").write_text("instruction: hello\n", encoding="utf-8")
+            (task_root / "docker-compose.yaml").write_text(
+                "\n".join(
+                    [
+                        "services:",
+                        "  client:",
+                        "    image: example:latest",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (task_root / "run-tests.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (trace_root / "agent-logs" / "proxy_server_trajectory.log").write_text(
+                "\n".join(
+                    [
+                        '{"timestamp": 1, "type": "response", "data": {"choices": [{"message": {"content": "broken"}}]}} trailing',
+                        json.dumps({"type": "response", "data": {"choices": [{"message": {"content": "done"}}]}}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            rows = generate_dataset(
+                tasks_root=tasks_root,
+                traces_root=traces_root,
+                output_path=output_path,
+            )
+
+        self.assertEqual(rows[0]["trace_response_count"], 2)
+        self.assertEqual(rows[0]["trace_malformed_line_count"], 1)
 
 
 if __name__ == "__main__":

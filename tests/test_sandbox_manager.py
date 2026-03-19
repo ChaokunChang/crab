@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,6 +19,39 @@ class FakeCommandRunner(CommandRunner):
     def run(self, command: list[str], *, cwd: Path | None = None):
         _ = cwd
         self.commands.append(tuple(command))
+        return type(
+            "Result",
+            (),
+            {"command": tuple(command), "returncode": 0, "stdout": "", "stderr": ""},
+        )()
+
+
+class ResumeRaceCommandRunner(CommandRunner):
+    def __init__(self, *, state_status_after_resume: str) -> None:
+        self.commands: list[tuple[str, ...]] = []
+        self._state_status_after_resume = state_status_after_resume
+
+    def run(self, command: list[str], *, cwd: Path | None = None):
+        _ = cwd
+        self.commands.append(tuple(command))
+        if command[-2:] == ["resume", "sbx-test"]:
+            return type(
+                "Result",
+                (),
+                {
+                    "command": tuple(command),
+                    "returncode": 1,
+                    "stdout": "",
+                    "stderr": 'time="2026-03-19T22:23:26+08:00" level=error msg="container not paused"',
+                },
+            )()
+        if command[-2:] == ["state", "sbx-test"]:
+            payload = {"status": self._state_status_after_resume, "pid": 123 if self._state_status_after_resume == "running" else 0}
+            return type(
+                "Result",
+                (),
+                {"command": tuple(command), "returncode": 0, "stdout": json.dumps(payload), "stderr": ""},
+            )()
         return type(
             "Result",
             (),
@@ -143,6 +177,62 @@ class SandboxManagerTests(unittest.TestCase):
                     )
                 ],
             )
+
+    def test_runc_resume_treats_not_paused_as_benign_when_container_is_already_running(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_sandbox_mgr_") as tmp:
+            root = Path(tmp)
+            runner = ResumeRaceCommandRunner(state_status_after_resume="running")
+            manager = RuncSandboxManager(
+                command_runner=runner,
+                paths=RuncSandboxManagerPaths(
+                    state_root=root / "state",
+                    bundle_root=root / "bundles",
+                    metadata_root=root / "metadata",
+                    zfs_dataset_prefix="pool/agent-cr",
+                ),
+            )
+
+            sandbox_id = manager.launch(
+                "runc",
+                {
+                    "sandbox_id": "sbx-test",
+                    "bundle_path": str(root / "bundles" / "sbx-test"),
+                },
+            )
+            manager.pause(sandbox_id)
+            manager.resume(sandbox_id)
+
+            self.assertEqual(manager.describe(sandbox_id).status, "running")
+            self.assertIn(
+                ("runc", "--root", str(root / "state"), "state", "sbx-test"),
+                runner.commands,
+            )
+
+    def test_runc_resume_treats_not_paused_as_benign_when_container_is_already_stopped(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_sandbox_mgr_") as tmp:
+            root = Path(tmp)
+            runner = ResumeRaceCommandRunner(state_status_after_resume="stopped")
+            manager = RuncSandboxManager(
+                command_runner=runner,
+                paths=RuncSandboxManagerPaths(
+                    state_root=root / "state",
+                    bundle_root=root / "bundles",
+                    metadata_root=root / "metadata",
+                    zfs_dataset_prefix="pool/agent-cr",
+                ),
+            )
+
+            sandbox_id = manager.launch(
+                "runc",
+                {
+                    "sandbox_id": "sbx-test",
+                    "bundle_path": str(root / "bundles" / "sbx-test"),
+                },
+            )
+            manager.pause(sandbox_id)
+            manager.resume(sandbox_id)
+
+            self.assertEqual(manager.describe(sandbox_id).status, "stopped")
 
 
 if __name__ == "__main__":

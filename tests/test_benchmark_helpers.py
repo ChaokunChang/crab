@@ -23,6 +23,7 @@ from agent_cr import (
 )
 from integrations.agents import BaseAgent, IFlowAgent, SandboxHandle, SimulatedAgent, TaskConfig, TaskDescription
 from integrations.agents.iflow import IFLOW_WRAPPER_ARG
+from integrations.sandboxes.iflow.harness import IFLOW_TOOL_OUTPUT_LIMIT_ENV
 from integrations.sandboxes.runtime import bundle as sandbox_bundle
 from integrations.sandboxes.runtime import compose as sandbox_compose
 from integrations.sandboxes.runtime import image as sandbox_image
@@ -1663,6 +1664,7 @@ services:
             self.assertIn(IFLOW_WRAPPER_ARG, payload["process"]["args"][2])
             self.assertIn("/data/iflow-task-logs/iflow.task.stdout", payload["process"]["args"][2])
             self.assertIn("/data/iflow-task-logs/iflow.task.stderr", payload["process"]["args"][2])
+            self.assertIn(f"{IFLOW_TOOL_OUTPUT_LIMIT_ENV}=1024", payload["process"]["env"])
             self.assertIn("FOO=bar", payload["process"]["env"])
             mounted_destinations = {mount["destination"] for mount in payload["mounts"]}
             self.assertIn("/opt/iflow-runtime", mounted_destinations)

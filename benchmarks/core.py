@@ -169,6 +169,18 @@ def trace_response_count_for_sandbox(sandbox: SandboxHandle) -> int:
         return 0
 
 
+def task_completion_timeout_seconds(sandbox: SandboxHandle) -> float:
+    timeout_s = task_timeout_seconds(sandbox.task_config or TaskConfig())
+    if not is_replay_llm_service_type(sandbox.llm_service_type):
+        return timeout_s
+    trace_response_count = trace_response_count_for_sandbox(sandbox)
+    if trace_response_count <= 0:
+        return timeout_s
+    # Replay benchmarks can legitimately exceed the original agent timeout after
+    # a recovery because they still need to execute the remaining trace steps.
+    return max(timeout_s, 900.0, trace_response_count * 20.0)
+
+
 def poll_sandbox_status(sandbox: SandboxHandle) -> dict[str, object]:
     status = dict(sandbox.last_status)
     if sandbox.task_run is not None:
@@ -190,10 +202,10 @@ def verify_task_accuracy(harness, sandbox: SandboxHandle) -> tuple[str, dict[str
     try:
         harness.wait_for_task_completion(
             sandbox,
-            timeout_s=task_timeout_seconds(sandbox.task_config or TaskConfig()),
+            timeout_s=task_completion_timeout_seconds(sandbox),
         )
     except Exception as exc:
-        task_error = str(exc)
+        task_error = str(exc) or exc.__class__.__name__
     else:
         try:
             verification = harness.verify_task_accuracy(

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -14,6 +15,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from integrations.llm_services.iflow_trace_replay.service import parse_replay_trace
+
+
+_TRACE_RESPONSE_LINE_RE = re.compile(r'"type"\s*:\s*"response"')
 
 
 def parse_args() -> argparse.Namespace:
@@ -66,6 +70,23 @@ def resolve_service_name(compose_file: Path) -> str:
     raise ValueError(f"compose file {compose_file} defines multiple services and no 'client' service")
 
 
+def count_trace_response_lines(trace_log: Path) -> int:
+    count = 0
+    for raw_line in trace_log.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            if _TRACE_RESPONSE_LINE_RE.search(line):
+                count += 1
+            continue
+        if isinstance(entry, dict) and entry.get("type") == "response":
+            count += 1
+    return count
+
+
 def build_dataset_row(
     *,
     task_id: str,
@@ -81,6 +102,7 @@ def build_dataset_row(
         raise FileNotFoundError(f"missing required task or trace files for {task_id}: {missing}")
     task = load_task_yaml(task_yaml)
     trace = parse_replay_trace(trace_log)
+    raw_trace_response_count = count_trace_response_lines(trace_log)
     instruction = task.get("instruction")
     if not isinstance(instruction, str) or not instruction.strip():
         raise ValueError(f"task {task_id} is missing instruction text")
@@ -103,7 +125,7 @@ def build_dataset_row(
         "llm_service_config": {
             "trace_path": _relative_path(trace.trace_path, output_path=output_path),
         },
-        "trace_response_count": len(trace.responses),
+        "trace_response_count": raw_trace_response_count,
         "trace_malformed_line_count": len(trace.malformed_lines),
     }
 

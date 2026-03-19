@@ -6,11 +6,12 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 from agent_cr import CheckpointId, JobStatus, SandboxId
 from integrations.agents import SandboxHandle
 from benchmarks.config import BenchmarkConfig
-from benchmarks.scenarios.common import wait_for_auto_replay_checkpoint
+from benchmarks.scenarios.common import choose_replay_chunk_targets, wait_for_auto_replay_checkpoint
 from benchmarks.scenarios.fault import (
     parse_fault_options,
     run_auto as run_fault_auto,
@@ -217,8 +218,21 @@ class _BaseScenarioHarness:
         self.clear_snapshot_metadata_calls.append((str(sandbox.sandbox_id), keys))
 
     def wait_for_task_completion(self, sandbox: SandboxHandle, timeout_s: float | None = None) -> None:
-        _ = (sandbox, timeout_s)
-        self.wait_for_task_completion_calls.append(str(sandbox.sandbox_id))
+        _ = timeout_s
+        sandbox_id = str(sandbox.sandbox_id)
+        self.wait_for_task_completion_calls.append(sandbox_id)
+        trace_response_count = sandbox.launch_metadata.get("benchmark", {}).get("trace_response_count")
+        if trace_response_count is None:
+            return
+        final_actions = int(trace_response_count)
+        payload = {
+            "state": "finished",
+            "total_actions": final_actions,
+            "replay_next_response_index": final_actions,
+            "replay_is_complete": True,
+        }
+        self._statuses[sandbox_id] = payload
+        sandbox.last_status = dict(payload)
 
     def verify_task_accuracy(self, sandbox: SandboxHandle, timeout_s: float | None = None) -> dict[str, object]:
         _ = (sandbox, timeout_s)
@@ -227,10 +241,28 @@ class _BaseScenarioHarness:
             "verification_status": "passed",
             "verification_exit_code": 0,
             "verification_ms": 0.0,
+            "verification_stdout": "ok\n",
+            "verification_stderr": "",
+            "verification_command": "bash /tests/run-tests.sh",
         }
 
 
 class FaultScenarioTests(unittest.TestCase):
+    def test_choose_replay_chunk_targets_uses_chunk_endpoints(self) -> None:
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("fault-0"),
+            bundle_dir=Path("/tmp/fault-0"),
+            status_port=20000,
+            last_status={"total_actions": 0},
+            agent_type="iflow",
+            llm_service_type="iflow_trace_replay",
+            launch_metadata={"benchmark": {"task_id": "cross-entropy-method", "trace_response_count": 24}},
+        )
+
+        targets = choose_replay_chunk_targets(sandbox, 5)
+
+        self.assertEqual(targets, [5, 10, 15, 20, 24])
+
     def test_manual_mode_runs_sandboxes_independently_and_sorts_rows(self) -> None:
         harness = _BaseScenarioHarness()
         harness.progress_delay_s = 0.05
@@ -259,8 +291,8 @@ class FaultScenarioTests(unittest.TestCase):
         )
 
         injected_rows = [(int(row["iteration"]), row["sandbox_id"]) for row in rows if int(row["event_injected"]) == 1]
-        self.assertEqual(injected_rows, [(2, "fault-0")])
-        self.assertEqual(harness.notify_fault_calls, ["fault-0"])
+        self.assertEqual(injected_rows, [(2, "fault-0"), (2, "fault-1")])
+        self.assertEqual(harness.notify_fault_calls, ["fault-0", "fault-1"])
 
     def test_replay_mode_treats_completion_before_later_checkpoint_as_success(self) -> None:
         class _ReplayEarlyFinishTaskRun:
@@ -268,11 +300,11 @@ class FaultScenarioTests(unittest.TestCase):
                 self._sandbox = sandbox
 
             def wait_for_progress(self, *, minimum_actions: int) -> dict[str, object]:
-                if minimum_actions <= 1:
+                if minimum_actions <= 42:
                     payload = {
                         "state": "running",
-                        "total_actions": 1,
-                        "replay_next_response_index": 1,
+                        "total_actions": 42,
+                        "replay_next_response_index": 42,
                         "replay_is_complete": False,
                     }
                     self._sandbox.last_status = dict(payload)
@@ -366,7 +398,7 @@ class FaultScenarioTests(unittest.TestCase):
         self.assertIsNotNone(manifest)
         self.assertEqual(checkpoint_actions, 4)
 
-    def test_replay_auto_mode_skips_final_task_verification(self) -> None:
+    def test_replay_auto_mode_waits_for_completion_and_runs_final_verification(self) -> None:
         harness = _BaseScenarioHarness()
         sandbox = SandboxHandle(
             sandbox_id=SandboxId("fault-0"),
@@ -390,7 +422,7 @@ class FaultScenarioTests(unittest.TestCase):
             scenario_options={"injection_rate": 0.0, "first_injection_iteration": 2},
         )
 
-        with unittest.mock.patch(
+        with mock.patch(
             "benchmarks.scenarios.fault.wait_for_auto_replay_checkpoint",
             return_value=(SimpleNamespace(metadata={"benchmark_replay_action_count": 2}), 2),
         ):
@@ -404,9 +436,87 @@ class FaultScenarioTests(unittest.TestCase):
 
         self.assertEqual(row["task_error"], "")
         self.assertEqual(row["success_ratio"], 1.0)
-        self.assertNotIn("verification_status", row)
-        self.assertEqual(harness.wait_for_task_completion_calls, [])
-        self.assertEqual(harness.verify_task_accuracy_calls, [])
+        self.assertEqual(row["verification_status"], "passed")
+        self.assertEqual(row["verification_stdout"], "ok\n")
+        self.assertEqual(row["replay_final_index"], 10)
+        self.assertTrue(bool(row["replay_is_complete"]))
+        self.assertEqual(harness.wait_for_task_completion_calls, ["fault-0"])
+        self.assertEqual(harness.verify_task_accuracy_calls, ["fault-0"])
+
+    def test_replay_auto_mode_uses_chunk_checkpoint_for_forced_fault(self) -> None:
+        class _ReplayChunkTaskRun:
+            def __init__(self, sandbox: SandboxHandle) -> None:
+                self._sandbox = sandbox
+
+            def wait_for_progress(self, *, minimum_actions: int) -> dict[str, object]:
+                if minimum_actions <= 5:
+                    payload = {
+                        "state": "running",
+                        "total_actions": 5,
+                        "replay_next_response_index": 5,
+                        "replay_is_complete": False,
+                    }
+                elif minimum_actions <= 10:
+                    payload = {
+                        "state": "running",
+                        "total_actions": 24,
+                        "replay_next_response_index": 24,
+                        "replay_is_complete": True,
+                    }
+                else:
+                    payload = {
+                        "state": "finished",
+                        "total_actions": 24,
+                        "replay_next_response_index": 24,
+                        "replay_is_complete": True,
+                    }
+                self._sandbox.last_status = dict(payload)
+                return payload
+
+            def poll_status(self) -> dict[str, object]:
+                return dict(self._sandbox.last_status)
+
+        harness = _BaseScenarioHarness()
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("fault-0"),
+            bundle_dir=Path("/tmp/fault-0"),
+            status_port=20000,
+            last_status={"total_actions": 0},
+            agent_type="iflow",
+            llm_service_type="iflow_trace_replay",
+            launch_metadata={"benchmark": {"task_id": "cross-entropy-method", "trace_response_count": 24}},
+        )
+        sandbox.task_run = _ReplayChunkTaskRun(sandbox)
+        harness._statuses[str(sandbox.sandbox_id)] = {"total_actions": 0}
+        config = _config(
+            "fault",
+            "auto",
+            sandboxes=1,
+            iterations=5,
+            agent="iflow",
+            llm_service="iflow_trace_replay",
+            scenario_options={"injection_rate": 0.0, "first_forced_event_chunk": 2},
+        )
+
+        with mock.patch(
+            "benchmarks.scenarios.fault.wait_for_auto_replay_checkpoint",
+            return_value=(SimpleNamespace(metadata={"benchmark_replay_action_count": 10}), 10),
+        ):
+            row = run_replay_auto_sandbox(
+                config,
+                harness,
+                sandbox_index=0,
+                sandbox=sandbox,
+                options=parse_fault_options(config),
+            )
+
+        self.assertEqual(row["task_error"], "")
+        self.assertEqual(row["events_injected"], 1)
+        self.assertEqual(row["recoveries_succeeded"], 1)
+        self.assertEqual(row["chunks_planned"], 5)
+        self.assertEqual(row["chunks_completed"], 3)
+        self.assertEqual(harness.inject_fault_calls, ["fault-0"])
+        self.assertEqual(harness.notify_fault_calls, ["fault-0"])
 
     def test_replay_auto_summary_uses_aggregate_metrics(self) -> None:
         rows = [
@@ -465,8 +575,8 @@ class SpotScenarioTests(unittest.TestCase):
         )
 
         injected_rows = [(int(row["iteration"]), row["sandbox_id"]) for row in rows if int(row["event_injected"]) == 1]
-        self.assertEqual(injected_rows, [(2, "spot-0")])
-        self.assertEqual(harness.notify_preemption_calls, ["spot-0"])
+        self.assertEqual(injected_rows, [(2, "spot-0"), (2, "spot-1")])
+        self.assertEqual(harness.notify_preemption_calls, ["spot-0", "spot-1"])
 
 
 if __name__ == "__main__":

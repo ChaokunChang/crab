@@ -333,6 +333,18 @@ class CRScheduler:
             raise
         try:
             snapshot = self._inspector.inspect(sandbox_id)
+            if not snapshot.is_running:
+                try:
+                    runtime_state = self._runtime.inspect_runtime(sandbox_id)
+                except Exception:
+                    runtime_state = None
+                if runtime_state is not None and runtime_state.is_running:
+                    logger.debug(
+                        "Using runtime state to keep sandbox %s marked running after successful pause; "
+                        "inspector snapshot was stale",
+                        sandbox_id,
+                    )
+                    snapshot = replace(snapshot, is_running=True)
             decision = self.evaluate(snapshot)
             if not decision.should_checkpoint:
                 if snapshot.is_running:

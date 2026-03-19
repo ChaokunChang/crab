@@ -52,7 +52,6 @@ class ReplayExchange:
     request: dict[str, Any]
     response: dict[str, Any]
     lookup_key: tuple[str, int, int, int, int]
-    counts_toward_progress: bool = True
 
 
 @dataclass(frozen=True)
@@ -85,46 +84,6 @@ def _decode_json_payload(raw: object) -> dict[str, Any] | None:
     if not isinstance(parsed, dict):
         return None
     return parsed
-
-
-def _is_non_replayable_stop_payload(parsed: dict[str, Any]) -> bool:
-    if "reasoning" in parsed and "confidence" in parsed:
-        return True
-    if len(parsed) != 1:
-        return False
-    [(key, value)] = parsed.items()
-    return isinstance(key, str) and key.startswith("corrected_") and key.endswith("string_escaping") and isinstance(
-        value, str
-    )
-
-
-def _is_non_replayable_stop_response(payload: dict[str, Any]) -> bool:
-    choices = payload.get("choices")
-    if not isinstance(choices, list) or not choices:
-        return False
-    first_choice = choices[0]
-    if not isinstance(first_choice, dict):
-        return False
-    if str(first_choice.get("finish_reason", "")).lower() != "stop":
-        return False
-    message = first_choice.get("message")
-    if not isinstance(message, dict):
-        return False
-    if message.get("tool_calls"):
-        return False
-    content = message.get("content")
-    if not isinstance(content, str):
-        return False
-    normalized = content.strip()
-    if normalized.startswith("```"):
-        lines = normalized.splitlines()
-        if len(lines) >= 3 and lines[0].strip().startswith("```") and lines[-1].strip() == "```":
-            normalized = "\n".join(lines[1:-1]).strip()
-    try:
-        parsed = json.loads(normalized)
-    except json.JSONDecodeError:
-        return False
-    return isinstance(parsed, dict) and _is_non_replayable_stop_payload(parsed)
 
 
 def _normalize_text(value: str) -> str:
@@ -272,13 +231,10 @@ def parse_replay_trace(trace_path: Path) -> ParsedReplayTrace:
             malformed_lines.append(line_number)
             continue
         if pending_request is None:
-            if not _is_non_replayable_stop_response(payload):
-                responses.append(payload)
+            responses.append(payload)
             continue
         path, request = pending_request
-        counts_toward_progress = not _is_non_replayable_stop_response(payload)
-        if counts_toward_progress:
-            responses.append(payload)
+        responses.append(payload)
         lookup_key = _lookup_stats(path, request)
         fingerprint = _response_fingerprint(payload)
         previous = fingerprints_by_key.get(lookup_key)
@@ -293,7 +249,6 @@ def parse_replay_trace(trace_path: Path) -> ParsedReplayTrace:
                 request=request,
                 response=payload,
                 lookup_key=lookup_key,
-                counts_toward_progress=counts_toward_progress,
             )
         )
         pending_request = None
@@ -326,7 +281,7 @@ class TraceReplayLLMState:
         self._response_delay_ms = max(0, response_delay_ms)
         self._events: list[dict[str, Any]] = []
         self._matched_response_count = 0
-        self._total_progress_responses = sum(1 for exchange in parsed.exchanges if exchange.counts_toward_progress)
+        self._total_progress_responses = len(parsed.exchanges)
         self._responses_by_key = {exchange.lookup_key: exchange for exchange in parsed.exchanges}
         self._hashes_by_shape: dict[tuple[int, int, int, int], list[str]] = {}
         for exchange in parsed.exchanges:
@@ -369,8 +324,7 @@ class TraceReplayLLMState:
                 f"hash={lookup_key[0][:12]} messages={lookup_key[1]} tool_messages={lookup_key[3]}"
             ) from exc
         with self._lock:
-            if exchange.counts_toward_progress:
-                self._matched_response_count += 1
+            self._matched_response_count += 1
             matched_response_count = self._matched_response_count
             self._events.append(
                 {
@@ -378,7 +332,6 @@ class TraceReplayLLMState:
                     "sandbox_id": sandbox_id,
                     "request_hash": lookup_key[0],
                     "matched_response_count": matched_response_count,
-                    "counts_toward_progress": exchange.counts_toward_progress,
                 }
             )
         if self._response_delay_ms > 0:

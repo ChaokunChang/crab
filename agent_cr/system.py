@@ -236,6 +236,7 @@ class AgentCRSystem:
             if self.restore_metadata_handler is not None:
                 restore_manifest = self._resolve_restore_manifest(sandbox_id, restore_checkpoint_id)
             self.runtime.mark_restored(sandbox_id)
+            self._mark_sandbox_running(sandbox_id)
             self.storage.handle_restore_complete(sandbox_id, result.checkpoint_id)
             if self.restore_metadata_handler is not None and restore_manifest is not None:
                 self.restore_metadata_handler(sandbox_id, restore_manifest)
@@ -367,6 +368,7 @@ class AgentCRSystem:
         started = utc_now()
         checkpoint_id = None
         restore_manifest: CheckpointManifest | None = None
+        pinned_restore_ids: list[CheckpointId] = []
         status = "failed"
         message = None
         try:
@@ -462,7 +464,9 @@ class AgentCRSystem:
                     event.sandbox_id,
                     checkpoint_id,
                 )
-                restore_manifest = self._resolve_restore_manifest(event.sandbox_id, checkpoint_id)
+                restore_manifest, pinned_restore_ids = self._pin_restore_checkpoints(event.sandbox_id, checkpoint_id)
+                if restore_manifest is None:
+                    raise FileNotFoundError(f"manifest not found: selected checkpoint {checkpoint_id}")
                 restore_result = self.restore_once(event.sandbox_id, checkpoint_id)
                 if restore_result.status.value == "succeeded":
                     self._release_checkpoint_response_gate(
@@ -547,6 +551,8 @@ class AgentCRSystem:
             with self._interceptor_lock:
                 self._interceptor_pending.discard(event.sandbox_id)
             self._release_coordination(event.sandbox_id)
+            if pinned_restore_ids:
+                self._unpin_restore_checkpoints(event.sandbox_id, pinned_restore_ids)
 
     def _execute_checkpoint_flow(self, sandbox_id: SandboxId) -> CheckpointResult | None:
         decision = self.scheduler.query_checkpoint(sandbox_id)
@@ -711,6 +717,36 @@ class AgentCRSystem:
         manifest = self.storage.get_manifest(sandbox_id, checkpoint_id)
         return resolve_restore_manifest(self.storage, manifest)
 
+    def _pin_restore_checkpoints(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> tuple[CheckpointManifest | None, list[CheckpointId]]:
+        pin_checkpoint = getattr(self.storage, "pin_checkpoint", None)
+        if not callable(pin_checkpoint):
+            return None, []
+        if not pin_checkpoint(sandbox_id, checkpoint_id):
+            return None, []
+        pinned_ids = [checkpoint_id]
+        manifest = self._resolve_restore_manifest(sandbox_id, checkpoint_id)
+        for metadata_key in ("process_restore_checkpoint_id", "filesystem_restore_checkpoint_id"):
+            raw_value = manifest.metadata.get(metadata_key)
+            if raw_value is None:
+                continue
+            candidate = CheckpointId(str(raw_value))
+            if candidate in pinned_ids:
+                continue
+            if pin_checkpoint(sandbox_id, candidate):
+                pinned_ids.append(candidate)
+        return manifest, pinned_ids
+
+    def _unpin_restore_checkpoints(self, sandbox_id: SandboxId, checkpoint_ids: list[CheckpointId]) -> None:
+        unpin_checkpoint = getattr(self.storage, "unpin_checkpoint", None)
+        if not callable(unpin_checkpoint):
+            return
+        for checkpoint_id in reversed(checkpoint_ids):
+            unpin_checkpoint(sandbox_id, checkpoint_id)
+
     def _release_checkpoint_response_gate(
         self,
         sandbox_id: SandboxId,
@@ -814,12 +850,6 @@ class AgentCRSystem:
 
     def _resume_sandbox(self, sandbox_id: SandboxId) -> None:
         try:
-            snapshot = self.inspector.inspect(sandbox_id)
-        except Exception:
-            snapshot = None
-        if snapshot is not None and not snapshot.is_running:
-            return
-        try:
             description = self.runtime.describe(sandbox_id)
         except Exception:
             return
@@ -829,6 +859,8 @@ class AgentCRSystem:
             self.runtime.resume(sandbox_id)
         except Exception:
             logger.exception("Failed to resume sandbox %s", sandbox_id)
+            return
+        self._mark_sandbox_running(sandbox_id)
 
     def _mark_sandbox_not_running(self, sandbox_id: SandboxId) -> None:
         upsert = getattr(self.inspector, "upsert_snapshot", None)
@@ -849,6 +881,26 @@ class AgentCRSystem:
             self.runtime.sync_runtime_state(sandbox_id, is_running=False)
         except Exception:
             logger.debug("Failed to sync runtime state for faulted sandbox %s", sandbox_id, exc_info=True)
+
+    def _mark_sandbox_running(self, sandbox_id: SandboxId) -> None:
+        upsert = getattr(self.inspector, "upsert_snapshot", None)
+        if upsert is not None:
+            try:
+                snapshot = self.inspector.inspect(sandbox_id)
+            except Exception:
+                snapshot = None
+            if snapshot is not None:
+                upsert(
+                    replace(
+                        snapshot,
+                        is_running=True,
+                        observed_at=utc_now(),
+                    )
+                )
+        try:
+            self.runtime.sync_runtime_state(sandbox_id, is_running=True)
+        except Exception:
+            logger.debug("Failed to sync runtime state for running sandbox %s", sandbox_id, exc_info=True)
 
     def _release_response_gate(self, sandbox_id: SandboxId) -> None:
         if self.response_gate_registry is not None:

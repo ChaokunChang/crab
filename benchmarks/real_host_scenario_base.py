@@ -1601,6 +1601,18 @@ class RealHostScenarioHarness:
             timeout_s=timeout_s,
         )
         verification_ms = (time.perf_counter() - command_started) * 1000.0
+        stdout = result.stdout.rstrip()
+        stderr = result.stderr.rstrip()
+        logger.info(
+            "Completed run-tests.sh sandbox=%s exit_code=%s command=%s",
+            sandbox.sandbox_id,
+            result.returncode,
+            " ".join(shlex.quote(part) for part in result.args),
+        )
+        if stdout:
+            logger.info("run-tests stdout sandbox=%s\n%s", sandbox.sandbox_id, stdout)
+        if stderr:
+            logger.warning("run-tests stderr sandbox=%s\n%s", sandbox.sandbox_id, stderr)
         return {
             "verification_status": "passed" if result.returncode == 0 else "failed",
             "verification_exit_code": result.returncode,

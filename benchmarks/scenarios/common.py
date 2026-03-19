@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 import time
 
@@ -8,22 +9,32 @@ from integrations.agents import SandboxHandle, TaskConfig
 
 from benchmarks.config import BenchmarkConfig
 from benchmarks.core import annotate_row, poll_sandbox_status, trace_response_count_for_sandbox, verify_task_accuracy
-from benchmarks.support import average, choose_replay_points, task_timeout_seconds, total_actions
+from benchmarks.support import average, task_timeout_seconds, total_actions
 
 
 def should_inject_event(
     *,
-    iteration: int,
+    chunk_index: int,
     sandbox_index: int,
     rate: float,
-    first_injection_iteration: int,
+    first_forced_event_chunk: int,
     rng: random.Random,
 ) -> bool:
-    if first_injection_iteration > 0 and iteration < first_injection_iteration:
+    _ = sandbox_index
+    if first_forced_event_chunk > 0 and chunk_index < first_forced_event_chunk:
         return False
-    if first_injection_iteration > 0 and iteration == first_injection_iteration and sandbox_index == 0:
+    if first_forced_event_chunk > 0 and chunk_index == first_forced_event_chunk:
         return True
     return rng.random() < rate
+
+
+def required_event_was_missed(
+    *,
+    chunk_index: int,
+    events_injected: int,
+    first_forced_event_chunk: int,
+) -> bool:
+    return first_forced_event_chunk > 0 and chunk_index >= first_forced_event_chunk and events_injected == 0
 
 
 def wait_for_iteration_progress(
@@ -99,16 +110,7 @@ def finalize_replay_row(
     verify_task_accuracy_result: bool = True,
     success_ratio: float | None = None,
 ) -> dict[str, object]:
-    status = poll_sandbox_status(sandbox)
-    row_payload = {
-        **row,
-        "trace_response_count": trace_response_count_for_sandbox(sandbox),
-        "replay_final_index": int(status.get("replay_next_response_index", status.get("total_actions", 0))),
-        "replay_is_complete": replay_status_is_complete(
-            status,
-            trace_response_count=trace_response_count_for_sandbox(sandbox),
-        ),
-    }
+    trace_response_count = trace_response_count_for_sandbox(sandbox)
     if verify_task_accuracy_result:
         verification = {
             "verification_status": "task_failed" if task_error else "verification_skipped",
@@ -117,11 +119,34 @@ def finalize_replay_row(
         }
         if not task_error:
             task_error, verification = verify_task_accuracy(harness, sandbox)
-        resolved_success_ratio = 1.0 if verification["verification_status"] == "passed" else 0.0
-        row_payload = {
-            **row_payload,
-            **verification,
-        }
+    else:
+        verification = {}
+    status = poll_sandbox_status(sandbox)
+    replay_is_complete = replay_status_is_complete(status, trace_response_count=trace_response_count)
+    raw_replay_final_index = int(status.get("replay_next_response_index", status.get("total_actions", 0)))
+    replay_final_index = raw_replay_final_index
+    if replay_is_complete and trace_response_count > 0:
+        replay_final_index = min(replay_final_index, trace_response_count)
+    if not task_error and str(status.get("state", "")) == "finished" and not replay_is_complete:
+        task_error = (
+            "replay task finished before reaching the end of the trace "
+            f"(replay_final_index={raw_replay_final_index}, trace_response_count={trace_response_count})"
+        )
+        if verify_task_accuracy_result:
+            verification = {
+                **verification,
+                "verification_status": "task_failed",
+                "verification_exit_code": -1,
+            }
+    row_payload = {
+        **row,
+        "trace_response_count": trace_response_count,
+        "replay_final_index": replay_final_index,
+        "replay_is_complete": replay_is_complete,
+        **verification,
+    }
+    if verify_task_accuracy_result:
+        resolved_success_ratio = 1.0 if not task_error and verification["verification_status"] == "passed" else 0.0
     else:
         resolved_success_ratio = 0.0 if task_error else (1.0 if success_ratio is None else float(success_ratio))
     return annotate_row(
@@ -134,8 +159,21 @@ def finalize_replay_row(
     )
 
 
-def choose_replay_targets(sandbox: SandboxHandle, iterations: int) -> list[int]:
-    return choose_replay_points(trace_response_count_for_sandbox(sandbox), iterations)
+def choose_replay_chunk_targets(
+    sandbox: SandboxHandle,
+    chunk_count: int,
+) -> list[int]:
+    total_responses = trace_response_count_for_sandbox(sandbox)
+    if total_responses <= 0 or chunk_count <= 0:
+        return []
+
+    targets: list[int] = []
+    for chunk_index in range(1, chunk_count + 1):
+        target = min(total_responses, max(1, math.ceil((total_responses * chunk_index) / chunk_count)))
+        if targets and target <= targets[-1]:
+            continue
+        targets.append(target)
+    return targets
 
 
 def summarize_metric_averages(metric_lists: dict[str, list[float]]) -> dict[str, float]:

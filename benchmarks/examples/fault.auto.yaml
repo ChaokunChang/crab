@@ -10,4 +10,4 @@ log_file: ../../logs/tmp/fault.auto.log
 log_level: info
 scenario_options:
   injection_rate: 0.3
-  first_injection_iteration: 2
+  first_forced_event_chunk: 2

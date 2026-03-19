@@ -13,7 +13,7 @@ from benchmarks.config import BenchmarkConfig
 from benchmarks.core import annotate_row, parallel_map, resolve_task_records
 from benchmarks.scenarios import HarnessSettings, ScenarioDefinition
 from benchmarks.scenarios.common import (
-    choose_replay_targets,
+    choose_replay_chunk_targets,
     finalize_replay_row,
     should_inject_event,
     wait_for_iteration_progress,
@@ -24,7 +24,7 @@ from benchmarks.support import average, compute_summary, is_replay_llm_service_t
 @dataclass(frozen=True)
 class SpotOptions:
     injection_rate: float = 0.5
-    first_injection_iteration: int = 0
+    first_forced_event_chunk: int = 0
     grace_period_seconds: float = 60.0
 
 
@@ -40,15 +40,21 @@ def parse_spot_options(config: BenchmarkConfig) -> SpotOptions:
     rate = float(config.scenario_options.get("injection_rate", 0.5))
     if rate < 0.0 or rate > 1.0:
         raise ValueError(f"scenario_options.injection_rate must be in [0.0, 1.0], got {rate}")
-    first = int(config.scenario_options.get("first_injection_iteration", 0))
+    raw_first = config.scenario_options.get(
+        "first_forced_event_chunk",
+        config.scenario_options.get("first_injection_iteration", 0),
+    )
+    first = int(raw_first)
     if first < 0:
-        raise ValueError("scenario_options.first_injection_iteration must be >= 0")
+        raise ValueError("scenario_options.first_forced_event_chunk must be >= 0")
+    if first > config.iterations:
+        raise ValueError("scenario_options.first_forced_event_chunk must be <= iterations")
     grace = float(config.scenario_options.get("grace_period_seconds", 60.0))
     if grace <= 0.0:
         raise ValueError("scenario_options.grace_period_seconds must be > 0")
     return SpotOptions(
         injection_rate=rate,
-        first_injection_iteration=first,
+        first_forced_event_chunk=first,
         grace_period_seconds=grace,
     )
 
@@ -136,10 +142,10 @@ def run_auto_sandbox(
     for iteration in range(1, config.iterations + 1):
         wait_for_iteration_progress(sandbox, iteration=iteration)
         injected = should_inject_event(
-            iteration=iteration,
+            chunk_index=iteration,
             sandbox_index=sandbox_index,
             rate=options.injection_rate,
-            first_injection_iteration=options.first_injection_iteration,
+            first_forced_event_chunk=options.first_forced_event_chunk,
             rng=rng,
         )
         if not injected:
@@ -219,7 +225,7 @@ def run_replay_manual_sandbox(
     sandbox: SandboxHandle,
     options: SpotOptions,
 ) -> dict[str, object]:
-    replay_points = choose_replay_targets(sandbox, config.iterations)
+    replay_chunk_targets = choose_replay_chunk_targets(sandbox, config.iterations)
     rng = random.Random(sandbox_index)
     checkpoint_ms_values: list[float] = []
     restore_ms_values: list[float] = []
@@ -228,7 +234,7 @@ def run_replay_manual_sandbox(
     end_to_end_recovery_ms_values: list[float] = []
     migration_ms_values: list[float] = []
     budget_slack_ms_values: list[float] = []
-    iterations_executed = 0
+    chunks_completed = 0
     events_injected = 0
     recoveries_succeeded = 0
     task_error = ""
@@ -236,14 +242,14 @@ def run_replay_manual_sandbox(
     try:
         if sandbox.task_run is None:
             raise RuntimeError("replay spot benchmark expected sandbox.task_run")
-        for iteration, checkpoint_target in enumerate(replay_points, start=1):
-            iterations_executed += 1
-            sandbox.task_run.wait_for_progress(minimum_actions=checkpoint_target)
+        for chunk_index, chunk_target in enumerate(replay_chunk_targets, start=1):
+            chunks_completed += 1
+            sandbox.task_run.wait_for_progress(minimum_actions=chunk_target)
             injected = should_inject_event(
-                iteration=iteration,
+                chunk_index=chunk_index,
                 sandbox_index=sandbox_index,
                 rate=options.injection_rate,
-                first_injection_iteration=options.first_injection_iteration,
+                first_forced_event_chunk=options.first_forced_event_chunk,
                 rng=rng,
             )
             if not injected:
@@ -293,8 +299,10 @@ def run_replay_manual_sandbox(
         sandbox,
         row={
             "event_type": "preemption",
-            "iterations_planned": len(replay_points),
-            "iterations_executed": iterations_executed,
+            "chunks_planned": len(replay_chunk_targets),
+            "chunks_completed": chunks_completed,
+            "iterations_planned": len(replay_chunk_targets),
+            "iterations_executed": chunks_completed,
             "events_injected": events_injected,
             "recoveries_succeeded": recoveries_succeeded,
             "grace_period_ms": options.grace_period_seconds * 1000.0,
@@ -306,7 +314,7 @@ def run_replay_manual_sandbox(
             "migration_ms_avg": average(migration_ms_values),
             "budget_slack_ms_avg": average(budget_slack_ms_values),
             "retained_checkpoints": len(harness.storage.list_checkpoints(sandbox.sandbox_id)),
-            "skipped_no_replay_checkpoint": 1 if not replay_points else 0,
+            "skipped_no_replay_checkpoint": 1 if not replay_chunk_targets else 0,
         },
         task_error=task_error,
         verify_task_accuracy_result=False,
@@ -322,14 +330,14 @@ def run_replay_auto_sandbox(
     sandbox: SandboxHandle,
     options: SpotOptions,
 ) -> dict[str, object]:
-    replay_points = choose_replay_targets(sandbox, config.iterations)
+    replay_chunk_targets = choose_replay_chunk_targets(sandbox, config.iterations)
     rng = random.Random(sandbox_index)
     recovery_ms_values: list[float] = []
     readiness_ms_values: list[float] = []
     end_to_end_recovery_ms_values: list[float] = []
     migration_ms_values: list[float] = []
     budget_slack_ms_values: list[float] = []
-    iterations_executed = 0
+    chunks_completed = 0
     events_injected = 0
     recoveries_succeeded = 0
     task_error = ""
@@ -337,14 +345,14 @@ def run_replay_auto_sandbox(
     try:
         if sandbox.task_run is None:
             raise RuntimeError("replay spot benchmark expected sandbox.task_run")
-        for iteration, checkpoint_target in enumerate(replay_points, start=1):
-            iterations_executed += 1
-            sandbox.task_run.wait_for_progress(minimum_actions=checkpoint_target)
+        for chunk_index, chunk_target in enumerate(replay_chunk_targets, start=1):
+            chunks_completed += 1
+            sandbox.task_run.wait_for_progress(minimum_actions=chunk_target)
             injected = should_inject_event(
-                iteration=iteration,
+                chunk_index=chunk_index,
                 sandbox_index=sandbox_index,
                 rate=options.injection_rate,
-                first_injection_iteration=options.first_injection_iteration,
+                first_forced_event_chunk=options.first_forced_event_chunk,
                 rng=rng,
             )
             if not injected:
@@ -386,8 +394,10 @@ def run_replay_auto_sandbox(
         sandbox,
         row={
             "event_type": "preemption",
-            "iterations_planned": len(replay_points),
-            "iterations_executed": iterations_executed,
+            "chunks_planned": len(replay_chunk_targets),
+            "chunks_completed": chunks_completed,
+            "iterations_planned": len(replay_chunk_targets),
+            "iterations_executed": chunks_completed,
             "events_injected": events_injected,
             "recoveries_succeeded": recoveries_succeeded,
             "grace_period_ms": options.grace_period_seconds * 1000.0,
@@ -399,7 +409,7 @@ def run_replay_auto_sandbox(
             "migration_ms_avg": average(migration_ms_values),
             "budget_slack_ms_avg": average(budget_slack_ms_values),
             "retained_checkpoints": len(harness.storage.list_checkpoints(sandbox.sandbox_id)),
-            "skipped_no_replay_checkpoint": 1 if not replay_points else 0,
+            "skipped_no_replay_checkpoint": 1 if not replay_chunk_targets else 0,
         },
         task_error=task_error,
         verify_task_accuracy_result=False,
@@ -461,7 +471,7 @@ def run_auto(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
 
 
 def summarize(config: BenchmarkConfig, rows: list[dict[str, object]]) -> dict[str, float]:
-    if rows and ("verification_status" in rows[0] or "iterations_planned" in rows[0]):
+    if rows and ("verification_status" in rows[0] or "chunks_planned" in rows[0] or "iterations_planned" in rows[0]):
         return compute_summary(
             rows,
             [

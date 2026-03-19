@@ -190,11 +190,31 @@ class RuncRuntime(Runtime):
 
     def resume(self, sandbox_id: SandboxId) -> None:
         description = self.describe(sandbox_id)
-        self._run_command(
-            [self._runtime_bin, "--root", str(self._paths.state_root), "resume", str(sandbox_id)],
-            operation="sandbox.runtime_resume",
-            sandbox_id=sandbox_id,
-        )
+        try:
+            self._run_command(
+                [self._runtime_bin, "--root", str(self._paths.state_root), "resume", str(sandbox_id)],
+                operation="sandbox.runtime_resume",
+                sandbox_id=sandbox_id,
+                expected_error_substrings=(
+                    "container not paused",
+                    "container not running",
+                    "container does not exist",
+                ),
+            )
+        except RuntimeError as exc:
+            if any(
+                fragment in str(exc)
+                for fragment in ("container not paused", "container not running", "container does not exist")
+            ):
+                runtime_state = self.inspect_runtime(sandbox_id)
+                if runtime_state.status.lower() == "running":
+                    self._update_description(replace(description, status="running"))
+                    return
+                if runtime_state.status.lower() in {"paused", "created"}:
+                    raise
+                self.sync_runtime_state(sandbox_id, is_running=False)
+                return
+            raise
         self._update_description(replace(description, status="running"))
 
     def sync_runtime_state(self, sandbox_id: SandboxId, *, is_running: bool) -> None:

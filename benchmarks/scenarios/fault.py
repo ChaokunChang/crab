@@ -19,8 +19,9 @@ from benchmarks.core import (
 )
 from benchmarks.scenarios import HarnessSettings, ScenarioDefinition
 from benchmarks.scenarios.common import (
-    choose_replay_targets,
+    choose_replay_chunk_targets,
     finalize_replay_row,
+    required_event_was_missed,
     replay_status_is_complete,
     should_inject_event,
     wait_for_auto_replay_checkpoint,
@@ -31,7 +32,7 @@ from benchmarks.support import average, compute_summary, is_replay_llm_service_t
 @dataclass(frozen=True)
 class FaultOptions:
     injection_rate: float = 0.5
-    first_injection_iteration: int = 0
+    first_forced_event_chunk: int = 0
 
 
 def benchmark_task_description() -> TaskDescription:
@@ -46,10 +47,16 @@ def parse_fault_options(config: BenchmarkConfig) -> FaultOptions:
     rate = float(config.scenario_options.get("injection_rate", 0.5))
     if rate < 0.0 or rate > 1.0:
         raise ValueError(f"scenario_options.injection_rate must be in [0.0, 1.0], got {rate}")
-    first = int(config.scenario_options.get("first_injection_iteration", 0))
+    raw_first = config.scenario_options.get(
+        "first_forced_event_chunk",
+        config.scenario_options.get("first_injection_iteration", 0),
+    )
+    first = int(raw_first)
     if first < 0:
-        raise ValueError("scenario_options.first_injection_iteration must be >= 0")
-    return FaultOptions(injection_rate=rate, first_injection_iteration=first)
+        raise ValueError("scenario_options.first_forced_event_chunk must be >= 0")
+    if first > config.iterations:
+        raise ValueError("scenario_options.first_forced_event_chunk must be <= iterations")
+    return FaultOptions(injection_rate=rate, first_forced_event_chunk=first)
 
 
 def build_harness_settings(config: BenchmarkConfig) -> HarnessSettings:
@@ -142,10 +149,10 @@ def run_auto_sandbox(
         current = sandbox.task_run.wait_for_progress(minimum_actions=6)
         pre_event = sandbox.task_run.wait_for_action_delta(delta=2)
         injected = should_inject_event(
-            iteration=iteration,
+            chunk_index=iteration,
             sandbox_index=sandbox_index,
             rate=options.injection_rate,
-            first_injection_iteration=options.first_injection_iteration,
+            first_forced_event_chunk=options.first_forced_event_chunk,
             rng=rng,
         )
         if not injected:
@@ -229,50 +236,62 @@ def run_replay_manual_sandbox(
     sandbox: SandboxHandle,
     options: FaultOptions,
 ) -> dict[str, object]:
-    replay_points = choose_replay_targets(sandbox, config.iterations)
+    replay_chunk_targets = choose_replay_chunk_targets(sandbox, config.iterations)
     rng = random.Random(sandbox_index)
+    trace_response_count = trace_response_count_for_sandbox(sandbox)
     checkpoint_ms_values: list[float] = []
     restore_ms_values: list[float] = []
     recovery_ms_values: list[float] = []
     readiness_ms_values: list[float] = []
     end_to_end_recovery_ms_values: list[float] = []
     lost_actions_values: list[float] = []
-    iterations_executed = 0
+    chunks_completed = 0
     events_injected = 0
     recoveries_succeeded = 0
     task_error = ""
+    required_event_became_unreachable = False
 
     try:
         if sandbox.task_run is None:
             raise RuntimeError("replay fault benchmark expected sandbox.task_run")
-        for iteration, checkpoint_target in enumerate(replay_points, start=1):
-            iterations_executed += 1
+        for chunk_index, chunk_target in enumerate(replay_chunk_targets, start=1):
+            chunks_completed += 1
             try:
-                current = sandbox.task_run.wait_for_progress(minimum_actions=checkpoint_target)
+                current = sandbox.task_run.wait_for_progress(minimum_actions=chunk_target)
             except RuntimeError as exc:
                 current = sandbox.task_run.poll_status()
                 if (
                     "iflow replay task finished before reaching replay action count" in str(exc)
                     and str(current.get("state", "")) == "finished"
                 ):
+                    required_event_became_unreachable = required_event_was_missed(
+                        chunk_index=chunk_index,
+                        events_injected=events_injected,
+                        first_forced_event_chunk=options.first_forced_event_chunk,
+                    )
                     sandbox.last_status = dict(current)
                     break
                 raise
-            if replay_status_is_complete(
-                current,
-                trace_response_count=trace_response_count_for_sandbox(sandbox),
-            ):
-                sandbox.last_status = dict(current)
-                break
             injected = should_inject_event(
-                iteration=iteration,
+                chunk_index=chunk_index,
                 sandbox_index=sandbox_index,
                 rate=options.injection_rate,
-                first_injection_iteration=options.first_injection_iteration,
+                first_forced_event_chunk=options.first_forced_event_chunk,
                 rng=rng,
             )
             if not injected:
+                if replay_status_is_complete(current, trace_response_count=trace_response_count):
+                    sandbox.last_status = dict(current)
+                    break
                 continue
+            if str(current.get("state", "")) == "finished":
+                required_event_became_unreachable = required_event_was_missed(
+                    chunk_index=chunk_index,
+                    events_injected=events_injected,
+                    first_forced_event_chunk=options.first_forced_event_chunk,
+                )
+                sandbox.last_status = dict(current)
+                break
             events_injected += 1
             checkpoint_started = time.perf_counter()
             checkpoint_result = harness.checkpoint_manual(sandbox, leave_running=True)
@@ -299,10 +318,16 @@ def run_replay_manual_sandbox(
             recovery_ms_values.append((recovery_finished - recovery_started) * 1000.0)
             readiness_ms_values.append((ready_at - recovery_finished) * 1000.0)
             end_to_end_recovery_ms_values.append((ready_at - event_started) * 1000.0)
-            lost_actions_values.append(max(0, total_actions(pre_event) - checkpoint_target))
+            lost_actions_values.append(max(0, total_actions(pre_event) - chunk_target))
             sandbox.last_status = post_recovery
     except Exception as exc:
         task_error = str(exc)
+
+    if required_event_became_unreachable and not task_error:
+        task_error = (
+            "replay completed before the required event could be injected "
+            f"(first_forced_event_chunk={options.first_forced_event_chunk})"
+        )
 
     return finalize_replay_row(
         config,
@@ -310,8 +335,10 @@ def run_replay_manual_sandbox(
         sandbox,
         row={
             "event_type": "fault",
-            "iterations_planned": len(replay_points),
-            "iterations_executed": iterations_executed,
+            "chunks_planned": len(replay_chunk_targets),
+            "chunks_completed": chunks_completed,
+            "iterations_planned": len(replay_chunk_targets),
+            "iterations_executed": chunks_completed,
             "events_injected": events_injected,
             "recoveries_succeeded": recoveries_succeeded,
             "checkpoint_ms_avg": average(checkpoint_ms_values),
@@ -321,10 +348,10 @@ def run_replay_manual_sandbox(
             "end_to_end_recovery_ms_avg": average(end_to_end_recovery_ms_values),
             "lost_actions_avg": average(lost_actions_values),
             "retained_checkpoints": len(harness.storage.list_checkpoints(sandbox.sandbox_id)),
-            "skipped_no_replay_checkpoint": 1 if not replay_points else 0,
+            "skipped_no_replay_checkpoint": 1 if not replay_chunk_targets else 0,
         },
         task_error=task_error,
-        verify_task_accuracy_result=False,
+        verify_task_accuracy_result=True,
         success_ratio=1.0 if not task_error and recoveries_succeeded == events_injected else 0.0,
     )
 
@@ -337,59 +364,75 @@ def run_replay_auto_sandbox(
     sandbox: SandboxHandle,
     options: FaultOptions,
 ) -> dict[str, object]:
-    replay_points = choose_replay_targets(sandbox, config.iterations)
+    replay_chunk_targets = choose_replay_chunk_targets(sandbox, config.iterations)
     rng = random.Random(sandbox_index)
+    trace_response_count = trace_response_count_for_sandbox(sandbox)
     recovery_ms_values: list[float] = []
     readiness_ms_values: list[float] = []
     end_to_end_recovery_ms_values: list[float] = []
     lost_actions_values: list[float] = []
-    iterations_executed = 0
+    chunks_completed = 0
     events_injected = 0
     recoveries_succeeded = 0
     task_error = ""
+    required_event_became_unreachable = False
 
     try:
         if sandbox.task_run is None:
             raise RuntimeError("replay fault benchmark expected sandbox.task_run")
-        for iteration, checkpoint_target in enumerate(replay_points, start=1):
-            iterations_executed += 1
+        for chunk_index, chunk_target in enumerate(replay_chunk_targets, start=1):
+            chunks_completed += 1
             try:
-                current = sandbox.task_run.wait_for_progress(minimum_actions=checkpoint_target)
+                current = sandbox.task_run.wait_for_progress(minimum_actions=chunk_target)
             except RuntimeError as exc:
                 current = sandbox.task_run.poll_status()
                 if (
                     "iflow replay task finished before reaching replay action count" in str(exc)
                     and str(current.get("state", "")) == "finished"
                 ):
+                    required_event_became_unreachable = required_event_was_missed(
+                        chunk_index=chunk_index,
+                        events_injected=events_injected,
+                        first_forced_event_chunk=options.first_forced_event_chunk,
+                    )
                     sandbox.last_status = dict(current)
                     break
                 raise
-            if replay_status_is_complete(
-                current,
-                trace_response_count=trace_response_count_for_sandbox(sandbox),
-            ):
-                sandbox.last_status = dict(current)
-                break
             injected = should_inject_event(
-                iteration=iteration,
+                chunk_index=chunk_index,
                 sandbox_index=sandbox_index,
                 rate=options.injection_rate,
-                first_injection_iteration=options.first_injection_iteration,
+                first_forced_event_chunk=options.first_forced_event_chunk,
                 rng=rng,
             )
             if not injected:
+                if replay_status_is_complete(current, trace_response_count=trace_response_count):
+                    sandbox.last_status = dict(current)
+                    break
                 continue
-            events_injected += 1
+            if str(current.get("state", "")) == "finished":
+                required_event_became_unreachable = required_event_was_missed(
+                    chunk_index=chunk_index,
+                    events_injected=events_injected,
+                    first_forced_event_chunk=options.first_forced_event_chunk,
+                )
+                sandbox.last_status = dict(current)
+                break
             checkpoint_manifest, checkpoint_actions = wait_for_auto_replay_checkpoint(
                 harness,
                 sandbox,
-                minimum_actions=checkpoint_target,
-                trace_response_count=trace_response_count_for_sandbox(sandbox),
+                minimum_actions=chunk_target,
+                trace_response_count=trace_response_count,
             )
             if checkpoint_manifest is None:
-                events_injected -= 1
+                required_event_became_unreachable = required_event_was_missed(
+                    chunk_index=chunk_index,
+                    events_injected=events_injected,
+                    first_forced_event_chunk=options.first_forced_event_chunk,
+                )
                 sandbox.last_status = dict(sandbox.task_run.poll_status())
                 break
+            events_injected += 1
             pre_event = sandbox.task_run.poll_status()
             event_started = time.perf_counter()
             harness.inject_fault(sandbox)
@@ -419,14 +462,22 @@ def run_replay_auto_sandbox(
     except Exception as exc:
         task_error = str(exc)
 
+    if required_event_became_unreachable and not task_error:
+        task_error = (
+            "replay completed before the required event could be injected "
+            f"(first_forced_event_chunk={options.first_forced_event_chunk})"
+        )
+
     return finalize_replay_row(
         config,
         harness,
         sandbox,
         row={
             "event_type": "fault",
-            "iterations_planned": len(replay_points),
-            "iterations_executed": iterations_executed,
+            "chunks_planned": len(replay_chunk_targets),
+            "chunks_completed": chunks_completed,
+            "iterations_planned": len(replay_chunk_targets),
+            "iterations_executed": chunks_completed,
             "events_injected": events_injected,
             "recoveries_succeeded": recoveries_succeeded,
             "checkpoint_ms_avg": 0.0,
@@ -436,10 +487,10 @@ def run_replay_auto_sandbox(
             "end_to_end_recovery_ms_avg": average(end_to_end_recovery_ms_values),
             "lost_actions_avg": average(lost_actions_values),
             "retained_checkpoints": len(harness.storage.list_checkpoints(sandbox.sandbox_id)),
-            "skipped_no_replay_checkpoint": 1 if not replay_points else 0,
+            "skipped_no_replay_checkpoint": 1 if not replay_chunk_targets else 0,
         },
         task_error=task_error,
-        verify_task_accuracy_result=False,
+        verify_task_accuracy_result=True,
         success_ratio=1.0 if not task_error and recoveries_succeeded == events_injected else 0.0,
     )
 
@@ -501,7 +552,7 @@ def run_auto(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
 
 
 def summarize(config: BenchmarkConfig, rows: list[dict[str, object]]) -> dict[str, float]:
-    if rows and ("verification_status" in rows[0] or "iterations_planned" in rows[0]):
+    if rows and ("verification_status" in rows[0] or "chunks_planned" in rows[0] or "iterations_planned" in rows[0]):
         return compute_summary(
             rows,
             [

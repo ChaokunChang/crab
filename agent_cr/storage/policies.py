@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections import defaultdict
+from threading import RLock
+
 from ..contracts import CheckpointManager
 from ..ids import CheckpointId, SandboxId
 from ..models import ArtifactPayload, ArtifactReference, CheckpointManifest
@@ -8,6 +11,8 @@ from ..models import ArtifactPayload, ArtifactReference, CheckpointManifest
 class DelegatingCheckpointManager(CheckpointManager):
     def __init__(self, delegate: CheckpointManager):
         self._delegate = delegate
+        self._pin_lock = RLock()
+        self._pinned_checkpoint_counts: dict[SandboxId, dict[CheckpointId, int]] = defaultdict(dict)
 
     def put_manifest(self, manifest: CheckpointManifest) -> None:
         self._delegate.put_manifest(manifest)
@@ -81,6 +86,8 @@ class DelegatingCheckpointManager(CheckpointManager):
             protected.add(latest_process)
         if latest_filesystem is not None:
             protected.add(latest_filesystem)
+        with self._pin_lock:
+            protected.update(self._pinned_checkpoint_counts.get(sandbox_id, {}).keys())
         return protected
 
     def _prune_unprotected(self, sandbox_id: SandboxId) -> None:
@@ -89,11 +96,35 @@ class DelegatingCheckpointManager(CheckpointManager):
             if checkpoint_id not in protected:
                 self.delete_checkpoint(sandbox_id, checkpoint_id)
 
+    def pin_checkpoint(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> bool:
+        try:
+            self.get_manifest(sandbox_id, checkpoint_id)
+        except FileNotFoundError:
+            return False
+        with self._pin_lock:
+            sandbox_pins = self._pinned_checkpoint_counts[sandbox_id]
+            sandbox_pins[checkpoint_id] = sandbox_pins.get(checkpoint_id, 0) + 1
+        return True
+
+    def unpin_checkpoint(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> None:
+        with self._pin_lock:
+            sandbox_pins = self._pinned_checkpoint_counts.get(sandbox_id)
+            if not sandbox_pins:
+                return
+            current = sandbox_pins.get(checkpoint_id, 0)
+            if current <= 1:
+                sandbox_pins.pop(checkpoint_id, None)
+            else:
+                sandbox_pins[checkpoint_id] = current - 1
+            if not sandbox_pins:
+                self._pinned_checkpoint_counts.pop(sandbox_id, None)
+
 
 class LatestOnlyCheckpointManager(DelegatingCheckpointManager):
     def handle_checkpoint_complete(self, manifest: CheckpointManifest) -> None:
         super().handle_checkpoint_complete(manifest)
-        self._prune_unprotected(manifest.sandbox_id)
+        with self._pin_lock:
+            self._prune_unprotected(manifest.sandbox_id)
 
 
 class DeleteAfterRestoreCheckpointManager(DelegatingCheckpointManager):
