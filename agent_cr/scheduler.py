@@ -7,7 +7,7 @@ from threading import Lock
 from typing import Protocol
 
 from .config import SchedulerConfig
-from .contracts import SandboxInspector, SandboxManager, SchedulerStateStore, TelemetrySink
+from .contracts import Runtime, SandboxInspector, SchedulerStateStore, TelemetrySink
 from .ids import SandboxId
 from .models import SandboxSnapshot, SchedulerCheckpointDecision, utc_now
 from .telemetry import NoopTelemetrySink
@@ -267,7 +267,7 @@ class CRScheduler:
         self,
         config: SchedulerConfig,
         inspector: SandboxInspector,
-        sandbox_manager: SandboxManager,
+        runtime: Runtime,
         state_store: SchedulerStateStore | None = None,
         telemetry: TelemetrySink | None = None,
         policy: SchedulerPolicy | None = None,
@@ -275,7 +275,7 @@ class CRScheduler:
         self._config = config
         self._policy = policy or CheckpointingPolicy(config)
         self._inspector = inspector
-        self._sandbox_manager = sandbox_manager
+        self._runtime = runtime
         self._state = state_store or InMemorySchedulerStateStore()
         self._telemetry = telemetry or NoopTelemetrySink()
 
@@ -319,7 +319,7 @@ class CRScheduler:
     def query_checkpoint(self, sandbox_id: SandboxId) -> SchedulerCheckpointDecision:
         logger.debug("Querying scheduler for sandbox %s", sandbox_id)
         try:
-            self._sandbox_manager.pause(sandbox_id)
+            self._runtime.pause(sandbox_id)
         except Exception:
             snapshot = self._inspector.inspect(sandbox_id)
             if not snapshot.is_running:
@@ -336,9 +336,9 @@ class CRScheduler:
             decision = self.evaluate(snapshot)
             if not decision.should_checkpoint:
                 if snapshot.is_running:
-                    self._sandbox_manager.resume(sandbox_id)
+                    self._runtime.resume(sandbox_id)
                 else:
-                    self._sandbox_manager.sync_runtime_state(sandbox_id, is_running=False)
+                    self._runtime.sync_runtime_state(sandbox_id, is_running=False)
                 logger.debug(
                     "Scheduler declined checkpoint for sandbox %s reason=%s",
                     sandbox_id,
@@ -361,9 +361,9 @@ class CRScheduler:
                 snapshot = None
             try:
                 if snapshot is not None and not snapshot.is_running:
-                    self._sandbox_manager.sync_runtime_state(sandbox_id, is_running=False)
+                    self._runtime.sync_runtime_state(sandbox_id, is_running=False)
                 else:
-                    self._sandbox_manager.resume(sandbox_id)
+                    self._runtime.resume(sandbox_id)
             except Exception:
                 logger.exception("Failed to resume sandbox %s after scheduler exception", sandbox_id)
             raise

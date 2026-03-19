@@ -900,18 +900,28 @@ class BenchmarkHelperTests(unittest.TestCase):
         harness.interceptor = None
         harness.executor = None
         harness.runtime_state_root = None
+        events: list[str] = []
+        harness.runtime = SimpleNamespace(
+            delete_runtime=Mock(side_effect=lambda *args, **kwargs: events.append("delete_runtime"))
+        )
         harness.pool_name = None
         harness.llm_server = None
         harness.llm_thread = None
         harness.network_manager.cleanup = Mock()
         harness._stop_host_inspector_server = Mock()
-        harness._task_executor.shutdown = Mock()
+        harness._task_executor.shutdown = Mock(side_effect=lambda *args, **kwargs: events.append("shutdown"))
 
         harness.__exit__(None, None, None)
 
         sandbox.task_run.request_stop.assert_called_once()
+        harness.runtime.delete_runtime.assert_called_once_with(
+            SandboxId("sbx-exit"),
+            force=True,
+            ignore_missing=True,
+        )
         harness.network_manager.cleanup.assert_called_once_with()
         harness._task_executor.shutdown.assert_called_once_with(wait=True, cancel_futures=True)
+        self.assertEqual(events, ["delete_runtime", "shutdown"])
 
     def test_launch_sandbox_from_docker_compose_file_translates_supported_service(self) -> None:
         harness = RealHostScenarioHarness(

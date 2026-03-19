@@ -12,14 +12,14 @@ flowchart TD
     System --> Executor[CRExecutor]
     System --> Storage[CheckpointManager]
     System --> Inspector[RequestAwareSandboxInspector]
-    System --> SandboxMgr[SandboxManager]
+    System --> Runtime[Runtime]
     System --> Telemetry[TelemetrySink]
     System --> RequestStore[InMemoryRequestStateStore]
     System --> ResponseGate[SandboxResponseGateRegistry]
 
     Scheduler --> Policy[Checkpointing Policy]
     Scheduler --> Inspector
-    Scheduler --> SandboxMgr
+    Scheduler --> Runtime
 
     Executor --> CWorker[DefaultCWorker]
     Executor --> RWorker[DefaultRWorker]
@@ -32,26 +32,26 @@ flowchart TD
     RWorker --> FsR[AdapterFileSystemRWorker]
     RWorker --> Storage
 
-    ProcessC --> Runtime[SandboxRuntimeAdapter]
+    ProcessC --> Runtime
     FsC --> Runtime
     ProcessR --> Runtime
     FsR --> Runtime
 ```
 
-`build_default_system(...)` assembles this graph with in-process implementations. Real-host tests and benchmarks often bypass the builder and wire the same pieces directly so they can control runtime paths, sandbox metadata directories, retention wrappers, and scheduler policies.
+`build_default_system(...)` assembles this graph with in-process implementations. Real-host tests and benchmarks often bypass the builder and wire the same pieces directly so they can control runtime paths, retention wrappers, and scheduler policies.
 
 ## Runtime Modes
 
 ### Docker test path
 
-- `build_default_system(runtime="docker")` creates `DockerRuntimeAdapter` and `InMemorySandboxManager`.
-- The adapter reports command shapes for checkpoint and restore, but does not execute a real runtime implementation.
+- `build_default_system(runtime="docker")` creates `InMemoryRuntime`.
+- The in-memory runtime reports command shapes for checkpoint and restore, but does not execute a real runtime implementation.
 - This path is mainly for unit tests and simulated end-to-end tests.
 
 ### Real `runc` path
 
-- `build_default_system(runtime="runc")` creates `RuncRuntimeAdapter` and `RuncSandboxManager`.
-- Real-host scenarios also construct these directly with explicit `RuncRuntimePaths` and `RuncSandboxManagerPaths`.
+- `build_default_system(runtime="runc")` creates `RuncRuntime`.
+- Real-host scenarios also construct this directly with explicit `RuncRuntimePaths`.
 - Process state is handled through `runc checkpoint` and `runc restore` backed by CRIU image directories.
 - Filesystem state is handled through ZFS snapshots and rollbacks.
 
@@ -81,7 +81,7 @@ That metadata is what `_validate_restore_checkpoint(...)` inspects when restore 
 
 `checkpoint_once(...)`:
 
-1. Pause the sandbox through the sandbox manager.
+1. Pause the sandbox through the runtime.
 2. Build a `CheckpointJob`.
 3. Execute checkpoint work through `CRExecutor`.
 4. `DefaultCWorker` runs process and filesystem checkpoint workers.
@@ -97,11 +97,11 @@ That metadata is what `_validate_restore_checkpoint(...)` inspects when restore 
 
 1. Convert the requested checkpoint ID to `CheckpointId`.
 2. If `enforce_restore_checkpoint_validation=True`, call `_validate_restore_checkpoint(...)` before mutating the sandbox.
-3. Ask the sandbox manager to prepare for restore.
+3. Ask the runtime to prepare for restore.
 4. Create a `RestoreJob`.
 5. `CRExecutor` dispatches to `DefaultRWorker`.
 6. `DefaultRWorker` resolves the effective restore manifest and restores filesystem state before process state.
-7. On success, the sandbox manager marks the sandbox as restored and storage receives `handle_restore_complete(...)`.
+7. On success, the runtime marks the sandbox as restored and storage receives `handle_restore_complete(...)`.
 
 Manifest resolution is important because restore may depend on artifacts from earlier checkpoints. `resolve_restore_manifest(...)` merges the effective process and filesystem artifacts before restore workers run.
 

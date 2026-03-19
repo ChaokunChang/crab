@@ -14,7 +14,7 @@ from ..contracts import (
     FileSystemRWorker,
     ProcessCWorker,
     ProcessRWorker,
-    SandboxRuntimeAdapter,
+    Runtime,
     TelemetrySink,
 )
 from ..ids import CheckpointId
@@ -107,14 +107,14 @@ class DefaultCWorker(CompositeCheckpointWorker):
         process_worker: ProcessCWorker,
         filesystem_worker: FileSystemCWorker,
         checkpoint_manager: CheckpointManager,
-        runtime_adapter: SandboxRuntimeAdapter,
+        runtime: Runtime,
         checkpoint_guard: Callable[[CheckpointJob], tuple[bool, str | None]] | None = None,
         telemetry: TelemetrySink | None = None,
     ):
         self._process_worker = process_worker
         self._filesystem_worker = filesystem_worker
         self._checkpoint_manager = checkpoint_manager
-        self._runtime_adapter = runtime_adapter
+        self._runtime = runtime
         self._checkpoint_guard = checkpoint_guard
         self._telemetry = telemetry or NoopTelemetrySink()
 
@@ -235,8 +235,8 @@ class DefaultCWorker(CompositeCheckpointWorker):
             checkpoint_id=checkpoint_id,
             sandbox_id=job.sandbox_id,
             created_at=utc_now(),
-            runtime_name=self._runtime_adapter.name,
-            runtime_version=self._runtime_adapter.version,
+            runtime_name=self._runtime.name,
+            runtime_version=self._runtime.version,
             process_artifacts=process_refs,
             filesystem_artifacts=fs_refs,
             metadata={

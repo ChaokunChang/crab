@@ -9,7 +9,7 @@ import time
 from typing import Callable
 
 from .config import ExecutorConfig, SchedulerConfig, StorageConfig, TelemetryConfig
-from .contracts import CheckpointManager, SandboxInspector, TelemetrySink
+from .contracts import CheckpointManager, Runtime, SandboxInspector, TelemetrySink
 from .executor import CRExecutor
 from .ids import CheckpointId, JobId
 from .inspector import EBPFSandboxInspector
@@ -28,8 +28,7 @@ from .models import (
     SandboxId,
     utc_now,
 )
-from .runtime import DockerRuntimeAdapter, RuncRuntimeAdapter, RuncRuntimeOptions
-from .sandbox_manager import InMemorySandboxManager, RuncSandboxManager
+from .runtime import InMemoryRuntime, RuncRuntime, RuncRuntimeOptions
 from .scheduler import CRScheduler, InMemorySchedulerStateStore, SchedulerPolicy
 from .storage import LocalCheckpointManager
 from .telemetry import CompositeTelemetrySink, InMemoryTelemetrySink, JsonlTelemetrySink, NoopTelemetrySink
@@ -70,7 +69,7 @@ class AgentCRSystem:
     executor: CRExecutor
     storage: CheckpointManager
     inspector: SandboxInspector
-    sandbox_manager: InMemorySandboxManager | RuncSandboxManager
+    runtime: Runtime
     telemetry: TelemetrySink
     request_state_store: InMemoryRequestStateStore | None = None
     response_gate_registry: SandboxResponseGateRegistry | None = None
@@ -89,6 +88,14 @@ class AgentCRSystem:
     _stop_event: Event = field(init=False, repr=False)
     _monitor_thread: Thread | None = field(init=False, repr=False, default=None)
     _recovery_thread: Thread | None = field(init=False, repr=False, default=None)
+
+    @property
+    def sandbox_manager(self) -> Runtime:
+        return self.runtime
+
+    @sandbox_manager.setter
+    def sandbox_manager(self, value: Runtime) -> None:
+        self.runtime = value
 
     def __post_init__(self) -> None:
         if self.response_gate_registry is None:
@@ -215,7 +222,7 @@ class AgentCRSystem:
                 failure_code=FailureCode.VALIDATION_ERROR,
                 message=restore_message,
             )
-        self.sandbox_manager.prepare_for_restore(sandbox_id)
+        self.runtime.prepare_for_restore(sandbox_id)
         job = RestoreJob(
             job_id=JobId.new(),
             sandbox_id=sandbox_id,
@@ -228,7 +235,7 @@ class AgentCRSystem:
             restore_manifest = None
             if self.restore_metadata_handler is not None:
                 restore_manifest = self._resolve_restore_manifest(sandbox_id, restore_checkpoint_id)
-            self.sandbox_manager.mark_restored(sandbox_id)
+            self.runtime.mark_restored(sandbox_id)
             self.storage.handle_restore_complete(sandbox_id, result.checkpoint_id)
             if self.restore_metadata_handler is not None and restore_manifest is not None:
                 self.restore_metadata_handler(sandbox_id, restore_manifest)
@@ -800,7 +807,7 @@ class AgentCRSystem:
 
     def _pause_for_manual_checkpoint(self, sandbox_id: SandboxId) -> bool:
         try:
-            self.sandbox_manager.pause(sandbox_id)
+            self.runtime.pause(sandbox_id)
             return True
         except Exception:
             logger.exception("Failed to pause sandbox %s for manual checkpoint", sandbox_id)
@@ -814,13 +821,13 @@ class AgentCRSystem:
         if snapshot is not None and not snapshot.is_running:
             return
         try:
-            description = self.sandbox_manager.describe(sandbox_id)
+            description = self.runtime.describe(sandbox_id)
         except Exception:
             return
         if description.status != "paused":
             return
         try:
-            self.sandbox_manager.resume(sandbox_id)
+            self.runtime.resume(sandbox_id)
         except Exception:
             logger.exception("Failed to resume sandbox %s", sandbox_id)
 
@@ -840,7 +847,7 @@ class AgentCRSystem:
                     )
                 )
         try:
-            self.sandbox_manager.sync_runtime_state(sandbox_id, is_running=False)
+            self.runtime.sync_runtime_state(sandbox_id, is_running=False)
         except Exception:
             logger.debug("Failed to sync runtime state for faulted sandbox %s", sandbox_id, exc_info=True)
 
@@ -857,7 +864,7 @@ class AgentCRSystem:
             return True
         if result is None or result.status.value != "succeeded":
             return True
-        if isinstance(self.sandbox_manager, InMemorySandboxManager):
+        if isinstance(self.runtime, InMemoryRuntime):
             return True
         return job.leave_running
 
@@ -902,21 +909,15 @@ def build_default_system(
         telemetry = sinks[0] if len(sinks) == 1 else CompositeTelemetrySink(sinks)
 
     if runtime == "docker":
-        adapter = DockerRuntimeAdapter()
-        sandbox_manager = InMemorySandboxManager(host_inspector_client=host_inspector_client)
+        runtime_impl = InMemoryRuntime(name="docker", host_inspector_client=host_inspector_client)
     elif runtime == "runc":
-        sandbox_manager = RuncSandboxManager(
+        runtime_impl = RuncRuntime(
             host_inspector_client=host_inspector_client,
             telemetry=telemetry,
-            checkpoint_options=(runc_runtime_options or RuncRuntimeOptions()).checkpoint,
-            restore_options=(runc_runtime_options or RuncRuntimeOptions()).restore,
-        )
-        adapter = RuncRuntimeAdapter(
-            sandbox_manager=sandbox_manager,
             options=runc_runtime_options,
         )
     else:
-        raise ValueError(f"unsupported runtime adapter: {runtime}")
+        raise ValueError(f"unsupported runtime: {runtime}")
     storage = checkpoint_manager or LocalCheckpointManager(store_cfg)
     request_store = request_state_store or InMemoryRequestStateStore()
     response_gate_registry = SandboxResponseGateRegistry()
@@ -927,16 +928,16 @@ def build_default_system(
         base_inspector = EBPFSandboxInspector()
     inspector = RequestAwareSandboxInspector(base_inspector, request_store)
 
-    process_c = AdapterProcessCWorker(adapter)
-    process_r = AdapterProcessRWorker(adapter)
-    fs_c = AdapterFileSystemCWorker(adapter)
-    fs_r = AdapterFileSystemRWorker(adapter)
+    process_c = AdapterProcessCWorker(runtime_impl)
+    process_r = AdapterProcessRWorker(runtime_impl)
+    fs_c = AdapterFileSystemCWorker(runtime_impl)
+    fs_r = AdapterFileSystemRWorker(runtime_impl)
 
     c_worker = DefaultCWorker(
         process_c,
         fs_c,
         storage,
-        adapter,
+        runtime_impl,
         checkpoint_guard=_checkpoint_guard_from_inspector(inspector),
         telemetry=telemetry,
     )
@@ -946,7 +947,7 @@ def build_default_system(
     scheduler = CRScheduler(
         scheduler_cfg,
         inspector,
-        sandbox_manager,
+        runtime_impl,
         InMemorySchedulerStateStore(),
         telemetry,
         scheduler_policy,
@@ -962,7 +963,7 @@ def build_default_system(
         executor=executor,
         storage=storage,
         inspector=inspector,
-        sandbox_manager=sandbox_manager,
+        runtime=runtime_impl,
         telemetry=telemetry,
         request_state_store=request_store,
         response_gate_registry=response_gate_registry,

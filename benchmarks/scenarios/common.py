@@ -51,10 +51,7 @@ def manifest_replay_next_response_index(manifest) -> int:
     metadata = getattr(manifest, "metadata", {})
     if not isinstance(metadata, dict):
         return 0
-    llm_state = metadata.get("llm_service_state")
-    if not isinstance(llm_state, dict):
-        return 0
-    raw_value = llm_state.get("next_response_index", 0)
+    raw_value = metadata.get("benchmark_replay_action_count", 0)
     try:
         return max(0, int(raw_value))
     except (TypeError, ValueError):

@@ -4,8 +4,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent_cr import RuncSandboxManager, RuncSandboxManagerPaths, SandboxId
+from agent_cr import RuncRuntime, RuncRuntimePaths, SandboxId
 from agent_cr.runtime import CommandRunner
+
+RuncSandboxManager = RuncRuntime
+RuncSandboxManagerPaths = RuncRuntimePaths
 
 
 class FakeCommandRunner(CommandRunner):

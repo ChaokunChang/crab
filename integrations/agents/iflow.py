@@ -104,7 +104,7 @@ class IFlowAgent(BaseAgent):
         task_config,
         *,
         runtime_state_root=None,
-        sandbox_manager=None,
+        runtime=None,
         agent_host_dir=None,
         llm_base_url=None,
     ) -> None:
@@ -113,7 +113,7 @@ class IFlowAgent(BaseAgent):
             task_description,
             task_config,
             runtime_state_root=runtime_state_root,
-            sandbox_manager=sandbox_manager,
+            runtime=runtime,
             agent_host_dir=agent_host_dir,
             llm_base_url=llm_base_url,
         )
@@ -470,9 +470,9 @@ class IFlowAgent(BaseAgent):
         }
 
     def _sandbox_is_live(self) -> bool:
-        if self.sandbox_manager is None:
+        if self.runtime is None:
             return False
-        payload = self.sandbox_manager.inspect_runtime(self.sandbox.sandbox_id)
+        payload = self.runtime.inspect_runtime(self.sandbox.sandbox_id)
         return payload.is_running
 
     def _read_marker_int(self, path: Path) -> int | None:

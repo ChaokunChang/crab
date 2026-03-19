@@ -339,7 +339,7 @@ class FaultScenarioTests(unittest.TestCase):
                 if self.calls < 2:
                     return []
                 return [
-                    SimpleNamespace(metadata={"llm_service_state": {"next_response_index": 4}}),
+                    SimpleNamespace(metadata={"benchmark_replay_action_count": 4}),
                 ]
 
         sandbox = SandboxHandle(

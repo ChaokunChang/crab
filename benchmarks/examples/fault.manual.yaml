@@ -6,6 +6,7 @@ llm_service: simulated
 sandboxes: 1
 iterations: 5
 output: ../../logs/tmp/fault.manual.csv
+log_file: ../../logs/tmp/fault.manual.log
 log_level: info
 scenario_options:
   injection_rate: 0.0

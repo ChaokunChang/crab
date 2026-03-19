@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
 def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
     scenario = SCENARIOS[config.scenario]
     settings = scenario.build_harness_settings(config)
-    configure_logging(config.log_level)
+    configure_logging(config.log_level, log_file=config.log_file)
     telemetry_output = config.telemetry_output
     if telemetry_output is None:
         telemetry_output = (
@@ -59,6 +59,14 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
     summary = scenario.summarize(config, rows)
     for key, value in summary.items():
         print(f"{key}_avg: {value:.3f}")
+    artifact_paths = [
+        ("log_file", config.log_file),
+        ("output", config.output),
+        ("telemetry_output", telemetry_output),
+    ]
+    for label, path in artifact_paths:
+        if path is not None:
+            print(f"{label}: {path.resolve()}")
     return rows
 
 

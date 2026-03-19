@@ -17,27 +17,31 @@ from agent_cr import (
     CheckpointManager,
     DefaultCWorker,
     DefaultRWorker,
-    DockerRuntimeAdapter,
     EBPFSandboxInspector,
     EBPFEvent,
     EBPFEventKind,
     FailureCode,
+    InMemoryRuntime,
     InMemoryEBPFEventCollector,
     JobId,
     LocalCheckpointManager,
     RestoreJob,
     RuncCheckpointOptions,
-    RuncRuntimeAdapter,
+    RuncRuntime,
     RuncRuntimeOptions,
     RuncRuntimePaths,
     RuncRestoreOptions,
+    Runtime,
     SandboxId,
     SandboxSnapshot,
     StorageConfig,
 )
-from agent_cr.contracts import SandboxRuntimeAdapter
 from agent_cr.models import CheckpointManifest, RuntimeOperationStatus, WorkerStepResult, utc_now
 from agent_cr.runtime import CommandRunner
+
+DockerRuntimeAdapter = InMemoryRuntime
+RuncRuntimeAdapter = RuncRuntime
+SandboxRuntimeAdapter = Runtime
 
 
 class FakeCommandRunner(CommandRunner):
@@ -506,7 +510,7 @@ class ContractTests(unittest.TestCase):
             process_worker=process_worker,
             filesystem_worker=filesystem_worker,
             checkpoint_manager=manager,
-            runtime_adapter=DockerRuntimeAdapter(),
+            runtime=DockerRuntimeAdapter(),
         )
         job = CheckpointJob(
             job_id=JobId("job-scoped"),
@@ -533,7 +537,7 @@ class ContractTests(unittest.TestCase):
             process_worker=process_worker,
             filesystem_worker=filesystem_worker,
             checkpoint_manager=manager,
-            runtime_adapter=DockerRuntimeAdapter(),
+            runtime=DockerRuntimeAdapter(),
             checkpoint_guard=lambda job: (False, f"{job.sandbox_id}:sandbox_not_running"),
         )
         job = CheckpointJob(

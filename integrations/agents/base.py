@@ -6,8 +6,9 @@ import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Event
 
-from agent_cr import EBPFEvent, EBPFEventKind, InMemoryEBPFEventCollector, SandboxId, SandboxManager
+from agent_cr import EBPFEvent, EBPFEventKind, InMemoryEBPFEventCollector, Runtime, SandboxId
 from agent_cr.models import utc_now
 
 from .contracts import SandboxHandle
@@ -53,6 +54,14 @@ class BaseAgent(ABC):
     requires_manual_task_launch = False
     requires_network_namespace = False
 
+    @property
+    def sandbox_manager(self) -> Runtime | None:
+        return self.runtime
+
+    @sandbox_manager.setter
+    def sandbox_manager(self, value: Runtime | None) -> None:
+        self.runtime = value
+
     def __init__(
         self,
         sandbox: SandboxHandle,
@@ -60,27 +69,31 @@ class BaseAgent(ABC):
         task_config: TaskConfig,
         *,
         runtime_state_root: Path | None = None,
-        sandbox_manager: SandboxManager | None = None,
+        runtime: Runtime | None = None,
+        sandbox_manager: Runtime | None = None,
         agent_host_dir: Path | None = None,
         llm_base_url: str | None = None,
     ) -> None:
+        if runtime is not None and sandbox_manager is not None and runtime is not sandbox_manager:
+            raise ValueError("runtime and sandbox_manager refer to the same runtime and cannot differ")
         self.sandbox = sandbox
         self.task_description = task_description
         self.task_config = task_config
         self.runtime_state_root = runtime_state_root
-        self.sandbox_manager = sandbox_manager
+        self.runtime = runtime if runtime is not None else sandbox_manager
         self.agent_host_dir = agent_host_dir
         self.llm_base_url = llm_base_url
         self._activity_collector = InMemoryEBPFEventCollector()
+        self._stop_requested = Event()
 
     @abstractmethod
     def perform_task(self) -> None:
         raise NotImplementedError
 
     def post_task_finish(self) -> None:
-        if self.sandbox_manager is None:
+        if self.runtime is None:
             return
-        self.sandbox_manager.delete_runtime(self.sandbox.sandbox_id, force=True, ignore_missing=True)
+        self.runtime.delete_runtime(self.sandbox.sandbox_id, force=True, ignore_missing=True)
 
     def prepare_sandbox(self) -> None:
         return None
@@ -124,7 +137,7 @@ class BaseAgent(ABC):
         return None
 
     def request_stop(self) -> None:
-        return None
+        self._stop_requested.set()
 
     def on_restore_complete(self) -> None:
         return None
@@ -133,10 +146,12 @@ class BaseAgent(ABC):
         return SandboxId(str(self.sandbox.sandbox_id))
 
     def wait_for_sandbox_exit(self, *, poll_interval_s: float = 0.2) -> None:
-        if self.sandbox_manager is None:
+        if self.runtime is None:
             return
         while True:
-            state = self.sandbox_manager.inspect_runtime(self.sandbox.sandbox_id)
+            if self._stop_requested.is_set():
+                return
+            state = self.runtime.inspect_runtime(self.sandbox.sandbox_id)
             if state.status.lower() in {"missing", "stopped"}:
                 return
             if not state.is_running:
@@ -147,6 +162,8 @@ class BaseAgent(ABC):
         deadline = time.time() + timeout_s
         last_exc: Exception | None = None
         while time.time() < deadline:
+            if self._stop_requested.is_set():
+                return dict(self.sandbox.last_status)
             try:
                 with urllib.request.urlopen(url, timeout=2.0) as resp:
                     return json.loads(resp.read().decode("utf-8"))
@@ -165,6 +182,8 @@ class BaseAgent(ABC):
     ) -> bool:
         deadline = time.time() + timeout_s
         while time.time() < deadline:
+            if self._stop_requested.is_set():
+                return False
             if predicate():
                 return True
             time.sleep(interval_s)

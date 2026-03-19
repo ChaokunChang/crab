@@ -31,10 +31,8 @@ from agent_cr import (
     InMemoryTelemetrySink,
     LocalCheckpointManager,
     RequestContext,
-    RuncRuntimeAdapter,
+    RuncRuntime,
     RuncRuntimePaths,
-    RuncSandboxManager,
-    RuncSandboxManagerPaths,
     SandboxId,
     SandboxSnapshot,
     SchedulerConfig,
@@ -44,6 +42,10 @@ from agent_cr import (
 from agent_cr.models import JobStatus, RecoveryEvent, utc_now
 from integrations.llm_services.simulated.service import SimulatedLLMState, handle_request
 from agent_cr.runtime import CommandRunner
+
+RuncRuntimeAdapter = RuncRuntime
+RuncSandboxManager = RuncRuntime
+RuncSandboxManagerPaths = RuncRuntimePaths
 
 
 class FakeCommandRunner(CommandRunner):
@@ -147,7 +149,7 @@ class SystemIntegrationTests(unittest.TestCase):
             executor=executor,
             storage=storage,
             inspector=inspector,
-            sandbox_manager=sandbox_manager,
+            runtime=sandbox_manager,
             telemetry=telemetry,
             request_state_store=request_store,
             relaunch_handler=relaunch_handler,
@@ -208,7 +210,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 executor=executor,
                 storage=storage,
                 inspector=inspector,
-                sandbox_manager=sandbox_manager,
+                runtime=sandbox_manager,
                 telemetry=telemetry,
             )
 
@@ -448,7 +450,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 executor=executor,
                 storage=storage,
                 inspector=inspector,
-                sandbox_manager=sandbox_manager,
+                runtime=sandbox_manager,
                 telemetry=telemetry,
             )
             sandbox_id = system.sandbox_manager.launch(
@@ -537,7 +539,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 executor=executor,
                 storage=storage,
                 inspector=inspector,
-                sandbox_manager=sandbox_manager,
+                runtime=sandbox_manager,
                 telemetry=telemetry,
                 request_state_store=request_store,
             )
@@ -1002,7 +1004,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 executor=executor,
                 storage=storage,
                 inspector=inspector,
-                sandbox_manager=sandbox_manager,
+                runtime=sandbox_manager,
                 telemetry=telemetry,
                 request_state_store=request_store,
                 relaunch_handler=lambda sandbox_id, event_type: relaunched.append((sandbox_id, event_type)),
@@ -1109,7 +1111,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 executor=executor,
                 storage=storage,
                 inspector=inspector,
-                sandbox_manager=sandbox_manager,
+                runtime=sandbox_manager,
                 telemetry=telemetry,
             )
             sandbox_id = system.sandbox_manager.launch(
@@ -1202,7 +1204,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 executor=executor,
                 storage=storage,
                 inspector=inspector,
-                sandbox_manager=sandbox_manager,
+                runtime=sandbox_manager,
                 telemetry=telemetry,
             )
             sandbox_id = system.sandbox_manager.launch(
@@ -1315,7 +1317,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 executor=executor,
                 storage=storage,
                 inspector=inspector,
-                sandbox_manager=sandbox_manager,
+                runtime=sandbox_manager,
                 telemetry=telemetry,
             )
             sandbox_id = system.sandbox_manager.launch(

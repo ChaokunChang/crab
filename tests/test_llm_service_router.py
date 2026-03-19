@@ -91,12 +91,24 @@ class BenchmarkLLMRouterTests(unittest.TestCase):
                     [
                         json.dumps(
                             {
+                                "type": "request",
+                                "data": {"model": "trace-model", "messages": [{"role": "user", "content": "first"}], "tools": []},
+                            }
+                        ),
+                        json.dumps(
+                            {
                                 "type": "response",
                                 "data": {
                                     "choices": [
                                         {"message": {"role": "assistant", "content": "first"}}
                                     ]
                                 },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "request",
+                                "data": {"model": "trace-model", "messages": [{"role": "user", "content": "second"}], "tools": []},
                             }
                         ),
                         json.dumps(
@@ -123,25 +135,25 @@ class BenchmarkLLMRouterTests(unittest.TestCase):
             first = router.handle_request(
                 path="/v1/chat/completions",
                 headers={"X-Agent-Sandbox-Id": "sbx-replay"},
-                payload={},
+                payload={"model": "trace-model", "messages": [{"role": "user", "content": "first"}], "tools": []},
             )
             checkpoint_metadata = router.checkpoint_metadata("sbx-replay")
             second = router.handle_request(
                 path="/v1/chat/completions",
                 headers={"X-Agent-Sandbox-Id": "sbx-replay"},
-                payload={},
+                payload={"model": "trace-model", "messages": [{"role": "user", "content": "second"}], "tools": []},
             )
             router.restore_from_checkpoint_metadata("sbx-replay", checkpoint_metadata)
             replayed_second = router.handle_request(
                 path="/v1/chat/completions",
                 headers={"X-Agent-Sandbox-Id": "sbx-replay"},
-                payload={},
+                payload={"model": "trace-model", "messages": [{"role": "user", "content": "second"}], "tools": []},
             )
             router.reset_sandbox("sbx-replay")
             replayed_first = router.handle_request(
                 path="/v1/chat/completions",
                 headers={"X-Agent-Sandbox-Id": "sbx-replay"},
-                payload={},
+                payload={"model": "trace-model", "messages": [{"role": "user", "content": "first"}], "tools": []},
             )
 
         self.assertEqual(first["choices"][0]["message"]["content"], "first")

@@ -37,6 +37,7 @@ class BenchmarkConfig:
     iterations: int = 1
     output: Path | None = None
     telemetry_output: Path | None = None
+    log_file: Path | None = None
     image_cache_root: Path | None = None
     log_level: str = "info"
     transfer_delay_ms: float = 0.0
@@ -114,6 +115,7 @@ def load_config(path: Path) -> BenchmarkConfig:
         iterations=iterations,
         output=_resolve_optional_path(base_dir, data.get("output")),
         telemetry_output=_resolve_optional_path(base_dir, data.get("telemetry_output")),
+        log_file=_resolve_optional_path(base_dir, data.get("log_file")),
         image_cache_root=_resolve_optional_path(base_dir, data.get("image_cache_root")),
         log_level=log_level,
         transfer_delay_ms=float(data.get("transfer_delay_ms", 0.0)),

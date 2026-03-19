@@ -24,6 +24,7 @@ class BenchmarkConfigTests(unittest.TestCase):
                         "mode: auto",
                         "task_dataset: datasets/tasks.jsonl",
                         "output: results/out.csv",
+                        "log_file: results/out.log",
                         "telemetry_output: results/out.telemetry.jsonl",
                         "image_cache_root: cache/images",
                         "work_dir_host_root: workdirs",
@@ -40,6 +41,7 @@ class BenchmarkConfigTests(unittest.TestCase):
             self.assertEqual(config.mode, "auto")
             self.assertEqual(config.task_dataset, (root / "datasets" / "tasks.jsonl").resolve())
             self.assertEqual(config.output, (root / "results" / "out.csv").resolve())
+            self.assertEqual(config.log_file, (root / "results" / "out.log").resolve())
             self.assertEqual(config.telemetry_output, (root / "results" / "out.telemetry.jsonl").resolve())
             self.assertEqual(config.image_cache_root, (root / "cache" / "images").resolve())
             self.assertEqual(config.work_dir_host_root, (root / "workdirs").resolve())
@@ -76,6 +78,7 @@ class BenchmarkRunDispatchTests(unittest.TestCase):
             iterations=1,
             output=None,
             telemetry_output=None,
+            log_file=None,
             image_cache_root=None,
             log_level="info",
             transfer_delay_ms=0.0,
@@ -158,6 +161,7 @@ class BenchmarkRunDispatchTests(unittest.TestCase):
             llm_service="simulated",
             output=Path("/tmp/out.csv"),
             telemetry_output=None,
+            log_file=Path("/tmp/out.log"),
             image_cache_root=None,
         )
 
@@ -169,6 +173,14 @@ class BenchmarkRunDispatchTests(unittest.TestCase):
             run_benchmark_config(config)
 
         self.assertEqual(calls[0]["telemetry_output"], Path("/tmp/out.telemetry.jsonl"))
+
+    def test_example_yaml_files_load(self) -> None:
+        examples = sorted((Path("/root/workspace/agent-cr/benchmarks/examples")).glob("*.yaml"))
+        self.assertTrue(examples)
+        for path in examples:
+            with self.subTest(path=path.name):
+                config = load_config(path)
+                self.assertEqual(config.config_path, path.resolve())
 
 
 if __name__ == "__main__":
