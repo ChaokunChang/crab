@@ -167,48 +167,9 @@ class FaultToleranceCheckpointingPolicy(CheckpointingPolicy):
         return "fault-tolerance"
 
     def evaluate(self, snapshot: SandboxSnapshot) -> SchedulerCheckpointDecision:
-        request_in_flight = bool(snapshot.metadata.get("llm_request_in_flight", False))
-        changed = snapshot.process_changed or snapshot.filesystem_changed
-        if snapshot.is_running and request_in_flight and not changed:
-            if snapshot.last_checkpoint_at is not None:
-                elapsed = (snapshot.observed_at - snapshot.last_checkpoint_at).total_seconds()
-                min_interval = self._config.min_checkpoint_interval_seconds
-                force_after = self._config.force_checkpoint_after_seconds
-                if force_after > 0 and elapsed >= force_after:
-                    return SchedulerCheckpointDecision(
-                        should_checkpoint=True,
-                        checkpoint_process=True,
-                        checkpoint_filesystem=False,
-                        leave_running=True,
-                        reason="force_interval_elapsed",
-                        policy_name=self.name,
-                        metadata={"elapsed_seconds": elapsed, "llm_request_in_flight": request_in_flight},
-                    )
-                if elapsed < min_interval:
-                    return SchedulerCheckpointDecision(
-                        should_checkpoint=False,
-                        checkpoint_process=False,
-                        checkpoint_filesystem=False,
-                        leave_running=False,
-                        reason="minimum_interval_not_elapsed",
-                        policy_name=self.name,
-                        metadata={"elapsed_seconds": elapsed, "llm_request_in_flight": request_in_flight},
-                    )
-            reason = "no_previous_checkpoint"
-            if self._config.prefer_checkpoint_during_llm_request:
-                reason = "llm_request_window_available"
-            return SchedulerCheckpointDecision(
-                should_checkpoint=True,
-                checkpoint_process=True,
-                checkpoint_filesystem=False,
-                leave_running=True,
-                reason=reason,
-                policy_name=self.name,
-                metadata={"llm_request_in_flight": request_in_flight},
-            )
         decision = super().evaluate(snapshot)
         if not decision.should_checkpoint:
-            return decision
+            return replace(decision, policy_name=self.name)
         return replace(decision, leave_running=True, policy_name=self.name)
 
 
@@ -332,11 +293,15 @@ class CRScheduler:
         decision = self._policy.evaluate(hydrated)
         log_fn = logger.info if decision.should_checkpoint else logger.debug
         log_fn(
-            "Scheduler evaluated sandbox %s with policy=%s should_checkpoint=%s reason=%s process=%s filesystem=%s leave_running=%s",
+            "Scheduler evaluated sandbox %s with policy=%s should_checkpoint=%s reason=%s "
+            "observed_process_changed=%s observed_filesystem_changed=%s "
+            "checkpoint_process=%s checkpoint_filesystem=%s leave_running=%s",
             hydrated.sandbox_id,
             self._policy.name,
             decision.should_checkpoint,
             decision.reason,
+            hydrated.process_changed,
+            hydrated.filesystem_changed,
             decision.checkpoint_process,
             decision.checkpoint_filesystem,
             decision.leave_running,
@@ -397,9 +362,12 @@ class CRScheduler:
                 )
             else:
                 logger.info(
-                    "Scheduler selected checkpoint for sandbox %s reason=%s process=%s filesystem=%s leave_running=%s",
+                    "Scheduler selected checkpoint for sandbox %s reason=%s observed_process_changed=%s "
+                    "observed_filesystem_changed=%s checkpoint_process=%s checkpoint_filesystem=%s leave_running=%s",
                     sandbox_id,
                     decision.reason,
+                    snapshot.process_changed,
+                    snapshot.filesystem_changed,
                     decision.checkpoint_process,
                     decision.checkpoint_filesystem,
                     decision.leave_running,

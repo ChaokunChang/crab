@@ -112,6 +112,7 @@ class ReplayExchange:
     path: str
     request: dict[str, Any]
     response: dict[str, Any]
+    response_index: int
     lookup_key: tuple[str, int, int, int, int]
 
 
@@ -384,6 +385,45 @@ def _is_tool_call_response(payload: dict[str, Any]) -> bool:
     return isinstance(tool_calls, list) and len(tool_calls) > 0
 
 
+def _response_mutates_filesystem(payload: dict[str, Any]) -> bool:
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return False
+    first_choice = choices[0]
+    if not isinstance(first_choice, dict):
+        return False
+    message = first_choice.get("message")
+    if not isinstance(message, dict):
+        return False
+    tool_calls = message.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return False
+    for tool_call in tool_calls:
+        if not isinstance(tool_call, dict):
+            continue
+        function = tool_call.get("function")
+        if not isinstance(function, dict):
+            continue
+        tool_name = function.get("name")
+        if not isinstance(tool_name, str):
+            continue
+        normalized_name = tool_name.lower()
+        if normalized_name == "run_shell_command":
+            arguments = function.get("arguments")
+            if not isinstance(arguments, str):
+                return True
+            try:
+                payload_arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                return True
+            command = payload_arguments.get("command")
+            return not isinstance(command, str) or not _is_read_only_shell_command(command)
+        if normalized_name in {"read_file", "list_dir", "todo_write"}:
+            continue
+        return True
+    return False
+
+
 def _build_dummy_tool_response(*, request_payload: dict[str, Any], original_response: dict[str, Any]) -> dict[str, Any] | None:
     choices = original_response.get("choices")
     if not isinstance(choices, list) or not choices:
@@ -495,6 +535,7 @@ def parse_replay_trace(trace_path: Path) -> ParsedReplayTrace:
                 path=path,
                 request=request,
                 response=payload,
+                response_index=len(exchanges) + 1,
                 lookup_key=lookup_key,
             )
         )
@@ -530,9 +571,16 @@ class TraceReplayLLMState:
         self._matched_response_count = 0
         self._duplicate_response_count = 0
         self._total_progress_responses = len(parsed.exchanges)
+        self._latest_mutating_response_count_by_progress = [0]
+        latest_mutating_response_count = 0
+        for exchange in parsed.exchanges:
+            if _response_mutates_filesystem(exchange.response):
+                latest_mutating_response_count = exchange.response_index
+            self._latest_mutating_response_count_by_progress.append(latest_mutating_response_count)
         self._served_request_keys: set[tuple[str, int, int, int, int]] = set()
         self._responses_by_key = {exchange.lookup_key: exchange for exchange in parsed.exchanges}
         self._hashes_by_shape: dict[tuple[int, int, int, int], list[str]] = {}
+        self._filesystem_restore_replay_action_count: int | None = None
         for exchange in parsed.exchanges:
             self._hashes_by_shape.setdefault(exchange.lookup_key[1:], []).append(exchange.lookup_key[0])
 
@@ -541,15 +589,32 @@ class TraceReplayLLMState:
 
     def checkpoint_metadata(self) -> dict[str, object]:
         with self._lock:
-            return {"benchmark_replay_action_count": self._matched_response_count}
+            matched_response_count = self._matched_response_count
+            return {
+                "benchmark_replay_action_count": matched_response_count,
+                "benchmark_latest_mutating_response_count": self._latest_mutating_response_count_by_progress[
+                    matched_response_count
+                ],
+                "benchmark_previous_mutating_response_count": self._latest_mutating_response_count_by_progress[
+                    max(0, matched_response_count - 1)
+                ],
+            }
 
     def restore_from_checkpoint_metadata(self, metadata: dict[str, object]) -> None:
-        _ = metadata
+        raw_filesystem_restore_count = metadata.get("filesystem_restore_replay_action_count")
+        if raw_filesystem_restore_count is None:
+            self._filesystem_restore_replay_action_count = None
+            return
+        try:
+            self._filesystem_restore_replay_action_count = max(0, int(raw_filesystem_restore_count))
+        except (TypeError, ValueError):
+            self._filesystem_restore_replay_action_count = None
 
     def reset(self) -> None:
         with self._lock:
             self._matched_response_count = 0
             self._duplicate_response_count = 0
+            self._filesystem_restore_replay_action_count = None
             self._served_request_keys.clear()
             self._events.clear()
 
@@ -581,18 +646,25 @@ class TraceReplayLLMState:
                 matched_response_count = self._matched_response_count
                 self._duplicate_response_count += 1
                 if _is_tool_call_response(exchange.response):
-                    response = _build_dummy_tool_response(request_payload=payload, original_response=exchange.response)
-                    if response is None:
-                        logger.warning(
-                            "Replay duplicate request fell back to original response because no tool schema was advertised "
-                            "path=%s hash=%s",
-                            path,
-                            lookup_key[0][:12],
-                        )
+                    if (
+                        self._filesystem_restore_replay_action_count is not None
+                        and exchange.response_index > self._filesystem_restore_replay_action_count
+                    ):
                         response = exchange.response
-                        response_kind = "duplicate_original"
+                        response_kind = "duplicate_original_missing_filesystem_state"
                     else:
-                        response_kind = "duplicate_dummy_tool"
+                        response = _build_dummy_tool_response(request_payload=payload, original_response=exchange.response)
+                        if response is None:
+                            logger.warning(
+                                "Replay duplicate request fell back to original response because no tool schema was advertised "
+                                "path=%s hash=%s",
+                                path,
+                                lookup_key[0][:12],
+                            )
+                            response = exchange.response
+                            response_kind = "duplicate_original"
+                        else:
+                            response_kind = "duplicate_dummy_tool"
                 else:
                     response = exchange.response
                     response_kind = "duplicate_original"
@@ -628,6 +700,7 @@ class TraceReplayLLMState:
                 "is_complete": matched_response_count >= self._total_progress_responses,
                 "malformed_line_count": len(self._trace.malformed_lines),
                 "malformed_lines": list(self._trace.malformed_lines),
+                "filesystem_restore_replay_action_count": self._filesystem_restore_replay_action_count,
                 "events": list(self._events),
             }
 

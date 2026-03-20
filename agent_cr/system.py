@@ -48,6 +48,8 @@ _CAPTURES_INFLIGHT_LLM = "captures_inflight_llm"
 _CAPTURED_REQUEST_ID = "captured_request_id"
 _CAPTURED_REQUEST_PROVIDER = "captured_request_provider"
 _CAPTURED_REQUEST_STARTED_AT = "captured_request_started_at"
+_RESTORE_RUNTIME_READY_ATTEMPTS = 10
+_RESTORE_RUNTIME_READY_DELAY_S = 0.1
 
 
 def _checkpoint_guard_from_inspector(inspector: SandboxInspector) -> Callable[[CheckpointJob], tuple[bool, str | None]]:
@@ -232,14 +234,31 @@ class AgentCRSystem:
         )
         result = self.executor.run_restore(job)
         if result.status.value == "succeeded":
-            restore_manifest = None
-            if self.restore_metadata_handler is not None:
-                restore_manifest = self._resolve_restore_manifest(sandbox_id, restore_checkpoint_id)
-            self.runtime.mark_restored(sandbox_id)
-            self._mark_sandbox_running(sandbox_id)
-            self.storage.handle_restore_complete(sandbox_id, result.checkpoint_id)
-            if self.restore_metadata_handler is not None and restore_manifest is not None:
-                self.restore_metadata_handler(sandbox_id, restore_manifest)
+            runtime_state = self._wait_for_runtime_running(sandbox_id)
+            if runtime_state is None:
+                self.runtime.sync_runtime_state(sandbox_id, is_running=False)
+                message = f"restore completed but sandbox {sandbox_id} is not running"
+                logger.warning(
+                    "Restore reported success but sandbox is not running sandbox=%s checkpoint=%s",
+                    sandbox_id,
+                    restore_checkpoint_id,
+                )
+                result = replace(
+                    result,
+                    status=JobStatus.FAILED,
+                    finished_at=utc_now(),
+                    failure_code=FailureCode.RUNTIME_ERROR,
+                    message=message,
+                )
+            else:
+                restore_manifest = None
+                if self.restore_metadata_handler is not None:
+                    restore_manifest = self._resolve_restore_manifest(sandbox_id, restore_checkpoint_id)
+                self.runtime.mark_restored(sandbox_id)
+                self._mark_sandbox_running(sandbox_id)
+                self.storage.handle_restore_complete(sandbox_id, result.checkpoint_id)
+                if self.restore_metadata_handler is not None and restore_manifest is not None:
+                    self.restore_metadata_handler(sandbox_id, restore_manifest)
         logger.info(
             "Manual restore for sandbox %s checkpoint=%s finished with status=%s",
             sandbox_id,
@@ -247,6 +266,18 @@ class AgentCRSystem:
             result.status.value,
         )
         return result
+
+    def _wait_for_runtime_running(self, sandbox_id: SandboxId):
+        for attempt in range(_RESTORE_RUNTIME_READY_ATTEMPTS):
+            try:
+                runtime_state = self.runtime.inspect_runtime(sandbox_id)
+            except Exception:
+                runtime_state = None
+            if runtime_state is not None and runtime_state.is_running:
+                return runtime_state
+            if attempt + 1 < _RESTORE_RUNTIME_READY_ATTEMPTS:
+                time.sleep(_RESTORE_RUNTIME_READY_DELAY_S)
+        return None
 
     def notify_fault(self, sandbox_id: SandboxId, *, reason: str = "fault") -> None:
         logger.info("Received fault notification for sandbox=%s reason=%s", sandbox_id, reason)
@@ -318,7 +349,27 @@ class AgentCRSystem:
             change = self.request_state_store.wait_for_change(timeout=0.5)
             if change is None or change.event_type != "request_start":
                 continue
+            if not self._should_coordinate_live_request(change.sandbox_id, change.request_id):
+                logger.debug(
+                    "Skipping stale request_start coordination sandbox=%s request_id=%s",
+                    change.sandbox_id,
+                    "" if change.request_id is None else change.request_id,
+                )
+                continue
             self._dispatch_coordination(change.sandbox_id)
+
+    def _should_coordinate_live_request(self, sandbox_id: SandboxId, request_id: str | None) -> bool:
+        if self.request_state_store is None or self.response_gate_registry is None:
+            return False
+        request_state = self.request_state_store.get(sandbox_id)
+        if not request_state.llm_request_in_flight:
+            return False
+        pending = self.response_gate_registry.get_pending(sandbox_id)
+        if pending is None:
+            return False
+        if request_id is not None and pending.request_id != request_id:
+            return False
+        return True
 
     def _run_recovery_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -722,13 +773,13 @@ class AgentCRSystem:
         sandbox_id: SandboxId,
         checkpoint_id: CheckpointId,
     ) -> tuple[CheckpointManifest | None, list[CheckpointId]]:
+        manifest = self._resolve_restore_manifest(sandbox_id, checkpoint_id)
         pin_checkpoint = getattr(self.storage, "pin_checkpoint", None)
         if not callable(pin_checkpoint):
-            return None, []
+            return manifest, []
         if not pin_checkpoint(sandbox_id, checkpoint_id):
             return None, []
         pinned_ids = [checkpoint_id]
-        manifest = self._resolve_restore_manifest(sandbox_id, checkpoint_id)
         for metadata_key in ("process_restore_checkpoint_id", "filesystem_restore_checkpoint_id"):
             raw_value = manifest.metadata.get(metadata_key)
             if raw_value is None:

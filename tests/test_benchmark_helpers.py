@@ -105,6 +105,34 @@ class BenchmarkHelperTests(unittest.TestCase):
                 ],
             )
 
+    def test_ensure_zpool_reuses_existing_dataset_when_destroy_does_not_remove_it(self) -> None:
+        harness = RealHostScenarioHarness.__new__(RealHostScenarioHarness)
+        harness.root = Path("/tmp/bench-root")
+        harness.pool_name = "benchpool"
+        harness.configured_zpool_image = Path("/tmp/benchpool.img")
+        harness._zpool_image_path = None
+        harness.reuse_zpool = True
+        harness.zpool_size = "10G"
+
+        with (
+            patch("benchmarks.real_host_scenario_base._zpool_exists", return_value=True),
+            patch("benchmarks.real_host_scenario_base._zfs_dataset_exists", side_effect=[True, True]),
+            patch("benchmarks.real_host_scenario_base.subprocess.run") as run,
+        ):
+            harness._ensure_zpool()
+
+        self.assertEqual(
+            run.call_args_list,
+            [
+                unittest.mock.call(
+                    ["zfs", "destroy", "-r", "benchpool/agent-cr"],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            ],
+        )
+
     def test_build_tree_search_checkpoint_index_collects_steps(self) -> None:
         manifests = [
             self._tree_search_manifest("ckpt-1", step=1),
@@ -2146,6 +2174,48 @@ services:
         self.assertFalse(worker.is_alive())
         self.assertEqual(errors, [])
         self.assertEqual(agent.poll_status()["state"], "finished")
+
+    def test_iflow_restore_wait_keeps_waiting_until_sandbox_is_live(self) -> None:
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-iflow-restore-live"),
+            bundle_dir=Path("/tmp/sbx-iflow-restore-live"),
+            status_port=8123,
+            last_status={},
+            launch_metadata={
+                "iflow": {
+                    "entrypoint": "/opt/iflow-runtime/global/lib/node_modules/@iflow-ai/iflow-cli/bundle/entry.js",
+                }
+            },
+        )
+        agent = IFlowAgent(sandbox, TaskDescription("do work"), TaskConfig(), runtime_state_root=Path("/tmp/runtime"))
+        live_states = iter([False, False, True])
+
+        agent.on_restore_complete()
+
+        with patch.object(agent, "_sandbox_is_live", side_effect=lambda: next(live_states)):
+            self.assertTrue(agent._wait_for_restore_or_stop())
+
+        self.assertFalse(agent._restore_reactivation_pending.is_set())
+
+    def test_iflow_restore_wait_uses_pending_reactivation_without_new_signal(self) -> None:
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-iflow-restore-pending"),
+            bundle_dir=Path("/tmp/sbx-iflow-restore-pending"),
+            status_port=8123,
+            last_status={},
+            launch_metadata={
+                "iflow": {
+                    "entrypoint": "/opt/iflow-runtime/global/lib/node_modules/@iflow-ai/iflow-cli/bundle/entry.js",
+                }
+            },
+        )
+        agent = IFlowAgent(sandbox, TaskDescription("do work"), TaskConfig(), runtime_state_root=Path("/tmp/runtime"))
+        agent._restore_reactivation_pending.set()
+
+        with patch.object(agent, "_sandbox_is_live", side_effect=[False, True]):
+            self.assertTrue(agent._wait_for_restore_or_stop())
+
+        self.assertFalse(agent._restore_reactivation_pending.is_set())
 
     def test_iflow_poll_status_is_non_mutating_until_status_helpers_run(self) -> None:
         sandbox = SandboxHandle(

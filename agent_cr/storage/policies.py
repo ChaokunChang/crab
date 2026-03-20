@@ -86,8 +86,24 @@ class DelegatingCheckpointManager(CheckpointManager):
             protected.add(latest_process)
         if latest_filesystem is not None:
             protected.add(latest_filesystem)
+        if latest_checkpoint is not None:
+            protected.update(self._restore_dependency_checkpoint_ids(sandbox_id, latest_checkpoint))
         with self._pin_lock:
             protected.update(self._pinned_checkpoint_counts.get(sandbox_id, {}).keys())
+        return protected
+
+    def _restore_dependency_checkpoint_ids(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> set[CheckpointId]:
+        try:
+            from ..workers.composite import resolve_restore_manifest
+
+            resolved = resolve_restore_manifest(self, self.get_manifest(sandbox_id, checkpoint_id))
+        except Exception:
+            return set()
+        protected = {checkpoint_id}
+        for metadata_key in ("process_restore_checkpoint_id", "filesystem_restore_checkpoint_id"):
+            raw_value = resolved.metadata.get(metadata_key)
+            if raw_value is not None:
+                protected.add(CheckpointId(str(raw_value)))
         return protected
 
     def _prune_unprotected(self, sandbox_id: SandboxId) -> None:

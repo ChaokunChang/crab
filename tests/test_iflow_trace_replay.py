@@ -209,6 +209,61 @@ class IFlowTraceReplayTests(unittest.TestCase):
         self.assertEqual(replayed_index, 1)
         self.assertEqual(replayed["choices"][0]["message"]["content"], "first")
 
+    def test_trace_replay_state_duplicate_tool_request_preserves_original_when_filesystem_restore_lags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.log"
+            trace_path.write_text(
+                "\n".join(
+                    self._tool_request_response_lines(
+                        ("first", "ls -la /app/process_data.sh"),
+                        ("second", "chmod +x /app/process_data.sh"),
+                    )
+                ),
+                encoding="utf-8",
+            )
+            state = TraceReplayLLMState(llm_service_config={"trace_path": str(trace_path)})
+
+            state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "first"}],
+                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                },
+            )
+            _, second = state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "second"}],
+                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                },
+            )
+            state.restore_from_checkpoint_metadata(
+                {
+                    "benchmark_replay_action_count": 2,
+                    "captures_inflight_llm": True,
+                    "filesystem_restore_replay_action_count": 1,
+                }
+            )
+            replayed_index, replayed = state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "second"}],
+                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                },
+            )
+
+        self.assertEqual(replayed_index, 2)
+        self.assertEqual(
+            second["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            replayed["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+        )
+
     def test_trace_replay_state_duplicate_tool_request_does_not_advance_progress_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "trace.log"

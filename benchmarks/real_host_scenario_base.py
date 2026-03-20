@@ -486,7 +486,13 @@ class RealHostScenarioHarness:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-            subprocess.run(["zfs", "create", dataset], check=True)
+            if _zfs_dataset_exists(dataset):
+                logger.warning(
+                    "Reusing existing benchmark dataset name=%s after destroy attempt did not remove it",
+                    dataset,
+                )
+            else:
+                subprocess.run(["zfs", "create", dataset], check=True)
             return
 
         subprocess.run(["truncate", "-s", self.zpool_size, str(zpool_image_path)], check=True)

@@ -115,6 +115,13 @@ class RuncRuntime(Runtime):
         bundle_path.mkdir(parents=True, exist_ok=True)
         rootfs_path.mkdir(parents=True, exist_ok=True)
         self._run_command(
+            [self._zfs_bin, "destroy", "-r", dataset],
+            operation="sandbox.zfs_destroy_stale_launch_dataset",
+            sandbox_id=sandbox_id,
+            check=False,
+            metadata={"dataset": dataset},
+        )
+        self._run_command(
             [self._zfs_bin, "create", "-o", f"mountpoint={rootfs_path}", dataset],
             operation="sandbox.zfs_create",
             sandbox_id=sandbox_id,

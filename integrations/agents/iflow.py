@@ -122,6 +122,7 @@ class IFlowAgent(BaseAgent):
         )
         self._state_lock = threading.Lock()
         self._restore_complete_event = threading.Event()
+        self._restore_reactivation_pending = threading.Event()
         self._stop_requested = threading.Event()
         self._started_at_monotonic: float | None = None
         self._finished_at_monotonic: float | None = None
@@ -319,6 +320,7 @@ class IFlowAgent(BaseAgent):
         output_paths = self._sandbox_task_output_paths()
         self._stop_requested.clear()
         self._restore_complete_event.clear()
+        self._restore_reactivation_pending.clear()
         with self._state_lock:
             self._started_at_monotonic = time.monotonic()
             self._finished_at_monotonic = None
@@ -377,11 +379,13 @@ class IFlowAgent(BaseAgent):
     def request_stop(self) -> None:
         self._stop_requested.set()
         self._restore_complete_event.set()
+        self._restore_reactivation_pending.set()
         logger.info("Stop requested for iflow task sandbox=%s", self.sandbox.sandbox_id)
 
     def on_restore_complete(self) -> None:
         if self._is_compose_replay_mode():
             self._clear_host_task_markers()
+            self._restore_reactivation_pending.set()
             self._restore_complete_event.set()
             logger.info("Observed restore completion for replay iflow task sandbox=%s", self.sandbox.sandbox_id)
             return
@@ -393,6 +397,7 @@ class IFlowAgent(BaseAgent):
                 baseline = max(0, int(self.sandbox.last_status.get("total_actions", 0)))
                 self._started_at_monotonic = time.monotonic() - (baseline * self._tick_seconds)
             self._finished_at_monotonic = None
+        self._restore_reactivation_pending.set()
         self._restore_complete_event.set()
         if baseline is None:
             logger.info("Observed restore completion for idle iflow task sandbox=%s", self.sandbox.sandbox_id)
@@ -552,6 +557,7 @@ class IFlowAgent(BaseAgent):
 
     def _wait_for_restore_or_stop(self) -> bool:
         wait_started = time.monotonic()
+        observed_restore_signal = False
         while True:
             if self._stop_requested.is_set():
                 logger.info(
@@ -560,6 +566,21 @@ class IFlowAgent(BaseAgent):
                     time.monotonic() - wait_started,
                 )
                 return False
+            if self._restore_reactivation_pending.is_set() and self._sandbox_is_live():
+                self._restore_reactivation_pending.clear()
+                if observed_restore_signal:
+                    logger.info(
+                        "Observed restore completion signal for iflow task sandbox=%s wait_s=%.3f",
+                        self.sandbox.sandbox_id,
+                        time.monotonic() - wait_started,
+                    )
+                else:
+                    logger.info(
+                        "Observed sandbox live again after restore for iflow task sandbox=%s wait_s=%.3f",
+                        self.sandbox.sandbox_id,
+                        time.monotonic() - wait_started,
+                    )
+                return True
             if self._restore_complete_event.wait(timeout=self.TASK_POLL_INTERVAL_SECONDS):
                 self._restore_complete_event.clear()
                 if self._stop_requested.is_set():
@@ -569,12 +590,7 @@ class IFlowAgent(BaseAgent):
                         time.monotonic() - wait_started,
                     )
                     return False
-                logger.info(
-                    "Observed restore completion signal for iflow task sandbox=%s wait_s=%.3f",
-                    self.sandbox.sandbox_id,
-                    time.monotonic() - wait_started,
-                )
-                return True
+                observed_restore_signal = True
 
     def post_task_finish(self) -> None:
         if self._is_compose_replay_mode():

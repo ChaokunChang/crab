@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 _PROCESS_RESTORE_CHECKPOINT_ID = "process_restore_checkpoint_id"
 _FILESYSTEM_RESTORE_CHECKPOINT_ID = "filesystem_restore_checkpoint_id"
+_FILESYSTEM_RESTORE_REPLAY_ACTION_COUNT = "filesystem_restore_replay_action_count"
 _CAPTURES_INFLIGHT_LLM = "captures_inflight_llm"
 _CAPTURED_REQUEST_ID = "captured_request_id"
 _CAPTURED_REQUEST_PROVIDER = "captured_request_provider"
@@ -45,50 +46,108 @@ def resolve_restore_manifest(
     checkpoint_manager: CheckpointManager,
     manifest: CheckpointManifest,
 ) -> CheckpointManifest:
-    process_artifacts = list(manifest.process_artifacts)
-    filesystem_artifacts = list(manifest.filesystem_artifacts)
-    metadata = dict(manifest.metadata)
-    process_manifest = manifest if process_artifacts else None
-    process_checkpoint_id = manifest.checkpoint_id if process_artifacts else None
-    filesystem_checkpoint_id = manifest.checkpoint_id if filesystem_artifacts else None
-
-    if process_artifacts and filesystem_artifacts:
-        metadata.setdefault(_PROCESS_RESTORE_CHECKPOINT_ID, str(manifest.checkpoint_id))
-        metadata.setdefault(_FILESYSTEM_RESTORE_CHECKPOINT_ID, str(manifest.checkpoint_id))
-        _copy_process_restore_metadata(metadata, manifest.metadata)
-        return replace(manifest, metadata=metadata).with_integrity()
-
     checkpoints = checkpoint_manager.list_checkpoints(manifest.sandbox_id)
     try:
         current_index = checkpoints.index(manifest.checkpoint_id)
-        candidate_ids = reversed(checkpoints[:current_index])
+        candidate_ids = checkpoints[: current_index + 1]
     except ValueError:
-        candidate_ids = reversed(checkpoints)
+        candidate_ids = checkpoints
 
-    for checkpoint_id in candidate_ids:
-        if process_artifacts and filesystem_artifacts:
-            break
-        candidate = checkpoint_manager.get_manifest(manifest.sandbox_id, checkpoint_id)
-        if not process_artifacts and candidate.process_artifacts:
-            process_artifacts = list(candidate.process_artifacts)
-            process_manifest = candidate
-            process_checkpoint_id = candidate.checkpoint_id
-        if not filesystem_artifacts and candidate.filesystem_artifacts:
-            filesystem_artifacts = list(candidate.filesystem_artifacts)
-            filesystem_checkpoint_id = candidate.checkpoint_id
+    candidates = [checkpoint_manager.get_manifest(manifest.sandbox_id, checkpoint_id) for checkpoint_id in candidate_ids]
+    index_by_checkpoint_id = {candidate.checkpoint_id: index for index, candidate in enumerate(candidates)}
+    current_candidate = candidates[-1] if candidates else manifest
 
-    if process_checkpoint_id is not None:
-        metadata[_PROCESS_RESTORE_CHECKPOINT_ID] = str(process_checkpoint_id)
-    if filesystem_checkpoint_id is not None:
-        metadata[_FILESYSTEM_RESTORE_CHECKPOINT_ID] = str(filesystem_checkpoint_id)
+    filesystem_manifest = _latest_manifest_with_artifacts(
+        candidates,
+        include=lambda candidate: bool(candidate.filesystem_artifacts),
+    )
+    process_manifest = _latest_manifest_with_artifacts(
+        candidates,
+        include=lambda candidate: bool(candidate.process_artifacts),
+    )
+
+    if (
+        filesystem_manifest is not None
+        and process_manifest is not None
+        and index_by_checkpoint_id[process_manifest.checkpoint_id] > index_by_checkpoint_id[filesystem_manifest.checkpoint_id]
+        and not _process_manifest_is_safe_with_filesystem(
+            process_manifest=process_manifest,
+            filesystem_manifest=filesystem_manifest,
+        )
+    ):
+        filesystem_index = index_by_checkpoint_id[filesystem_manifest.checkpoint_id]
+        process_manifest = _latest_manifest_with_artifacts(
+            candidates[: filesystem_index + 1],
+            include=lambda candidate: bool(candidate.process_artifacts),
+        )
+
+    process_artifacts = [] if process_manifest is None else list(process_manifest.process_artifacts)
+    filesystem_artifacts = [] if filesystem_manifest is None else list(filesystem_manifest.filesystem_artifacts)
+    metadata = dict(current_candidate.metadata)
+    if process_manifest is not None:
+        metadata[_PROCESS_RESTORE_CHECKPOINT_ID] = str(process_manifest.checkpoint_id)
+    if filesystem_manifest is not None:
+        metadata[_FILESYSTEM_RESTORE_CHECKPOINT_ID] = str(filesystem_manifest.checkpoint_id)
+        metadata[_FILESYSTEM_RESTORE_REPLAY_ACTION_COUNT] = _committed_replay_action_count(
+            filesystem_manifest.metadata
+        )
     _copy_process_restore_metadata(metadata, {} if process_manifest is None else process_manifest.metadata)
 
     return replace(
-        manifest,
+        current_candidate,
         process_artifacts=process_artifacts,
         filesystem_artifacts=filesystem_artifacts,
         metadata=metadata,
     ).with_integrity()
+
+
+def _latest_manifest_with_artifacts(
+    manifests: list[CheckpointManifest],
+    *,
+    include: Callable[[CheckpointManifest], bool],
+) -> CheckpointManifest | None:
+    for candidate in reversed(manifests):
+        if include(candidate):
+            return candidate
+    return None
+
+
+def _replay_action_count(metadata: dict[str, object]) -> int:
+    raw_value = metadata.get("benchmark_replay_action_count", 0)
+    try:
+        return max(0, int(raw_value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _committed_replay_action_count(metadata: dict[str, object]) -> int:
+    replay_action_count = _replay_action_count(metadata)
+    if bool(metadata.get(_CAPTURES_INFLIGHT_LLM, False)):
+        return max(0, replay_action_count - 1)
+    return replay_action_count
+
+
+def _latest_committed_mutating_response_count(metadata: dict[str, object]) -> int:
+    latest_mutating = _replay_action_count(
+        {"benchmark_replay_action_count": metadata.get("benchmark_latest_mutating_response_count", 0)}
+    )
+    if not bool(metadata.get(_CAPTURES_INFLIGHT_LLM, False)):
+        return latest_mutating
+    if latest_mutating == _replay_action_count(metadata):
+        return _replay_action_count(
+            {"benchmark_replay_action_count": metadata.get("benchmark_previous_mutating_response_count", 0)}
+        )
+    return latest_mutating
+
+
+def _process_manifest_is_safe_with_filesystem(
+    *,
+    process_manifest: CheckpointManifest,
+    filesystem_manifest: CheckpointManifest,
+) -> bool:
+    return _latest_committed_mutating_response_count(process_manifest.metadata) <= _latest_committed_mutating_response_count(
+        filesystem_manifest.metadata
+    )
 
 
 def _copy_process_restore_metadata(target: dict[str, object], source: dict[str, object]) -> None:

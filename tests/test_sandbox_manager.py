@@ -146,6 +146,7 @@ class SandboxManagerTests(unittest.TestCase):
             self.assertEqual(
                 runner.commands,
                 [
+                    ("zfs", "destroy", "-r", "pool/agent-cr/sbx-test"),
                     ("zfs", "create", "-o", f"mountpoint={root / 'bundles' / 'sbx-test' / 'rootfs'}", "pool/agent-cr/sbx-test"),
                     ("runc", "--root", str(root / "state"), "create", "--bundle", str(root / "bundles" / "sbx-test"), "sbx-test"),
                     ("runc", "--root", str(root / "state"), "start", "sbx-test"),
