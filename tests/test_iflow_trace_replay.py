@@ -37,6 +37,52 @@ class IFlowTraceReplayTests(unittest.TestCase):
             )
         return lines
 
+    @staticmethod
+    def _tool_request_response_lines(*items: tuple[str, str]) -> list[str]:
+        lines: list[str] = []
+        for content, command in items:
+            lines.append(
+                json.dumps(
+                    {
+                        "type": "request",
+                        "data": {
+                            "model": "trace-model",
+                            "messages": [{"role": "user", "content": content}],
+                            "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                        },
+                    }
+                )
+            )
+            lines.append(
+                json.dumps(
+                    {
+                        "type": "response",
+                        "data": {
+                            "choices": [
+                                {
+                                    "finish_reason": "tool_calls",
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": None,
+                                        "tool_calls": [
+                                            {
+                                                "id": f"call-{content}",
+                                                "type": "function",
+                                                "function": {
+                                                    "name": "run_shell_command",
+                                                    "arguments": json.dumps({"command": command}, sort_keys=True),
+                                                },
+                                            }
+                                        ],
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                )
+            )
+        return lines
+
     def test_parse_replay_trace_skips_noise_and_tracks_malformed_lines(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "trace.log"
@@ -69,11 +115,16 @@ class IFlowTraceReplayTests(unittest.TestCase):
         self.assertEqual(parsed.responses[1]["choices"][0]["message"]["content"], "second")
         self.assertEqual(list(parsed.malformed_lines), [1])
 
-    def test_trace_replay_state_checkpoint_restore_and_reset(self) -> None:
+    def test_trace_replay_state_checkpoint_restore_returns_dummy_tool_call_for_duplicate_request(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "trace.log"
             trace_path.write_text(
-                "\n".join(self._request_response_lines("first", "second")),
+                "\n".join(
+                    self._tool_request_response_lines(
+                        ("first", 'sh -lc "echo first >/tmp/first.txt"'),
+                        ("second", 'sh -lc "echo second >/tmp/second.txt"'),
+                    )
+                ),
                 encoding="utf-8",
             )
             state = TraceReplayLLMState(llm_service_config={"trace_path": str(trace_path)})
@@ -81,35 +132,55 @@ class IFlowTraceReplayTests(unittest.TestCase):
             first_index, first = state.next_response(
                 path="/v1/chat/completions",
                 headers={"X-Agent-Sandbox-Id": "sbx"},
-                payload={"model": "trace-model", "messages": [{"role": "user", "content": "first"}], "tools": []},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "first"}],
+                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                },
             )
             checkpoint = state.checkpoint_metadata()
             second_index, second = state.next_response(
                 path="/v1/chat/completions",
                 headers={"X-Agent-Sandbox-Id": "sbx"},
-                payload={"model": "trace-model", "messages": [{"role": "user", "content": "second"}], "tools": []},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "second"}],
+                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                },
             )
             state.restore_from_checkpoint_metadata(checkpoint)
             replayed_index, replayed = state.next_response(
                 path="/v1/chat/completions",
                 headers={"X-Agent-Sandbox-Id": "sbx"},
-                payload={"model": "trace-model", "messages": [{"role": "user", "content": "second"}], "tools": []},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "second"}],
+                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                },
             )
             state.reset()
             reset_index, reset_response = state.next_response(
                 path="/v1/chat/completions",
                 headers={"X-Agent-Sandbox-Id": "sbx"},
-                payload={"model": "trace-model", "messages": [{"role": "user", "content": "first"}], "tools": []},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "first"}],
+                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                },
             )
 
         self.assertEqual(first_index, 1)
         self.assertEqual(second_index, 2)
-        self.assertEqual(replayed_index, 3)
+        self.assertEqual(replayed_index, 2)
         self.assertEqual(reset_index, 1)
-        self.assertEqual(first["choices"][0]["message"]["content"], "first")
-        self.assertEqual(second["choices"][0]["message"]["content"], "second")
-        self.assertEqual(replayed["choices"][0]["message"]["content"], "second")
-        self.assertEqual(reset_response["choices"][0]["message"]["content"], "first")
+        first_command = json.loads(first["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"])["command"]
+        second_command = json.loads(second["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"])["command"]
+        replayed_command = json.loads(replayed["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"])["command"]
+        reset_command = json.loads(reset_response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"])["command"]
+        self.assertEqual(first_command, 'sh -lc "echo first >/tmp/first.txt"')
+        self.assertEqual(second_command, 'sh -lc "echo second >/tmp/second.txt"')
+        self.assertIn("/dev/null", replayed_command)
+        self.assertEqual(reset_command, 'sh -lc "echo first >/tmp/first.txt"')
 
     def test_trace_replay_state_restore_metadata_is_a_noop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -135,8 +206,375 @@ class IFlowTraceReplayTests(unittest.TestCase):
 
         self.assertEqual(first_index, 1)
         self.assertEqual(first["choices"][0]["message"]["content"], "first")
-        self.assertEqual(replayed_index, 2)
+        self.assertEqual(replayed_index, 1)
         self.assertEqual(replayed["choices"][0]["message"]["content"], "first")
+
+    def test_trace_replay_state_duplicate_tool_request_does_not_advance_progress_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.log"
+            trace_path.write_text(
+                "\n".join(
+                    self._tool_request_response_lines(
+                        ("first", 'sh -lc "echo first >/tmp/first.txt"'),
+                        ("second", 'sh -lc "echo second >/tmp/second.txt"'),
+                    )
+                ),
+                encoding="utf-8",
+            )
+            state = TraceReplayLLMState(llm_service_config={"trace_path": str(trace_path), "response_delay_ms": 0})
+
+            state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "first"}],
+                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                },
+            )
+            duplicate_index, duplicate_response = state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "first"}],
+                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                },
+            )
+            snapshot = state.snapshot()
+
+        self.assertEqual(duplicate_index, 1)
+        duplicate_command = json.loads(
+            duplicate_response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+        )["command"]
+        self.assertIn("/dev/null", duplicate_command)
+        self.assertEqual(snapshot["matched_response_count"], 1)
+        self.assertEqual(snapshot["duplicate_response_count"], 1)
+        self.assertEqual(snapshot["next_response_index"], 1)
+
+    def test_trace_replay_state_duplicate_tool_request_keeps_followup_request_matchable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.log"
+            original_arguments = json.dumps({"command": 'sh -lc "echo first >/tmp/first.txt"'}, sort_keys=True)
+            trace_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "request",
+                                "data": {
+                                    "model": "trace-model",
+                                    "messages": [{"role": "user", "content": "first"}],
+                                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "response",
+                                "data": {
+                                    "choices": [
+                                        {
+                                            "finish_reason": "tool_calls",
+                                            "message": {
+                                                "role": "assistant",
+                                                "content": "Let me do the work.",
+                                                "tool_calls": [
+                                                    {
+                                                        "id": "call-first",
+                                                        "type": "function",
+                                                        "function": {
+                                                            "name": "run_shell_command",
+                                                            "arguments": original_arguments,
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                        }
+                                    ]
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "request",
+                                "data": {
+                                    "model": "trace-model",
+                                    "messages": [
+                                        {"role": "user", "content": "first"},
+                                        {
+                                            "role": "assistant",
+                                            "content": "Let me do the work.",
+                                            "tool_calls": [
+                                                {
+                                                    "id": "call-first",
+                                                    "type": "function",
+                                                    "function": {
+                                                        "name": "run_shell_command",
+                                                        "arguments": original_arguments,
+                                                    },
+                                                }
+                                            ],
+                                        },
+                                        {"role": "tool", "tool_call_id": "call-first", "content": "original tool output"},
+                                    ],
+                                    "tools": [],
+                                },
+                            }
+                        ),
+                        json.dumps({"type": "response", "data": {"choices": [{"message": {"content": "done"}}]}}),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            state = TraceReplayLLMState(llm_service_config={"trace_path": str(trace_path), "response_delay_ms": 0})
+
+            _, original = state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "first"}],
+                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                },
+            )
+            duplicate_index, duplicate = state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "first"}],
+                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                },
+            )
+            duplicate_arguments = duplicate["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+            followup_index, followup = state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={
+                    "model": "trace-model",
+                    "messages": [
+                        {"role": "user", "content": "first"},
+                        {
+                            "role": "assistant",
+                            "content": duplicate["choices"][0]["message"]["content"],
+                            "tool_calls": [
+                                {
+                                    "id": duplicate["choices"][0]["message"]["tool_calls"][0]["id"],
+                                    "type": "function",
+                                    "function": {
+                                        "name": duplicate["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+                                        "arguments": duplicate_arguments,
+                                    },
+                                }
+                            ],
+                        },
+                        {"role": "tool", "tool_call_id": "call-first", "content": "dummy tool output"},
+                    ],
+                    "tools": [],
+                },
+            )
+
+        self.assertEqual(duplicate_index, 1)
+        self.assertEqual(followup_index, 2)
+        self.assertEqual(original["choices"][0]["message"]["content"], duplicate["choices"][0]["message"]["content"])
+        self.assertEqual(
+            original["choices"][0]["message"]["tool_calls"][0]["id"],
+            duplicate["choices"][0]["message"]["tool_calls"][0]["id"],
+        )
+        self.assertIn("/dev/null", json.loads(duplicate_arguments)["command"])
+        self.assertEqual(followup["choices"][0]["message"]["content"], "done")
+
+    def test_trace_replay_state_duplicate_non_shell_tool_request_preserves_original_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.log"
+            trace_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "request",
+                                "data": {
+                                    "model": "trace-model",
+                                    "messages": [{"role": "user", "content": "read first"}],
+                                    "tools": [
+                                        {
+                                            "type": "function",
+                                            "function": {
+                                                "name": "read_file",
+                                                "parameters": {
+                                                    "type": "object",
+                                                    "properties": {"absolute_path": {"type": "string"}},
+                                                    "required": ["absolute_path"],
+                                                },
+                                            },
+                                        }
+                                    ],
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "response",
+                                "data": {
+                                    "choices": [
+                                        {
+                                            "finish_reason": "tool_calls",
+                                            "message": {
+                                                "role": "assistant",
+                                                "content": "Let me read the file.",
+                                                "tool_calls": [
+                                                    {
+                                                        "id": "call-read",
+                                                        "type": "function",
+                                                        "function": {
+                                                            "name": "read_file",
+                                                            "arguments": json.dumps(
+                                                                {"absolute_path": "/app/input.txt"},
+                                                                sort_keys=True,
+                                                            ),
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                        }
+                                    ]
+                                },
+                            }
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            state = TraceReplayLLMState(llm_service_config={"trace_path": str(trace_path), "response_delay_ms": 0})
+
+            _, original = state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "read first"}],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"absolute_path": {"type": "string"}},
+                                    "required": ["absolute_path"],
+                                },
+                            },
+                        }
+                    ],
+                },
+            )
+            duplicate_index, duplicate = state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "read first"}],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"absolute_path": {"type": "string"}},
+                                    "required": ["absolute_path"],
+                                },
+                            },
+                        }
+                    ],
+                },
+            )
+
+        self.assertEqual(duplicate_index, 1)
+        self.assertEqual(
+            original["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            duplicate["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+        )
+
+    def test_trace_replay_state_duplicate_read_only_shell_request_preserves_original_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.log"
+            trace_path.write_text(
+                "\n".join(
+                    self._tool_request_response_lines(
+                        ("check pip", "pip3 --version"),
+                    )
+                ),
+                encoding="utf-8",
+            )
+            state = TraceReplayLLMState(llm_service_config={"trace_path": str(trace_path), "response_delay_ms": 0})
+
+            _, original = state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "check pip"}],
+                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                },
+            )
+            duplicate_index, duplicate = state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "check pip"}],
+                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                },
+            )
+
+        self.assertEqual(duplicate_index, 1)
+        self.assertEqual(
+            original["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            duplicate["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+        )
+
+    def test_trace_replay_state_duplicate_system_setup_shell_request_preserves_original_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.log"
+            trace_path.write_text(
+                "\n".join(
+                    self._tool_request_response_lines(
+                        (
+                            "install deps",
+                            "apt-get install -y python3-pip && pip3 install --break-system-packages pyarrow",
+                        ),
+                    )
+                ),
+                encoding="utf-8",
+            )
+            state = TraceReplayLLMState(llm_service_config={"trace_path": str(trace_path), "response_delay_ms": 0})
+
+            _, original = state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "install deps"}],
+                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                },
+            )
+            duplicate_index, duplicate = state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "install deps"}],
+                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                },
+            )
+
+        self.assertEqual(duplicate_index, 1)
+        self.assertEqual(
+            original["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            duplicate["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+        )
 
     def test_trace_replay_state_applies_default_response_delay(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

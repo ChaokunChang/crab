@@ -556,8 +556,10 @@ class HostInspectorDaemon:
             "sandbox_id": record.sandbox_id,
             "runtime_name": record.runtime_name,
             "is_running": record.is_running,
-            "process_changed": record.is_running, # record.process_changed,
-            "filesystem_changed": record.is_running, # record.filesystem_changed,
+            # "process_changed": record.is_running, # record.process_changed,
+            # "filesystem_changed": record.is_running, # record.filesystem_changed,
+            "process_changed": record.process_changed,
+            "filesystem_changed": record.filesystem_changed,
             "observed_at": _isoformat(record.observed_at),
             "last_reset_at": _isoformat(record.last_reset_at),
             "metadata": record.metadata(),
@@ -573,7 +575,10 @@ class HostInspectorServer:
         daemon: HostInspectorDaemon | None = None,
     ) -> None:
         self._daemon = daemon or HostInspectorDaemon()
-        self._server = ThreadingHTTPServer((host, port), self._build_handler())
+        class _ReusableThreadingHTTPServer(ThreadingHTTPServer):
+            allow_reuse_address = True
+
+        self._server = _ReusableThreadingHTTPServer((host, port), self._build_handler())
         self._thread: Thread | None = None
 
     @property

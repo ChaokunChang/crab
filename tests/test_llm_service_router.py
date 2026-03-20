@@ -83,7 +83,7 @@ class BenchmarkLLMRouterTests(unittest.TestCase):
             "run_shell_command",
         )
 
-    def test_router_dispatches_to_iflow_trace_replay_and_rewinds_from_checkpoint_metadata(self) -> None:
+    def test_router_dispatches_to_iflow_trace_replay_and_deduplicates_duplicate_tool_requests_after_restore(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "trace.log"
             trace_path.write_text(
@@ -92,7 +92,11 @@ class BenchmarkLLMRouterTests(unittest.TestCase):
                         json.dumps(
                             {
                                 "type": "request",
-                                "data": {"model": "trace-model", "messages": [{"role": "user", "content": "first"}], "tools": []},
+                                "data": {
+                                    "model": "trace-model",
+                                    "messages": [{"role": "user", "content": "first"}],
+                                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                                },
                             }
                         ),
                         json.dumps(
@@ -100,7 +104,26 @@ class BenchmarkLLMRouterTests(unittest.TestCase):
                                 "type": "response",
                                 "data": {
                                     "choices": [
-                                        {"message": {"role": "assistant", "content": "first"}}
+                                        {
+                                            "finish_reason": "tool_calls",
+                                            "message": {
+                                                "role": "assistant",
+                                                "content": None,
+                                                "tool_calls": [
+                                                    {
+                                                        "id": "call-first",
+                                                        "type": "function",
+                                                        "function": {
+                                                            "name": "run_shell_command",
+                                                            "arguments": json.dumps(
+                                                                {"command": 'sh -lc "echo first >/tmp/first.txt"'},
+                                                                sort_keys=True,
+                                                            ),
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                        }
                                     ]
                                 },
                             }
@@ -108,7 +131,11 @@ class BenchmarkLLMRouterTests(unittest.TestCase):
                         json.dumps(
                             {
                                 "type": "request",
-                                "data": {"model": "trace-model", "messages": [{"role": "user", "content": "second"}], "tools": []},
+                                "data": {
+                                    "model": "trace-model",
+                                    "messages": [{"role": "user", "content": "second"}],
+                                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                                },
                             }
                         ),
                         json.dumps(
@@ -116,7 +143,26 @@ class BenchmarkLLMRouterTests(unittest.TestCase):
                                 "type": "response",
                                 "data": {
                                     "choices": [
-                                        {"message": {"role": "assistant", "content": "second"}}
+                                        {
+                                            "finish_reason": "tool_calls",
+                                            "message": {
+                                                "role": "assistant",
+                                                "content": None,
+                                                "tool_calls": [
+                                                    {
+                                                        "id": "call-second",
+                                                        "type": "function",
+                                                        "function": {
+                                                            "name": "run_shell_command",
+                                                            "arguments": json.dumps(
+                                                                {"command": 'sh -lc "echo second >/tmp/second.txt"'},
+                                                                sort_keys=True,
+                                                            ),
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                        }
                                     ]
                                 },
                             }
@@ -135,31 +181,53 @@ class BenchmarkLLMRouterTests(unittest.TestCase):
             first = router.handle_request(
                 path="/v1/chat/completions",
                 headers={"X-Agent-Sandbox-Id": "sbx-replay"},
-                payload={"model": "trace-model", "messages": [{"role": "user", "content": "first"}], "tools": []},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "first"}],
+                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                },
             )
             checkpoint_metadata = router.checkpoint_metadata("sbx-replay")
             second = router.handle_request(
                 path="/v1/chat/completions",
                 headers={"X-Agent-Sandbox-Id": "sbx-replay"},
-                payload={"model": "trace-model", "messages": [{"role": "user", "content": "second"}], "tools": []},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "second"}],
+                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                },
             )
             router.restore_from_checkpoint_metadata("sbx-replay", checkpoint_metadata)
             replayed_second = router.handle_request(
                 path="/v1/chat/completions",
                 headers={"X-Agent-Sandbox-Id": "sbx-replay"},
-                payload={"model": "trace-model", "messages": [{"role": "user", "content": "second"}], "tools": []},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "second"}],
+                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                },
             )
             router.reset_sandbox("sbx-replay")
             replayed_first = router.handle_request(
                 path="/v1/chat/completions",
                 headers={"X-Agent-Sandbox-Id": "sbx-replay"},
-                payload={"model": "trace-model", "messages": [{"role": "user", "content": "first"}], "tools": []},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "first"}],
+                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                },
             )
 
-        self.assertEqual(first["choices"][0]["message"]["content"], "first")
-        self.assertEqual(second["choices"][0]["message"]["content"], "second")
-        self.assertEqual(replayed_second["choices"][0]["message"]["content"], "second")
-        self.assertEqual(replayed_first["choices"][0]["message"]["content"], "first")
+        first_command = json.loads(first["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"])["command"]
+        second_command = json.loads(second["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"])["command"]
+        replayed_command = json.loads(replayed_second["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"])["command"]
+        replayed_first_command = json.loads(
+            replayed_first["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+        )["command"]
+        self.assertEqual(first_command, 'sh -lc "echo first >/tmp/first.txt"')
+        self.assertEqual(second_command, 'sh -lc "echo second >/tmp/second.txt"')
+        self.assertIn("/dev/null", replayed_command)
+        self.assertEqual(replayed_first_command, 'sh -lc "echo first >/tmp/first.txt"')
 
 
 if __name__ == "__main__":

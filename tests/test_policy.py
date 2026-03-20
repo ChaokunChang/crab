@@ -225,6 +225,34 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(decision.leave_running)
         self.assertEqual(decision.policy_name, "fault-tolerance")
 
+    def test_fault_tolerance_policy_uses_process_only_checkpoint_for_request_window_without_host_change(self) -> None:
+        policy = FaultToleranceCheckpointingPolicy(
+            SchedulerConfig(
+                min_checkpoint_interval_seconds=0.0,
+                force_checkpoint_after_seconds=0.0,
+                require_change_signal=True,
+                prefer_checkpoint_during_llm_request=True,
+            )
+        )
+        snapshot = SandboxSnapshot(
+            sandbox_id=SandboxId("sbx-1"),
+            runtime_name="docker",
+            is_running=True,
+            process_changed=False,
+            filesystem_changed=False,
+            observed_at=utc_now(),
+            metadata={"llm_request_in_flight": True},
+        )
+
+        decision = policy.evaluate(snapshot)
+
+        self.assertTrue(decision.should_checkpoint)
+        self.assertTrue(decision.checkpoint_process)
+        self.assertFalse(decision.checkpoint_filesystem)
+        self.assertEqual(decision.reason, "llm_request_window_available")
+        self.assertTrue(decision.leave_running)
+        self.assertEqual(decision.policy_name, "fault-tolerance")
+
     def test_spot_policy_requires_preemption_notice(self) -> None:
         policy = SpotPreemptionCheckpointingPolicy(SchedulerConfig())
         snapshot = SandboxSnapshot(

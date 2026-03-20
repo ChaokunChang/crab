@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_cr import RuncRuntime, RuncRuntimePaths, SandboxId
 from agent_cr.runtime import CommandRunner
@@ -77,6 +78,26 @@ class FakeHostInspectorClient:
 
     def unregister_sandbox(self, sandbox_id: SandboxId) -> dict[str, object]:
         self.unregister_calls.append(sandbox_id)
+        return {"ok": True}
+
+
+class FlakyHostInspectorClient(FakeHostInspectorClient):
+    def __init__(self, *, failures_before_success: int) -> None:
+        super().__init__()
+        self._failures_before_success = failures_before_success
+
+    def register_sandbox(
+        self,
+        sandbox_id: SandboxId,
+        runtime: str,
+        object_id: str,
+        *,
+        ignore_process_rules=None,
+    ) -> dict[str, object]:
+        self.register_calls.append((sandbox_id, runtime, object_id, ignore_process_rules))
+        if self._failures_before_success > 0:
+            self._failures_before_success -= 1
+            raise TimeoutError("timed out")
         return {"ok": True}
 
 
@@ -177,6 +198,42 @@ class SandboxManagerTests(unittest.TestCase):
                     )
                 ],
             )
+
+    def test_runc_sandbox_manager_retries_host_inspector_registration(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_sandbox_mgr_") as tmp:
+            root = Path(tmp)
+            runner = FakeCommandRunner()
+            host_inspector = FlakyHostInspectorClient(failures_before_success=2)
+            manager = RuncSandboxManager(
+                command_runner=runner,
+                host_inspector_client=host_inspector,
+                paths=RuncSandboxManagerPaths(
+                    state_root=root / "state",
+                    bundle_root=root / "bundles",
+                    metadata_root=root / "metadata",
+                    zfs_dataset_prefix="pool/agent-cr",
+                ),
+            )
+
+            with patch("agent_cr.runtime.runc.time.sleep") as sleep:
+                sandbox_id = manager.launch(
+                    "runc",
+                    {
+                        "sandbox_id": "sbx-retry",
+                        "bundle_path": str(root / "bundles" / "sbx-retry"),
+                    },
+                )
+
+            self.assertEqual(sandbox_id, SandboxId("sbx-retry"))
+            self.assertEqual(
+                host_inspector.register_calls,
+                [
+                    (SandboxId("sbx-retry"), "runc", "sbx-retry", None),
+                    (SandboxId("sbx-retry"), "runc", "sbx-retry", None),
+                    (SandboxId("sbx-retry"), "runc", "sbx-retry", None),
+                ],
+            )
+            self.assertEqual(sleep.call_count, 2)
 
     def test_runc_resume_treats_not_paused_as_benign_when_container_is_already_running(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_sandbox_mgr_") as tmp:

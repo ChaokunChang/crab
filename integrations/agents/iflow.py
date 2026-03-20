@@ -22,7 +22,6 @@ from integrations.sandboxes.runtime.bundle import merge_environment_defaults
 
 logger = logging.getLogger(__name__)
 
-SANDBOX_TASK_OUTPUT_DIR = Path("/data/iflow-task-logs")
 IFLOW_WRAPPER_ARG = "--agent-cr-iflow-wrapper"
 _IFLOW_INLINE_WRAPPER = """
 const fs = require("fs");
@@ -240,11 +239,8 @@ class IFlowAgent(BaseAgent):
                     f"export AGENT_CR_IFLOW_EXIT_PATH={shlex.quote(marker_mount_paths['exit'])}",
                     f"cd {shlex.quote(compose_cwd)}",
                     *_INSTALL_AGENT_SETUP_COMMANDS,
-                    f"mkdir -p {shlex.quote(str(SANDBOX_TASK_OUTPUT_DIR))}",
                     (
                         "rm -f "
-                        f"{shlex.quote(str(output_paths['stdout']))} "
-                        f"{shlex.quote(str(output_paths['stderr']))} "
                         f"{shlex.quote(marker_mount_paths['exit'])} "
                         f"{shlex.quote(marker_mount_paths['done'])}"
                     ),
@@ -278,11 +274,8 @@ class IFlowAgent(BaseAgent):
                     f"export AGENT_CR_IFLOW_EXIT_PATH={shlex.quote(marker_mount_paths['exit'])}",
                     "cd /work",
                     *_INSTALL_AGENT_SETUP_COMMANDS,
-                    f"mkdir -p {shlex.quote(str(SANDBOX_TASK_OUTPUT_DIR))}",
                     (
                         "rm -f "
-                        f"{shlex.quote(str(output_paths['stdout']))} "
-                        f"{shlex.quote(str(output_paths['stderr']))} "
                         f"{shlex.quote(marker_mount_paths['exit'])} "
                         f"{shlex.quote(marker_mount_paths['done'])}"
                     ),
@@ -465,8 +458,8 @@ class IFlowAgent(BaseAgent):
 
     def _sandbox_task_output_paths(self) -> dict[str, Path]:
         return {
-            "stdout": SANDBOX_TASK_OUTPUT_DIR / "iflow.task.stdout",
-            "stderr": SANDBOX_TASK_OUTPUT_DIR / "iflow.task.stderr",
+            "stdout": Path("/dev/null"),
+            "stderr": Path("/dev/null"),
         }
 
     def _sandbox_is_live(self) -> bool:

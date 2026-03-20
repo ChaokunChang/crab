@@ -6,8 +6,12 @@ llm_service: iflow_trace_replay
 task_dataset: /root/workspace/agent-cr/results/datasets/termnius_iflow_replay.jsonl
 sandboxes: 10
 iterations: 5
-output: ../../logs/tmp/iflow.fault.auto.large.chunkfix.clean.csv
-log_file: ../../logs/tmp/iflow.fault.auto.large.chunkfix.clean.log
+output: ../../logs/iflow.fault.auto.debug.csv
+log_file: ../../logs/iflow.fault.auto.debug.log
+zpool_size: 64G
+zpool_name: agentcrbench-full
+zpool_image: /root/workspace/agent-cr/data/agent_cr/results/zpool/agentcrbench-full.zpool.img
+reuse_zpool: true
 log_level: debug
 scenario_options:
   injection_rate: 0.0

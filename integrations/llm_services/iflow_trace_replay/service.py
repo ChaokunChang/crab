@@ -7,15 +7,76 @@ import logging
 import re
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 _DEFAULT_RESPONSE_DELAY_MS = 250
 _TOOL_RESULT_SENTINEL = "<tool-result>"
+_TOOL_ARGUMENTS_SENTINEL = "<tool-arguments>"
 _IFLOW_SYSTEM_PROMPT_SENTINEL = "<iflow-system-prompt>"
 _IFLOW_CONTEXT_SENTINEL = "<iflow-context-bootstrap>"
 _IFLOW_CONTEXT_ACK_SENTINEL = "<iflow-context-ack>"
+_DUMMY_TOOL_RESPONSE_MODEL = "agent-cr-iflow-trace-replay"
+_DUMMY_TOOL_COMMAND = 'sh -lc "echo hello world >> /dev/null"'
+_READ_ONLY_SHELL_PREFIXES: tuple[str, ...] = (
+    "apt-cache ",
+    "cat ",
+    "curl --head ",
+    "dpkg -l",
+    "env",
+    "file ",
+    "find ",
+    "git branch",
+    "git diff",
+    "git log",
+    "git rev-parse",
+    "git show",
+    "git status",
+    "grep ",
+    "head ",
+    "id",
+    "ls ",
+    "lsof ",
+    "md5sum ",
+    "pip --version",
+    "pip3 --version",
+    "printenv",
+    "ps ",
+    "pwd",
+    "python --version",
+    "python3 --version",
+    "python3 -m pip --version",
+    "readlink ",
+    "realpath ",
+    "rg ",
+    "sed -n ",
+    "sha256sum ",
+    "ss ",
+    "stat ",
+    "tail ",
+    "uname",
+    "wc ",
+    "which ",
+)
+_MUTATING_SHELL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?:^|[;&|]\s*|&&\s*|\|\|\s*)(?:rm|mv|cp|touch|mkdir|rmdir|install|chmod|chown|ln|patch)\b"),
+    re.compile(r"(?:^|[;&|]\s*|&&\s*|\|\|\s*)(?:make|cmake|ninja|cargo|go\s+build|gcc|g\+\+|clang|clang\+\+)\b"),
+    re.compile(r"(?:^|[;&|]\s*|&&\s*|\|\|\s*)(?:apt|apt-get)\s+(?:install|remove|upgrade|dist-upgrade)\b"),
+    re.compile(r"(?:^|[;&|]\s*|&&\s*|\|\|\s*)(?:pip|pip3|uv\s+pip|npm|pnpm|yarn)\s+(?:install|add|remove|update|upgrade)\b"),
+    re.compile(r"(?:^|[;&|]\s*|&&\s*|\|\|\s*)python(?:3)?\s+[^;&|]*\.py\b"),
+    re.compile(r"(?:^|[;&|]\s*|&&\s*|\|\|\s*)sh\s+-lc\s+\"[^\"]*>>?[^\"]*\""),
+    re.compile(r"(?:^|[;&|]\s*|&&\s*|\|\|\s*)bash\s+-lc\s+\"[^\"]*>>?[^\"]*\""),
+    re.compile(r">>?(?![&|])"),
+    re.compile(r"\|\s*tee\b"),
+)
+_SYSTEM_SETUP_SHELL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?:^|[;&|]\s*|&&\s*|\|\|\s*)(?:apt|apt-get)\s+(?:update|install|remove|upgrade|dist-upgrade)\b"),
+    re.compile(r"(?:^|[;&|]\s*|&&\s*|\|\|\s*)(?:pip|pip3|uv\s+pip)\s+(?:install|uninstall|remove|update|upgrade)\b"),
+    re.compile(r"(?:^|[;&|]\s*|&&\s*|\|\|\s*)python(?:3)?\s+-m\s+(?:pip|ensurepip)\b"),
+    re.compile(r"bootstrap\.pypa\.io/get-pip\.py"),
+)
 _VOLATILE_TEXT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(
@@ -119,7 +180,7 @@ def _normalize_tool_calls(tool_calls: object) -> list[object]:
         if isinstance(function, dict):
             payload["function"] = {
                 "name": function.get("name"),
-                "arguments": function.get("arguments"),
+                "arguments": _TOOL_ARGUMENTS_SENTINEL,
             }
         normalized.append(payload)
     return normalized
@@ -195,6 +256,192 @@ def _lookup_stats(path: str, payload: dict[str, Any]) -> tuple[str, int, int, in
 
 def _response_fingerprint(payload: dict[str, Any]) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _tool_specs(payload: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    tools = payload.get("tools")
+    if not isinstance(tools, list):
+        return []
+    specs: list[tuple[str, dict[str, Any]]] = []
+    for item in tools:
+        if not isinstance(item, dict):
+            continue
+        function = item.get("function")
+        if not isinstance(function, dict):
+            continue
+        name = function.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        parameters = function.get("parameters")
+        specs.append((name, parameters if isinstance(parameters, dict) else {}))
+    return specs
+
+
+def _tool_parameters_by_name(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    parameters_by_name: dict[str, dict[str, Any]] = {}
+    for name, parameters in _tool_specs(payload):
+        parameters_by_name.setdefault(name, parameters)
+    return parameters_by_name
+
+
+def _tool_priority(name: str) -> tuple[int, str]:
+    normalized = name.lower()
+    if normalized == "run_shell_command":
+        return (0, normalized)
+    if any(token in normalized for token in ("read", "show", "list", "fetch")):
+        return (1, normalized)
+    if "write" in normalized:
+        return (2, normalized)
+    return (3, normalized)
+
+
+def _dummy_value_for_schema(*, name: str, schema: dict[str, Any]) -> object:
+    const = schema.get("const")
+    if const is not None:
+        return const
+    enum = schema.get("enum")
+    if isinstance(enum, list) and enum:
+        return enum[0]
+    for key in ("oneOf", "anyOf", "allOf"):
+        variants = schema.get(key)
+        if isinstance(variants, list):
+            for variant in variants:
+                if isinstance(variant, dict):
+                    return _dummy_value_for_schema(name=name, schema=variant)
+    normalized_name = name.lower()
+    if normalized_name in {"command", "cmd", "script"} or normalized_name.endswith("_command"):
+        return _DUMMY_TOOL_COMMAND
+    if normalized_name in {"path", "file_path", "filepath", "filename"} or normalized_name.endswith("_path"):
+        return "/dev/null"
+    if normalized_name in {"dirname", "directory", "dir"}:
+        return "."
+    if normalized_name in {"url", "uri"}:
+        return "http://127.0.0.1/"
+    if normalized_name in {"content", "text", "body", "message", "note", "line", "query"}:
+        return "agent-cr replay noop"
+    value_type = schema.get("type")
+    if value_type == "boolean":
+        return False
+    if value_type == "integer":
+        return 0
+    if value_type == "number":
+        return 0
+    if value_type == "array":
+        return []
+    if value_type == "object":
+        return {}
+    return ""
+
+
+def _dummy_tool_input(tool_name: str, parameters: dict[str, Any]) -> dict[str, Any]:
+    normalized_name = tool_name.lower()
+    if normalized_name == "run_shell_command":
+        return {"command": _DUMMY_TOOL_COMMAND}
+    properties = parameters.get("properties")
+    required = parameters.get("required")
+    if not isinstance(properties, dict):
+        return {}
+    required_names = [str(item) for item in required] if isinstance(required, list) else []
+    property_names = required_names or [str(name) for name in properties.keys()]
+    payload: dict[str, Any] = {}
+    for property_name in property_names:
+        schema = properties.get(property_name)
+        if isinstance(schema, dict):
+            payload[property_name] = _dummy_value_for_schema(name=property_name, schema=schema)
+    return payload
+
+
+def _is_read_only_shell_command(command: str) -> bool:
+    normalized = command.strip()
+    if not normalized:
+        return False
+    if any(pattern.search(normalized) for pattern in _MUTATING_SHELL_PATTERNS):
+        return False
+    lowered = normalized.lower()
+    return lowered.startswith(_READ_ONLY_SHELL_PREFIXES)
+
+
+def _should_preserve_duplicate_shell_command(command: str) -> bool:
+    normalized = command.strip()
+    if not normalized:
+        return False
+    if _is_read_only_shell_command(normalized):
+        return True
+    return any(pattern.search(normalized) for pattern in _SYSTEM_SETUP_SHELL_PATTERNS)
+
+
+def _is_tool_call_response(payload: dict[str, Any]) -> bool:
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return False
+    first_choice = choices[0]
+    if not isinstance(first_choice, dict):
+        return False
+    message = first_choice.get("message")
+    if not isinstance(message, dict):
+        return False
+    tool_calls = message.get("tool_calls")
+    return isinstance(tool_calls, list) and len(tool_calls) > 0
+
+
+def _build_dummy_tool_response(*, request_payload: dict[str, Any], original_response: dict[str, Any]) -> dict[str, Any] | None:
+    choices = original_response.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    first_choice = choices[0]
+    if not isinstance(first_choice, dict):
+        return None
+    message = first_choice.get("message")
+    if not isinstance(message, dict):
+        return None
+    original_tool_calls = message.get("tool_calls")
+    if not isinstance(original_tool_calls, list) or not original_tool_calls:
+        return None
+    parameters_by_name = _tool_parameters_by_name(request_payload)
+    if not parameters_by_name:
+        return None
+    response = copy.deepcopy(original_response)
+    response["model"] = _DUMMY_TOOL_RESPONSE_MODEL
+    response["id"] = f"chatcmpl-iflow-replay-dummy-{uuid.uuid4().hex[:8]}"
+    response["created"] = int(time.time())
+    response["usage"] = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    response_choices = response.get("choices")
+    assert isinstance(response_choices, list)
+    response_choice = response_choices[0]
+    assert isinstance(response_choice, dict)
+    response_message = response_choice.get("message")
+    assert isinstance(response_message, dict)
+    response_tool_calls = response_message.get("tool_calls")
+    assert isinstance(response_tool_calls, list)
+    for tool_call in response_tool_calls:
+        if not isinstance(tool_call, dict):
+            continue
+        function = tool_call.get("function")
+        if not isinstance(function, dict):
+            continue
+        tool_name = function.get("name")
+        if not isinstance(tool_name, str) or not tool_name:
+            continue
+        if tool_name.lower() != "run_shell_command":
+            continue
+        original_arguments = function.get("arguments")
+        if isinstance(original_arguments, str):
+            try:
+                original_payload = json.loads(original_arguments)
+            except json.JSONDecodeError:
+                original_payload = None
+            if isinstance(original_payload, dict):
+                original_command = original_payload.get("command")
+                if isinstance(original_command, str) and _should_preserve_duplicate_shell_command(original_command):
+                    continue
+                rewritten_payload = dict(original_payload)
+                rewritten_payload["command"] = _DUMMY_TOOL_COMMAND
+                function["arguments"] = json.dumps(rewritten_payload, sort_keys=True)
+                continue
+        parameters = parameters_by_name.get(tool_name, {})
+        tool_input = _dummy_tool_input(tool_name, parameters)
+        function["arguments"] = json.dumps(tool_input, sort_keys=True)
+    return response
 
 
 def parse_replay_trace(trace_path: Path) -> ParsedReplayTrace:
@@ -281,7 +528,9 @@ class TraceReplayLLMState:
         self._response_delay_ms = max(0, response_delay_ms)
         self._events: list[dict[str, Any]] = []
         self._matched_response_count = 0
+        self._duplicate_response_count = 0
         self._total_progress_responses = len(parsed.exchanges)
+        self._served_request_keys: set[tuple[str, int, int, int, int]] = set()
         self._responses_by_key = {exchange.lookup_key: exchange for exchange in parsed.exchanges}
         self._hashes_by_shape: dict[tuple[int, int, int, int], list[str]] = {}
         for exchange in parsed.exchanges:
@@ -300,6 +549,8 @@ class TraceReplayLLMState:
     def reset(self) -> None:
         with self._lock:
             self._matched_response_count = 0
+            self._duplicate_response_count = 0
+            self._served_request_keys.clear()
             self._events.clear()
 
     def next_response(self, *, path: str, headers: dict[str, str], payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -324,19 +575,44 @@ class TraceReplayLLMState:
                 f"hash={lookup_key[0][:12]} messages={lookup_key[1]} tool_messages={lookup_key[3]}"
             ) from exc
         with self._lock:
-            self._matched_response_count += 1
-            matched_response_count = self._matched_response_count
+            is_duplicate = lookup_key in self._served_request_keys
+            response_kind = "replay"
+            if is_duplicate:
+                matched_response_count = self._matched_response_count
+                self._duplicate_response_count += 1
+                if _is_tool_call_response(exchange.response):
+                    response = _build_dummy_tool_response(request_payload=payload, original_response=exchange.response)
+                    if response is None:
+                        logger.warning(
+                            "Replay duplicate request fell back to original response because no tool schema was advertised "
+                            "path=%s hash=%s",
+                            path,
+                            lookup_key[0][:12],
+                        )
+                        response = exchange.response
+                        response_kind = "duplicate_original"
+                    else:
+                        response_kind = "duplicate_dummy_tool"
+                else:
+                    response = exchange.response
+                    response_kind = "duplicate_original"
+            else:
+                self._served_request_keys.add(lookup_key)
+                self._matched_response_count += 1
+                matched_response_count = self._matched_response_count
+                response = exchange.response
             self._events.append(
                 {
                     "event": "response",
                     "sandbox_id": sandbox_id,
                     "request_hash": lookup_key[0],
                     "matched_response_count": matched_response_count,
+                    "response_kind": response_kind,
                 }
             )
         if self._response_delay_ms > 0:
             time.sleep(self._response_delay_ms / 1000.0)
-        return matched_response_count, copy.deepcopy(exchange.response)
+        return matched_response_count, copy.deepcopy(response)
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -346,6 +622,7 @@ class TraceReplayLLMState:
                 "response_delay_ms": self._response_delay_ms,
                 "total_responses": self._total_progress_responses,
                 "matched_response_count": matched_response_count,
+                "duplicate_response_count": self._duplicate_response_count,
                 "next_response_index": matched_response_count,
                 "responses_served": matched_response_count,
                 "is_complete": matched_response_count >= self._total_progress_responses,

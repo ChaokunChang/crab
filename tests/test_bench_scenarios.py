@@ -11,6 +11,7 @@ from unittest import mock
 from agent_cr import CheckpointId, JobStatus, SandboxId
 from integrations.agents import SandboxHandle
 from benchmarks.config import BenchmarkConfig
+from benchmarks.real_host_scenario_base import RealHostScenarioHarness
 from benchmarks.scenarios.common import choose_replay_chunk_targets, wait_for_auto_replay_checkpoint
 from benchmarks.scenarios.fault import (
     parse_fault_options,
@@ -397,6 +398,25 @@ class FaultScenarioTests(unittest.TestCase):
 
         self.assertIsNotNone(manifest)
         self.assertEqual(checkpoint_actions, 4)
+
+    def test_list_checkpoint_manifests_skips_manifest_deleted_during_enumeration(self) -> None:
+        class _Storage:
+            def list_checkpoints(self, sandbox_id):
+                _ = sandbox_id
+                return [CheckpointId("ckpt-1"), CheckpointId("ckpt-2")]
+
+            def get_manifest(self, sandbox_id, checkpoint_id):
+                _ = sandbox_id
+                if checkpoint_id == CheckpointId("ckpt-1"):
+                    return SimpleNamespace(checkpoint_id=checkpoint_id, metadata={"benchmark_replay_action_count": 1})
+                raise FileNotFoundError("manifest pruned")
+
+        harness = RealHostScenarioHarness.__new__(RealHostScenarioHarness)
+        harness.storage = _Storage()
+
+        manifests = harness.list_checkpoint_manifests(SandboxId("fault-0"))
+
+        self.assertEqual([manifest.checkpoint_id for manifest in manifests], [CheckpointId("ckpt-1")])
 
     def test_replay_auto_mode_waits_for_completion_and_runs_final_verification(self) -> None:
         harness = _BaseScenarioHarness()

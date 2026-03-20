@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import errno
 import json
 import logging
 import shutil
@@ -251,25 +252,39 @@ class RealHostScenarioHarness:
     def _start_host_inspector_server(self) -> str:
         assert self.runtime_state_root is not None
         if self._host_inspector_server is not None:
-            return f"http://{_HOST_INSPECTOR_HOST}:{_HOST_INSPECTOR_PORT}"
+            return f"http://{_HOST_INSPECTOR_HOST}:{self._host_inspector_server.port}"
 
         self.runtime_state_root.mkdir(parents=True, exist_ok=True)
-        self._host_inspector_server = HostInspectorServer(
-            host=_HOST_INSPECTOR_HOST,
-            port=_HOST_INSPECTOR_PORT,
-            daemon=HostInspectorDaemon(
-                resolver=RuntimeResolver(runc_state_root=self.runtime_state_root),
-                fs_monitor=LibbpfFilesystemMonitor(),
-            ),
+        daemon = HostInspectorDaemon(
+            resolver=RuntimeResolver(runc_state_root=self.runtime_state_root),
+            fs_monitor=LibbpfFilesystemMonitor(),
         )
+        try:
+            self._host_inspector_server = HostInspectorServer(
+                host=_HOST_INSPECTOR_HOST,
+                port=_HOST_INSPECTOR_PORT,
+                daemon=daemon,
+            )
+        except OSError as exc:
+            if exc.errno != errno.EADDRINUSE:
+                raise
+            logger.warning(
+                "Host inspector port %d is already in use; falling back to an ephemeral port",
+                _HOST_INSPECTOR_PORT,
+            )
+            self._host_inspector_server = HostInspectorServer(
+                host=_HOST_INSPECTOR_HOST,
+                port=0,
+                daemon=daemon,
+            )
         logger.info(
             "Starting host inspector server in-process host=%s port=%d runc_state_root=%s",
             _HOST_INSPECTOR_HOST,
-            _HOST_INSPECTOR_PORT,
+            self._host_inspector_server.port,
             self.runtime_state_root,
         )
         self._host_inspector_server.start()
-        url = f"http://{_HOST_INSPECTOR_HOST}:{_HOST_INSPECTOR_PORT}"
+        url = f"http://{_HOST_INSPECTOR_HOST}:{self._host_inspector_server.port}"
         try:
             wait_for_http_json(f"{url}/healthz")
         except Exception:
@@ -1070,7 +1085,17 @@ class RealHostScenarioHarness:
 
     def list_checkpoint_manifests(self, sandbox_id: SandboxId) -> list[CheckpointManifest]:
         assert self.storage is not None
-        return [self.storage.get_manifest(sandbox_id, checkpoint_id) for checkpoint_id in self.storage.list_checkpoints(sandbox_id)]
+        manifests: list[CheckpointManifest] = []
+        for checkpoint_id in self.storage.list_checkpoints(sandbox_id):
+            try:
+                manifests.append(self.storage.get_manifest(sandbox_id, checkpoint_id))
+            except FileNotFoundError:
+                logger.debug(
+                    "Skipped checkpoint manifest that disappeared during enumeration sandbox=%s checkpoint=%s",
+                    sandbox_id,
+                    checkpoint_id,
+                )
+        return manifests
 
     def collect_tree_search_checkpoints(
         self,

@@ -119,6 +119,7 @@ class DefaultCWorker(CompositeCheckpointWorker):
         self._telemetry = telemetry or NoopTelemetrySink()
 
     def checkpoint(self, job: CheckpointJob) -> CheckpointResult:
+        job = self._ensure_restorable_checkpoint(job)
         started = utc_now()
         checkpoint_id = CheckpointId(str(job.metadata.get("checkpoint_id", CheckpointId.new())))
         if self._checkpoint_guard is not None:
@@ -308,6 +309,39 @@ class DefaultCWorker(CompositeCheckpointWorker):
             manifest=manifest,
             operation_statuses=operation_statuses,
         )
+
+    def _ensure_restorable_checkpoint(self, job: CheckpointJob) -> CheckpointJob:
+        if job.checkpoint_process or not job.checkpoint_filesystem:
+            return job
+        if self._has_process_ancestor(job.sandbox_id):
+            return job
+        logger.info(
+            "Promoting checkpoint scope to include process for sandbox %s because no prior process checkpoint exists",
+            job.sandbox_id,
+        )
+        metadata = dict(job.metadata)
+        metadata.setdefault("promoted_process_checkpoint", True)
+        metadata.setdefault("promoted_process_checkpoint_reason", "missing_process_ancestor")
+        return replace(job, checkpoint_process=True, metadata=metadata)
+
+    def _has_process_ancestor(self, sandbox_id) -> bool:
+        try:
+            checkpoint_ids = self._checkpoint_manager.list_checkpoints(sandbox_id)
+        except Exception:
+            logger.warning(
+                "Falling back to process checkpoint for sandbox %s because existing checkpoints could not be listed",
+                sandbox_id,
+            )
+            return False
+
+        for checkpoint_id in reversed(checkpoint_ids):
+            try:
+                manifest = self._checkpoint_manager.get_manifest(sandbox_id, checkpoint_id)
+            except FileNotFoundError:
+                continue
+            if manifest.process_artifacts:
+                return True
+        return False
 
     def _timed_checkpoint_process(
         self,

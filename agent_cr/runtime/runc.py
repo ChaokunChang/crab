@@ -17,6 +17,8 @@ from ..telemetry import NoopTelemetrySink
 from .base import CommandResult, CommandRunner, SubprocessCommandRunner
 
 logger = logging.getLogger(__name__)
+_HOST_INSPECTOR_REGISTER_ATTEMPTS = 3
+_HOST_INSPECTOR_REGISTER_RETRY_DELAY_S = 0.2
 
 
 @dataclass(frozen=True)
@@ -608,16 +610,28 @@ class RuncRuntime(Runtime):
     def _register_with_host_inspector(self, description: SandboxDescription) -> None:
         if self._host_inspector_client is None:
             return
-        try:
-            ignore_process_rules = description.metadata.get("host_inspector_ignore_process_rules")
-            self._host_inspector_client.register_sandbox(
-                description.sandbox_id,
-                self.name,
-                str(description.sandbox_id),
-                ignore_process_rules=None if ignore_process_rules is None else list(ignore_process_rules),
-            )
-        except Exception:
-            logger.exception("Failed to register sandbox %s with host inspector", description.sandbox_id)
+        ignore_process_rules = description.metadata.get("host_inspector_ignore_process_rules")
+        for attempt in range(1, _HOST_INSPECTOR_REGISTER_ATTEMPTS + 1):
+            try:
+                self._host_inspector_client.register_sandbox(
+                    description.sandbox_id,
+                    self.name,
+                    str(description.sandbox_id),
+                    ignore_process_rules=None if ignore_process_rules is None else list(ignore_process_rules),
+                )
+                return
+            except Exception as exc:
+                if attempt >= _HOST_INSPECTOR_REGISTER_ATTEMPTS:
+                    logger.exception("Failed to register sandbox %s with host inspector", description.sandbox_id)
+                    return
+                logger.warning(
+                    "Host inspector registration attempt %d/%d failed for sandbox %s; retrying: %s",
+                    attempt,
+                    _HOST_INSPECTOR_REGISTER_ATTEMPTS,
+                    description.sandbox_id,
+                    exc,
+                )
+                time.sleep(_HOST_INSPECTOR_REGISTER_RETRY_DELAY_S)
 
     def _metadata_path(self, sandbox_id: SandboxId) -> Path:
         return self._paths.metadata_root / f"{sandbox_id}.json"

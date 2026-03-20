@@ -12,6 +12,7 @@ from agent_cr import (
     AdapterProcessRWorker,
     ArtifactKind,
     ArtifactPayload,
+    ArtifactReference,
     CheckpointId,
     CheckpointJob,
     CheckpointManager,
@@ -152,15 +153,24 @@ class RecordingCheckpointWorker:
 
 
 class RecordingCheckpointManager:
-    def __init__(self) -> None:
+    def __init__(self, existing_manifests: list[CheckpointManifest] | None = None) -> None:
         self.manifest: CheckpointManifest | None = None
         self.completed: list[CheckpointManifest] = []
+        self._manifests: dict[tuple[SandboxId, CheckpointId], CheckpointManifest] = {}
+        self._ordered: dict[SandboxId, list[CheckpointId]] = {}
+        for manifest in existing_manifests or []:
+            self._manifests[(manifest.sandbox_id, manifest.checkpoint_id)] = manifest
+            self._ordered.setdefault(manifest.sandbox_id, []).append(manifest.checkpoint_id)
 
     def put_manifest(self, manifest: CheckpointManifest) -> None:
         self.manifest = manifest
+        self._manifests[(manifest.sandbox_id, manifest.checkpoint_id)] = manifest
+        self._ordered.setdefault(manifest.sandbox_id, []).append(manifest.checkpoint_id)
 
     def get_manifest(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> CheckpointManifest:
-        _ = (sandbox_id, checkpoint_id)
+        manifest = self._manifests.get((sandbox_id, checkpoint_id))
+        if manifest is not None:
+            return manifest
         assert self.manifest is not None
         return self.manifest
 
@@ -180,8 +190,7 @@ class RecordingCheckpointManager:
         return b""
 
     def list_checkpoints(self, sandbox_id: SandboxId) -> list[CheckpointId]:
-        _ = sandbox_id
-        return []
+        return list(self._ordered.get(sandbox_id, []))
 
     def delete_checkpoint(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> None:
         _ = (sandbox_id, checkpoint_id)
@@ -556,6 +565,71 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(process_worker.calls, [])
         self.assertEqual(filesystem_worker.calls, [])
         self.assertEqual(manager.completed, [])
+
+    def test_default_checkpoint_worker_promotes_first_filesystem_only_checkpoint(self) -> None:
+        manager = RecordingCheckpointManager()
+        process_worker = RecordingCheckpointWorker("process")
+        filesystem_worker = RecordingCheckpointWorker("filesystem")
+        worker = DefaultCWorker(
+            process_worker=process_worker,
+            filesystem_worker=filesystem_worker,
+            checkpoint_manager=manager,
+            runtime=DockerRuntimeAdapter(),
+        )
+        job = CheckpointJob(
+            job_id=JobId("job-fs-first"),
+            sandbox_id=SandboxId("sbx-1"),
+            requested_at=utc_now(),
+            checkpoint_process=False,
+            checkpoint_filesystem=True,
+        )
+
+        result = worker.checkpoint(job)
+
+        self.assertEqual(result.status.value, "succeeded")
+        self.assertEqual(len(process_worker.calls), 1)
+        self.assertEqual(len(filesystem_worker.calls), 1)
+        assert result.manifest is not None
+        self.assertTrue(result.manifest.metadata["promoted_process_checkpoint"])
+        self.assertEqual(result.manifest.metadata["promoted_process_checkpoint_reason"], "missing_process_ancestor")
+
+    def test_default_checkpoint_worker_keeps_filesystem_only_scope_with_process_ancestor(self) -> None:
+        sid = SandboxId("sbx-1")
+        prior_process = CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=CheckpointId("ckpt-1"),
+            sandbox_id=sid,
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version=None,
+            process_artifacts=[ArtifactReference(kind=ArtifactKind.PROCESS, name="process.json", relative_path="p", size_bytes=1, sha256="0" * 64, metadata={})],
+            filesystem_artifacts=[],
+            metadata={},
+        ).with_integrity()
+        manager = RecordingCheckpointManager(existing_manifests=[prior_process])
+        process_worker = RecordingCheckpointWorker("process")
+        filesystem_worker = RecordingCheckpointWorker("filesystem")
+        worker = DefaultCWorker(
+            process_worker=process_worker,
+            filesystem_worker=filesystem_worker,
+            checkpoint_manager=manager,
+            runtime=DockerRuntimeAdapter(),
+        )
+        job = CheckpointJob(
+            job_id=JobId("job-fs-next"),
+            sandbox_id=sid,
+            requested_at=utc_now(),
+            checkpoint_process=False,
+            checkpoint_filesystem=True,
+        )
+
+        result = worker.checkpoint(job)
+
+        self.assertEqual(result.status.value, "succeeded")
+        self.assertEqual(len(process_worker.calls), 0)
+        self.assertEqual(len(filesystem_worker.calls), 1)
+        assert result.manifest is not None
+        self.assertNotIn("promoted_process_checkpoint", result.manifest.metadata)
 
     def test_default_restore_worker_backfills_missing_process_from_previous_checkpoint(self) -> None:
         sid = SandboxId("sbx-1")
