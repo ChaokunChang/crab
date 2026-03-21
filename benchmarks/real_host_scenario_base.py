@@ -1710,18 +1710,23 @@ class RealHostScenarioHarness:
         if self.llm_server is None:
             return {}
         try:
-            return self.llm_server.benchmark_llm_router.checkpoint_metadata(str(sandbox_id))  # type: ignore[attr-defined]
+            snapshot = self.llm_server.benchmark_llm_router.snapshot()  # type: ignore[attr-defined]
         except Exception:
             logger.exception("Failed to capture llm service checkpoint metadata for sandbox=%s", sandbox_id)
             return {}
-
-    def _restore_llm_service_state(self, sandbox_id: SandboxId, manifest: CheckpointManifest) -> None:
-        if self.llm_server is None:
-            return
-        self.llm_server.benchmark_llm_router.restore_from_checkpoint_metadata(  # type: ignore[attr-defined]
-            str(sandbox_id),
-            manifest.metadata,
-        )
+        sandbox_snapshot = snapshot.get(str(sandbox_id))
+        if not isinstance(sandbox_snapshot, dict):
+            return {}
+        if sandbox_snapshot.get("llm_service_type") != "iflow_trace_replay":
+            return {}
+        state = sandbox_snapshot.get("state")
+        if not isinstance(state, dict):
+            return {}
+        try:
+            matched_response_count = max(0, int(state.get("matched_response_count", 0)))
+        except (TypeError, ValueError):
+            return {}
+        return {"benchmark_replay_action_count": matched_response_count}
 
     def _reset_llm_service_state(self, sandbox_id: SandboxId) -> None:
         if self.llm_server is None:
@@ -1730,6 +1735,31 @@ class RealHostScenarioHarness:
             self.llm_server.benchmark_llm_router.reset_sandbox(str(sandbox_id))  # type: ignore[attr-defined]
         except Exception:
             logger.exception("Failed to reset llm service state for sandbox=%s", sandbox_id)
+
+    def _restore_llm_service_state(self, sandbox_id: SandboxId, manifest: CheckpointManifest) -> None:
+        if self.llm_server is None:
+            return
+        metadata = manifest.metadata if isinstance(manifest.metadata, dict) else {}
+        raw_value = metadata.get("process_restore_replay_action_count")
+        try:
+            matched_response_count = max(0, int(raw_value))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Skipping llm service state restore for sandbox=%s because process_restore_replay_action_count is missing or invalid",
+                sandbox_id,
+            )
+            return
+        try:
+            self.llm_server.benchmark_llm_router.restore_sandbox(  # type: ignore[attr-defined]
+                str(sandbox_id),
+                matched_response_count=matched_response_count,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to restore llm service state for sandbox=%s matched_response_count=%s",
+                sandbox_id,
+                matched_response_count,
+            )
 
     def _set_sandbox_running_state(self, sandbox_id: SandboxId, *, is_running: bool) -> None:
         assert self.base_inspector is not None

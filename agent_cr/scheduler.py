@@ -76,6 +76,17 @@ class CheckpointingPolicy:
                 policy_name=self.name,
             )
 
+        # for debug purpose, let's force full checkpoint if there is no checkpoint avaialble.
+        if snapshot.last_checkpoint_at is None:
+            return SchedulerCheckpointDecision(
+                should_checkpoint=False,
+                checkpoint_process=True,
+                checkpoint_filesystem=True,
+                leave_running=False,
+                reason="no_previous_checkpoint",
+                policy_name=self.name,
+            )
+
         request_in_flight = bool(snapshot.metadata.get("llm_request_in_flight", False))
         if self._config.require_change_signal and not changed:
             return SchedulerCheckpointDecision(

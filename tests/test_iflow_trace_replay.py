@@ -115,7 +115,7 @@ class IFlowTraceReplayTests(unittest.TestCase):
         self.assertEqual(parsed.responses[1]["choices"][0]["message"]["content"], "second")
         self.assertEqual(list(parsed.malformed_lines), [1])
 
-    def test_trace_replay_state_checkpoint_restore_returns_dummy_tool_call_for_duplicate_request(self) -> None:
+    def test_trace_replay_state_duplicate_tool_request_returns_dummy_tool_call(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "trace.log"
             trace_path.write_text(
@@ -138,7 +138,6 @@ class IFlowTraceReplayTests(unittest.TestCase):
                     "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
                 },
             )
-            checkpoint = state.checkpoint_metadata()
             second_index, second = state.next_response(
                 path="/v1/chat/completions",
                 headers={"X-Agent-Sandbox-Id": "sbx"},
@@ -148,7 +147,6 @@ class IFlowTraceReplayTests(unittest.TestCase):
                     "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
                 },
             )
-            state.restore_from_checkpoint_metadata(checkpoint)
             replayed_index, replayed = state.next_response(
                 path="/v1/chat/completions",
                 headers={"X-Agent-Sandbox-Id": "sbx"},
@@ -182,7 +180,7 @@ class IFlowTraceReplayTests(unittest.TestCase):
         self.assertIn("/dev/null", replayed_command)
         self.assertEqual(reset_command, 'sh -lc "echo first >/tmp/first.txt"')
 
-    def test_trace_replay_state_restore_metadata_is_a_noop(self) -> None:
+    def test_trace_replay_state_snapshot_reports_matched_response_count(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "trace.log"
             trace_path.write_text(
@@ -196,20 +194,104 @@ class IFlowTraceReplayTests(unittest.TestCase):
                 headers={"X-Agent-Sandbox-Id": "sbx"},
                 payload={"model": "trace-model", "messages": [{"role": "user", "content": "first"}], "tools": []},
             )
-            checkpoint = state.checkpoint_metadata()
-            state.restore_from_checkpoint_metadata({**checkpoint, "captures_inflight_llm": True})
-            replayed_index, replayed = state.next_response(
-                path="/v1/chat/completions",
-                headers={"X-Agent-Sandbox-Id": "sbx"},
-                payload={"model": "trace-model", "messages": [{"role": "user", "content": "first"}], "tools": []},
-            )
+            snapshot = state.snapshot()
 
         self.assertEqual(first_index, 1)
         self.assertEqual(first["choices"][0]["message"]["content"], "first")
-        self.assertEqual(replayed_index, 1)
-        self.assertEqual(replayed["choices"][0]["message"]["content"], "first")
+        self.assertEqual(snapshot["matched_response_count"], 1)
+        self.assertEqual(snapshot["next_response_index"], 1)
 
-    def test_trace_replay_state_duplicate_tool_request_preserves_original_when_filesystem_restore_lags(self) -> None:
+    def test_trace_replay_state_restore_rewinds_duplicate_tracking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.log"
+            trace_path.write_text(
+                "\n".join(
+                    self._tool_request_response_lines(
+                        ("first", 'sh -lc "echo first >/tmp/first.txt"'),
+                        ("second", 'sh -lc "echo second >/tmp/second.txt"'),
+                    )
+                ),
+                encoding="utf-8",
+            )
+            state = TraceReplayLLMState(llm_service_config={"trace_path": str(trace_path)})
+
+            state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "first"}],
+                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                },
+            )
+            state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "second"}],
+                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                },
+            )
+
+            state.restore(matched_response_count=1)
+            restored_index, restored = state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "second"}],
+                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                },
+            )
+
+        restored_command = json.loads(
+            restored["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+        )["command"]
+        self.assertEqual(restored_index, 2)
+        self.assertEqual(restored_command, 'sh -lc "echo second >/tmp/second.txt"')
+
+    def test_trace_replay_state_restore_preserves_dummy_for_consumed_response(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.log"
+            trace_path.write_text(
+                "\n".join(
+                    self._tool_request_response_lines(
+                        ("first", 'sh -lc "echo first >/tmp/first.txt"'),
+                    )
+                ),
+                encoding="utf-8",
+            )
+            state = TraceReplayLLMState(llm_service_config={"trace_path": str(trace_path)})
+
+            state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "first"}],
+                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                },
+            )
+
+            state.restore(matched_response_count=1)
+            replayed_index, replayed = state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "first"}],
+                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                },
+            )
+
+        replayed_command = json.loads(
+            replayed["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+        )["command"]
+        self.assertEqual(replayed_index, 1)
+        self.assertIn("/dev/null", replayed_command)
+
+    def test_trace_replay_state_duplicate_later_tool_request_returns_dummy_arguments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "trace.log"
             trace_path.write_text(
@@ -241,13 +323,6 @@ class IFlowTraceReplayTests(unittest.TestCase):
                     "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
                 },
             )
-            state.restore_from_checkpoint_metadata(
-                {
-                    "benchmark_replay_action_count": 2,
-                    "captures_inflight_llm": True,
-                    "filesystem_restore_replay_action_count": 1,
-                }
-            )
             replayed_index, replayed = state.next_response(
                 path="/v1/chat/completions",
                 headers={"X-Agent-Sandbox-Id": "sbx"},
@@ -259,9 +334,13 @@ class IFlowTraceReplayTests(unittest.TestCase):
             )
 
         self.assertEqual(replayed_index, 2)
-        self.assertEqual(
+        self.assertNotEqual(
             second["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
             replayed["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+        )
+        self.assertIn(
+            "/dev/null",
+            json.loads(replayed["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"])["command"],
         )
 
     def test_trace_replay_state_duplicate_tool_request_does_not_advance_progress_snapshot(self) -> None:
@@ -440,7 +519,7 @@ class IFlowTraceReplayTests(unittest.TestCase):
         self.assertIn("/dev/null", json.loads(duplicate_arguments)["command"])
         self.assertEqual(followup["choices"][0]["message"]["content"], "done")
 
-    def test_trace_replay_state_duplicate_non_shell_tool_request_preserves_original_arguments(self) -> None:
+    def test_trace_replay_state_duplicate_non_shell_tool_request_returns_dummy_arguments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "trace.log"
             trace_path.write_text(
@@ -548,11 +627,11 @@ class IFlowTraceReplayTests(unittest.TestCase):
 
         self.assertEqual(duplicate_index, 1)
         self.assertEqual(
-            original["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
-            duplicate["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            json.loads(duplicate["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]),
+            {"absolute_path": "/dev/null"},
         )
 
-    def test_trace_replay_state_duplicate_read_only_shell_request_preserves_original_arguments(self) -> None:
+    def test_trace_replay_state_duplicate_read_only_shell_request_returns_dummy_arguments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "trace.log"
             trace_path.write_text(
@@ -585,20 +664,21 @@ class IFlowTraceReplayTests(unittest.TestCase):
             )
 
         self.assertEqual(duplicate_index, 1)
-        self.assertEqual(
-            original["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
-            duplicate["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+        self.assertIn(
+            "/dev/null",
+            json.loads(duplicate["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"])["command"],
         )
 
     def test_trace_replay_state_duplicate_system_setup_shell_request_preserves_original_arguments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "trace.log"
+            original_command = "apt-get install -y python3-pip && pip3 install --break-system-packages pyarrow"
             trace_path.write_text(
                 "\n".join(
                     self._tool_request_response_lines(
                         (
                             "install deps",
-                            "apt-get install -y python3-pip && pip3 install --break-system-packages pyarrow",
+                            original_command,
                         ),
                     )
                 ),
@@ -626,9 +706,10 @@ class IFlowTraceReplayTests(unittest.TestCase):
             )
 
         self.assertEqual(duplicate_index, 1)
+        self.assertEqual(original, duplicate)
         self.assertEqual(
-            original["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
-            duplicate["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            json.loads(duplicate["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"])["command"],
+            original_command,
         )
 
     def test_trace_replay_state_applies_default_response_delay(self) -> None:
@@ -1312,6 +1393,72 @@ class IFlowTraceReplayTests(unittest.TestCase):
 
         self.assertEqual(rows[0]["trace_response_count"], 2)
         self.assertEqual(rows[0]["trace_malformed_line_count"], 1)
+
+
+class TestHashCollisionRealTraces(unittest.TestCase):
+    RESULTS_DIR = Path("/root/workspace/agent-cr/results/2026-02-24__20-20-40_passed")
+
+    def _find_trace_files(self) -> list[Path]:
+        return sorted(self.RESULTS_DIR.glob("**/proxy_server_trajectory.log"))
+
+    def test_no_hash_collisions_in_real_traces(self) -> None:
+        trace_files = self._find_trace_files()
+        self.assertGreater(len(trace_files), 0, "No trace files found")
+
+        parse_errors: list[tuple[Path, str]] = []
+        collisions: list[dict] = []
+        total_exchanges = 0
+
+        for trace_path in trace_files:
+            try:
+                parsed = parse_replay_trace(trace_path)
+            except ValueError as exc:
+                # parse_replay_trace already detects different-response collisions
+                parse_errors.append((trace_path, str(exc)))
+                continue
+
+            # Check for same-key, different-request collisions not caught by parse
+            seen: dict[str, tuple[int, dict]] = {}  # lookup_key -> (response_index, request)
+            for exchange in parsed.exchanges:
+                total_exchanges += 1
+                key = exchange.lookup_key
+                if key in seen:
+                    prev_idx, prev_req = seen[key]
+                    if exchange.request != prev_req:
+                        collisions.append({
+                            "trace": trace_path.parent.parent.name,
+                            "hash_prefix": key[:16],
+                            "exchange_a_index": prev_idx,
+                            "exchange_b_index": exchange.response_index,
+                        })
+                else:
+                    seen[key] = (exchange.response_index, exchange.request)
+
+        # Print diagnostic summary regardless of outcome
+        print(
+            f"\nTraces checked: {len(trace_files)}, "
+            f"successful: {len(trace_files) - len(parse_errors)}, "
+            f"total exchanges: {total_exchanges}"
+        )
+        for path, err in parse_errors:
+            print(f"  PARSE ERROR {path.parent.parent.name}: {err}")
+        for c in collisions:
+            print(
+                f"  COLLISION {c['trace']} hash={c['hash_prefix']} "
+                f"exchanges #{c['exchange_a_index']} vs #{c['exchange_b_index']}"
+            )
+
+        self.assertEqual(
+            parse_errors,
+            [],
+            f"{len(parse_errors)} traces failed to parse (ambiguous same-hash responses):\n"
+            + "\n".join(f"  {p.parent.parent.name}: {e}" for p, e in parse_errors),
+        )
+        self.assertEqual(
+            collisions,
+            [],
+            f"{len(collisions)} hash collisions found (same key, different requests)",
+        )
 
 
 if __name__ == "__main__":

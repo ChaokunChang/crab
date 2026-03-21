@@ -13,70 +13,11 @@ from pathlib import Path
 from typing import Any
 
 _DEFAULT_RESPONSE_DELAY_MS = 250
-_TOOL_RESULT_SENTINEL = "<tool-result>"
-_TOOL_ARGUMENTS_SENTINEL = "<tool-arguments>"
 _IFLOW_SYSTEM_PROMPT_SENTINEL = "<iflow-system-prompt>"
 _IFLOW_CONTEXT_SENTINEL = "<iflow-context-bootstrap>"
 _IFLOW_CONTEXT_ACK_SENTINEL = "<iflow-context-ack>"
 _DUMMY_TOOL_RESPONSE_MODEL = "agent-cr-iflow-trace-replay"
 _DUMMY_TOOL_COMMAND = 'sh -lc "echo hello world >> /dev/null"'
-_READ_ONLY_SHELL_PREFIXES: tuple[str, ...] = (
-    "apt-cache ",
-    "cat ",
-    "curl --head ",
-    "dpkg -l",
-    "env",
-    "file ",
-    "find ",
-    "git branch",
-    "git diff",
-    "git log",
-    "git rev-parse",
-    "git show",
-    "git status",
-    "grep ",
-    "head ",
-    "id",
-    "ls ",
-    "lsof ",
-    "md5sum ",
-    "pip --version",
-    "pip3 --version",
-    "printenv",
-    "ps ",
-    "pwd",
-    "python --version",
-    "python3 --version",
-    "python3 -m pip --version",
-    "readlink ",
-    "realpath ",
-    "rg ",
-    "sed -n ",
-    "sha256sum ",
-    "ss ",
-    "stat ",
-    "tail ",
-    "uname",
-    "wc ",
-    "which ",
-)
-_MUTATING_SHELL_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"(?:^|[;&|]\s*|&&\s*|\|\|\s*)(?:rm|mv|cp|touch|mkdir|rmdir|install|chmod|chown|ln|patch)\b"),
-    re.compile(r"(?:^|[;&|]\s*|&&\s*|\|\|\s*)(?:make|cmake|ninja|cargo|go\s+build|gcc|g\+\+|clang|clang\+\+)\b"),
-    re.compile(r"(?:^|[;&|]\s*|&&\s*|\|\|\s*)(?:apt|apt-get)\s+(?:install|remove|upgrade|dist-upgrade)\b"),
-    re.compile(r"(?:^|[;&|]\s*|&&\s*|\|\|\s*)(?:pip|pip3|uv\s+pip|npm|pnpm|yarn)\s+(?:install|add|remove|update|upgrade)\b"),
-    re.compile(r"(?:^|[;&|]\s*|&&\s*|\|\|\s*)python(?:3)?\s+[^;&|]*\.py\b"),
-    re.compile(r"(?:^|[;&|]\s*|&&\s*|\|\|\s*)sh\s+-lc\s+\"[^\"]*>>?[^\"]*\""),
-    re.compile(r"(?:^|[;&|]\s*|&&\s*|\|\|\s*)bash\s+-lc\s+\"[^\"]*>>?[^\"]*\""),
-    re.compile(r">>?(?![&|])"),
-    re.compile(r"\|\s*tee\b"),
-)
-_SYSTEM_SETUP_SHELL_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"(?:^|[;&|]\s*|&&\s*|\|\|\s*)(?:apt|apt-get)\s+(?:update|install|remove|upgrade|dist-upgrade)\b"),
-    re.compile(r"(?:^|[;&|]\s*|&&\s*|\|\|\s*)(?:pip|pip3|uv\s+pip)\s+(?:install|uninstall|remove|update|upgrade)\b"),
-    re.compile(r"(?:^|[;&|]\s*|&&\s*|\|\|\s*)python(?:3)?\s+-m\s+(?:pip|ensurepip)\b"),
-    re.compile(r"bootstrap\.pypa\.io/get-pip\.py"),
-)
 _VOLATILE_TEXT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(
@@ -93,16 +34,25 @@ _VOLATILE_TEXT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         ),
         "<date>",
     ),
-    (re.compile(r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})\b"), "<timestamp>"),
+    (re.compile(
+        r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})\b"), "<timestamp>"),
     (re.compile(r"\b\d{4}-\d{2}-\d{2}\b"), "<date>"),
     (re.compile(r"\b\d{1,2}/\d{1,2}/\d{4}\b"), "<date>"),
     (re.compile(r"\b\d{2}:\d{2}:\d{2}(?:\.\d+)?\b"), "<time>"),
-    (re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.IGNORECASE), "<uuid>"),
+    (re.compile(
+        r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.IGNORECASE), "<uuid>"),
     (re.compile(r"https?://[^\s\"']+"), "<url>"),
     (re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b"), "<ip>"),
     (re.compile(r"/tmp/[^\s\"']+"), "/tmp/<temp>"),
 )
-_SYSTEM_REMINDER_PATTERN = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
+_SYSTEM_REMINDER_PATTERN = re.compile(
+    r"<system-reminder>.*?</system-reminder>", re.DOTALL)
+_SYSTEM_SETUP_SHELL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?:^|[;&|]\s*|&&\s*|\|\|\s*)(?:apt|apt-get)\s+(?:update|install|remove|upgrade|dist-upgrade)\b"),
+    re.compile(r"(?:^|[;&|]\s*|&&\s*|\|\|\s*)(?:pip|pip3|uv\s+pip)\s+(?:install|uninstall|remove|update|upgrade)\b"),
+    re.compile(r"(?:^|[;&|]\s*|&&\s*|\|\|\s*)python(?:3)?\s+-m\s+(?:pip|ensurepip)\b"),
+    re.compile(r"bootstrap\.pypa\.io/get-pip\.py"),
+)
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +63,7 @@ class ReplayExchange:
     request: dict[str, Any]
     response: dict[str, Any]
     response_index: int
-    lookup_key: tuple[str, int, int, int, int]
+    lookup_key: str
 
 
 @dataclass(frozen=True)
@@ -165,28 +115,6 @@ def _normalize_value(value: object) -> object:
     return value
 
 
-def _normalize_tool_calls(tool_calls: object) -> list[object]:
-    if not isinstance(tool_calls, list):
-        return []
-    normalized: list[object] = []
-    for item in tool_calls:
-        if not isinstance(item, dict):
-            normalized.append(_normalize_value(item))
-            continue
-        function = item.get("function")
-        payload: dict[str, object] = {
-            "id": item.get("id"),
-            "type": item.get("type"),
-        }
-        if isinstance(function, dict):
-            payload["function"] = {
-                "name": function.get("name"),
-                "arguments": _TOOL_ARGUMENTS_SENTINEL,
-            }
-        normalized.append(payload)
-    return normalized
-
-
 def _normalize_message_content(role: str, content: object) -> object:
     normalized = _normalize_value(content)
     if role == "system" and isinstance(normalized, str):
@@ -194,65 +122,59 @@ def _normalize_message_content(role: str, content: object) -> object:
             return _IFLOW_SYSTEM_PROMPT_SENTINEL
         return normalized
     if role == "assistant" and isinstance(normalized, str):
-        if "Thanks for the context" in normalized:
-            return _IFLOW_CONTEXT_ACK_SENTINEL
         return normalized
-    if role == "user" and isinstance(normalized, list) and len(normalized) == 1:
-        item = normalized[0]
-        if isinstance(item, dict) and item.get("type") == "text":
-            text = item.get("text")
-            if isinstance(text, str) and text.startswith("This is the iFlow CLI. We are setting up the context"):
-                return [{"type": "text", "text": _IFLOW_CONTEXT_SENTINEL}]
+    if role == "user" and isinstance(normalized, list) and len(normalized) >= 1:
+        item = normalized[-1]
+        if (isinstance(item, dict) and item.get("type") == "text"):
+            value = item.get("text", _IFLOW_CONTEXT_SENTINEL)
+            if isinstance(value, str):
+                return value
+            else:
+                return _IFLOW_CONTEXT_SENTINEL
     return normalized
 
 
-def _normalize_message(message: object) -> dict[str, object]:
-    if not isinstance(message, dict):
-        return {"raw": _normalize_value(message)}
-    role = str(message.get("role", ""))
-    normalized: dict[str, object] = {"role": role}
-    if "name" in message:
-        normalized["name"] = message.get("name")
-    if "tool_call_id" in message:
-        normalized["tool_call_id"] = message.get("tool_call_id")
-    if role in {"tool", "function"}:
-        normalized["content"] = _TOOL_RESULT_SENTINEL
-    else:
-        normalized["content"] = _normalize_message_content(role, message.get("content"))
-    tool_calls = _normalize_tool_calls(message.get("tool_calls"))
-    if tool_calls:
-        normalized["tool_calls"] = tool_calls
-    return normalized
-
-
-def _lookup_stats(path: str, payload: dict[str, Any]) -> tuple[str, int, int, int, int]:
+def _normalized_lookup_messages(payload: dict[str, Any]) -> tuple[object, ...]:
     messages = payload.get("messages")
     if not isinstance(messages, list):
-        messages = []
-    normalized_messages = [_normalize_message(item) for item in messages]
+        return ()
+    normalized_messages: list[object] = []
+    last_user_msg = -1
+    for i, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role", ""))
+        if role == "user":
+            last_user_msg = i
+    for i, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role", ""))
+        if role not in {"user", "assistant"}:
+            continue
+        if role == "user" and i < last_user_msg:
+            continue
+        normalized_messages.append(
+            {
+                "role": role,
+                "content": _normalize_message_content(role, message.get("content")),
+            }
+        )
+    return tuple(normalized_messages)
+
+
+def _lookup_stats(path: str, payload: dict[str, Any]) -> tuple[str, int]:
+    lookup_messages = _normalized_lookup_messages(payload)
     normalized = {
         "path": path,
-        "messages": normalized_messages,
+        "messages": lookup_messages,
     }
-    canonical = json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    canonical = json.dumps(normalized, sort_keys=True, separators=(
+        ",", ":"), ensure_ascii=False).encode("utf-8")
     request_hash = hashlib.sha256(canonical).hexdigest()
-    assistant_message_count = 0
-    tool_message_count = 0
-    assistant_tool_call_count = 0
-    for message in normalized_messages:
-        role = str(message.get("role", ""))
-        if role == "assistant":
-            assistant_message_count += 1
-            assistant_tool_call_count += len(message.get("tool_calls", []))
-        elif role == "tool":
-            tool_message_count += 1
-    return (
-        request_hash,
-        len(normalized_messages),
-        assistant_message_count,
-        tool_message_count,
-        assistant_tool_call_count,
-    )
+    assistant_message_count = sum(1 for message in lookup_messages if isinstance(
+        message, dict) and message.get("role") == "assistant")
+    return (request_hash, assistant_message_count)
 
 
 def _response_fingerprint(payload: dict[str, Any]) -> str:
@@ -274,7 +196,8 @@ def _tool_specs(payload: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
         if not isinstance(name, str) or not name:
             continue
         parameters = function.get("parameters")
-        specs.append((name, parameters if isinstance(parameters, dict) else {}))
+        specs.append(
+            (name, parameters if isinstance(parameters, dict) else {}))
     return specs
 
 
@@ -285,15 +208,11 @@ def _tool_parameters_by_name(payload: dict[str, Any]) -> dict[str, dict[str, Any
     return parameters_by_name
 
 
-def _tool_priority(name: str) -> tuple[int, str]:
-    normalized = name.lower()
-    if normalized == "run_shell_command":
-        return (0, normalized)
-    if any(token in normalized for token in ("read", "show", "list", "fetch")):
-        return (1, normalized)
-    if "write" in normalized:
-        return (2, normalized)
-    return (3, normalized)
+def _should_preserve_duplicate_shell_command(command: str) -> bool:
+    normalized = command.strip()
+    if not normalized:
+        return False
+    return any(pattern.search(normalized) for pattern in _SYSTEM_SETUP_SHELL_PATTERNS)
 
 
 def _dummy_value_for_schema(*, name: str, schema: dict[str, Any]) -> object:
@@ -342,33 +261,17 @@ def _dummy_tool_input(tool_name: str, parameters: dict[str, Any]) -> dict[str, A
     required = parameters.get("required")
     if not isinstance(properties, dict):
         return {}
-    required_names = [str(item) for item in required] if isinstance(required, list) else []
-    property_names = required_names or [str(name) for name in properties.keys()]
+    required_names = [str(item) for item in required] if isinstance(
+        required, list) else []
+    property_names = required_names or [
+        str(name) for name in properties.keys()]
     payload: dict[str, Any] = {}
     for property_name in property_names:
         schema = properties.get(property_name)
         if isinstance(schema, dict):
-            payload[property_name] = _dummy_value_for_schema(name=property_name, schema=schema)
+            payload[property_name] = _dummy_value_for_schema(
+                name=property_name, schema=schema)
     return payload
-
-
-def _is_read_only_shell_command(command: str) -> bool:
-    normalized = command.strip()
-    if not normalized:
-        return False
-    if any(pattern.search(normalized) for pattern in _MUTATING_SHELL_PATTERNS):
-        return False
-    lowered = normalized.lower()
-    return lowered.startswith(_READ_ONLY_SHELL_PREFIXES)
-
-
-def _should_preserve_duplicate_shell_command(command: str) -> bool:
-    normalized = command.strip()
-    if not normalized:
-        return False
-    if _is_read_only_shell_command(normalized):
-        return True
-    return any(pattern.search(normalized) for pattern in _SYSTEM_SETUP_SHELL_PATTERNS)
 
 
 def _is_tool_call_response(payload: dict[str, Any]) -> bool:
@@ -385,7 +288,7 @@ def _is_tool_call_response(payload: dict[str, Any]) -> bool:
     return isinstance(tool_calls, list) and len(tool_calls) > 0
 
 
-def _response_mutates_filesystem(payload: dict[str, Any]) -> bool:
+def _should_preserve_duplicate_tool_response(payload: dict[str, Any]) -> bool:
     choices = payload.get("choices")
     if not isinstance(choices, list) or not choices:
         return False
@@ -396,7 +299,7 @@ def _response_mutates_filesystem(payload: dict[str, Any]) -> bool:
     if not isinstance(message, dict):
         return False
     tool_calls = message.get("tool_calls")
-    if not isinstance(tool_calls, list):
+    if not isinstance(tool_calls, list) or not tool_calls:
         return False
     for tool_call in tool_calls:
         if not isinstance(tool_call, dict):
@@ -404,23 +307,20 @@ def _response_mutates_filesystem(payload: dict[str, Any]) -> bool:
         function = tool_call.get("function")
         if not isinstance(function, dict):
             continue
-        tool_name = function.get("name")
-        if not isinstance(tool_name, str):
+        if function.get("name") != "run_shell_command":
             continue
-        normalized_name = tool_name.lower()
-        if normalized_name == "run_shell_command":
-            arguments = function.get("arguments")
-            if not isinstance(arguments, str):
-                return True
-            try:
-                payload_arguments = json.loads(arguments)
-            except json.JSONDecodeError:
-                return True
-            command = payload_arguments.get("command")
-            return not isinstance(command, str) or not _is_read_only_shell_command(command)
-        if normalized_name in {"read_file", "list_dir", "todo_write"}:
+        arguments = function.get("arguments")
+        if not isinstance(arguments, str):
             continue
-        return True
+        try:
+            parsed_arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed_arguments, dict):
+            continue
+        command = parsed_arguments.get("command")
+        if isinstance(command, str) and _should_preserve_duplicate_shell_command(command):
+            return True
     return False
 
 
@@ -434,8 +334,7 @@ def _build_dummy_tool_response(*, request_payload: dict[str, Any], original_resp
     message = first_choice.get("message")
     if not isinstance(message, dict):
         return None
-    original_tool_calls = message.get("tool_calls")
-    if not isinstance(original_tool_calls, list) or not original_tool_calls:
+    if not isinstance(message.get("tool_calls"), list) or not message.get("tool_calls"):
         return None
     parameters_by_name = _tool_parameters_by_name(request_payload)
     if not parameters_by_name:
@@ -444,7 +343,8 @@ def _build_dummy_tool_response(*, request_payload: dict[str, Any], original_resp
     response["model"] = _DUMMY_TOOL_RESPONSE_MODEL
     response["id"] = f"chatcmpl-iflow-replay-dummy-{uuid.uuid4().hex[:8]}"
     response["created"] = int(time.time())
-    response["usage"] = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    response["usage"] = {"prompt_tokens": 1,
+                         "completion_tokens": 1, "total_tokens": 2}
     response_choices = response.get("choices")
     assert isinstance(response_choices, list)
     response_choice = response_choices[0]
@@ -462,22 +362,6 @@ def _build_dummy_tool_response(*, request_payload: dict[str, Any], original_resp
         tool_name = function.get("name")
         if not isinstance(tool_name, str) or not tool_name:
             continue
-        if tool_name.lower() != "run_shell_command":
-            continue
-        original_arguments = function.get("arguments")
-        if isinstance(original_arguments, str):
-            try:
-                original_payload = json.loads(original_arguments)
-            except json.JSONDecodeError:
-                original_payload = None
-            if isinstance(original_payload, dict):
-                original_command = original_payload.get("command")
-                if isinstance(original_command, str) and _should_preserve_duplicate_shell_command(original_command):
-                    continue
-                rewritten_payload = dict(original_payload)
-                rewritten_payload["command"] = _DUMMY_TOOL_COMMAND
-                function["arguments"] = json.dumps(rewritten_payload, sort_keys=True)
-                continue
         parameters = parameters_by_name.get(tool_name, {})
         tool_input = _dummy_tool_input(tool_name, parameters)
         function["arguments"] = json.dumps(tool_input, sort_keys=True)
@@ -490,7 +374,7 @@ def parse_replay_trace(trace_path: Path) -> ParsedReplayTrace:
     malformed_lines: list[int] = []
     exchanges: list[ReplayExchange] = []
     pending_request: tuple[str, dict[str, Any]] | None = None
-    fingerprints_by_key: dict[tuple[str, int, int, int, int, int], str] = {}
+    fingerprints_by_key: dict[str, str] = {}
     for line_number, raw_line in enumerate(resolved.read_text(encoding="utf-8").splitlines(), start=1):
         line = raw_line.strip()
         if not line:
@@ -522,12 +406,12 @@ def parse_replay_trace(trace_path: Path) -> ParsedReplayTrace:
             continue
         path, request = pending_request
         responses.append(payload)
-        lookup_key = _lookup_stats(path, request)
+        lookup_key, _ = _lookup_stats(path, request)
         fingerprint = _response_fingerprint(payload)
         previous = fingerprints_by_key.get(lookup_key)
         if previous is not None and previous != fingerprint:
             raise ValueError(
-                f"trace {resolved} has ambiguous replay responses for request key={lookup_key[0][:12]}"
+                f"trace {resolved} has ambiguous replay responses for request key={lookup_key[:12]}"
             )
         fingerprints_by_key[lookup_key] = fingerprint
         exchanges.append(
@@ -541,7 +425,8 @@ def parse_replay_trace(trace_path: Path) -> ParsedReplayTrace:
         )
         pending_request = None
     if not responses:
-        raise ValueError(f"trace {resolved} did not contain any replayable responses")
+        raise ValueError(
+            f"trace {resolved} did not contain any replayable responses")
     return ParsedReplayTrace(
         trace_path=resolved,
         responses=tuple(responses),
@@ -555,15 +440,18 @@ class TraceReplayLLMState:
         config = dict(llm_service_config or {})
         trace_path_value = config.get("trace_path")
         if not isinstance(trace_path_value, str) or not trace_path_value:
-            raise ValueError("iflow_trace_replay requires llm_service_config.trace_path")
-        raw_delay_ms = config.get("response_delay_ms", _DEFAULT_RESPONSE_DELAY_MS)
+            raise ValueError(
+                "iflow_trace_replay requires llm_service_config.trace_path")
+        raw_delay_ms = config.get(
+            "response_delay_ms", _DEFAULT_RESPONSE_DELAY_MS)
         try:
             response_delay_ms = int(raw_delay_ms)
         except (TypeError, ValueError):
             response_delay_ms = _DEFAULT_RESPONSE_DELAY_MS
         parsed = parse_replay_trace(Path(trace_path_value))
         if not parsed.exchanges:
-            raise ValueError(f"trace {parsed.trace_path} did not contain any replayable request/response pairs")
+            raise ValueError(
+                f"trace {parsed.trace_path} did not contain any replayable request/response pairs")
         self._trace = parsed
         self._lock = threading.Lock()
         self._response_delay_ms = max(0, response_delay_ms)
@@ -571,73 +459,49 @@ class TraceReplayLLMState:
         self._matched_response_count = 0
         self._duplicate_response_count = 0
         self._total_progress_responses = len(parsed.exchanges)
-        self._latest_mutating_response_count_by_progress = [0]
-        latest_mutating_response_count = 0
-        for exchange in parsed.exchanges:
-            if _response_mutates_filesystem(exchange.response):
-                latest_mutating_response_count = exchange.response_index
-            self._latest_mutating_response_count_by_progress.append(latest_mutating_response_count)
-        self._served_request_keys: set[tuple[str, int, int, int, int]] = set()
-        self._responses_by_key = {exchange.lookup_key: exchange for exchange in parsed.exchanges}
-        self._hashes_by_shape: dict[tuple[int, int, int, int], list[str]] = {}
-        self._filesystem_restore_replay_action_count: int | None = None
-        for exchange in parsed.exchanges:
-            self._hashes_by_shape.setdefault(exchange.lookup_key[1:], []).append(exchange.lookup_key[0])
+        self._served_request_keys: set[str] = set()
+        self._responses_by_key = {
+            exchange.lookup_key: exchange for exchange in parsed.exchanges}
 
     def handle_request(self, *, path: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
         return handle_request(path=path, headers=headers, payload=payload, state=self)
-
-    def checkpoint_metadata(self) -> dict[str, object]:
-        with self._lock:
-            matched_response_count = self._matched_response_count
-            return {
-                "benchmark_replay_action_count": matched_response_count,
-                "benchmark_latest_mutating_response_count": self._latest_mutating_response_count_by_progress[
-                    matched_response_count
-                ],
-                "benchmark_previous_mutating_response_count": self._latest_mutating_response_count_by_progress[
-                    max(0, matched_response_count - 1)
-                ],
-            }
-
-    def restore_from_checkpoint_metadata(self, metadata: dict[str, object]) -> None:
-        raw_filesystem_restore_count = metadata.get("filesystem_restore_replay_action_count")
-        if raw_filesystem_restore_count is None:
-            self._filesystem_restore_replay_action_count = None
-            return
-        try:
-            self._filesystem_restore_replay_action_count = max(0, int(raw_filesystem_restore_count))
-        except (TypeError, ValueError):
-            self._filesystem_restore_replay_action_count = None
 
     def reset(self) -> None:
         with self._lock:
             self._matched_response_count = 0
             self._duplicate_response_count = 0
-            self._filesystem_restore_replay_action_count = None
             self._served_request_keys.clear()
             self._events.clear()
 
+    def restore(self, *, matched_response_count: int) -> None:
+        with self._lock:
+            restored_count = max(0, min(int(matched_response_count), self._total_progress_responses))
+            self._matched_response_count = restored_count
+            self._duplicate_response_count = 0
+            self._served_request_keys = {
+                exchange.lookup_key for exchange in self._trace.exchanges[:restored_count]
+            }
+            self._events.append(
+                {
+                    "event": "restore",
+                    "matched_response_count": restored_count,
+                }
+            )
+
     def next_response(self, *, path: str, headers: dict[str, str], payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         sandbox_id = _sandbox_id_from_request(headers, payload)
-        lookup_key = _lookup_stats(path, payload)
+        lookup_key, assistant_message_count = _lookup_stats(path, payload)
         try:
             exchange = self._responses_by_key[lookup_key]
         except KeyError as exc:
-            matching_hashes = self._hashes_by_shape.get(lookup_key[1:], [])
             logger.warning(
-                "Replay lookup miss path=%s hash=%s messages=%d assistant_messages=%d tool_messages=%d assistant_tool_calls=%d shape_match_count=%d",
+                "Replay lookup miss path=%s hash=%s assistant_messages=%d",
                 path,
-                lookup_key[0][:12],
-                lookup_key[1],
-                lookup_key[2],
-                lookup_key[3],
-                lookup_key[4],
-                len(matching_hashes),
+                lookup_key[:12],
+                assistant_message_count,
             )
             raise ValueError(
-                "no replay response found for request "
-                f"hash={lookup_key[0][:12]} messages={lookup_key[1]} tool_messages={lookup_key[3]}"
+                "no replay response found for request " f"hash={lookup_key[:12]} assistant_messages={assistant_message_count}"
             ) from exc
         with self._lock:
             is_duplicate = lookup_key in self._served_request_keys
@@ -646,25 +510,23 @@ class TraceReplayLLMState:
                 matched_response_count = self._matched_response_count
                 self._duplicate_response_count += 1
                 if _is_tool_call_response(exchange.response):
-                    if (
-                        self._filesystem_restore_replay_action_count is not None
-                        and exchange.response_index > self._filesystem_restore_replay_action_count
-                    ):
+                    if _should_preserve_duplicate_tool_response(exchange.response):
                         response = exchange.response
-                        response_kind = "duplicate_original_missing_filesystem_state"
+                        response_kind = "duplicate_original"
                     else:
-                        response = _build_dummy_tool_response(request_payload=payload, original_response=exchange.response)
-                        if response is None:
-                            logger.warning(
-                                "Replay duplicate request fell back to original response because no tool schema was advertised "
-                                "path=%s hash=%s",
-                                path,
-                                lookup_key[0][:12],
-                            )
-                            response = exchange.response
-                            response_kind = "duplicate_original"
-                        else:
-                            response_kind = "duplicate_dummy_tool"
+                        response = _build_dummy_tool_response(
+                            request_payload=payload, original_response=exchange.response)
+                    if response is None:
+                        logger.warning(
+                            "Replay duplicate request fell back to original response because no tool schema was advertised "
+                            "path=%s hash=%s",
+                            path,
+                            lookup_key[:12],
+                        )
+                        response = exchange.response
+                        response_kind = "duplicate_original"
+                    else:
+                        response_kind = "duplicate_dummy_tool"
                 else:
                     response = exchange.response
                     response_kind = "duplicate_original"
@@ -677,7 +539,7 @@ class TraceReplayLLMState:
                 {
                     "event": "response",
                     "sandbox_id": sandbox_id,
-                    "request_hash": lookup_key[0],
+                    "request_hash": lookup_key,
                     "matched_response_count": matched_response_count,
                     "response_kind": response_kind,
                 }
@@ -700,7 +562,6 @@ class TraceReplayLLMState:
                 "is_complete": matched_response_count >= self._total_progress_responses,
                 "malformed_line_count": len(self._trace.malformed_lines),
                 "malformed_lines": list(self._trace.malformed_lines),
-                "filesystem_restore_replay_action_count": self._filesystem_restore_replay_action_count,
                 "events": list(self._events),
             }
 
@@ -714,5 +575,6 @@ def handle_request(
 ) -> dict[str, Any]:
     if path != "/v1/chat/completions":
         raise ValueError(f"unsupported path for iflow_trace_replay: {path}")
-    _, response = state.next_response(path=path, headers=headers, payload=payload)
+    _, response = state.next_response(
+        path=path, headers=headers, payload=payload)
     return response

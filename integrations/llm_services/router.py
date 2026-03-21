@@ -48,11 +48,9 @@ class LLMServiceState(Protocol):
 
     def snapshot(self) -> dict[str, Any]: ...
 
-    def checkpoint_metadata(self) -> dict[str, object]: ...
-
-    def restore_from_checkpoint_metadata(self, metadata: dict[str, object]) -> None: ...
-
     def reset(self) -> None: ...
+
+    def restore(self, *, matched_response_count: int) -> None: ...
 
 
 class SimulatedServiceState:
@@ -66,13 +64,11 @@ class SimulatedServiceState:
     def snapshot(self) -> dict[str, Any]:
         return {"turns": self._state.snapshot()}
 
-    def checkpoint_metadata(self) -> dict[str, object]:
-        return {}
-
-    def restore_from_checkpoint_metadata(self, metadata: dict[str, object]) -> None:
-        _ = metadata
-
     def reset(self) -> None:
+        return
+
+    def restore(self, *, matched_response_count: int) -> None:
+        _ = matched_response_count
         return
 
 
@@ -90,13 +86,11 @@ class ManualServiceState:
     def snapshot(self) -> dict[str, Any]:
         return self._state.snapshot()
 
-    def checkpoint_metadata(self) -> dict[str, object]:
-        return {}
-
-    def restore_from_checkpoint_metadata(self, metadata: dict[str, object]) -> None:
-        _ = metadata
-
     def reset(self) -> None:
+        return
+
+    def restore(self, *, matched_response_count: int) -> None:
+        _ = matched_response_count
         return
 
 
@@ -114,13 +108,11 @@ class SimulatedForIFlowServiceState:
     def snapshot(self) -> dict[str, Any]:
         return self._state.snapshot()
 
-    def checkpoint_metadata(self) -> dict[str, object]:
-        return {}
-
-    def restore_from_checkpoint_metadata(self, metadata: dict[str, object]) -> None:
-        _ = metadata
-
     def reset(self) -> None:
+        return
+
+    def restore(self, *, matched_response_count: int) -> None:
+        _ = matched_response_count
         return
 
 
@@ -134,14 +126,11 @@ class IFlowTraceReplayServiceState:
     def snapshot(self) -> dict[str, Any]:
         return self._state.snapshot()
 
-    def checkpoint_metadata(self) -> dict[str, object]:
-        return self._state.checkpoint_metadata()
-
-    def restore_from_checkpoint_metadata(self, metadata: dict[str, object]) -> None:
-        self._state.restore_from_checkpoint_metadata(metadata)
-
     def reset(self) -> None:
         self._state.reset()
+
+    def restore(self, *, matched_response_count: int) -> None:
+        self._state.restore(matched_response_count=matched_response_count)
 
 
 def build_llm_service_registry() -> dict[str, type[LLMServiceState]]:
@@ -222,14 +211,13 @@ class BenchmarkLLMRouter:
                 for sandbox_id, item in self._services.items()
             }
 
-    def checkpoint_metadata(self, sandbox_id: str) -> dict[str, object]:
-        return self.resolve_service(sandbox_id).service_state.checkpoint_metadata()
-
-    def restore_from_checkpoint_metadata(self, sandbox_id: str, metadata: dict[str, object]) -> None:
-        self.resolve_service(sandbox_id).service_state.restore_from_checkpoint_metadata(metadata)
-
     def reset_sandbox(self, sandbox_id: str) -> None:
         self.resolve_service(sandbox_id).service_state.reset()
+
+    def restore_sandbox(self, sandbox_id: str, *, matched_response_count: int) -> None:
+        self.resolve_service(sandbox_id).service_state.restore(
+            matched_response_count=matched_response_count
+        )
 
 
 def serve_benchmark_llm_router(*, host: str, port: int, registry: dict[str, type[LLMServiceState]] | None = None) -> ThreadingHTTPServer:

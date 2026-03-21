@@ -418,24 +418,24 @@ def run_replay_auto_sandbox(
                 )
                 sandbox.last_status = dict(current)
                 break
-            checkpoint_manifest, checkpoint_actions = wait_for_auto_replay_checkpoint(
-                harness,
-                sandbox,
-                minimum_actions=chunk_target,
-                trace_response_count=trace_response_count,
-            )
-            if checkpoint_manifest is None:
-                required_event_became_unreachable = required_event_was_missed(
-                    chunk_index=chunk_index,
-                    events_injected=events_injected,
-                    first_forced_event_chunk=options.first_forced_event_chunk,
-                )
-                sandbox.last_status = dict(sandbox.task_run.poll_status())
-                break
-            events_injected += 1
+            # checkpoint_manifest, checkpoint_actions = wait_for_auto_replay_checkpoint(
+            #     harness,
+            #     sandbox,
+            #     minimum_actions=chunk_target,
+            #     trace_response_count=trace_response_count,
+            # )
+            # if checkpoint_manifest is None:
+            #     required_event_became_unreachable = required_event_was_missed(
+            #         chunk_index=chunk_index,
+            #         events_injected=events_injected,
+            #         first_forced_event_chunk=options.first_forced_event_chunk,
+            #     )
+            #     sandbox.last_status = dict(sandbox.task_run.poll_status())
+            #     break
             pre_event = sandbox.task_run.poll_status()
             event_started = time.perf_counter()
             harness.inject_fault(sandbox)
+            events_injected += 1
             observed_after = utc_now()
             harness.notify_fault(sandbox)
             recovery_started = time.perf_counter()
@@ -457,7 +457,7 @@ def run_replay_auto_sandbox(
             readiness_ms_values.append((ready_at - recovery_finished) * 1000.0)
             end_to_end_recovery_ms_values.append((ready_at - event_started) * 1000.0)
             lost_actions_values.append(max(0, total_actions(pre_event) - total_actions(post_recovery)))
-            _ = checkpoint_actions
+            # _ = checkpoint_actions
             sandbox.last_status = post_recovery
     except Exception as exc:
         task_error = str(exc)

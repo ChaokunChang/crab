@@ -83,7 +83,7 @@ class BenchmarkLLMRouterTests(unittest.TestCase):
             "run_shell_command",
         )
 
-    def test_router_dispatches_to_iflow_trace_replay_and_deduplicates_duplicate_tool_requests_after_restore(self) -> None:
+    def test_router_dispatches_to_iflow_trace_replay_and_deduplicates_duplicate_tool_requests(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "trace.log"
             trace_path.write_text(
@@ -187,7 +187,6 @@ class BenchmarkLLMRouterTests(unittest.TestCase):
                     "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
                 },
             )
-            checkpoint_metadata = router.checkpoint_metadata("sbx-replay")
             second = router.handle_request(
                 path="/v1/chat/completions",
                 headers={"X-Agent-Sandbox-Id": "sbx-replay"},
@@ -197,7 +196,6 @@ class BenchmarkLLMRouterTests(unittest.TestCase):
                     "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
                 },
             )
-            router.restore_from_checkpoint_metadata("sbx-replay", checkpoint_metadata)
             replayed_second = router.handle_request(
                 path="/v1/chat/completions",
                 headers={"X-Agent-Sandbox-Id": "sbx-replay"},
@@ -228,6 +226,88 @@ class BenchmarkLLMRouterTests(unittest.TestCase):
         self.assertEqual(second_command, 'sh -lc "echo second >/tmp/second.txt"')
         self.assertIn("/dev/null", replayed_command)
         self.assertEqual(replayed_first_command, 'sh -lc "echo first >/tmp/first.txt"')
+
+    def test_router_dispatches_to_iflow_trace_replay_and_preserves_duplicate_system_setup_tool_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.log"
+            original_command = "apt-get install -y python3-pip && pip3 install --break-system-packages pyarrow"
+            trace_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "request",
+                                "data": {
+                                    "model": "trace-model",
+                                    "messages": [{"role": "user", "content": "install deps"}],
+                                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "response",
+                                "data": {
+                                    "choices": [
+                                        {
+                                            "finish_reason": "tool_calls",
+                                            "message": {
+                                                "role": "assistant",
+                                                "content": None,
+                                                "tool_calls": [
+                                                    {
+                                                        "id": "call-install",
+                                                        "type": "function",
+                                                        "function": {
+                                                            "name": "run_shell_command",
+                                                            "arguments": json.dumps(
+                                                                {"command": original_command},
+                                                                sort_keys=True,
+                                                            ),
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                        }
+                                    ]
+                                },
+                            }
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            router = BenchmarkLLMRouter()
+            router.register_sandbox(
+                sandbox_id="sbx-replay",
+                llm_service_type="iflow_trace_replay",
+                llm_service_config={"trace_path": str(trace_path), "response_delay_ms": 0},
+            )
+
+            original = router.handle_request(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx-replay"},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "install deps"}],
+                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                },
+            )
+            duplicate = router.handle_request(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx-replay"},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "install deps"}],
+                    "tools": [{"type": "function", "function": {"name": "run_shell_command"}}],
+                },
+            )
+
+        original_args = json.loads(original["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"])
+        duplicate_args = json.loads(duplicate["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"])
+        self.assertEqual(original, duplicate)
+        self.assertEqual(original_args["command"], original_command)
+        self.assertEqual(duplicate_args["command"], original_command)
 
 
 if __name__ == "__main__":

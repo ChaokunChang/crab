@@ -857,6 +857,84 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(process_worker.manifests[0].metadata["filesystem_restore_checkpoint_id"], "ckpt-2")
         self.assertEqual(process_worker.manifests[0].metadata["filesystem_restore_replay_action_count"], 6)
 
+    def test_default_restore_worker_rewinds_unsafe_newer_process_checkpoint_without_mutating_metadata(self) -> None:
+        sid = SandboxId("sbx-1")
+        manager = LocalCheckpointManager(StorageConfig(root_dir=Path(tempfile.mkdtemp())))
+        early_process_ref = manager.put_artifact(
+            sid,
+            CheckpointId("ckpt-bootstrap-process-1"),
+            ArtifactPayload(kind=ArtifactKind.PROCESS, name="process.json", data=b"{}"),
+        )
+        fs_ref = manager.put_artifact(
+            sid,
+            CheckpointId("ckpt-bootstrap-fs"),
+            ArtifactPayload(kind=ArtifactKind.FILESYSTEM, name="filesystem.json", data=b"{}"),
+        )
+        late_process_ref = manager.put_artifact(
+            sid,
+            CheckpointId("ckpt-bootstrap-process-2"),
+            ArtifactPayload(kind=ArtifactKind.PROCESS, name="process.json", data=b"{}"),
+        )
+        early_process_manifest = CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=CheckpointId("ckpt-1"),
+            sandbox_id=sid,
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version=None,
+            process_artifacts=[early_process_ref],
+            filesystem_artifacts=[],
+            metadata={"benchmark_replay_action_count": 6},
+        ).with_integrity()
+        filesystem_manifest = CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=CheckpointId("ckpt-2"),
+            sandbox_id=sid,
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version=None,
+            process_artifacts=[],
+            filesystem_artifacts=[fs_ref],
+            metadata={"benchmark_replay_action_count": 6},
+        ).with_integrity()
+        late_process_manifest = CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=CheckpointId("ckpt-3"),
+            sandbox_id=sid,
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version=None,
+            process_artifacts=[late_process_ref],
+            filesystem_artifacts=[],
+            metadata={
+                "benchmark_replay_action_count": 12,
+                "captures_inflight_llm": True,
+            },
+        ).with_integrity()
+        fs_worker = RecordingRestoreWorker()
+        process_worker = RecordingRestoreWorker()
+        restore_worker = DefaultRWorker(
+            process_worker=process_worker,
+            filesystem_worker=fs_worker,
+            checkpoint_manager=ManifestCheckpointManager(
+                [early_process_manifest, filesystem_manifest, late_process_manifest]
+            ),
+        )
+
+        result = restore_worker.restore(
+            RestoreJob(
+                job_id=JobId("job-restore-unsafe-process-no-mutating-metadata"),
+                sandbox_id=sid,
+                checkpoint_id=CheckpointId("ckpt-3"),
+                requested_at=utc_now(),
+            )
+        )
+
+        self.assertEqual(result.status.value, "succeeded")
+        self.assertEqual(process_worker.manifests[0].metadata["process_restore_checkpoint_id"], "ckpt-1")
+        self.assertEqual(process_worker.manifests[0].metadata["filesystem_restore_checkpoint_id"], "ckpt-2")
+        self.assertEqual(process_worker.manifests[0].metadata["filesystem_restore_replay_action_count"], 6)
+
     def test_default_restore_worker_uses_committed_replay_count_for_inflight_filesystem_checkpoint(self) -> None:
         sid = SandboxId("sbx-1")
         manager = LocalCheckpointManager(StorageConfig(root_dir=Path(tempfile.mkdtemp())))

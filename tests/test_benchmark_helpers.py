@@ -1418,6 +1418,75 @@ services:
             llm_service_config=None,
         )
 
+    def test_restore_llm_service_state_prefers_process_restore_replay_action_count(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        restore_sandbox = Mock()
+        harness.llm_server = SimpleNamespace(
+            benchmark_llm_router=SimpleNamespace(restore_sandbox=restore_sandbox),
+        )
+
+        harness._restore_llm_service_state(
+            SandboxId("sbx-replay"),
+            CheckpointManifest(
+                schema_version="v1",
+                checkpoint_id=CheckpointId("ckpt-1"),
+                sandbox_id=SandboxId("sbx-replay"),
+                created_at=utc_now(),
+                runtime_name="runc",
+                runtime_version=None,
+                process_artifacts=[],
+                filesystem_artifacts=[],
+                metadata={
+                    "process_restore_replay_action_count": 2,
+                    "benchmark_replay_action_count": 5,
+                    "filesystem_restore_replay_action_count": 4,
+                },
+            ).with_integrity(),
+        )
+
+        restore_sandbox.assert_called_once_with("sbx-replay", matched_response_count=2)
+
+    def test_restore_llm_service_state_skips_restore_without_process_replay_action_count(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        restore_sandbox = Mock()
+        harness.llm_server = SimpleNamespace(
+            benchmark_llm_router=SimpleNamespace(restore_sandbox=restore_sandbox),
+        )
+
+        harness._restore_llm_service_state(
+            SandboxId("sbx-replay"),
+            CheckpointManifest(
+                schema_version="v1",
+                checkpoint_id=CheckpointId("ckpt-1"),
+                sandbox_id=SandboxId("sbx-replay"),
+                created_at=utc_now(),
+                runtime_name="runc",
+                runtime_version=None,
+                process_artifacts=[],
+                filesystem_artifacts=[],
+                metadata={
+                    "benchmark_replay_action_count": 5,
+                    "filesystem_restore_replay_action_count": 4,
+                },
+            ).with_integrity(),
+        )
+
+        restore_sandbox.assert_not_called()
+
     def test_launch_sandbox_uses_benchmark_network_for_iflow_agents(self) -> None:
         harness = RealHostScenarioHarness(
             provider="openai",
