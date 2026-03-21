@@ -67,7 +67,7 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
     )
     run_context = benchmark_run_context(config.config_path)
     logger.info(
-        "========== benchmark.run start config=%s scenario=%s mode=%s provider=%s agent=%s llm_service=%s sandboxes=%d iterations=%d pid=%s ==========",
+        "========== benchmark.run start config=%s scenario=%s mode=%s provider=%s agent=%s llm_service=%s sandboxes=%d max_workers=%d iterations=%d pid=%s ==========",
         config.config_path.resolve(),
         config.scenario,
         config.mode,
@@ -75,6 +75,7 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
         config.agent,
         config.llm_service or "",
         config.sandboxes,
+        config.effective_max_workers,
         config.iterations,
         run_context["pid"],
     )

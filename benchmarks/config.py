@@ -35,6 +35,7 @@ class BenchmarkConfig:
     llm_service: str | None = None
     task_dataset: Path | None = None
     sandboxes: int = 1
+    max_workers: int | None = None
     iterations: int = 1
     output: Path | None = None
     telemetry_output: Path | None = None
@@ -53,6 +54,11 @@ class BenchmarkConfig:
     @property
     def config_dir(self) -> Path:
         return self.config_path.parent
+
+    @property
+    def effective_max_workers(self) -> int:
+        configured = self.max_workers if self.max_workers is not None else self.sandboxes
+        return max(1, min(self.sandboxes, configured))
 
 
 def _resolve_optional_path(base_dir: Path, raw_value: object) -> Path | None:
@@ -102,6 +108,10 @@ def load_config(path: Path) -> BenchmarkConfig:
     sandboxes = int(data.get("sandboxes", 1))
     if sandboxes <= 0:
         raise ValueError(f"sandboxes must be positive, got {sandboxes}")
+    raw_max_workers = data.get("max_workers")
+    max_workers = None if raw_max_workers is None else int(raw_max_workers)
+    if max_workers is not None and max_workers <= 0:
+        raise ValueError(f"max_workers must be positive when provided, got {max_workers}")
 
     iterations = int(data.get("iterations", _DEFAULT_ITERATIONS[scenario]))
     if iterations <= 0:
@@ -122,6 +132,7 @@ def load_config(path: Path) -> BenchmarkConfig:
         llm_service=None if data.get("llm_service") is None else str(data["llm_service"]),
         task_dataset=_resolve_optional_path(base_dir, data.get("task_dataset")),
         sandboxes=sandboxes,
+        max_workers=max_workers,
         iterations=iterations,
         output=_resolve_optional_path(base_dir, data.get("output")),
         telemetry_output=_resolve_optional_path(base_dir, data.get("telemetry_output")),

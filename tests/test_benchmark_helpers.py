@@ -2522,6 +2522,73 @@ services:
         sandbox.task_run.on_restore_complete.assert_called_once()
         self.assertEqual(record.checkpoint_id, CheckpointId("ckpt-1"))
 
+    def test_inject_fault_waits_for_quiescent_window(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-fault"),
+            bundle_dir=Path("/tmp/sbx-fault"),
+            status_port=8123,
+            last_status={},
+        )
+        state = {"request_in_flight": True, "checkpoint_active": True}
+        harness.request_state_store = SimpleNamespace(
+            get=lambda sandbox_id: SimpleNamespace(llm_request_in_flight=state["request_in_flight"])
+        )
+        harness.executor = SimpleNamespace(has_active_checkpoint=lambda sandbox_id: state["checkpoint_active"])
+        harness._delete_runtime = Mock()
+        harness._set_sandbox_running_state = Mock()
+
+        def _settle() -> None:
+            time.sleep(0.05)
+            state["request_in_flight"] = False
+            time.sleep(0.05)
+            state["checkpoint_active"] = False
+
+        thread = threading.Thread(target=_settle)
+        thread.start()
+        try:
+            harness.inject_fault(sandbox)
+        finally:
+            thread.join(timeout=1.0)
+
+        harness._delete_runtime.assert_called_once_with(sandbox.sandbox_id)
+        harness._set_sandbox_running_state.assert_called_once_with(sandbox.sandbox_id, is_running=False)
+
+    def test_inject_fault_times_out_when_quiescent_window_never_arrives(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-fault"),
+            bundle_dir=Path("/tmp/sbx-fault"),
+            status_port=8123,
+            last_status={},
+        )
+        harness.request_state_store = SimpleNamespace(
+            get=lambda sandbox_id: SimpleNamespace(llm_request_in_flight=True)
+        )
+        harness.executor = SimpleNamespace(has_active_checkpoint=lambda sandbox_id: True)
+        harness._delete_runtime = Mock()
+        harness._set_sandbox_running_state = Mock()
+
+        with self.assertRaisesRegex(RuntimeError, "fault injection window"):
+            harness.wait_for_fault_injection_window(sandbox, timeout_s=0.05)
+
+        harness._delete_runtime.assert_not_called()
+        harness._set_sandbox_running_state.assert_not_called()
+
     def test_load_dataset_normalizes_relative_paths_and_cycles_rows(self) -> None:
         harness = RealHostScenarioHarness(
             provider="openai",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import timedelta
 import unittest
 
 from agent_cr import (
@@ -98,6 +99,7 @@ class SchedulerTests(unittest.TestCase):
         )
 
     def test_query_resumes_sandbox_when_checkpoint_not_needed(self) -> None:
+        observed_at = utc_now()
         self.inspector.upsert_snapshot(
             SandboxSnapshot(
                 sandbox_id=self.sandbox_id,
@@ -105,7 +107,8 @@ class SchedulerTests(unittest.TestCase):
                 is_running=True,
                 process_changed=False,
                 filesystem_changed=False,
-                observed_at=utc_now(),
+                observed_at=observed_at,
+                last_checkpoint_at=observed_at - timedelta(seconds=31),
             )
         )
 
@@ -116,6 +119,7 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(self.sandbox_manager.describe(self.sandbox_id).status, "running")
 
     def test_query_expands_process_change_to_process_and_filesystem_checkpoint(self) -> None:
+        observed_at = utc_now()
         self.inspector.upsert_snapshot(
             SandboxSnapshot(
                 sandbox_id=self.sandbox_id,
@@ -123,7 +127,8 @@ class SchedulerTests(unittest.TestCase):
                 is_running=True,
                 process_changed=True,
                 filesystem_changed=False,
-                observed_at=utc_now(),
+                observed_at=observed_at,
+                last_checkpoint_at=observed_at - timedelta(seconds=31),
             )
         )
 
@@ -133,6 +138,29 @@ class SchedulerTests(unittest.TestCase):
         self.assertTrue(decision.checkpoint_process)
         self.assertTrue(decision.checkpoint_filesystem)
         self.assertFalse(decision.leave_running)
+        self.assertEqual(self.sandbox_manager.calls, [("pause", self.sandbox_id)])
+        self.assertEqual(self.sandbox_manager.describe(self.sandbox_id).status, "paused")
+
+    def test_query_forces_full_checkpoint_when_no_previous_checkpoint_exists(self) -> None:
+        self.inspector.upsert_snapshot(
+            SandboxSnapshot(
+                sandbox_id=self.sandbox_id,
+                runtime_name="runc",
+                is_running=True,
+                process_changed=False,
+                filesystem_changed=False,
+                observed_at=utc_now(),
+                last_checkpoint_at=None,
+            )
+        )
+
+        decision = self.scheduler.query_checkpoint(self.sandbox_id)
+
+        self.assertTrue(decision.should_checkpoint)
+        self.assertTrue(decision.checkpoint_process)
+        self.assertTrue(decision.checkpoint_filesystem)
+        self.assertFalse(decision.leave_running)
+        self.assertEqual(decision.reason, "no_previous_checkpoint")
         self.assertEqual(self.sandbox_manager.calls, [("pause", self.sandbox_id)])
         self.assertEqual(self.sandbox_manager.describe(self.sandbox_id).status, "paused")
 
@@ -158,6 +186,7 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(self.sandbox_manager.describe(self.sandbox_id).status, "stopped")
 
     def test_query_keeps_filesystem_only_scope_for_filesystem_change(self) -> None:
+        observed_at = utc_now()
         self.inspector.upsert_snapshot(
             SandboxSnapshot(
                 sandbox_id=self.sandbox_id,
@@ -165,7 +194,8 @@ class SchedulerTests(unittest.TestCase):
                 is_running=True,
                 process_changed=False,
                 filesystem_changed=True,
-                observed_at=utc_now(),
+                observed_at=observed_at,
+                last_checkpoint_at=observed_at - timedelta(seconds=31),
             )
         )
 
@@ -293,15 +323,12 @@ class SchedulerTests(unittest.TestCase):
 
         decision = scheduler.query_checkpoint(self.sandbox_id)
 
-        self.assertFalse(decision.should_checkpoint)
-        self.assertFalse(decision.checkpoint_process)
-        self.assertFalse(decision.checkpoint_filesystem)
-        self.assertFalse(decision.leave_running)
-        self.assertEqual(decision.reason, "no_change_signal")
-        self.assertEqual(
-            self.sandbox_manager.calls,
-            [("pause", self.sandbox_id), ("resume", self.sandbox_id)],
-        )
+        self.assertTrue(decision.should_checkpoint)
+        self.assertTrue(decision.checkpoint_process)
+        self.assertTrue(decision.checkpoint_filesystem)
+        self.assertTrue(decision.leave_running)
+        self.assertEqual(decision.reason, "llm_request_window_available")
+        self.assertEqual(self.sandbox_manager.calls, [("pause", self.sandbox_id)])
 
     def test_query_fault_tolerance_policy_forces_filesystem_checkpoint_for_process_change_in_request_window(self) -> None:
         scheduler = CRScheduler(

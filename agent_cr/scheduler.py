@@ -76,18 +76,23 @@ class CheckpointingPolicy:
                 policy_name=self.name,
             )
 
-        # for debug purpose, let's force full checkpoint if there is no checkpoint avaialble.
+        request_in_flight = bool(snapshot.metadata.get("llm_request_in_flight", False))
+
+        # Force a full baseline checkpoint before applying the normal change-driven policy.
         if snapshot.last_checkpoint_at is None:
+            reason = "no_previous_checkpoint"
+            if self._config.prefer_checkpoint_during_llm_request and request_in_flight:
+                reason = "llm_request_window_available"
             return SchedulerCheckpointDecision(
-                should_checkpoint=False,
+                should_checkpoint=True,
                 checkpoint_process=True,
                 checkpoint_filesystem=True,
                 leave_running=False,
-                reason="no_previous_checkpoint",
+                reason=reason,
                 policy_name=self.name,
+                metadata={"llm_request_in_flight": request_in_flight},
             )
 
-        request_in_flight = bool(snapshot.metadata.get("llm_request_in_flight", False))
         if self._config.require_change_signal and not changed:
             return SchedulerCheckpointDecision(
                 should_checkpoint=False,
@@ -96,29 +101,6 @@ class CheckpointingPolicy:
                 leave_running=False,
                 reason="no_change_signal",
                 policy_name=self.name,
-            )
-
-        if snapshot.last_checkpoint_at is None:
-            if self._config.require_llm_request_for_checkpoint and not request_in_flight:
-                return SchedulerCheckpointDecision(
-                    should_checkpoint=False,
-                    checkpoint_process=False,
-                    checkpoint_filesystem=False,
-                    leave_running=False,
-                    reason="llm_request_required",
-                    policy_name=self.name,
-                )
-            reason = "no_previous_checkpoint"
-            if self._config.prefer_checkpoint_during_llm_request and request_in_flight:
-                reason = "llm_request_window_available"
-            return SchedulerCheckpointDecision(
-                should_checkpoint=True,
-                checkpoint_process=checkpoint_process,
-                checkpoint_filesystem=checkpoint_filesystem,
-                leave_running=False,
-                reason=reason,
-                policy_name=self.name,
-                metadata={"llm_request_in_flight": request_in_flight},
             )
 
         elapsed = (snapshot.observed_at - snapshot.last_checkpoint_at).total_seconds()

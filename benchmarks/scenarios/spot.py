@@ -69,7 +69,7 @@ def build_harness_settings(config: BenchmarkConfig) -> HarnessSettings:
         scheduler_config=scheduler_config,
         scheduler_policy=SpotPreemptionCheckpointingPolicy(scheduler_config),
         checkpoint_manager_factory=lambda base: DeleteAfterRestoreCheckpointManager(base),
-        max_workers=config.sandboxes,
+        max_workers=config.effective_max_workers,
     )
 
 
@@ -466,7 +466,11 @@ def run_auto(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
             ]
         return run_auto_sandbox(config, harness, sandbox_index=sandbox_index, sandbox=sandbox, options=options)
 
-    rows = [row for group in parallel_map(indexed_records, launch_and_run, max_workers=config.sandboxes) for row in group]
+    rows = [
+        row
+        for group in parallel_map(indexed_records, launch_and_run, max_workers=config.effective_max_workers)
+        for row in group
+    ]
     return sorted(rows, key=lambda row: (int(row["iteration"]), str(row["sandbox_id"])))
 
 

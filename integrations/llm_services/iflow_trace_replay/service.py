@@ -56,6 +56,11 @@ _SYSTEM_SETUP_SHELL_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 logger = logging.getLogger(__name__)
 
+_IFLOW_CONTEXT_ACK_MESSAGES = {
+    "Got it. Thanks for the context!",
+    "Thanks for the context. Ready when you are.",
+}
+
 
 @dataclass(frozen=True)
 class ReplayExchange:
@@ -102,26 +107,50 @@ def _normalize_text(value: str) -> str:
     normalized = _SYSTEM_REMINDER_PATTERN.sub("", value).strip()
     for pattern, replacement in _VOLATILE_TEXT_PATTERNS:
         normalized = pattern.sub(replacement, normalized)
+    if normalized.startswith("```"):
+        lines = normalized.splitlines()
+        if len(lines) >= 3 and lines[0].strip().startswith("```") and lines[-1].strip() == "```":
+            normalized = "\n".join(lines[1:-1]).strip()
     return normalized
 
 
-def _normalize_value(value: object) -> object:
+def _normalize_text_relaxed(value: str) -> str:
+    normalized = _normalize_text(value)
+    return (
+        normalized.replace("\\\\r\\\\n", "\n")
+        .replace("\\\\n", "\n")
+        .replace("\\\\r", "\r")
+        .replace("\\\\t", "\t")
+        .replace('\\"', '"')
+        .replace("\\'", "'")
+        .replace("\\r\\n", "\n")
+        .replace("\\n", "\n")
+        .replace("\\r", "\r")
+        .replace("\\t", "\t")
+    )
+
+
+def _normalize_value(value: object, *, relaxed: bool = False) -> object:
     if isinstance(value, str):
+        if relaxed:
+            return _normalize_text_relaxed(value)
         return _normalize_text(value)
     if isinstance(value, dict):
-        return {str(key): _normalize_value(item) for key, item in sorted(value.items())}
+        return {str(key): _normalize_value(item, relaxed=relaxed) for key, item in sorted(value.items())}
     if isinstance(value, list):
-        return [_normalize_value(item) for item in value]
+        return [_normalize_value(item, relaxed=relaxed) for item in value]
     return value
 
 
-def _normalize_message_content(role: str, content: object) -> object:
-    normalized = _normalize_value(content)
+def _normalize_message_content(role: str, content: object, *, relaxed: bool = False) -> object:
+    normalized = _normalize_value(content, relaxed=relaxed)
     if role == "system" and isinstance(normalized, str):
         if normalized.startswith("You are iFlow CLI, an interactive CLI agent"):
             return _IFLOW_SYSTEM_PROMPT_SENTINEL
         return normalized
     if role == "assistant" and isinstance(normalized, str):
+        if normalized in _IFLOW_CONTEXT_ACK_MESSAGES:
+            return _IFLOW_CONTEXT_ACK_SENTINEL
         return normalized
     if role == "user" and isinstance(normalized, list) and len(normalized) >= 1:
         item = normalized[-1]
@@ -134,7 +163,7 @@ def _normalize_message_content(role: str, content: object) -> object:
     return normalized
 
 
-def _normalized_lookup_messages(payload: dict[str, Any]) -> tuple[object, ...]:
+def _normalized_lookup_messages(payload: dict[str, Any], *, relaxed: bool = False) -> tuple[object, ...]:
     messages = payload.get("messages")
     if not isinstance(messages, list):
         return ()
@@ -157,14 +186,14 @@ def _normalized_lookup_messages(payload: dict[str, Any]) -> tuple[object, ...]:
         normalized_messages.append(
             {
                 "role": role,
-                "content": _normalize_message_content(role, message.get("content")),
+                "content": _normalize_message_content(role, message.get("content"), relaxed=relaxed),
             }
         )
     return tuple(normalized_messages)
 
 
-def _lookup_stats(path: str, payload: dict[str, Any]) -> tuple[str, int]:
-    lookup_messages = _normalized_lookup_messages(payload)
+def _lookup_stats(path: str, payload: dict[str, Any], *, relaxed: bool = False) -> tuple[str, int]:
+    lookup_messages = _normalized_lookup_messages(payload, relaxed=relaxed)
     normalized = {
         "path": path,
         "messages": lookup_messages,
@@ -307,6 +336,8 @@ def _should_preserve_duplicate_tool_response(payload: dict[str, Any]) -> bool:
         function = tool_call.get("function")
         if not isinstance(function, dict):
             continue
+        if function.get("name") == "write_file":
+            return True
         if function.get("name") != "run_shell_command":
             continue
         arguments = function.get("arguments")
@@ -462,6 +493,20 @@ class TraceReplayLLMState:
         self._served_request_keys: set[str] = set()
         self._responses_by_key = {
             exchange.lookup_key: exchange for exchange in parsed.exchanges}
+        self._responses_by_relaxed_key: dict[str, ReplayExchange] = {}
+        self._ambiguous_relaxed_lookup_keys: set[str] = set()
+        for exchange in parsed.exchanges:
+            relaxed_key, _ = _lookup_stats(exchange.path, exchange.request, relaxed=True)
+            if relaxed_key in self._ambiguous_relaxed_lookup_keys:
+                continue
+            existing = self._responses_by_relaxed_key.get(relaxed_key)
+            if existing is None:
+                self._responses_by_relaxed_key[relaxed_key] = exchange
+                continue
+            if existing.lookup_key == exchange.lookup_key:
+                continue
+            self._ambiguous_relaxed_lookup_keys.add(relaxed_key)
+            self._responses_by_relaxed_key.pop(relaxed_key, None)
 
     def handle_request(self, *, path: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
         return handle_request(path=path, headers=headers, payload=payload, state=self)
@@ -494,15 +539,30 @@ class TraceReplayLLMState:
         try:
             exchange = self._responses_by_key[lookup_key]
         except KeyError as exc:
-            logger.warning(
-                "Replay lookup miss path=%s hash=%s assistant_messages=%d",
-                path,
-                lookup_key[:12],
-                assistant_message_count,
-            )
-            raise ValueError(
-                "no replay response found for request " f"hash={lookup_key[:12]} assistant_messages={assistant_message_count}"
-            ) from exc
+            relaxed_lookup_key, _ = _lookup_stats(path, payload, relaxed=True)
+            exchange = self._responses_by_relaxed_key.get(relaxed_lookup_key)
+            if exchange is not None:
+                lookup_key = exchange.lookup_key
+                logger.info(
+                    "Replay lookup relaxed-match path=%s sandbox_id=%s strict_hash=%s relaxed_hash=%s assistant_messages=%d",
+                    path,
+                    sandbox_id,
+                    _lookup_stats(path, payload)[0][:12],
+                    relaxed_lookup_key[:12],
+                    assistant_message_count,
+                )
+            else:
+                logger.warning(
+                    "Replay lookup miss path=%s sandbox_id=%s hash=%s assistant_messages=%d",
+                    path,
+                    sandbox_id,
+                    lookup_key[:12],
+                    assistant_message_count,
+                )
+                logger.warning(f"{sandbox_id=} Replay lookup miss: {self._matched_response_count=}, {payload=}")
+                raise ValueError(
+                    "no replay response found for request " f"hash={lookup_key[:12]} assistant_messages={assistant_message_count}"
+                ) from exc
         with self._lock:
             is_duplicate = lookup_key in self._served_request_keys
             response_kind = "replay"

@@ -1202,8 +1202,38 @@ class RealHostScenarioHarness:
         self._delete_runtime(sandbox.sandbox_id)
         self._set_sandbox_running_state(sandbox.sandbox_id, is_running=False)
 
+    def _fault_injection_ready(self, sandbox: SandboxHandle) -> bool:
+        request_state = None if self.request_state_store is None else self.request_state_store.get(sandbox.sandbox_id)
+        request_in_flight = False if request_state is None else request_state.llm_request_in_flight
+        checkpoint_active = False if self.executor is None else self.executor.has_active_checkpoint(sandbox.sandbox_id)
+        return not request_in_flight and not checkpoint_active
+
+    def wait_for_fault_injection_window(self, sandbox: SandboxHandle, *, timeout_s: float = 60.0) -> None:
+        logger.info(
+            "Waiting for fault injection window sandbox=%s timeout_s=%.1f",
+            sandbox.sandbox_id,
+            timeout_s,
+        )
+        ready = benchmark_support.wait_for(
+            lambda: self._fault_injection_ready(sandbox),
+            timeout_s=timeout_s,
+            interval_s=0.01,
+            raise_on_timeout=False,
+        )
+        if ready:
+            logger.info("Fault injection window ready sandbox=%s", sandbox.sandbox_id)
+            return
+        request_state = None if self.request_state_store is None else self.request_state_store.get(sandbox.sandbox_id)
+        request_in_flight = False if request_state is None else request_state.llm_request_in_flight
+        checkpoint_active = False if self.executor is None else self.executor.has_active_checkpoint(sandbox.sandbox_id)
+        raise RuntimeError(
+            "timed out waiting for fault injection window "
+            f"(sandbox={sandbox.sandbox_id} request_in_flight={request_in_flight} checkpoint_active={checkpoint_active})"
+        )
+
     def inject_fault(self, sandbox: SandboxHandle) -> None:
         logger.info("Injecting fault into sandbox=%s", sandbox.sandbox_id)
+        self.wait_for_fault_injection_window(sandbox)
         self._delete_runtime(sandbox.sandbox_id)
         self._set_sandbox_running_state(sandbox.sandbox_id, is_running=False)
 
@@ -1740,8 +1770,10 @@ class RealHostScenarioHarness:
         if self.llm_server is None:
             return
         metadata = manifest.metadata if isinstance(manifest.metadata, dict) else {}
-        raw_value = metadata.get("process_restore_replay_action_count")
+        raw_value_p = metadata.get("process_restore_replay_action_count")
+        raw_value_f = metadata.get("filesystem_restore_replay_action_count")
         try:
+            raw_value = max(int(raw_value_p), int(raw_value_f))
             matched_response_count = max(0, int(raw_value))
         except (TypeError, ValueError):
             logger.warning(

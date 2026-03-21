@@ -112,6 +112,10 @@ class _BaseScenarioHarness:
         self._progress_lock = threading.Lock()
         self._active_progress = 0
         self.max_concurrent_progress = 0
+        self.launch_delay_s = 0.0
+        self._launch_lock = threading.Lock()
+        self._active_launches = 0
+        self.max_concurrent_launches = 0
         self.fail_on_restore_sandbox: str | None = None
         self.fail_recovery_record_sandbox: str | None = None
         self._unreachable_sandboxes: set[str] = set()
@@ -129,6 +133,15 @@ class _BaseScenarioHarness:
         )
 
     def launch_task_record(self, sandbox_name: str, record: BenchmarkTaskRecord) -> SandboxHandle:
+        if self.launch_delay_s > 0:
+            with self._launch_lock:
+                self._active_launches += 1
+                self.max_concurrent_launches = max(self.max_concurrent_launches, self._active_launches)
+            try:
+                time.sleep(self.launch_delay_s)
+            finally:
+                with self._launch_lock:
+                    self._active_launches -= 1
         sandbox_id = SandboxId(sandbox_name)
         handle = SandboxHandle(
             sandbox_id=sandbox_id,
@@ -294,6 +307,26 @@ class FaultScenarioTests(unittest.TestCase):
         injected_rows = [(int(row["iteration"]), row["sandbox_id"]) for row in rows if int(row["event_injected"]) == 1]
         self.assertEqual(injected_rows, [(2, "fault-0"), (2, "fault-1")])
         self.assertEqual(harness.notify_fault_calls, ["fault-0", "fault-1"])
+
+    def test_auto_mode_can_limit_launch_parallelism_below_sandbox_count(self) -> None:
+        harness = _BaseScenarioHarness()
+        harness.launch_delay_s = 0.05
+
+        rows = run_fault_auto(
+            _config(
+                "fault",
+                "auto",
+                sandboxes=4,
+                max_workers=2,
+                iterations=1,
+                scenario_options={"injection_rate": 0.0},
+            ),
+            harness,
+        )
+
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(harness.launched, ["fault-0", "fault-1", "fault-2", "fault-3"])
+        self.assertLessEqual(harness.max_concurrent_launches, 2)
 
     def test_replay_mode_treats_completion_before_later_checkpoint_as_success(self) -> None:
         class _ReplayEarlyFinishTaskRun:

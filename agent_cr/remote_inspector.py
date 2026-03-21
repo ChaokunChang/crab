@@ -162,6 +162,10 @@ class RemoteSandboxInspector(SandboxInspector):
     def _read_remote_snapshot(self, sandbox_id: SandboxId) -> SandboxSnapshot:
         payload = self._service_client.get_proc_and_fs_status(sandbox_id)
         status = dict(payload["status"])
+        metadata = dict(status.get("metadata", {}))
+        last_reset_at = _parse_ts(status.get("last_reset_at"))
+        if last_reset_at is not None:
+            metadata["host_last_reset_at"] = last_reset_at.isoformat()
         return SandboxSnapshot(
             sandbox_id=sandbox_id,
             runtime_name=str(status["runtime_name"]),
@@ -169,8 +173,11 @@ class RemoteSandboxInspector(SandboxInspector):
             process_changed=bool(status["process_changed"]),
             filesystem_changed=bool(status["filesystem_changed"]),
             observed_at=_parse_ts(status.get("observed_at")) or utc_now(),
-            last_checkpoint_at=_parse_ts(status.get("last_reset_at")),
-            metadata=dict(status.get("metadata", {})),
+            # Host-inspector resets also happen for non-checkpoint baselines.
+            # Only explicit mark_checkpoint_complete() calls should advance the
+            # scheduler-visible checkpoint timestamp.
+            last_checkpoint_at=None,
+            metadata=metadata,
         )
 
     def _merge_snapshots(

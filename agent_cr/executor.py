@@ -72,6 +72,15 @@ class CRExecutor:
         with self._lock:
             return self._records.get(job_id)
 
+    def has_active_checkpoint(self, sandbox_id) -> bool:
+        with self._lock:
+            return any(
+                record.job_type == JobType.CHECKPOINT
+                and record.sandbox_id == sandbox_id
+                and record.status in {JobStatus.PENDING, JobStatus.RUNNING}
+                for record in self._records.values()
+            )
+
     def submit_checkpoint(self, job: CheckpointJob) -> Future[CheckpointResult]:
         self._set_record(
             JobRecord(

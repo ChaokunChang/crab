@@ -46,7 +46,7 @@ def build_harness_settings(config: BenchmarkConfig) -> HarnessSettings:
         scheduler_config=scheduler_config,
         scheduler_policy=None,
         checkpoint_manager_factory=lambda base: base,
-        max_workers=config.sandboxes,
+        max_workers=config.effective_max_workers,
     )
 
 
@@ -118,7 +118,7 @@ def run_manual(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
         harness,
         sandbox_name_prefix="sandbox",
         records=records,
-        max_workers=config.sandboxes,
+        max_workers=config.effective_max_workers,
     )
     if sandboxes and any(is_replay_llm_service_type(sandbox.llm_service_type) for sandbox in sandboxes):
         rows = [

@@ -76,7 +76,7 @@ def build_harness_settings(config: BenchmarkConfig) -> HarnessSettings:
         scheduler_config=scheduler_config,
         scheduler_policy=TreeSearchCheckpointingPolicy(),
         checkpoint_manager_factory=lambda base: KeepAllCheckpointManager(base),
-        max_workers=max(1, config.sandboxes * max(1, options.branch_points + 1)),
+        max_workers=max(1, config.effective_max_workers * max(1, options.branch_points + 1)),
     )
 
 
@@ -463,7 +463,7 @@ def _launch_sources(config: BenchmarkConfig, harness) -> list[SandboxHandle]:
         harness,
         sandbox_name_prefix="tree-source",
         records=records,
-        max_workers=config.sandboxes,
+        max_workers=config.effective_max_workers,
     )
 
 
@@ -483,7 +483,7 @@ def run_manual(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
                 source=item[1],
                 replay_steps=replay_steps,
             ),
-            max_workers=max(1, len(indexed_sources)),
+            max_workers=min(config.effective_max_workers, max(1, len(indexed_sources))),
         )
     finally:
         for source in sources:
@@ -511,7 +511,7 @@ def run_auto(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
                 source=item[1],
                 replay_steps=replay_steps,
             ),
-            max_workers=max(1, len(indexed_sources)),
+            max_workers=min(config.effective_max_workers, max(1, len(indexed_sources))),
         )
     finally:
         if hasattr(harness, "drain_request_state_changes"):

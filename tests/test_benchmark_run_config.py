@@ -23,8 +23,10 @@ class BenchmarkConfigTests(unittest.TestCase):
                         "scenario: fault",
                         "mode: auto",
                         "task_dataset: datasets/tasks.jsonl",
+                        "sandboxes: 4",
                         "output: results/out.csv",
                         "log_file: results/out.log",
+                        "max_workers: 3",
                         "log_file_mode: write",
                         "zpool_size: 32G",
                         "zpool_name: benchcache",
@@ -47,6 +49,8 @@ class BenchmarkConfigTests(unittest.TestCase):
             self.assertEqual(config.task_dataset, (root / "datasets" / "tasks.jsonl").resolve())
             self.assertEqual(config.output, (root / "results" / "out.csv").resolve())
             self.assertEqual(config.log_file, (root / "results" / "out.log").resolve())
+            self.assertEqual(config.max_workers, 3)
+            self.assertEqual(config.effective_max_workers, 3)
             self.assertEqual(config.log_file_mode, "write")
             self.assertEqual(config.zpool_size, "32G")
             self.assertEqual(config.zpool_name, "benchcache")
@@ -72,6 +76,23 @@ class BenchmarkConfigTests(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(ValueError, "log_file_mode"):
+                load_config(config_path)
+
+    def test_load_config_rejects_non_positive_max_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "bench.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "scenario: fault",
+                        "mode: auto",
+                        "max_workers: 0",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "max_workers"):
                 load_config(config_path)
 
     def test_load_config_rejects_invalid_scenario_mode_pair(self) -> None:
@@ -270,6 +291,7 @@ class BenchmarkRunDispatchTests(unittest.TestCase):
 
             log_text = log_file.read_text(encoding="utf-8")
             self.assertIn("benchmark.run start", log_text)
+            self.assertIn("max_workers=1", log_text)
             self.assertIn("success_ratio_avg: 1.000", log_text)
             self.assertIn(f"output: {output.resolve()}", log_text)
             self.assertIn("benchmark.run end status=completed", log_text)
