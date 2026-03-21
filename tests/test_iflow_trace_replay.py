@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from benchmarks.generate_termnius_iflow_replay_dataset import generate_dataset
-from integrations.llm_services.iflow_trace_replay.service import TraceReplayLLMState, parse_replay_trace
+from integrations.llm_services.iflow_trace_replay.service import TraceReplayLLMState, _lookup_stats, parse_replay_trace
 
 
 class IFlowTraceReplayTests(unittest.TestCase):
@@ -200,6 +200,37 @@ class IFlowTraceReplayTests(unittest.TestCase):
         self.assertEqual(first["choices"][0]["message"]["content"], "first")
         self.assertEqual(snapshot["matched_response_count"], 1)
         self.assertEqual(snapshot["next_response_index"], 1)
+
+    def test_trace_replay_state_matches_escape_only_formatting_differences(self) -> None:
+        trace_content = 'If potentially_problematic_new_string is console.log("Hello\nWorld"), fix it.'
+        live_content = 'If potentially_problematic_new_string is console.log(\\"Hello\\\\nWorld\\"), fix it.'
+
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.log"
+            trace_path.write_text(
+                "\n".join(self._request_response_lines(trace_content)),
+                encoding="utf-8",
+            )
+            state = TraceReplayLLMState(llm_service_config={"trace_path": str(trace_path)})
+
+            strict_hash, _ = _lookup_stats(
+                "/v1/chat/completions",
+                {"model": "trace-model", "messages": [{"role": "user", "content": live_content}]},
+            )
+            trace_hash, _ = _lookup_stats(
+                "/v1/chat/completions",
+                {"model": "trace-model", "messages": [{"role": "user", "content": trace_content}]},
+            )
+            self.assertNotEqual(strict_hash, trace_hash)
+
+            replayed_index, replayed = state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={"model": "trace-model", "messages": [{"role": "user", "content": live_content}]},
+            )
+
+        self.assertEqual(replayed_index, 1)
+        self.assertEqual(replayed["choices"][0]["message"]["content"], trace_content)
 
     def test_trace_replay_state_restore_rewinds_duplicate_tracking(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
