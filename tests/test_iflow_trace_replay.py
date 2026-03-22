@@ -232,6 +232,65 @@ class IFlowTraceReplayTests(unittest.TestCase):
         self.assertEqual(replayed_index, 1)
         self.assertEqual(replayed["choices"][0]["message"]["content"], trace_content)
 
+    def test_trace_replay_state_unmatched_request_falls_back_to_cursor_response(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.log"
+            trace_path.write_text(
+                "\n".join(self._request_response_lines("first", "second")),
+                encoding="utf-8",
+            )
+            state = TraceReplayLLMState(llm_service_config={"trace_path": str(trace_path), "response_delay_ms": 0})
+
+            first_index, first = state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={"model": "trace-model", "messages": [{"role": "user", "content": "unmatched"}], "tools": []},
+            )
+            second_index, second = state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={"model": "trace-model", "messages": [{"role": "user", "content": "second"}], "tools": []},
+            )
+            snapshot = state.snapshot()
+
+        self.assertEqual(first_index, 1)
+        self.assertEqual(first["choices"][0]["message"]["content"], "first")
+        self.assertEqual(second_index, 2)
+        self.assertEqual(second["choices"][0]["message"]["content"], "second")
+        self.assertEqual(snapshot["matched_response_count"], 2)
+        self.assertEqual(snapshot["next_response_index"], 2)
+        self.assertEqual(snapshot["events"][0]["response_kind"], "cursor_fallback")
+
+    def test_trace_replay_state_restore_after_cursor_fallback_preserves_prefix_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.log"
+            trace_path.write_text(
+                "\n".join(self._request_response_lines("first", "second", "third")),
+                encoding="utf-8",
+            )
+            state = TraceReplayLLMState(llm_service_config={"trace_path": str(trace_path), "response_delay_ms": 0})
+
+            state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={"model": "trace-model", "messages": [{"role": "user", "content": "first"}], "tools": []},
+            )
+            state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={"model": "trace-model", "messages": [{"role": "user", "content": "unmatched"}], "tools": []},
+            )
+
+            state.restore(matched_response_count=2)
+            restored_index, restored = state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={"model": "trace-model", "messages": [{"role": "user", "content": "third"}], "tools": []},
+            )
+
+        self.assertEqual(restored_index, 3)
+        self.assertEqual(restored["choices"][0]["message"]["content"], "third")
+
     def test_trace_replay_state_restore_rewinds_duplicate_tracking(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "trace.log"
@@ -959,6 +1018,14 @@ class IFlowTraceReplayTests(unittest.TestCase):
             trace_path.write_text("\n".join(self._request_response_lines("first")), encoding="utf-8")
             state = TraceReplayLLMState(llm_service_config={"trace_path": str(trace_path)})
 
+            first_index, first = state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={"model": "trace-model", "messages": [{"role": "user", "content": "unmatched"}], "tools": []},
+            )
+
+            self.assertEqual(first_index, 1)
+            self.assertEqual(first["choices"][0]["message"]["content"], "first")
             with self.assertRaisesRegex(ValueError, "no replay response found"):
                 state.next_response(
                     path="/v1/chat/completions",

@@ -116,12 +116,18 @@ def _normalize_text(value: str) -> str:
 
 def _normalize_text_relaxed(value: str) -> str:
     normalized = _normalize_text(value)
+    return _collapse_escape_only_formatting(normalized)
+
+
+def _collapse_escape_only_formatting(value: str) -> str:
     return (
-        normalized.replace("\\\\r\\\\n", "\n")
+        value.replace("\\\\r\\\\n", "\n")
         .replace("\\\\n", "\n")
         .replace("\\\\r", "\r")
         .replace("\\\\t", "\t")
+        .replace('\\\\\\"', '"')
         .replace('\\"', '"')
+        .replace("\\\\'", "'")
         .replace("\\'", "'")
         .replace("\\r\\n", "\n")
         .replace("\\n", "\n")
@@ -336,8 +342,6 @@ def _should_preserve_duplicate_tool_response(payload: dict[str, Any]) -> bool:
         function = tool_call.get("function")
         if not isinstance(function, dict):
             continue
-        if function.get("name") == "write_file":
-            return True
         if function.get("name") != "run_shell_command":
             continue
         arguments = function.get("arguments")
@@ -450,7 +454,7 @@ def parse_replay_trace(trace_path: Path) -> ParsedReplayTrace:
                 path=path,
                 request=request,
                 response=payload,
-                response_index=len(exchanges) + 1,
+                response_index=len(exchanges),
                 lookup_key=lookup_key,
             )
         )
@@ -490,6 +494,7 @@ class TraceReplayLLMState:
         self._matched_response_count = 0
         self._duplicate_response_count = 0
         self._total_progress_responses = len(parsed.exchanges)
+        self._next_response_index = 0
         self._served_request_keys: set[str] = set()
         self._responses_by_key = {
             exchange.lookup_key: exchange for exchange in parsed.exchanges}
@@ -515,6 +520,7 @@ class TraceReplayLLMState:
         with self._lock:
             self._matched_response_count = 0
             self._duplicate_response_count = 0
+            self._next_response_index = 0
             self._served_request_keys.clear()
             self._events.clear()
 
@@ -523,6 +529,7 @@ class TraceReplayLLMState:
             restored_count = max(0, min(int(matched_response_count), self._total_progress_responses))
             self._matched_response_count = restored_count
             self._duplicate_response_count = 0
+            self._next_response_index = restored_count
             self._served_request_keys = {
                 exchange.lookup_key for exchange in self._trace.exchanges[:restored_count]
             }
@@ -552,17 +559,29 @@ class TraceReplayLLMState:
                     assistant_message_count,
                 )
             else:
-                logger.warning(
-                    "Replay lookup miss path=%s sandbox_id=%s hash=%s assistant_messages=%d",
+                if self._next_response_index >= self._total_progress_responses:
+                    logger.warning(
+                        "Replay lookup miss path=%s sandbox_id=%s hash=%s assistant_messages=%d",
+                        path,
+                        sandbox_id,
+                        lookup_key[:12],
+                        assistant_message_count,
+                    )
+                    logger.warning(f"{sandbox_id=} Replay lookup miss: {self._matched_response_count=}, {payload=}")
+                    raise ValueError(
+                        "no replay response found for request "
+                        f"hash={lookup_key[:12]} assistant_messages={assistant_message_count}"
+                    ) from exc
+                exchange = self._trace.exchanges[self._next_response_index]
+                logger.info(
+                    "Replay cursor-fallback response path=%s sandbox_id=%s requested_hash=%s response_index=%d assistant_messages=%d",
                     path,
                     sandbox_id,
                     lookup_key[:12],
+                    exchange.response_index,
                     assistant_message_count,
                 )
-                logger.warning(f"{sandbox_id=} Replay lookup miss: {self._matched_response_count=}, {payload=}")
-                raise ValueError(
-                    "no replay response found for request " f"hash={lookup_key[:12]} assistant_messages={assistant_message_count}"
-                ) from exc
+        self._next_response_index = exchange.response_index + 1
         with self._lock:
             is_duplicate = lookup_key in self._served_request_keys
             response_kind = "replay"
@@ -591,6 +610,7 @@ class TraceReplayLLMState:
                     response = exchange.response
                     response_kind = "duplicate_original"
             else:
+                self._served_request_keys.add(exchange.lookup_key)
                 self._served_request_keys.add(lookup_key)
                 self._matched_response_count += 1
                 matched_response_count = self._matched_response_count
@@ -602,6 +622,8 @@ class TraceReplayLLMState:
                     "request_hash": lookup_key,
                     "matched_response_count": matched_response_count,
                     "response_kind": response_kind,
+                    "response_index": exchange.response_index,
+                    "lookup_key_matched": True,
                 }
             )
         if self._response_delay_ms > 0:
@@ -617,8 +639,8 @@ class TraceReplayLLMState:
                 "total_responses": self._total_progress_responses,
                 "matched_response_count": matched_response_count,
                 "duplicate_response_count": self._duplicate_response_count,
-                "next_response_index": matched_response_count,
-                "responses_served": matched_response_count,
+                "next_response_index": self._next_response_index,
+                "responses_served": self._next_response_index,
                 "is_complete": matched_response_count >= self._total_progress_responses,
                 "malformed_line_count": len(self._trace.malformed_lines),
                 "malformed_lines": list(self._trace.malformed_lines),
