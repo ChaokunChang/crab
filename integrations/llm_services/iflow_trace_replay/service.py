@@ -640,7 +640,7 @@ class TraceReplayLLMState:
                 "matched_response_count": matched_response_count,
                 "duplicate_response_count": self._duplicate_response_count,
                 "next_response_index": self._next_response_index,
-                "responses_served": self._next_response_index,
+                "responses_served": matched_response_count,
                 "is_complete": matched_response_count >= self._total_progress_responses,
                 "malformed_line_count": len(self._trace.malformed_lines),
                 "malformed_lines": list(self._trace.malformed_lines),
