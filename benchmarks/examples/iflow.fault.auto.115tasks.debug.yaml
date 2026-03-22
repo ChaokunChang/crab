@@ -6,9 +6,14 @@ llm_service: iflow_trace_replay
 task_dataset: /root/workspace/agent-cr/results/datasets/termnius_iflow_replay_x115.jsonl
 sandboxes: 115
 max_workers: 48
-iterations: 5
-output: ../../logs/iflow.fault.auto.101tasks.debug.csv
-log_file: ../../logs/iflow.fault.auto.101tasks.debug.log
+iterations: 10
+output: ../../logs/iflow.fault.auto.115tasks.debug.csv
+log_file: ../../logs/iflow.fault.auto.115tasks.debug.log
+telemetry:
+  output: ../../logs/iflow.fault.auto.115tasks.debug.telemetry.jsonl
+  detail_level: detailed
+  capture_command_output: false
+  max_text_attribute_bytes: 2048
 zpool_size: 100G
 zpool_name: agentcrbench-101
 zpool_image: /root/workspace/agent-cr/data/agent_cr/results/zpool/agentcrbench-101.zpool.img
@@ -16,4 +21,4 @@ reuse_zpool: true
 log_level: info
 scenario_options:
   injection_rate: 0.0
-  first_forced_event_chunk: 2
+  first_forced_event_chunk: 5

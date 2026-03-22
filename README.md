@@ -243,6 +243,23 @@ The benchmark runner is now telemetry-first for timing summaries:
 
 This removes the old replay-mode `avg of avg` summary issue for timing metrics like checkpoint, restore, and recovery latency.
 
+Telemetry analysis and visualization:
+
+```bash
+python3 -m agent_cr.telemetry_analysis.report \
+  --input logs/iflow.fault.auto.minimax_hard_14tasks.debug.telemetry.jsonl \
+  --output-dir logs/iflow.fault.auto.minimax_hard_14tasks.telemetry_report
+```
+
+The analyzer is streaming-oriented and is intended for large JSONL files. It does not load the full telemetry file into memory. The generated output directory contains:
+
+- `report.html`: self-contained visual report with hotspot charts, task latency charts, LLM/checkpoint breakdown views, and lifecycle-gap diagnostics
+- `summary.json`: machine-readable aggregate report
+- `operation_summary.csv`: per-operation counts and latency quantiles
+- `task_summary.csv`: per-task benchmark and recovery metrics
+- `slow_operations.csv`: slowest recorded operations with correlation identifiers
+- `lifecycle_gaps.csv`: operations where `*.start` and `*.finish` counts do not match
+
 Logging notes:
 
 - `log_file` sends benchmark logs to a file instead of stderr/stdout.
