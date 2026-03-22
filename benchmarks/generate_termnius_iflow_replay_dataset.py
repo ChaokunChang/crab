@@ -134,15 +134,18 @@ def generate_dataset(*, tasks_root: Path, traces_root: Path, output_path: Path) 
     task_dirs = {path.name: path for path in tasks_root.iterdir() if path.is_dir()}
     trace_dirs = {path.name: path for path in traces_root.iterdir() if path.is_dir()}
     task_ids = sorted(task_dirs.keys() & trace_dirs.keys())
-    rows = [
-        build_dataset_row(
-            task_id=task_id,
-            task_root=task_dirs[task_id],
-            trace_log=resolve_trace_log(trace_dirs[task_id]),
-            output_path=output_path,
-        )
-        for task_id in task_ids
-    ]
+    rows = []
+    for task_id in task_ids:
+        try:
+            row = build_dataset_row(
+                task_id=task_id,
+                task_root=task_dirs[task_id],
+                trace_log=resolve_trace_log(trace_dirs[task_id]),
+                output_path=output_path,
+            )
+            rows.append(row)
+        except Exception as e:
+            print(f"{task_id} can not be parsed, skipped with error {e}")
     return rows
 
 

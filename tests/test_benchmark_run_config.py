@@ -28,6 +28,7 @@ class BenchmarkConfigTests(unittest.TestCase):
                         "log_file: results/out.log",
                         "max_workers: 3",
                         "log_file_mode: write",
+                        "benchmark_root: benchmark-runs",
                         "zpool_size: 32G",
                         "zpool_name: benchcache",
                         "zpool_image: cache/bench.zpool.img",
@@ -52,6 +53,7 @@ class BenchmarkConfigTests(unittest.TestCase):
             self.assertEqual(config.max_workers, 3)
             self.assertEqual(config.effective_max_workers, 3)
             self.assertEqual(config.log_file_mode, "write")
+            self.assertEqual(config.benchmark_root, (root / "benchmark-runs").resolve())
             self.assertEqual(config.zpool_size, "32G")
             self.assertEqual(config.zpool_name, "benchcache")
             self.assertEqual(config.zpool_image, (root / "cache" / "bench.zpool.img").resolve())
@@ -128,6 +130,7 @@ class BenchmarkRunDispatchTests(unittest.TestCase):
             telemetry_output=None,
             log_file=None,
             log_file_mode="append",
+            benchmark_root=None,
             zpool_size="10G",
             zpool_name=None,
             zpool_image=None,
@@ -216,6 +219,7 @@ class BenchmarkRunDispatchTests(unittest.TestCase):
             telemetry_output=None,
             log_file=Path("/tmp/out.log"),
             log_file_mode="append",
+            benchmark_root=Path("/tmp/bench-root"),
             zpool_size="10G",
             zpool_name=None,
             zpool_image=None,
@@ -231,6 +235,7 @@ class BenchmarkRunDispatchTests(unittest.TestCase):
             run_benchmark_config(config)
 
         self.assertEqual(calls[0]["telemetry_output"], Path("/tmp/out.telemetry.jsonl"))
+        self.assertEqual(calls[0]["benchmark_root"], Path("/tmp/bench-root"))
 
     def test_run_benchmark_config_logs_run_markers_and_summary_to_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -273,6 +278,7 @@ class BenchmarkRunDispatchTests(unittest.TestCase):
                 telemetry_output=telemetry_output,
                 log_file=log_file,
                 log_file_mode="write",
+                benchmark_root=root / "bench-root",
                 zpool_size="10G",
                 zpool_name=None,
                 zpool_image=None,

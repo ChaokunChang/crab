@@ -5,10 +5,10 @@ from concurrent.futures import ThreadPoolExecutor
 import errno
 import json
 import logging
-import shutil
-import subprocess
 import os
 import shlex
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -196,6 +196,7 @@ class RealHostScenarioHarness:
         auto_cr: bool = False,
         work_dir_host_root: Path | None = None,
         telemetry_output: Path | None = None,
+        benchmark_root: Path | None = None,
         zpool_size: str = "10G",
         zpool_name: str | None = None,
         zpool_image: Path | None = None,
@@ -211,6 +212,7 @@ class RealHostScenarioHarness:
         self.auto_cr = auto_cr
         self.work_dir_host_root = work_dir_host_root
         self.telemetry_output = telemetry_output
+        self.configured_benchmark_root = None if benchmark_root is None else benchmark_root.expanduser().resolve()
         self.zpool_size = zpool_size
         self.configured_zpool_name = zpool_name
         self.configured_zpool_image = zpool_image
@@ -308,11 +310,14 @@ class RealHostScenarioHarness:
             self.network_manager.bridge_ip,
         )
         self._tmpdir = tempfile.TemporaryDirectory(prefix="agent_cr_scenario_bench_")
-        # self.root = Path("/root/workspace/agent-cr/logs/tmp/agent_cr_bench")
-        bench_dir = os.environ.get("AGENTCR_BENCH_DIR", None)
-        if bench_dir and bench_dir.lower() not in ['tmpdir', 'tmp']:
+        benchmark_root = self.configured_benchmark_root
+        if benchmark_root is None:
+            bench_dir = os.environ.get("AGENTCR_BENCH_DIR", None)
+            if bench_dir and bench_dir.lower() not in ["tmpdir", "tmp"]:
+                benchmark_root = Path(bench_dir).expanduser().resolve()
+        if benchmark_root is not None:
             suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.root = (Path(bench_dir).expanduser().resolve() / suffix)
+            self.root = benchmark_root / suffix
         else:
             self.root = Path(self._tmpdir.name)
         unique_suffix = uuid.uuid4().hex[:10]
@@ -888,7 +893,7 @@ class RealHostScenarioHarness:
         task_agent_logs_path = host_logs_root / "agent-logs"
         task_logs_path.mkdir(parents=True, exist_ok=True)
         task_agent_logs_path.mkdir(parents=True, exist_ok=True)
-        image_component = sandbox_image.docker_tag_component(f"{task_id}-{sandbox_name}")
+        image_component = sandbox_image.docker_tag_component(f"{task_id}")
         return {
             "T_BENCH_CONTAINER_LOGS_PATH": "/logs",
             "T_BENCH_CONTAINER_AGENT_LOGS_PATH": "/agent-logs",

@@ -97,6 +97,7 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
         auto_cr=config.mode == "auto",
         work_dir_host_root=config.work_dir_host_root,
         telemetry_output=telemetry_output,
+        benchmark_root=config.benchmark_root,
         zpool_size=config.zpool_size,
         zpool_name=config.zpool_name,
         zpool_image=config.zpool_image,

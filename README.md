@@ -172,6 +172,7 @@ iterations: 5
 output: logs/tmp/out.csv
 log_file: logs/tmp/out.log
 log_file_mode: append | write
+benchmark_root: logs/tmp/benchmark-runs
 zpool_size: 10G
 zpool_name: agentcrbench-cache
 zpool_image: logs/tmp/bench.zpool.img
@@ -188,6 +189,7 @@ Logging notes:
 - `log_file_mode` controls the Python `FileHandler` mode.
 - Default `log_file_mode: append` preserves existing log history.
 - Use `log_file_mode: write` when you want each benchmark run to start with a fresh log file.
+- `benchmark_root` places each run under a timestamped subdirectory rooted at the configured path. If omitted, benchmarks use a temporary directory. `AGENTCR_BENCH_DIR` is still accepted as a fallback for older workflows.
 - `benchmark.run` now logs an explicit start marker and end marker for each run, and the final summary/artifact paths are logged as well as printed.
 - `zpool_size` controls the backing file size for ephemeral benchmark zpools.
 - `reuse_zpool: true` keeps the zpool across runs instead of recreating it every time.

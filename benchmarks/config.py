@@ -41,6 +41,7 @@ class BenchmarkConfig:
     telemetry_output: Path | None = None
     log_file: Path | None = None
     log_file_mode: str = "append"
+    benchmark_root: Path | None = None
     zpool_size: str = "10G"
     zpool_name: str | None = None
     zpool_image: Path | None = None
@@ -138,6 +139,7 @@ def load_config(path: Path) -> BenchmarkConfig:
         telemetry_output=_resolve_optional_path(base_dir, data.get("telemetry_output")),
         log_file=_resolve_optional_path(base_dir, data.get("log_file")),
         log_file_mode=log_file_mode,
+        benchmark_root=_resolve_optional_path(base_dir, data.get("benchmark_root")),
         zpool_size=str(data.get("zpool_size", "10G")),
         zpool_name=None if data.get("zpool_name") is None else str(data.get("zpool_name")),
         zpool_image=_resolve_optional_path(base_dir, data.get("zpool_image")),
