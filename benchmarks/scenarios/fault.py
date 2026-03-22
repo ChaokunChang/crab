@@ -12,6 +12,7 @@ from integrations.agents import SandboxHandle, TaskConfig, TaskDescription
 from benchmarks.config import BenchmarkConfig
 from benchmarks.core import (
     annotate_row,
+    emit_row_telemetry,
     launch_task_records,
     parallel_map,
     resolve_task_records,
@@ -26,7 +27,7 @@ from benchmarks.scenarios.common import (
     should_inject_event,
     wait_for_auto_replay_checkpoint,
 )
-from benchmarks.support import average, compute_summary, is_replay_llm_service_type, total_actions, wait_for
+from benchmarks.support import average, compute_summary, compute_summary_aliases, is_replay_llm_service_type, total_actions, wait_for
 
 
 @dataclass(frozen=True)
@@ -107,30 +108,30 @@ def run_manual_sandbox(
         post_resume = sandbox.task_run.wait_for_action_delta(delta=1)
         workload_resumed_at = time.perf_counter()
         success_ratio = 1.0 if restore_result.status.value == "succeeded" else 0.0
-        rows.append(
-            annotate_row(
-                config,
-                sandbox,
-                iteration=iteration,
-                success_ratio=success_ratio,
-                row={
-                    "event_type": "fault",
-                    "event_injected": 1,
-                    "recovery_status": restore_result.status.value,
-                    "checkpoint_ms": (checkpoint_finished - checkpoint_started) * 1000.0,
-                    "restore_ms": (restore_result.finished_at - restore_result.started_at).total_seconds() * 1000.0,
-                    "recovery_ms": (recovery_finished - recovery_started) * 1000.0,
-                    "readiness_ms": (ready_at - recovery_finished) * 1000.0,
-                    "end_to_end_recovery_ms": (ready_at - event_started) * 1000.0,
-                    "workload_resume_ms": (workload_resumed_at - workload_resume_started) * 1000.0,
-                    "checkpoint_actions": checkpoint_actions,
-                    "pre_event_actions": total_actions(pre_event),
-                    "post_recovery_actions": total_actions(post_resume),
-                    "lost_actions": max(0, total_actions(pre_event) - checkpoint_actions),
-                    "retained_checkpoints": len(harness.storage.list_checkpoints(sandbox.sandbox_id)),
-                },
-            )
+        row = annotate_row(
+            config,
+            sandbox,
+            iteration=iteration,
+            success_ratio=success_ratio,
+            row={
+                "event_type": "fault",
+                "event_injected": 1,
+                "recovery_status": restore_result.status.value,
+                "checkpoint_ms": (checkpoint_finished - checkpoint_started) * 1000.0,
+                "restore_ms": (restore_result.finished_at - restore_result.started_at).total_seconds() * 1000.0,
+                "recovery_ms": (recovery_finished - recovery_started) * 1000.0,
+                "readiness_ms": (ready_at - recovery_finished) * 1000.0,
+                "end_to_end_recovery_ms": (ready_at - event_started) * 1000.0,
+                "workload_resume_ms": (workload_resumed_at - workload_resume_started) * 1000.0,
+                "checkpoint_actions": checkpoint_actions,
+                "pre_event_actions": total_actions(pre_event),
+                "post_recovery_actions": total_actions(post_resume),
+                "lost_actions": max(0, total_actions(pre_event) - checkpoint_actions),
+                "retained_checkpoints": len(harness.storage.list_checkpoints(sandbox.sandbox_id)),
+            },
         )
+        emit_row_telemetry(harness, sandbox, row, iteration=iteration)
+        rows.append(row)
     return rows
 
 
@@ -156,30 +157,30 @@ def run_auto_sandbox(
             rng=rng,
         )
         if not injected:
-            rows.append(
-                annotate_row(
-                    config,
-                    sandbox,
-                    iteration=iteration,
-                    success_ratio=1.0,
-                    row={
-                        "event_type": "fault",
-                        "event_injected": 0,
-                        "recovery_status": "none",
-                        "checkpoint_ms": 0.0,
-                        "restore_ms": 0.0,
-                        "recovery_ms": 0.0,
-                        "readiness_ms": 0.0,
-                        "end_to_end_recovery_ms": 0.0,
-                        "workload_resume_ms": 0.0,
-                        "checkpoint_actions": 0,
-                        "pre_event_actions": total_actions(current),
-                        "post_recovery_actions": total_actions(current),
-                        "lost_actions": 0,
-                        "retained_checkpoints": len(harness.storage.list_checkpoints(sandbox.sandbox_id)),
-                    },
-                )
+            row = annotate_row(
+                config,
+                sandbox,
+                iteration=iteration,
+                success_ratio=1.0,
+                row={
+                    "event_type": "fault",
+                    "event_injected": 0,
+                    "recovery_status": "none",
+                    "checkpoint_ms": 0.0,
+                    "restore_ms": 0.0,
+                    "recovery_ms": 0.0,
+                    "readiness_ms": 0.0,
+                    "end_to_end_recovery_ms": 0.0,
+                    "workload_resume_ms": 0.0,
+                    "checkpoint_actions": 0,
+                    "pre_event_actions": total_actions(current),
+                    "post_recovery_actions": total_actions(current),
+                    "lost_actions": 0,
+                    "retained_checkpoints": len(harness.storage.list_checkpoints(sandbox.sandbox_id)),
+                },
             )
+            emit_row_telemetry(harness, sandbox, row, iteration=iteration)
+            rows.append(row)
             continue
         event_started = time.perf_counter()
         harness.inject_fault(sandbox)
@@ -199,30 +200,30 @@ def run_auto_sandbox(
             post_recovery = sandbox.task_run.poll_status()
             ready_at = time.perf_counter()
             sandbox.last_status = post_recovery
-        rows.append(
-            annotate_row(
-                config,
-                sandbox,
-                iteration=iteration,
-                success_ratio=success_ratio,
-                row={
-                    "event_type": "fault",
-                    "event_injected": 1,
-                    "recovery_status": record.status,
-                    "checkpoint_ms": 0.0,
-                    "restore_ms": 0.0,
-                    "recovery_ms": (recovery_finished - recovery_started) * 1000.0,
-                    "readiness_ms": (ready_at - recovery_finished) * 1000.0,
-                    "end_to_end_recovery_ms": (ready_at - event_started) * 1000.0,
-                    "workload_resume_ms": 0.0,
-                    "checkpoint_actions": 0,
-                    "pre_event_actions": total_actions(pre_event),
-                    "post_recovery_actions": total_actions(post_recovery),
-                    "lost_actions": max(0, total_actions(pre_event) - total_actions(post_recovery)),
-                    "retained_checkpoints": len(harness.storage.list_checkpoints(sandbox.sandbox_id)),
-                },
-            )
+        row = annotate_row(
+            config,
+            sandbox,
+            iteration=iteration,
+            success_ratio=success_ratio,
+            row={
+                "event_type": "fault",
+                "event_injected": 1,
+                "recovery_status": record.status,
+                "checkpoint_ms": 0.0,
+                "restore_ms": 0.0,
+                "recovery_ms": (recovery_finished - recovery_started) * 1000.0,
+                "readiness_ms": (ready_at - recovery_finished) * 1000.0,
+                "end_to_end_recovery_ms": (ready_at - event_started) * 1000.0,
+                "workload_resume_ms": 0.0,
+                "checkpoint_actions": 0,
+                "pre_event_actions": total_actions(pre_event),
+                "post_recovery_actions": total_actions(post_recovery),
+                "lost_actions": max(0, total_actions(pre_event) - total_actions(post_recovery)),
+                "retained_checkpoints": len(harness.storage.list_checkpoints(sandbox.sandbox_id)),
+            },
         )
+        emit_row_telemetry(harness, sandbox, row, iteration=iteration)
+        rows.append(row)
         if success_ratio == 0.0:
             break
     return rows
@@ -237,6 +238,7 @@ def run_replay_manual_sandbox(
     options: FaultOptions,
 ) -> dict[str, object]:
     replay_chunk_targets = choose_replay_chunk_targets(sandbox, config.iterations)
+    emit_metric = getattr(harness, "emit_benchmark_metric", None)
     rng = random.Random(sandbox_index)
     trace_response_count = trace_response_count_for_sandbox(sandbox)
     checkpoint_ms_values: list[float] = []
@@ -312,13 +314,24 @@ def run_replay_manual_sandbox(
             ready_at = time.perf_counter()
             if restore_result.status.value == "succeeded":
                 recoveries_succeeded += 1
-            restore_ms_values.append(
-                (restore_result.finished_at - restore_result.started_at).total_seconds() * 1000.0
-            )
-            recovery_ms_values.append((recovery_finished - recovery_started) * 1000.0)
-            readiness_ms_values.append((ready_at - recovery_finished) * 1000.0)
-            end_to_end_recovery_ms_values.append((ready_at - event_started) * 1000.0)
-            lost_actions_values.append(max(0, total_actions(pre_event) - chunk_target))
+            checkpoint_ms = (checkpoint_finished - checkpoint_started) * 1000.0
+            restore_ms = (restore_result.finished_at - restore_result.started_at).total_seconds() * 1000.0
+            recovery_ms = (recovery_finished - recovery_started) * 1000.0
+            readiness_ms = (ready_at - recovery_finished) * 1000.0
+            end_to_end_recovery_ms = (ready_at - event_started) * 1000.0
+            lost_actions = max(0, total_actions(pre_event) - chunk_target)
+            restore_ms_values.append(restore_ms)
+            recovery_ms_values.append(recovery_ms)
+            readiness_ms_values.append(readiness_ms)
+            end_to_end_recovery_ms_values.append(end_to_end_recovery_ms)
+            lost_actions_values.append(lost_actions)
+            if callable(emit_metric):
+                emit_metric("benchmark.checkpoint_ms", checkpoint_ms, sandbox, iteration=chunk_index, event_type="fault")
+                emit_metric("benchmark.restore_ms", restore_ms, sandbox, iteration=chunk_index, event_type="fault")
+                emit_metric("benchmark.recovery_ms", recovery_ms, sandbox, iteration=chunk_index, event_type="fault")
+                emit_metric("benchmark.readiness_ms", readiness_ms, sandbox, iteration=chunk_index, event_type="fault")
+                emit_metric("benchmark.end_to_end_recovery_ms", end_to_end_recovery_ms, sandbox, iteration=chunk_index, event_type="fault")
+                emit_metric("benchmark.lost_actions", float(lost_actions), sandbox, iteration=chunk_index, event_type="fault")
             sandbox.last_status = post_recovery
     except Exception as exc:
         task_error = str(exc)
@@ -365,6 +378,7 @@ def run_replay_auto_sandbox(
     options: FaultOptions,
 ) -> dict[str, object]:
     replay_chunk_targets = choose_replay_chunk_targets(sandbox, config.iterations)
+    emit_metric = getattr(harness, "emit_benchmark_metric", None)
     rng = random.Random(sandbox_index)
     trace_response_count = trace_response_count_for_sandbox(sandbox)
     recovery_ms_values: list[float] = []
@@ -453,10 +467,19 @@ def run_replay_auto_sandbox(
                 recoveries_succeeded += 1
             else:
                 raise RuntimeError(f"fault recovery failed with status={record.status}")
-            recovery_ms_values.append((recovery_finished - recovery_started) * 1000.0)
-            readiness_ms_values.append((ready_at - recovery_finished) * 1000.0)
-            end_to_end_recovery_ms_values.append((ready_at - event_started) * 1000.0)
-            lost_actions_values.append(max(0, total_actions(pre_event) - total_actions(post_recovery)))
+            recovery_ms = (recovery_finished - recovery_started) * 1000.0
+            readiness_ms = (ready_at - recovery_finished) * 1000.0
+            end_to_end_recovery_ms = (ready_at - event_started) * 1000.0
+            lost_actions = max(0, total_actions(pre_event) - total_actions(post_recovery))
+            recovery_ms_values.append(recovery_ms)
+            readiness_ms_values.append(readiness_ms)
+            end_to_end_recovery_ms_values.append(end_to_end_recovery_ms)
+            lost_actions_values.append(lost_actions)
+            if callable(emit_metric):
+                emit_metric("benchmark.recovery_ms", recovery_ms, sandbox, iteration=chunk_index, event_type="fault")
+                emit_metric("benchmark.readiness_ms", readiness_ms, sandbox, iteration=chunk_index, event_type="fault")
+                emit_metric("benchmark.end_to_end_recovery_ms", end_to_end_recovery_ms, sandbox, iteration=chunk_index, event_type="fault")
+                emit_metric("benchmark.lost_actions", float(lost_actions), sandbox, iteration=chunk_index, event_type="fault")
             # _ = checkpoint_actions
             sandbox.last_status = post_recovery
     except Exception as exc:
@@ -553,17 +576,17 @@ def run_auto(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
 
 def summarize(config: BenchmarkConfig, rows: list[dict[str, object]]) -> dict[str, float]:
     if rows and ("verification_status" in rows[0] or "chunks_planned" in rows[0] or "iterations_planned" in rows[0]):
-        return compute_summary(
+        return compute_summary_aliases(
             rows,
-            [
-                "checkpoint_ms_avg",
-                "restore_ms_avg",
-                "recovery_ms_avg",
-                "readiness_ms_avg",
-                "end_to_end_recovery_ms_avg",
-                "lost_actions_avg",
-                "success_ratio",
-            ],
+            {
+                "checkpoint_ms": "checkpoint_ms_avg",
+                "restore_ms": "restore_ms_avg",
+                "recovery_ms": "recovery_ms_avg",
+                "readiness_ms": "readiness_ms_avg",
+                "end_to_end_recovery_ms": "end_to_end_recovery_ms_avg",
+                "lost_actions_avg": "lost_actions_avg",
+                "success_ratio": "success_ratio",
+            },
         )
     if config.mode == "auto":
         event_rows = [row for row in rows if int(row["event_injected"]) == 1]

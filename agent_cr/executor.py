@@ -20,7 +20,7 @@ from .models import (
     RestoreResult,
     utc_now,
 )
-from .telemetry import NoopTelemetrySink
+from .telemetry import NoopTelemetrySink, start_operation
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +93,7 @@ class CRExecutor:
             )
         )
         self._telemetry.emit_event(
-            "executor.job_pending",
+            "executor.job_submitted",
             {
                 "job_id": str(job.job_id),
                 "job_type": JobType.CHECKPOINT.value,
@@ -138,7 +138,7 @@ class CRExecutor:
             )
         )
         self._telemetry.emit_event(
-            "executor.job_pending",
+            "executor.job_submitted",
             {
                 "job_id": str(job.job_id),
                 "job_type": JobType.RESTORE.value,
@@ -171,6 +171,25 @@ class CRExecutor:
 
     def _execute_checkpoint(self, job: CheckpointJob) -> CheckpointResult:
         started = utc_now()
+        queue_wait_ms = max(0.0, (started - job.requested_at).total_seconds() * 1000.0)
+        self._telemetry.emit_event(
+            "executor.job_dequeued",
+            {
+                "job_id": str(job.job_id),
+                "job_type": JobType.CHECKPOINT.value,
+                "sandbox_id": str(job.sandbox_id),
+                "queue_wait_ms": queue_wait_ms,
+            },
+        )
+        self._telemetry.emit_metric(
+            "executor.job_queue_wait_ms",
+            queue_wait_ms,
+            {
+                "job_id": str(job.job_id),
+                "job_type": JobType.CHECKPOINT.value,
+                "sandbox_id": str(job.sandbox_id),
+            },
+        )
         self._set_record(
             JobRecord(
                 job_id=job.job_id,
@@ -183,9 +202,11 @@ class CRExecutor:
             )
         )
 
-        self._telemetry.emit_event(
-            "executor.job_running",
+        operation = start_operation(
+            self._telemetry,
+            "executor.job",
             {
+                "component": "executor",
                 "job_id": str(job.job_id),
                 "job_type": JobType.CHECKPOINT.value,
                 "sandbox_id": str(job.sandbox_id),
@@ -270,6 +291,13 @@ class CRExecutor:
                 "checkpoint_id": str(last_result.checkpoint_id),
             },
         )
+        operation.finish(
+            status=last_result.status.value,
+            attributes={
+                "checkpoint_id": str(last_result.checkpoint_id),
+                "attempt_count": self._config.max_retries + 1 if last_result.status != JobStatus.SUCCEEDED else attempt + 1,
+            },
+        )
         log_fn = logger.info if (
             last_result.status == JobStatus.SUCCEEDED
             or last_result.failure_code == FailureCode.VALIDATION_ERROR
@@ -285,6 +313,27 @@ class CRExecutor:
 
     def _execute_restore(self, job: RestoreJob) -> RestoreResult:
         started = utc_now()
+        queue_wait_ms = max(0.0, (started - job.requested_at).total_seconds() * 1000.0)
+        self._telemetry.emit_event(
+            "executor.job_dequeued",
+            {
+                "job_id": str(job.job_id),
+                "job_type": JobType.RESTORE.value,
+                "sandbox_id": str(job.sandbox_id),
+                "checkpoint_id": str(job.checkpoint_id),
+                "queue_wait_ms": queue_wait_ms,
+            },
+        )
+        self._telemetry.emit_metric(
+            "executor.job_queue_wait_ms",
+            queue_wait_ms,
+            {
+                "job_id": str(job.job_id),
+                "job_type": JobType.RESTORE.value,
+                "sandbox_id": str(job.sandbox_id),
+                "checkpoint_id": str(job.checkpoint_id),
+            },
+        )
         self._set_record(
             JobRecord(
                 job_id=job.job_id,
@@ -297,9 +346,11 @@ class CRExecutor:
             )
         )
 
-        self._telemetry.emit_event(
-            "executor.job_running",
+        operation = start_operation(
+            self._telemetry,
+            "executor.job",
             {
+                "component": "executor",
                 "job_id": str(job.job_id),
                 "job_type": JobType.RESTORE.value,
                 "sandbox_id": str(job.sandbox_id),
@@ -384,6 +435,10 @@ class CRExecutor:
                 "sandbox_id": str(job.sandbox_id),
                 "checkpoint_id": str(job.checkpoint_id),
             },
+        )
+        operation.finish(
+            status=last_result.status.value,
+            attributes={"attempt_count": self._config.max_retries + 1 if last_result.status != JobStatus.SUCCEEDED else attempt + 1},
         )
         log_fn = logger.info if last_result.status == JobStatus.SUCCEEDED else logger.error
         log_fn(

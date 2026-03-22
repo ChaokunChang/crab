@@ -74,7 +74,7 @@ from .storage import (
     LocalCheckpointManager,
 )
 from .system import AgentCRSystem, build_default_system
-from .telemetry import CompositeTelemetrySink, InMemoryTelemetrySink, JsonlTelemetrySink, NoopTelemetrySink
+from .telemetry import CompositeTelemetrySink, ConfiguredTelemetrySink, InMemoryTelemetrySink, JsonlTelemetrySink, NoopTelemetrySink
 from .workers import (
     AdapterFileSystemCWorker,
     AdapterFileSystemRWorker,
@@ -114,6 +114,7 @@ __all__ = [
     "InMemorySchedulerStateStore",
     "InMemoryTelemetrySink",
     "JsonlTelemetrySink",
+    "ConfiguredTelemetrySink",
     "JobId",
     "JobRecord",
     "JobStatus",

@@ -8,7 +8,7 @@ from agent_cr import CheckpointId
 from integrations.agents import SandboxHandle, TaskConfig
 
 from benchmarks.config import BenchmarkConfig
-from benchmarks.core import annotate_row, poll_sandbox_status, trace_response_count_for_sandbox, verify_task_accuracy
+from benchmarks.core import annotate_row, emit_row_telemetry, poll_sandbox_status, trace_response_count_for_sandbox, verify_task_accuracy
 from benchmarks.support import average, task_timeout_seconds, total_actions
 
 
@@ -149,7 +149,7 @@ def finalize_replay_row(
         resolved_success_ratio = 1.0 if not task_error and verification["verification_status"] == "passed" else 0.0
     else:
         resolved_success_ratio = 0.0 if task_error else (1.0 if success_ratio is None else float(success_ratio))
-    return annotate_row(
+    annotated = annotate_row(
         config,
         sandbox,
         iteration=iteration,
@@ -157,6 +157,8 @@ def finalize_replay_row(
         task_error=task_error,
         row=row_payload,
     )
+    emit_row_telemetry(harness, sandbox, annotated, iteration=iteration)
+    return annotated
 
 
 def choose_replay_chunk_targets(

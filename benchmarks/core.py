@@ -267,5 +267,53 @@ def annotate_row(
     }
 
 
+def emit_row_telemetry(
+    harness,
+    sandbox: SandboxHandle,
+    row: dict[str, object],
+    *,
+    iteration: int,
+) -> None:
+    emit_metric = getattr(harness, "emit_benchmark_metric", None)
+    if not callable(emit_metric):
+        return
+    field_to_metric = {
+        "checkpoint_ms": "benchmark.checkpoint_ms",
+        "restore_ms": "benchmark.restore_ms",
+        "recovery_ms": "benchmark.recovery_ms",
+        "readiness_ms": "benchmark.readiness_ms",
+        "end_to_end_recovery_ms": "benchmark.end_to_end_recovery_ms",
+        "workload_resume_ms": "benchmark.workload_resume_ms",
+        "migration_ms": "benchmark.migration_ms",
+        "budget_slack_ms": "benchmark.budget_slack_ms",
+        "checkpoint_batch_ms": "benchmark.checkpoint_batch_ms",
+        "restore_batch_ms": "benchmark.restore_batch_ms",
+        "replay_progress_ms": "benchmark.replay_progress_ms",
+        "fanout_ms": "benchmark.fanout_ms",
+        "lost_actions": "benchmark.lost_actions",
+        "success_ratio": "benchmark.task.success_ratio",
+    }
+    event_type = None if row.get("event_type") is None else str(row.get("event_type"))
+    checkpoint_id = None
+    raw_checkpoint_id = row.get("checkpoint_id")
+    if isinstance(raw_checkpoint_id, str) and raw_checkpoint_id:
+        checkpoint_id = raw_checkpoint_id
+    for field_name, metric_name in field_to_metric.items():
+        if field_name not in row:
+            continue
+        try:
+            value = float(row[field_name])
+        except (TypeError, ValueError):
+            continue
+        extra = {"source_row_field": field_name}
+        if row.get("event_injected") is not None:
+            extra["event_injected"] = int(row["event_injected"])
+        if row.get("recovery_status") is not None:
+            extra["recovery_status"] = str(row["recovery_status"])
+        if checkpoint_id is not None:
+            extra["checkpoint_id"] = checkpoint_id
+        emit_metric(metric_name, value, sandbox, iteration=iteration, event_type=event_type, extra=extra)
+
+
 def replay_enabled(records: Iterable[BenchmarkTaskRecord]) -> bool:
     return any(is_replay_llm_service_type(record.llm_service_type) for record in records)

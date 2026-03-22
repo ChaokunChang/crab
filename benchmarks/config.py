@@ -5,12 +5,19 @@ from pathlib import Path
 
 import yaml
 
+from agent_cr.telemetry import (
+    DEFAULT_TELEMETRY_CAPTURE_COMMAND_OUTPUT,
+    DEFAULT_TELEMETRY_DETAIL_LEVEL,
+    DEFAULT_TELEMETRY_MAX_TEXT_ATTRIBUTE_BYTES,
+)
+
 
 _SCENARIOS = {"e2e", "fault", "spot", "tree"}
 _MODES = {"manual", "auto"}
 _PROVIDERS = {"openai", "anthropic"}
 _LOG_LEVELS = {"debug", "info", "warning", "error", "critical"}
 _LOG_FILE_MODES = {"append": "a", "write": "w"}
+_TELEMETRY_DETAIL_LEVELS = {"basic", "detailed"}
 _SUPPORTED_MODES = {
     "e2e": {"manual"},
     "fault": {"manual", "auto"},
@@ -39,6 +46,9 @@ class BenchmarkConfig:
     iterations: int = 1
     output: Path | None = None
     telemetry_output: Path | None = None
+    telemetry_detail_level: str = DEFAULT_TELEMETRY_DETAIL_LEVEL
+    telemetry_capture_command_output: bool = DEFAULT_TELEMETRY_CAPTURE_COMMAND_OUTPUT
+    telemetry_max_text_attribute_bytes: int = DEFAULT_TELEMETRY_MAX_TEXT_ATTRIBUTE_BYTES
     log_file: Path | None = None
     log_file_mode: str = "append"
     benchmark_root: Path | None = None
@@ -124,6 +134,37 @@ def load_config(path: Path) -> BenchmarkConfig:
     scenario_options = _require_object(scenario_options, label="scenario_options")
 
     base_dir = config_path.parent
+    telemetry_options = data.get("telemetry", {})
+    if telemetry_options is None:
+        telemetry_options = {}
+    telemetry_options = _require_object(telemetry_options, label="telemetry")
+    telemetry_output = _resolve_optional_path(
+        base_dir,
+        telemetry_options.get("output", data.get("telemetry_output")),
+    )
+    telemetry_detail_level = str(
+        telemetry_options.get("detail_level", DEFAULT_TELEMETRY_DETAIL_LEVEL)
+    ).strip().lower()
+    if telemetry_detail_level not in _TELEMETRY_DETAIL_LEVELS:
+        raise ValueError(
+            f"telemetry.detail_level must be one of {sorted(_TELEMETRY_DETAIL_LEVELS)}, "
+            f"got {telemetry_detail_level!r}"
+        )
+    telemetry_capture_command_output = bool(
+        telemetry_options.get(
+            "capture_command_output",
+            DEFAULT_TELEMETRY_CAPTURE_COMMAND_OUTPUT,
+        )
+    )
+    telemetry_max_text_attribute_bytes = int(
+        telemetry_options.get(
+            "max_text_attribute_bytes",
+            DEFAULT_TELEMETRY_MAX_TEXT_ATTRIBUTE_BYTES,
+        )
+    )
+    if telemetry_max_text_attribute_bytes <= 0:
+        raise ValueError("telemetry.max_text_attribute_bytes must be positive")
+
     return BenchmarkConfig(
         config_path=config_path,
         scenario=scenario,
@@ -136,7 +177,10 @@ def load_config(path: Path) -> BenchmarkConfig:
         max_workers=max_workers,
         iterations=iterations,
         output=_resolve_optional_path(base_dir, data.get("output")),
-        telemetry_output=_resolve_optional_path(base_dir, data.get("telemetry_output")),
+        telemetry_output=telemetry_output,
+        telemetry_detail_level=telemetry_detail_level,
+        telemetry_capture_command_output=telemetry_capture_command_output,
+        telemetry_max_text_attribute_bytes=telemetry_max_text_attribute_bytes,
         log_file=_resolve_optional_path(base_dir, data.get("log_file")),
         log_file_mode=log_file_mode,
         benchmark_root=_resolve_optional_path(base_dir, data.get("benchmark_root")),

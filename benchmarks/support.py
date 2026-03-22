@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import logging
 import os
 import random
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -32,6 +34,7 @@ def configure_logging(level_name: str, *, log_file: Path | None = None, log_file
 def benchmark_run_context(config_path: Path) -> dict[str, object]:
     return {
         "pid": os.getpid(),
+        "run_id": uuid.uuid4().hex,
         "started_at_monotonic": time.perf_counter(),
         "config_path": str(config_path.resolve()),
     }
@@ -102,6 +105,72 @@ def compute_summary(rows: list[dict[str, object]], metric_keys: Iterable[str]) -
         return summary
     for key in metric_keys:
         summary[key] = sum(float(row[key]) for row in rows) / len(rows)
+    return summary
+
+
+def compute_summary_aliases(
+    rows: list[dict[str, object]],
+    metric_aliases: dict[str, str],
+) -> dict[str, float]:
+    summary: dict[str, float] = {}
+    if not rows:
+        return summary
+    for summary_key, row_key in metric_aliases.items():
+        summary[summary_key] = sum(float(row[row_key]) for row in rows) / len(rows)
+    return summary
+
+
+def compute_telemetry_summary(
+    telemetry_path: Path | None,
+    metric_aliases: dict[str, str | tuple[str, ...]],
+    *,
+    run_id: str | None = None,
+    required_keys: Iterable[str] | None = None,
+    attribute_filters: dict[str, dict[str, object]] | None = None,
+) -> dict[str, float]:
+    if telemetry_path is None or not telemetry_path.exists():
+        return {}
+    rows_by_summary: dict[str, list[float]] = {key: [] for key in metric_aliases}
+    required = set(metric_aliases if required_keys is None else required_keys)
+    filters = attribute_filters or {}
+    with telemetry_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            payload = json.loads(stripped)
+            if payload.get("kind") != "metric":
+                continue
+            attributes = payload.get("attributes", {})
+            if not isinstance(attributes, dict):
+                attributes = {}
+            if run_id and str(attributes.get("run_id", "")) != run_id:
+                continue
+            metric_name = str(payload.get("name", ""))
+            for summary_key, aliases in metric_aliases.items():
+                candidates = (aliases,) if isinstance(aliases, str) else tuple(aliases)
+                if metric_name not in candidates:
+                    continue
+                expected_attributes = filters.get(summary_key, {})
+                matches = True
+                for attr_name, expected_value in expected_attributes.items():
+                    if attributes.get(attr_name) != expected_value:
+                        matches = False
+                        break
+                if not matches:
+                    continue
+                try:
+                    rows_by_summary[summary_key].append(float(payload["value"]))
+                except (KeyError, TypeError, ValueError):
+                    pass
+                break
+    summary = {
+        key: sum(values) / len(values)
+        for key, values in rows_by_summary.items()
+        if values
+    }
+    if required and not required.issubset(summary.keys()):
+        return {}
     return summary
 
 

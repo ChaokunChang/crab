@@ -10,7 +10,7 @@ from agent_cr.models import utc_now
 from integrations.agents import SandboxHandle, TaskConfig, TaskDescription
 
 from benchmarks.config import BenchmarkConfig
-from benchmarks.core import annotate_row, parallel_map, resolve_task_records
+from benchmarks.core import annotate_row, emit_row_telemetry, parallel_map, resolve_task_records
 from benchmarks.scenarios import HarnessSettings, ScenarioDefinition
 from benchmarks.scenarios.common import (
     choose_replay_chunk_targets,
@@ -18,7 +18,7 @@ from benchmarks.scenarios.common import (
     should_inject_event,
     wait_for_iteration_progress,
 )
-from benchmarks.support import average, compute_summary, is_replay_llm_service_type
+from benchmarks.support import average, compute_summary, compute_summary_aliases, is_replay_llm_service_type
 
 
 @dataclass(frozen=True)
@@ -104,28 +104,28 @@ def run_manual_sandbox(
             "preemption_notice",
             "preemption_grace_remaining_seconds",
         )
-        rows.append(
-            annotate_row(
-                config,
-                sandbox,
-                iteration=iteration,
-                success_ratio=1.0 if restore_result.status.value == "succeeded" else 0.0,
-                row={
-                    "event_type": "preemption",
-                    "event_injected": 1,
-                    "recovery_status": restore_result.status.value,
-                    "grace_period_ms": options.grace_period_seconds * 1000.0,
-                    "checkpoint_ms": (checkpoint_finished - recovery_started) * 1000.0,
-                    "restore_ms": (restore_result.finished_at - restore_result.started_at).total_seconds() * 1000.0,
-                    "recovery_ms": (recovery_finished - recovery_started) * 1000.0,
-                    "readiness_ms": (ready_at - recovery_finished) * 1000.0,
-                    "end_to_end_recovery_ms": (ready_at - event_started) * 1000.0,
-                    "migration_ms": (ready_at - event_started) * 1000.0,
-                    "budget_slack_ms": options.grace_period_seconds * 1000.0 - (ready_at - event_started) * 1000.0,
-                    "retained_checkpoints": len(harness.storage.list_checkpoints(sandbox.sandbox_id)),
-                },
-            )
+        row = annotate_row(
+            config,
+            sandbox,
+            iteration=iteration,
+            success_ratio=1.0 if restore_result.status.value == "succeeded" else 0.0,
+            row={
+                "event_type": "preemption",
+                "event_injected": 1,
+                "recovery_status": restore_result.status.value,
+                "grace_period_ms": options.grace_period_seconds * 1000.0,
+                "checkpoint_ms": (checkpoint_finished - recovery_started) * 1000.0,
+                "restore_ms": (restore_result.finished_at - restore_result.started_at).total_seconds() * 1000.0,
+                "recovery_ms": (recovery_finished - recovery_started) * 1000.0,
+                "readiness_ms": (ready_at - recovery_finished) * 1000.0,
+                "end_to_end_recovery_ms": (ready_at - event_started) * 1000.0,
+                "migration_ms": (ready_at - event_started) * 1000.0,
+                "budget_slack_ms": options.grace_period_seconds * 1000.0 - (ready_at - event_started) * 1000.0,
+                "retained_checkpoints": len(harness.storage.list_checkpoints(sandbox.sandbox_id)),
+            },
         )
+        emit_row_telemetry(harness, sandbox, row, iteration=iteration)
+        rows.append(row)
     return rows
 
 
@@ -149,28 +149,28 @@ def run_auto_sandbox(
             rng=rng,
         )
         if not injected:
-            rows.append(
-                annotate_row(
-                    config,
-                    sandbox,
-                    iteration=iteration,
-                    success_ratio=1.0,
-                    row={
-                        "event_type": "preemption",
-                        "event_injected": 0,
-                        "recovery_status": "none",
-                        "grace_period_ms": options.grace_period_seconds * 1000.0,
-                        "checkpoint_ms": 0.0,
-                        "restore_ms": 0.0,
-                        "recovery_ms": 0.0,
-                        "readiness_ms": 0.0,
-                        "end_to_end_recovery_ms": 0.0,
-                        "migration_ms": 0.0,
-                        "budget_slack_ms": options.grace_period_seconds * 1000.0,
-                        "retained_checkpoints": len(harness.storage.list_checkpoints(sandbox.sandbox_id)),
-                    },
-                )
+            row = annotate_row(
+                config,
+                sandbox,
+                iteration=iteration,
+                success_ratio=1.0,
+                row={
+                    "event_type": "preemption",
+                    "event_injected": 0,
+                    "recovery_status": "none",
+                    "grace_period_ms": options.grace_period_seconds * 1000.0,
+                    "checkpoint_ms": 0.0,
+                    "restore_ms": 0.0,
+                    "recovery_ms": 0.0,
+                    "readiness_ms": 0.0,
+                    "end_to_end_recovery_ms": 0.0,
+                    "migration_ms": 0.0,
+                    "budget_slack_ms": options.grace_period_seconds * 1000.0,
+                    "retained_checkpoints": len(harness.storage.list_checkpoints(sandbox.sandbox_id)),
+                },
             )
+            emit_row_telemetry(harness, sandbox, row, iteration=iteration)
+            rows.append(row)
             continue
         event_started = time.perf_counter()
         observed_after = utc_now()
@@ -190,28 +190,28 @@ def run_auto_sandbox(
             assert sandbox.task_run is not None
             sandbox.last_status = sandbox.task_run.poll_status()
             ready_at = time.perf_counter()
-        rows.append(
-            annotate_row(
-                config,
-                sandbox,
-                iteration=iteration,
-                success_ratio=1.0 if record.status in {"restored", "relaunched"} else 0.0,
-                row={
-                    "event_type": "preemption",
-                    "event_injected": 1,
-                    "recovery_status": record.status,
-                    "grace_period_ms": options.grace_period_seconds * 1000.0,
-                    "checkpoint_ms": 0.0,
-                    "restore_ms": 0.0,
-                    "recovery_ms": (recovery_finished - migration_started) * 1000.0,
-                    "readiness_ms": (ready_at - recovery_finished) * 1000.0,
-                    "end_to_end_recovery_ms": (ready_at - event_started) * 1000.0,
-                    "migration_ms": (ready_at - event_started) * 1000.0,
-                    "budget_slack_ms": options.grace_period_seconds * 1000.0 - (ready_at - event_started) * 1000.0,
-                    "retained_checkpoints": len(harness.storage.list_checkpoints(sandbox.sandbox_id)),
-                },
-            )
+        row = annotate_row(
+            config,
+            sandbox,
+            iteration=iteration,
+            success_ratio=1.0 if record.status in {"restored", "relaunched"} else 0.0,
+            row={
+                "event_type": "preemption",
+                "event_injected": 1,
+                "recovery_status": record.status,
+                "grace_period_ms": options.grace_period_seconds * 1000.0,
+                "checkpoint_ms": 0.0,
+                "restore_ms": 0.0,
+                "recovery_ms": (recovery_finished - migration_started) * 1000.0,
+                "readiness_ms": (ready_at - recovery_finished) * 1000.0,
+                "end_to_end_recovery_ms": (ready_at - event_started) * 1000.0,
+                "migration_ms": (ready_at - event_started) * 1000.0,
+                "budget_slack_ms": options.grace_period_seconds * 1000.0 - (ready_at - event_started) * 1000.0,
+                "retained_checkpoints": len(harness.storage.list_checkpoints(sandbox.sandbox_id)),
+            },
         )
+        emit_row_telemetry(harness, sandbox, row, iteration=iteration)
+        rows.append(row)
         if record.status not in {"restored", "relaunched"}:
             break
     return rows
@@ -226,6 +226,7 @@ def run_replay_manual_sandbox(
     options: SpotOptions,
 ) -> dict[str, object]:
     replay_chunk_targets = choose_replay_chunk_targets(sandbox, config.iterations)
+    emit_metric = getattr(harness, "emit_benchmark_metric", None)
     rng = random.Random(sandbox_index)
     checkpoint_ms_values: list[float] = []
     restore_ms_values: list[float] = []
@@ -279,16 +280,26 @@ def run_replay_manual_sandbox(
                 "preemption_grace_remaining_seconds",
             )
             checkpoint_ms_values.append((checkpoint_finished - recovery_started) * 1000.0)
-            restore_ms_values.append(
-                (restore_result.finished_at - restore_result.started_at).total_seconds() * 1000.0
-            )
-            recovery_ms_values.append((recovery_finished - recovery_started) * 1000.0)
-            readiness_ms_values.append((ready_at - recovery_finished) * 1000.0)
-            end_to_end_recovery_ms_values.append((ready_at - event_started) * 1000.0)
-            migration_ms_values.append((ready_at - event_started) * 1000.0)
-            budget_slack_ms_values.append(
-                options.grace_period_seconds * 1000.0 - (ready_at - event_started) * 1000.0
-            )
+            restore_ms = (restore_result.finished_at - restore_result.started_at).total_seconds() * 1000.0
+            recovery_ms = (recovery_finished - recovery_started) * 1000.0
+            readiness_ms = (ready_at - recovery_finished) * 1000.0
+            end_to_end_recovery_ms = (ready_at - event_started) * 1000.0
+            migration_ms = (ready_at - event_started) * 1000.0
+            budget_slack_ms = options.grace_period_seconds * 1000.0 - (ready_at - event_started) * 1000.0
+            restore_ms_values.append(restore_ms)
+            recovery_ms_values.append(recovery_ms)
+            readiness_ms_values.append(readiness_ms)
+            end_to_end_recovery_ms_values.append(end_to_end_recovery_ms)
+            migration_ms_values.append(migration_ms)
+            budget_slack_ms_values.append(budget_slack_ms)
+            if callable(emit_metric):
+                emit_metric("benchmark.checkpoint_ms", checkpoint_ms_values[-1], sandbox, iteration=chunk_index, event_type="preemption")
+                emit_metric("benchmark.restore_ms", restore_ms, sandbox, iteration=chunk_index, event_type="preemption")
+                emit_metric("benchmark.recovery_ms", recovery_ms, sandbox, iteration=chunk_index, event_type="preemption")
+                emit_metric("benchmark.readiness_ms", readiness_ms, sandbox, iteration=chunk_index, event_type="preemption")
+                emit_metric("benchmark.end_to_end_recovery_ms", end_to_end_recovery_ms, sandbox, iteration=chunk_index, event_type="preemption")
+                emit_metric("benchmark.migration_ms", migration_ms, sandbox, iteration=chunk_index, event_type="preemption")
+                emit_metric("benchmark.budget_slack_ms", budget_slack_ms, sandbox, iteration=chunk_index, event_type="preemption")
             recoveries_succeeded += 1
     except Exception as exc:
         task_error = str(exc)
@@ -331,6 +342,7 @@ def run_replay_auto_sandbox(
     options: SpotOptions,
 ) -> dict[str, object]:
     replay_chunk_targets = choose_replay_chunk_targets(sandbox, config.iterations)
+    emit_metric = getattr(harness, "emit_benchmark_metric", None)
     rng = random.Random(sandbox_index)
     recovery_ms_values: list[float] = []
     readiness_ms_values: list[float] = []
@@ -376,13 +388,22 @@ def run_replay_auto_sandbox(
                 sandbox.last_status = sandbox.task_run.poll_status()
                 ready_at = time.perf_counter()
                 recoveries_succeeded += 1
-            recovery_ms_values.append((recovery_finished - migration_started) * 1000.0)
-            readiness_ms_values.append((ready_at - recovery_finished) * 1000.0)
-            end_to_end_recovery_ms_values.append((ready_at - event_started) * 1000.0)
-            migration_ms_values.append((ready_at - event_started) * 1000.0)
-            budget_slack_ms_values.append(
-                options.grace_period_seconds * 1000.0 - (ready_at - event_started) * 1000.0
-            )
+            recovery_ms = (recovery_finished - migration_started) * 1000.0
+            readiness_ms = (ready_at - recovery_finished) * 1000.0
+            end_to_end_recovery_ms = (ready_at - event_started) * 1000.0
+            migration_ms = (ready_at - event_started) * 1000.0
+            budget_slack_ms = options.grace_period_seconds * 1000.0 - (ready_at - event_started) * 1000.0
+            recovery_ms_values.append(recovery_ms)
+            readiness_ms_values.append(readiness_ms)
+            end_to_end_recovery_ms_values.append(end_to_end_recovery_ms)
+            migration_ms_values.append(migration_ms)
+            budget_slack_ms_values.append(budget_slack_ms)
+            if callable(emit_metric):
+                emit_metric("benchmark.recovery_ms", recovery_ms, sandbox, iteration=chunk_index, event_type="preemption")
+                emit_metric("benchmark.readiness_ms", readiness_ms, sandbox, iteration=chunk_index, event_type="preemption")
+                emit_metric("benchmark.end_to_end_recovery_ms", end_to_end_recovery_ms, sandbox, iteration=chunk_index, event_type="preemption")
+                emit_metric("benchmark.migration_ms", migration_ms, sandbox, iteration=chunk_index, event_type="preemption")
+                emit_metric("benchmark.budget_slack_ms", budget_slack_ms, sandbox, iteration=chunk_index, event_type="preemption")
             if record.status not in {"restored", "relaunched"}:
                 raise RuntimeError(f"preemption recovery failed with status={record.status}")
     except Exception as exc:
@@ -476,18 +497,18 @@ def run_auto(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
 
 def summarize(config: BenchmarkConfig, rows: list[dict[str, object]]) -> dict[str, float]:
     if rows and ("verification_status" in rows[0] or "chunks_planned" in rows[0] or "iterations_planned" in rows[0]):
-        return compute_summary(
+        return compute_summary_aliases(
             rows,
-            [
-                "checkpoint_ms_avg",
-                "restore_ms_avg",
-                "recovery_ms_avg",
-                "readiness_ms_avg",
-                "end_to_end_recovery_ms_avg",
-                "migration_ms_avg",
-                "budget_slack_ms_avg",
-                "success_ratio",
-            ],
+            {
+                "checkpoint_ms": "checkpoint_ms_avg",
+                "restore_ms": "restore_ms_avg",
+                "recovery_ms": "recovery_ms_avg",
+                "readiness_ms": "readiness_ms_avg",
+                "end_to_end_recovery_ms": "end_to_end_recovery_ms_avg",
+                "migration_ms": "migration_ms_avg",
+                "budget_slack_ms": "budget_slack_ms_avg",
+                "success_ratio": "success_ratio",
+            },
         )
     if config.mode == "auto":
         event_rows = [row for row in rows if int(row["event_injected"]) == 1]

@@ -10,7 +10,7 @@ from .config import SchedulerConfig
 from .contracts import Runtime, SandboxInspector, SchedulerStateStore, TelemetrySink
 from .ids import SandboxId
 from .models import SandboxSnapshot, SchedulerCheckpointDecision, utc_now
-from .telemetry import NoopTelemetrySink
+from .telemetry import NoopTelemetrySink, start_operation
 
 logger = logging.getLogger(__name__)
 
@@ -273,6 +273,15 @@ class CRScheduler:
         self._telemetry = telemetry or NoopTelemetrySink()
 
     def evaluate(self, sandbox: SandboxSnapshot) -> SchedulerCheckpointDecision:
+        operation = start_operation(
+            self._telemetry,
+            "scheduler.evaluate",
+            {
+                "component": "scheduler",
+                "sandbox_id": str(sandbox.sandbox_id),
+                "policy": self._policy.name,
+            },
+        )
         hydrated = sandbox
         if hydrated.last_checkpoint_at is None:
             last = self._state.get_last_checkpoint(hydrated.sandbox_id)
@@ -304,6 +313,17 @@ class CRScheduler:
             {
                 "sandbox_id": str(hydrated.sandbox_id),
                 "policy": self._policy.name,
+                "should_checkpoint": decision.should_checkpoint,
+                "reason": decision.reason,
+                "checkpoint_process": decision.checkpoint_process,
+                "checkpoint_filesystem": decision.checkpoint_filesystem,
+                "leave_running": decision.leave_running,
+            },
+        )
+        operation.finish(
+            status="succeeded",
+            attributes={
+                "sandbox_id": str(hydrated.sandbox_id),
                 "should_checkpoint": decision.should_checkpoint,
                 "reason": decision.reason,
                 "checkpoint_process": decision.checkpoint_process,

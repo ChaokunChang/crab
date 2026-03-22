@@ -13,7 +13,7 @@ from ..contracts import Runtime, TelemetrySink
 from ..ids import CheckpointId, SandboxId
 from ..models import RuntimeCapabilities, RuntimeOperationStatus, SandboxDescription, SandboxExecResult, SandboxRuntimeState
 from ..remote_inspector import HostInspectorServiceClient
-from ..telemetry import NoopTelemetrySink
+from ..telemetry import NoopTelemetrySink, start_operation, telemetry_capture_command_output, telemetry_is_detailed
 from .base import CommandResult, CommandRunner, SubprocessCommandRunner
 
 logger = logging.getLogger(__name__)
@@ -338,6 +338,21 @@ class RuncRuntime(Runtime):
         started = time.perf_counter()
         stdout_target = subprocess.PIPE if capture_output else subprocess.DEVNULL
         stderr_target = subprocess.PIPE if capture_output else subprocess.DEVNULL
+        operation_context = start_operation(
+            self._telemetry,
+            "sandbox.runtime_exec",
+            self._command_attributes(
+                operation="sandbox.runtime_exec",
+                command=command,
+                sandbox_id=sandbox_id,
+                metadata={
+                    "cwd": cwd,
+                    "user": user,
+                    "capture_output": capture_output,
+                    "timeout_s": timeout_s,
+                },
+            ),
+        )
         completed = subprocess.run(
             command,
             check=False,
@@ -350,15 +365,54 @@ class RuncRuntime(Runtime):
         duration_ms = (time.perf_counter() - started) * 1000.0
         stdout = "" if completed.stdout is None else completed.stdout
         stderr = "" if completed.stderr is None else completed.stderr
-        self._emit_command_telemetry(
-            "sandbox.runtime_exec",
-            command=command,
-            duration_ms=duration_ms,
-            sandbox_id=sandbox_id,
-            success=completed.returncode == 0,
-            metadata={"cwd": cwd, "user": user, "capture_output": capture_output},
-            stdout=stdout,
-            stderr=stderr,
+        success = completed.returncode == 0
+        operation_context.finish(
+            status="succeeded" if success else "failed",
+            attributes=self._command_finish_attributes(
+                success=success,
+                returncode=completed.returncode,
+                stdout=stdout,
+                stderr=stderr,
+            ),
+        )
+        self._telemetry.emit_metric(
+            "sandbox.command_duration_ms",
+            duration_ms,
+            self._command_metric_attributes(
+                operation="sandbox.runtime_exec",
+                command=command,
+                sandbox_id=sandbox_id,
+                checkpoint_id=None,
+                success=success,
+                returncode=completed.returncode,
+                metadata={
+                    "cwd": cwd,
+                    "user": user,
+                    "capture_output": capture_output,
+                    "timeout_s": timeout_s,
+                },
+                stdout=stdout,
+                stderr=stderr,
+            ),
+        )
+        self._telemetry.emit_event(
+            "sandbox.command",
+            self._command_metric_attributes(
+                operation="sandbox.runtime_exec",
+                command=command,
+                sandbox_id=sandbox_id,
+                checkpoint_id=None,
+                success=success,
+                returncode=completed.returncode,
+                metadata={
+                    "cwd": cwd,
+                    "user": user,
+                    "capture_output": capture_output,
+                    "timeout_s": timeout_s,
+                },
+                stdout=stdout,
+                stderr=stderr,
+            ),
         )
         return SandboxExecResult(args=tuple(command), returncode=int(completed.returncode), stdout=stdout, stderr=stderr)
 
@@ -687,22 +741,58 @@ class RuncRuntime(Runtime):
         expected_error_substrings: tuple[str, ...] = (),
         metadata: dict[str, object] | None = None,
     ) -> CommandResult:
-        started = time.perf_counter()
+        operation_context = start_operation(
+            self._telemetry,
+            operation,
+            self._command_attributes(
+                operation=operation,
+                command=command,
+                sandbox_id=sandbox_id,
+                checkpoint_id=checkpoint_id,
+                metadata={**(metadata or {}), "cwd": None if cwd is None else str(cwd)},
+            ),
+        )
         result = self._runner.run(command, cwd=cwd)
-        duration_ms = (time.perf_counter() - started) * 1000.0
         stderr = result.stderr.strip()
         stdout = result.stdout.strip()
         success = result.returncode == 0
-        self._emit_command_telemetry(
-            operation,
-            command=command,
-            duration_ms=duration_ms,
-            sandbox_id=sandbox_id,
-            checkpoint_id=checkpoint_id,
-            success=success,
-            metadata={**(metadata or {}), "cwd": None if cwd is None else str(cwd)},
-            stdout=stdout,
-            stderr=stderr,
+        duration_ms = operation_context.finish(
+            status="succeeded" if success else "failed",
+            attributes=self._command_finish_attributes(
+                success=success,
+                returncode=result.returncode,
+                stdout=stdout,
+                stderr=stderr,
+            ),
+        )
+        self._telemetry.emit_metric(
+            "sandbox.command_duration_ms",
+            duration_ms,
+            self._command_metric_attributes(
+                operation=operation,
+                command=command,
+                sandbox_id=sandbox_id,
+                checkpoint_id=checkpoint_id,
+                success=success,
+                returncode=result.returncode,
+                metadata={**(metadata or {}), "cwd": None if cwd is None else str(cwd)},
+                stdout=stdout,
+                stderr=stderr,
+            ),
+        )
+        self._telemetry.emit_event(
+            "sandbox.command",
+            self._command_metric_attributes(
+                operation=operation,
+                command=command,
+                sandbox_id=sandbox_id,
+                checkpoint_id=checkpoint_id,
+                success=success,
+                returncode=result.returncode,
+                metadata={**(metadata or {}), "cwd": None if cwd is None else str(cwd)},
+                stdout=stdout,
+                stderr=stderr,
+            ),
         )
         if not success and check:
             log_fn = logger.error
@@ -722,31 +812,64 @@ class RuncRuntime(Runtime):
             )
         return result
 
-    def _emit_command_telemetry(
+    def _command_attributes(
         self,
-        operation: str,
         *,
+        operation: str,
         command: list[str],
-        duration_ms: float,
         sandbox_id: SandboxId | None,
         checkpoint_id: CheckpointId | None = None,
-        success: bool,
         metadata: dict[str, object] | None = None,
-        stdout: str,
-        stderr: str,
-    ) -> None:
+    ) -> dict[str, object]:
         attributes = {
+            "component": "runtime",
             "operation": operation,
             "command": list(command),
             "sandbox_id": "" if sandbox_id is None else str(sandbox_id),
             "checkpoint_id": "" if checkpoint_id is None else str(checkpoint_id),
-            "success": success,
-            "stdout": stdout,
-            "stderr": stderr,
             **(metadata or {}),
         }
-        self._telemetry.emit_metric("sandbox.command_duration_ms", duration_ms, attributes)
-        self._telemetry.emit_event("sandbox.command", attributes)
+        return attributes
+
+    def _command_finish_attributes(
+        self,
+        *,
+        success: bool,
+        returncode: int,
+        stdout: str,
+        stderr: str,
+    ) -> dict[str, object]:
+        attributes: dict[str, object] = {
+            "success": success,
+            "returncode": int(returncode),
+        }
+        if telemetry_capture_command_output(self._telemetry) or telemetry_is_detailed(self._telemetry):
+            attributes["stdout"] = stdout
+            attributes["stderr"] = stderr
+        return attributes
+
+    def _command_metric_attributes(
+        self,
+        *,
+        operation: str,
+        command: list[str],
+        sandbox_id: SandboxId | None,
+        checkpoint_id: CheckpointId | None,
+        success: bool,
+        returncode: int,
+        metadata: dict[str, object] | None,
+        stdout: str,
+        stderr: str,
+    ) -> dict[str, object]:
+        attributes = self._command_attributes(
+            operation=operation,
+            command=command,
+            sandbox_id=sandbox_id,
+            checkpoint_id=checkpoint_id,
+            metadata=metadata,
+        )
+        attributes.update(self._command_finish_attributes(success=success, returncode=returncode, stdout=stdout, stderr=stderr))
+        return attributes
 
     def _checkpoint_optional_args(self) -> list[str]:
         args: list[str] = []

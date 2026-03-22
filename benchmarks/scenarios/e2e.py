@@ -8,6 +8,7 @@ from integrations.agents import TaskConfig, TaskDescription
 from benchmarks.config import BenchmarkConfig
 from benchmarks.core import (
     annotate_row,
+    emit_row_telemetry,
     launch_task_records,
     poll_sandbox_status,
     resolve_task_records,
@@ -89,7 +90,7 @@ def _run_replay_accuracy_sandbox(
 
     status = poll_sandbox_status(sandbox)
     success_ratio = 1.0 if verification["verification_status"] == "passed" else 0.0
-    return annotate_row(
+    row = annotate_row(
         config,
         sandbox,
         iteration=1,
@@ -106,6 +107,8 @@ def _run_replay_accuracy_sandbox(
             **verification,
         },
     )
+    emit_row_telemetry(harness, sandbox, row, iteration=1)
+    return row
 
 
 def run_manual(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
@@ -152,32 +155,33 @@ def run_manual(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
         t2 = time.perf_counter()
         for sandbox in sandboxes:
             harness.set_snapshot_metadata(sandbox)
-        rows.append(
-            {
-                "scenario": config.scenario,
-                "mode": config.mode,
-                "provider": config.provider,
-                "agent": config.agent,
-                "llm_service": config.llm_service or "",
-                "sandbox_id": "batch",
-                "task_id": "batch",
-                "iteration": iteration,
-                "success_ratio": (
-                    sum(1 for item in restore_results if item.status.value == "succeeded")
-                    / max(1, len(restore_results))
-                ),
-                "task_error": "",
-                "sandbox_count": config.sandboxes,
-                "tool_actions": sum(int(sandbox.last_status["total_actions"]) for sandbox in sandboxes),
-                "fs_actions": sum(int(sandbox.last_status["filesystem_actions"]) for sandbox in sandboxes),
-                "process_actions": sum(int(sandbox.last_status["process_actions"]) for sandbox in sandboxes),
-                "network_actions": sum(int(sandbox.last_status["network_actions"]) for sandbox in sandboxes),
-                "checkpoint_count": len(checkpoint_results),
-                "restore_count": len(restore_results),
-                "checkpoint_batch_ms": (t1 - t0) * 1000.0,
-                "restore_batch_ms": (t2 - t1) * 1000.0,
-            }
-        )
+        row = {
+            "scenario": config.scenario,
+            "mode": config.mode,
+            "provider": config.provider,
+            "agent": config.agent,
+            "llm_service": config.llm_service or "",
+            "sandbox_id": "batch",
+            "task_id": "batch",
+            "iteration": iteration,
+            "success_ratio": (
+                sum(1 for item in restore_results if item.status.value == "succeeded")
+                / max(1, len(restore_results))
+            ),
+            "task_error": "",
+            "sandbox_count": config.sandboxes,
+            "tool_actions": sum(int(sandbox.last_status["total_actions"]) for sandbox in sandboxes),
+            "fs_actions": sum(int(sandbox.last_status["filesystem_actions"]) for sandbox in sandboxes),
+            "process_actions": sum(int(sandbox.last_status["process_actions"]) for sandbox in sandboxes),
+            "network_actions": sum(int(sandbox.last_status["network_actions"]) for sandbox in sandboxes),
+            "checkpoint_count": len(checkpoint_results),
+            "restore_count": len(restore_results),
+            "checkpoint_batch_ms": (t1 - t0) * 1000.0,
+            "restore_batch_ms": (t2 - t1) * 1000.0,
+        }
+        for sandbox in sandboxes:
+            emit_row_telemetry(harness, sandbox, row, iteration=iteration)
+        rows.append(row)
     return rows
 
 

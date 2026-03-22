@@ -14,6 +14,7 @@ from benchmarks.scenarios.tree import SCENARIO as TREE_SCENARIO
 from benchmarks.support import (
     benchmark_run_context,
     benchmark_run_duration_seconds,
+    compute_telemetry_summary,
     configure_logging,
     write_rows,
 )
@@ -37,6 +38,68 @@ def parse_args() -> argparse.Namespace:
 
 def _summary_lines(summary: dict[str, float]) -> list[str]:
     return [f"{key}_avg: {value:.3f}" for key, value in summary.items()]
+
+
+def _telemetry_metric_aliases(config: BenchmarkConfig, rows: list[dict[str, object]]) -> tuple[dict[str, str | tuple[str, ...]], dict[str, dict[str, object]]]:
+    aliases: dict[str, str | tuple[str, ...]] = {}
+    attribute_filters: dict[str, dict[str, object]] = {}
+    if config.scenario == "fault":
+        aliases.update(
+            {
+                "checkpoint_ms": "benchmark.checkpoint_ms",
+                "restore_ms": "benchmark.restore_ms",
+                "recovery_ms": "benchmark.recovery_ms",
+                "readiness_ms": "benchmark.readiness_ms",
+                "end_to_end_recovery_ms": "benchmark.end_to_end_recovery_ms",
+                "workload_resume_ms": "benchmark.workload_resume_ms",
+            }
+        )
+        if config.mode == "auto" and not (rows and ("verification_status" in rows[0] or "chunks_planned" in rows[0] or "iterations_planned" in rows[0])):
+            for key in ("checkpoint_ms", "restore_ms", "recovery_ms", "readiness_ms", "end_to_end_recovery_ms", "workload_resume_ms"):
+                attribute_filters[key] = {"event_injected": 1}
+    elif config.scenario == "spot":
+        aliases.update(
+            {
+                "checkpoint_ms": "benchmark.checkpoint_ms",
+                "restore_ms": "benchmark.restore_ms",
+                "recovery_ms": "benchmark.recovery_ms",
+                "readiness_ms": "benchmark.readiness_ms",
+                "end_to_end_recovery_ms": "benchmark.end_to_end_recovery_ms",
+                "migration_ms": "benchmark.migration_ms",
+                "budget_slack_ms": "benchmark.budget_slack_ms",
+            }
+        )
+        if config.mode == "auto" and not (rows and ("verification_status" in rows[0] or "chunks_planned" in rows[0] or "iterations_planned" in rows[0])):
+            for key in aliases:
+                attribute_filters[key] = {"event_injected": 1}
+    elif config.scenario == "e2e":
+        if rows and "verification_status" in rows[0]:
+            aliases.update(
+                {
+                    "task_completion_ms": "benchmark.task.duration_ms",
+                    "verification_ms": "benchmark.task.verify.duration_ms",
+                }
+            )
+        else:
+            aliases.update(
+                {
+                    "checkpoint_batch_ms": "benchmark.checkpoint_batch_ms",
+                    "restore_batch_ms": "benchmark.restore_batch_ms",
+                }
+            )
+    elif config.scenario == "tree":
+        aliases.update(
+            {
+                "checkpoint_ms": "benchmark.checkpoint_ms",
+                "restore_ms": "benchmark.restore_ms",
+                "recovery_ms": "benchmark.recovery_ms",
+                "readiness_ms": "benchmark.readiness_ms",
+                "end_to_end_recovery_ms": "benchmark.end_to_end_recovery_ms",
+                "replay_progress_ms": "benchmark.replay_progress_ms",
+                "fanout_ms": "benchmark.fanout_ms",
+            }
+        )
+    return aliases, attribute_filters
 
 
 def _artifact_lines(*, log_file: Path | None, output: Path | None, telemetry_output: Path | None) -> list[str]:
@@ -94,16 +157,20 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
             scheduler_policy=settings.scheduler_policy,
             checkpoint_manager_factory=settings.checkpoint_manager_factory,
             max_workers=settings.max_workers,
-        auto_cr=config.mode == "auto",
-        work_dir_host_root=config.work_dir_host_root,
-        telemetry_output=telemetry_output,
-        benchmark_root=config.benchmark_root,
-        zpool_size=config.zpool_size,
-        zpool_name=config.zpool_name,
-        zpool_image=config.zpool_image,
-        reuse_zpool=config.reuse_zpool,
-        image_cache_root=config.image_cache_root,
-    ) as harness:
+            auto_cr=config.mode == "auto",
+            work_dir_host_root=config.work_dir_host_root,
+            telemetry_output=telemetry_output,
+            telemetry_detail_level=config.telemetry_detail_level,
+            telemetry_capture_command_output=config.telemetry_capture_command_output,
+            telemetry_max_text_attribute_bytes=config.telemetry_max_text_attribute_bytes,
+            benchmark_root=config.benchmark_root,
+            zpool_size=config.zpool_size,
+            zpool_name=config.zpool_name,
+            zpool_image=config.zpool_image,
+            reuse_zpool=config.reuse_zpool,
+            image_cache_root=config.image_cache_root,
+            run_id=str(run_context["run_id"]),
+        ) as harness:
             if scenario.prepare_harness is not None:
                 scenario.prepare_harness(config, harness)
             rows = scenario.runner_for_mode(config.mode)(config, harness)
@@ -111,6 +178,16 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
             config.output.parent.mkdir(parents=True, exist_ok=True)
             write_rows(str(config.output), rows)
         summary = scenario.summarize(config, rows)
+        telemetry_aliases, telemetry_filters = _telemetry_metric_aliases(config, rows)
+        if telemetry_aliases:
+            telemetry_summary = compute_telemetry_summary(
+                telemetry_output,
+                telemetry_aliases,
+                run_id=str(run_context["run_id"]),
+                attribute_filters=telemetry_filters,
+            )
+            if telemetry_summary:
+                summary = {**summary, **telemetry_summary}
         _emit_lines(_summary_lines(summary))
         _emit_lines(
             _artifact_lines(

@@ -55,3 +55,6 @@ class TelemetryConfig:
     enabled: bool = True
     jsonl_path: Path | None = None
     keep_in_memory_copy: bool = True
+    detail_level: str = "basic"
+    capture_command_output: bool = False
+    max_text_attribute_bytes: int = 2048

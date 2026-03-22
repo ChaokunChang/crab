@@ -11,6 +11,7 @@ import time
 from integrations.agents.base import BaseAgent
 from integrations.sandboxes.iflow.harness import (
     IFLOW_HOME_MOUNT_PATH,
+    IFLOW_TOOL_OUTPUT_LIMIT_ENV,
     LOGS_MOUNT_PATH,
     NPM_HOME_MOUNT_PATH,
     RUNTIME_MOUNT_PATH,
@@ -188,6 +189,7 @@ class IFlowAgent(BaseAgent):
             "UV_USE_IO_URING=0",
             "HOME=/root",
             "IFLOW_NON_INTERACTIVE=true",
+            f"{IFLOW_TOOL_OUTPUT_LIMIT_ENV}={os.environ.get(IFLOW_TOOL_OUTPUT_LIMIT_ENV, '1024')}",
             ] + [f"{key}={value}" for key, value in self.task_config.options.items()],
         )
         mounts = [

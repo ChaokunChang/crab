@@ -63,6 +63,59 @@ class BenchmarkConfigTests(unittest.TestCase):
             self.assertEqual(config.work_dir_host_root, (root / "workdirs").resolve())
             self.assertEqual(config.scenario_options["injection_rate"], 0.25)
 
+    def test_load_config_supports_nested_telemetry_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "bench.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "scenario: fault",
+                        "mode: auto",
+                        "telemetry:",
+                        "  output: results/nested.telemetry.jsonl",
+                        "  detail_level: detailed",
+                        "  capture_command_output: true",
+                        "  max_text_attribute_bytes: 512",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+            self.assertEqual(
+                config.telemetry_output,
+                (root / "results" / "nested.telemetry.jsonl").resolve(),
+            )
+            self.assertEqual(config.telemetry_detail_level, "detailed")
+            self.assertTrue(config.telemetry_capture_command_output)
+            self.assertEqual(config.telemetry_max_text_attribute_bytes, 512)
+
+    def test_load_config_nested_telemetry_output_overrides_legacy_field(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "bench.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "scenario: fault",
+                        "mode: auto",
+                        "telemetry_output: results/legacy.telemetry.jsonl",
+                        "telemetry:",
+                        "  output: results/nested.telemetry.jsonl",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+            self.assertEqual(
+                config.telemetry_output,
+                (root / "results" / "nested.telemetry.jsonl").resolve(),
+            )
+
     def test_load_config_rejects_invalid_log_file_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "bench.yaml"
@@ -128,6 +181,9 @@ class BenchmarkRunDispatchTests(unittest.TestCase):
             iterations=1,
             output=None,
             telemetry_output=None,
+            telemetry_detail_level="basic",
+            telemetry_capture_command_output=False,
+            telemetry_max_text_attribute_bytes=2048,
             log_file=None,
             log_file_mode="append",
             benchmark_root=None,
@@ -235,7 +291,69 @@ class BenchmarkRunDispatchTests(unittest.TestCase):
             run_benchmark_config(config)
 
         self.assertEqual(calls[0]["telemetry_output"], Path("/tmp/out.telemetry.jsonl"))
+        self.assertEqual(calls[0]["telemetry_detail_level"], "basic")
+        self.assertFalse(calls[0]["telemetry_capture_command_output"])
+        self.assertEqual(calls[0]["telemetry_max_text_attribute_bytes"], 2048)
         self.assertEqual(calls[0]["benchmark_root"], Path("/tmp/bench-root"))
+
+    def test_run_benchmark_config_passes_telemetry_yaml_settings_to_harness(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        class _HarnessContext:
+            def __init__(self, **kwargs) -> None:
+                calls.append(kwargs)
+
+            def __enter__(self):
+                return {"kind": "fake-harness"}
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                _ = (exc_type, exc, tb)
+
+        scenario = ScenarioDefinition(
+            name="fake",
+            supported_modes=frozenset({"manual"}),
+            build_harness_settings=lambda config: HarnessSettings(
+                scheduler_config={"mode": config.mode},
+                scheduler_policy=None,
+                checkpoint_manager_factory=lambda base: base,
+                max_workers=1,
+            ),
+            run_manual=lambda config, harness: [],
+            run_auto=None,
+            summarize=lambda config, rows: {},
+        )
+        config = BenchmarkConfig(
+            config_path=Path("/tmp/bench.yaml"),
+            scenario="fake",
+            mode="manual",
+            provider="openai",
+            agent="simulated",
+            llm_service="simulated",
+            output=None,
+            telemetry_output=Path("/tmp/out.telemetry.jsonl"),
+            telemetry_detail_level="detailed",
+            telemetry_capture_command_output=True,
+            telemetry_max_text_attribute_bytes=512,
+            log_file=None,
+            log_file_mode="append",
+            benchmark_root=None,
+            zpool_size="10G",
+            zpool_name=None,
+            zpool_image=None,
+            reuse_zpool=False,
+            image_cache_root=None,
+        )
+
+        with patch("benchmarks.run.RealHostScenarioHarness", _HarnessContext), patch.dict(
+            "benchmarks.run.SCENARIOS",
+            {"fake": scenario},
+            clear=True,
+        ):
+            run_benchmark_config(config)
+
+        self.assertEqual(calls[0]["telemetry_detail_level"], "detailed")
+        self.assertTrue(calls[0]["telemetry_capture_command_output"])
+        self.assertEqual(calls[0]["telemetry_max_text_attribute_bytes"], 512)
 
     def test_run_benchmark_config_logs_run_markers_and_summary_to_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

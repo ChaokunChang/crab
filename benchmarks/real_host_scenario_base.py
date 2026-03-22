@@ -43,6 +43,7 @@ from agent_cr import (
     RemoteSandboxInspector,
     ExecutorConfig,
     CompositeTelemetrySink,
+    ConfiguredTelemetrySink,
     InMemoryRequestStateStore,
     InMemorySchedulerStateStore,
     InMemoryTelemetrySink,
@@ -62,6 +63,7 @@ from agent_cr import (
     TelemetryRequestInterceptorHook,
 )
 from agent_cr.models import ArtifactPayload, utc_now
+from agent_cr.telemetry import start_operation
 from agent_cr.host_inspector.fs_helper import LibbpfFilesystemMonitor
 from agent_cr.host_inspector.runtime_resolver import RuntimeResolver
 from agent_cr.host_inspector.server import HostInspectorDaemon, HostInspectorServer
@@ -196,12 +198,16 @@ class RealHostScenarioHarness:
         auto_cr: bool = False,
         work_dir_host_root: Path | None = None,
         telemetry_output: Path | None = None,
+        telemetry_detail_level: str = "basic",
+        telemetry_capture_command_output: bool = False,
+        telemetry_max_text_attribute_bytes: int = 2048,
         benchmark_root: Path | None = None,
         zpool_size: str = "10G",
         zpool_name: str | None = None,
         zpool_image: Path | None = None,
         reuse_zpool: bool = False,
         image_cache_root: Path | None = None,
+        run_id: str | None = None,
     ) -> None:
         self.provider = provider
         self.transfer_delay_ms = transfer_delay_ms
@@ -212,12 +218,16 @@ class RealHostScenarioHarness:
         self.auto_cr = auto_cr
         self.work_dir_host_root = work_dir_host_root
         self.telemetry_output = telemetry_output
+        self.telemetry_detail_level = telemetry_detail_level
+        self.telemetry_capture_command_output = telemetry_capture_command_output
+        self.telemetry_max_text_attribute_bytes = telemetry_max_text_attribute_bytes
         self.configured_benchmark_root = None if benchmark_root is None else benchmark_root.expanduser().resolve()
         self.zpool_size = zpool_size
         self.configured_zpool_name = zpool_name
         self.configured_zpool_image = zpool_image
         self.reuse_zpool = reuse_zpool
         self.image_cache_root = (image_cache_root or _DEFAULT_IMAGE_CACHE_ROOT).resolve()
+        self.run_id = "" if run_id is None else str(run_id)
         self._tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self.root: Path | None = None
         self.pool_name = ""
@@ -246,6 +256,7 @@ class RealHostScenarioHarness:
         self._sandbox_image_lock = threading.Lock()
         self._task_executor = ThreadPoolExecutor(max_workers=max(1, self.max_workers))
         self._zpool_image_path: Path | None = None
+        self._task_attempts: dict[str, int] = {}
 
     @property
     def benchmark_bridge_ip(self) -> str:
@@ -324,17 +335,22 @@ class RealHostScenarioHarness:
         self.pool_name = self.configured_zpool_name or f"agentcrbench{unique_suffix}"
         self.runtime_state_root = self.root / "runtime-state"
         self.host_inspector_url = self._start_host_inspector_server()
-        self.llm_server = serve_benchmark_llm_router(host="127.0.0.1", port=0)
+        telemetry_sinks: list[TelemetrySink] = [InMemoryTelemetrySink()]
+        telemetry_path = self.telemetry_output or (self.root / "telemetry.jsonl")
+        telemetry_sinks.append(JsonlTelemetrySink(telemetry_path))
+        self.telemetry = ConfiguredTelemetrySink(
+            CompositeTelemetrySink(telemetry_sinks),
+            default_attributes={"run_id": self.run_id} if self.run_id else None,
+            detail_level=self.telemetry_detail_level,
+            capture_command_output=self.telemetry_capture_command_output,
+            max_text_attribute_bytes=self.telemetry_max_text_attribute_bytes,
+        )
+        self.request_state_store = InMemoryRequestStateStore()
+        self.llm_server = serve_benchmark_llm_router(host="127.0.0.1", port=0, telemetry=self.telemetry)
         self.llm_thread = threading.Thread(target=self.llm_server.serve_forever, daemon=True)
         self.llm_thread.start()
         wait_for_http_json(f"http://127.0.0.1:{self.llm_server.server_address[1]}/healthz")
         self._ensure_zpool()
-
-        telemetry_sinks: list[TelemetrySink] = [InMemoryTelemetrySink()]
-        telemetry_path = self.telemetry_output or (self.root / "telemetry.jsonl")
-        telemetry_sinks.append(JsonlTelemetrySink(telemetry_path))
-        self.telemetry = CompositeTelemetrySink(telemetry_sinks)
-        self.request_state_store = InMemoryRequestStateStore()
 
         self.host_inspector_client = HostInspectorServiceClient(self.host_inspector_url)
         self.base_inspector = RemoteSandboxInspector(self.host_inspector_client)
@@ -694,6 +710,7 @@ class RealHostScenarioHarness:
             raise RuntimeError("runtime is not initialized")
         runtime.launch("runc", launch_metadata)
         task_run.wait_for_task_ready()
+        self.emit_benchmark_event("benchmark.task.ready", handle)
         logger.info(
             "Launched benchmark sandbox name=%s sandbox_id=%s status_host=%s status_port=%d auto_cr=%s agent_type=%s",
             sandbox_name,
@@ -704,6 +721,103 @@ class RealHostScenarioHarness:
             agent_type,
         )
         return handle
+
+    def benchmark_telemetry_attributes(
+        self,
+        sandbox: SandboxHandle,
+        *,
+        iteration: int | None = None,
+        event_type: str | None = None,
+        checkpoint_id: CheckpointId | None = None,
+        request_id: str | None = None,
+        extra: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        attributes: dict[str, object] = {
+            "component": "benchmark",
+            "sandbox_id": str(sandbox.sandbox_id),
+            "task_id": benchmark_core.task_id_for_sandbox(sandbox),
+            "agent_type": sandbox.agent_type,
+            "llm_service_type": sandbox.llm_service_type,
+            "task_attempt": self._task_attempts.get(str(sandbox.sandbox_id), 0),
+        }
+        if iteration is not None:
+            attributes["iteration"] = int(iteration)
+        if event_type is not None:
+            attributes["event_type"] = event_type
+        if checkpoint_id is not None:
+            attributes["checkpoint_id"] = str(checkpoint_id)
+        if request_id is not None:
+            attributes["request_id"] = request_id
+        if extra:
+            attributes.update(extra)
+        return attributes
+
+    def emit_benchmark_metric(
+        self,
+        name: str,
+        value: float,
+        sandbox: SandboxHandle,
+        *,
+        iteration: int | None = None,
+        event_type: str | None = None,
+        checkpoint_id: CheckpointId | None = None,
+        extra: dict[str, object] | None = None,
+    ) -> None:
+        if self.telemetry is None:
+            return
+        self.telemetry.emit_metric(
+            name,
+            float(value),
+            self.benchmark_telemetry_attributes(
+                sandbox,
+                iteration=iteration,
+                event_type=event_type,
+                checkpoint_id=checkpoint_id,
+                extra=extra,
+            ),
+        )
+
+    def emit_benchmark_event(
+        self,
+        name: str,
+        sandbox: SandboxHandle,
+        *,
+        iteration: int | None = None,
+        event_type: str | None = None,
+        checkpoint_id: CheckpointId | None = None,
+        extra: dict[str, object] | None = None,
+    ) -> None:
+        if self.telemetry is None:
+            return
+        self.telemetry.emit_event(
+            name,
+            self.benchmark_telemetry_attributes(
+                sandbox,
+                iteration=iteration,
+                event_type=event_type,
+                checkpoint_id=checkpoint_id,
+                extra=extra,
+            ),
+        )
+
+    def _bind_task_future_telemetry(self, handle: SandboxHandle, task_future) -> None:
+        if self.telemetry is None:
+            return
+        operation = start_operation(
+            self.telemetry,
+            "benchmark.task",
+            self.benchmark_telemetry_attributes(handle),
+        )
+
+        def _finalize(future) -> None:
+            try:
+                future.result()
+            except Exception:
+                operation.finish(status="failed")
+                return
+            operation.finish(status="succeeded")
+
+        task_future.add_done_callback(_finalize)
 
     def launch_task(
         self,
@@ -722,7 +836,10 @@ class RealHostScenarioHarness:
         handle.task_config = task_config
         task_run = self.build_task_run(agent_type, handle, task_description, task_config)
         handle.task_run = task_run
+        self._task_attempts[str(handle.sandbox_id)] = self._task_attempts.get(str(handle.sandbox_id), 0) + 1
+        self.emit_benchmark_event("benchmark.task.start", handle)
         handle.task_future = self._task_executor.submit(task_run.perform_task)
+        self._bind_task_future_telemetry(handle, handle.task_future)
         return task_run
 
     def launch_sandbox_and_task(
@@ -1085,6 +1202,7 @@ class RealHostScenarioHarness:
             wait_for_task_ready = getattr(sandbox.task_run, "wait_for_task_ready", None)
             if callable(wait_for_task_ready):
                 wait_for_task_ready()
+                self.emit_benchmark_event("benchmark.task.ready", sandbox, event_type=event_type)
         logger.info(
             "Observed recovery record sandbox=%s event_type=%s status=%s checkpoint=%s",
             sandbox.sandbox_id,
@@ -1660,6 +1778,11 @@ class RealHostScenarioHarness:
         timeout_s: float | None = None,
     ) -> dict[str, object]:
         command_started = time.perf_counter()
+        verify_operation = None if self.telemetry is None else start_operation(
+            self.telemetry,
+            "benchmark.task.verify",
+            self.benchmark_telemetry_attributes(sandbox),
+        )
         result = self.exec_in_sandbox(
             sandbox,
             ["/bin/bash", "-lc", "bash /tests/run-tests.sh"],
@@ -1680,6 +1803,8 @@ class RealHostScenarioHarness:
             logger.info("run-tests stdout sandbox=%s\n%s", sandbox.sandbox_id, stdout)
         if stderr:
             logger.warning("run-tests stderr sandbox=%s\n%s", sandbox.sandbox_id, stderr)
+        if verify_operation is not None:
+            verify_operation.finish(status="succeeded" if result.returncode == 0 else "failed")
         return {
             "verification_status": "passed" if result.returncode == 0 else "failed",
             "verification_exit_code": result.returncode,
@@ -1777,10 +1902,8 @@ class RealHostScenarioHarness:
             return
         metadata = manifest.metadata if isinstance(manifest.metadata, dict) else {}
         raw_value_p = metadata.get("process_restore_replay_action_count")
-        raw_value_f = metadata.get("filesystem_restore_replay_action_count")
         try:
-            raw_value = max(int(raw_value_p), int(raw_value_f))
-            matched_response_count = max(0, int(raw_value))
+            matched_response_count = max(0, int(raw_value_p))
         except (TypeError, ValueError):
             logger.warning(
                 "Skipping llm service state restore for sandbox=%s because process_restore_replay_action_count is missing or invalid",

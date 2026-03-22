@@ -587,7 +587,7 @@ class FaultScenarioTests(unittest.TestCase):
 
         summary = summarize_fault(_config("fault", "auto", agent="iflow", llm_service="iflow_trace_replay"), rows)
 
-        self.assertEqual(summary["recovery_ms_avg"], 12.0)
+        self.assertEqual(summary["recovery_ms"], 12.0)
         self.assertEqual(summary["success_ratio"], 1.0)
 
 

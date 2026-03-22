@@ -15,7 +15,7 @@ from agent_cr import (
 from integrations.agents import SandboxHandle, TaskConfig, TaskDescription
 
 from benchmarks.config import BenchmarkConfig
-from benchmarks.core import annotate_row, launch_task_records, parallel_map, resolve_task_records
+from benchmarks.core import annotate_row, emit_row_telemetry, launch_task_records, parallel_map, resolve_task_records
 from benchmarks.scenarios import HarnessSettings, ScenarioDefinition
 from benchmarks.support import (
     TreeSearchCheckpointRecord,
@@ -290,7 +290,7 @@ def run_replay_progress(
         action_budget=fork_steps,
     )
     progress_finished = time.perf_counter()
-    return annotate_row(
+    row = annotate_row(
         config,
         fork,
         iteration=restored.prepared.replay_step,
@@ -311,6 +311,8 @@ def run_replay_progress(
             "retained_source_checkpoints": retained_source_checkpoints,
         },
     )
+    emit_row_telemetry(harness, fork, row, iteration=restored.prepared.replay_step)
+    return row
 
 
 def cleanup_replay_fork(harness, prepared: PreparedReplayFork) -> None:

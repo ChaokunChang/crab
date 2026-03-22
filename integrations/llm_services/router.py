@@ -7,6 +7,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Protocol
 from urllib.parse import parse_qs, urlparse
 
+from agent_cr.telemetry import start_operation
+
 from integrations.llm_services.iflow_trace_replay.service import TraceReplayLLMState
 from integrations.llm_services.manual.service import ManualLLMState, handle_control_request
 from integrations.llm_services.simulated.service import SimulatedLLMState, handle_request as handle_simulated_request
@@ -151,8 +153,9 @@ class RegisteredSandboxService:
 
 
 class BenchmarkLLMRouter:
-    def __init__(self, registry: dict[str, type[LLMServiceState]] | None = None) -> None:
+    def __init__(self, registry: dict[str, type[LLMServiceState]] | None = None, telemetry=None) -> None:
         self._registry = registry or build_llm_service_registry()
+        self._telemetry = telemetry
         self._lock = threading.Lock()
         self._services: dict[str, RegisteredSandboxService] = {}
 
@@ -187,7 +190,28 @@ class BenchmarkLLMRouter:
     def handle_request(self, *, path: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
         sandbox_id = _sandbox_id_from_request(headers, payload)
         service = self.resolve_service(sandbox_id)
-        return service.service_state.handle_request(path=path, headers=headers, payload=payload)
+        request_id = headers.get("X-AgentCR-Request-Id", "").strip()
+        attributes = {
+            "component": "llm_service",
+            "request_id": request_id,
+            "sandbox_id": sandbox_id,
+            "path": path,
+            "llm_service_type": service.llm_service_type,
+        }
+        operation = None if self._telemetry is None else start_operation(
+            self._telemetry,
+            "llm.service.request",
+            attributes,
+        )
+        try:
+            response = service.service_state.handle_request(path=path, headers=headers, payload=payload)
+        except Exception:
+            if operation is not None:
+                operation.finish(status="failed")
+            raise
+        if operation is not None:
+            operation.finish(status="succeeded")
+        return response
 
     def handle_control_request(self, *, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         sandbox_id = str(payload.get("sandbox_id", "")).strip()
@@ -220,8 +244,14 @@ class BenchmarkLLMRouter:
         )
 
 
-def serve_benchmark_llm_router(*, host: str, port: int, registry: dict[str, type[LLMServiceState]] | None = None) -> ThreadingHTTPServer:
-    router = BenchmarkLLMRouter(registry=registry)
+def serve_benchmark_llm_router(
+    *,
+    host: str,
+    port: int,
+    registry: dict[str, type[LLMServiceState]] | None = None,
+    telemetry=None,
+) -> ThreadingHTTPServer:
+    router = BenchmarkLLMRouter(registry=registry, telemetry=telemetry)
 
     class RouterHandler(BaseHTTPRequestHandler):
         benchmark_llm_router = router

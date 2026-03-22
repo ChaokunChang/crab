@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_cr import (
     AdapterFileSystemCWorker,
@@ -24,6 +26,7 @@ from agent_cr import (
     FailureCode,
     InMemoryRuntime,
     InMemoryEBPFEventCollector,
+    InMemoryTelemetrySink,
     JobId,
     LocalCheckpointManager,
     RestoreJob,
@@ -1089,6 +1092,41 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(runner.commands[0][0:3], ("runc", "--root", str(base / "state")))
             self.assertIn("--leave-running=true", runner.commands[0])
             self.assertEqual(runner.commands[1], ("zfs", "snapshot", "pool/agent-cr/sbx-1@ckpt-1"))
+
+    def test_runc_runtime_exec_emits_telemetry_without_deleted_helper(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_runc_exec_") as tmp:
+            base = Path(tmp)
+            telemetry = InMemoryTelemetrySink()
+            adapter = RuncRuntimeAdapter(
+                telemetry=telemetry,
+                paths=RuncRuntimePaths(
+                    state_root=base / "state",
+                    bundle_root=base / "bundles",
+                    checkpoint_root=base / "checkpoints",
+                    metadata_root=base / "metadata",
+                    zfs_dataset_prefix="pool/agent-cr",
+                ),
+            )
+
+            completed = subprocess.CompletedProcess(
+                args=["runc", "exec"],
+                returncode=0,
+                stdout="ok\n",
+                stderr="",
+            )
+            with patch("agent_cr.runtime.runc.subprocess.run", return_value=completed):
+                result = adapter.exec(
+                    SandboxId("sbx-1"),
+                    ["/bin/true"],
+                    cwd="/app",
+                    capture_output=True,
+                )
+
+            self.assertEqual(result.returncode, 0)
+            event_names = [name for name, _ in telemetry.events]
+            self.assertIn("sandbox.runtime_exec.start", event_names)
+            self.assertIn("sandbox.runtime_exec.finish", event_names)
+            self.assertIn("sandbox.command", event_names)
 
     def test_ebpf_inspector_uses_recorded_events(self) -> None:
         collector = InMemoryEBPFEventCollector()

@@ -37,6 +37,8 @@ from benchmarks.support import (
     BenchmarkTaskRecord,
     TreeSearchCheckpointRecord,
     bounded_probability,
+    compute_summary_aliases,
+    compute_telemetry_summary,
     build_tree_search_checkpoint_index,
     compute_summary,
     resolve_checkpoint_copy_plan,
@@ -193,6 +195,58 @@ class BenchmarkHelperTests(unittest.TestCase):
             compute_summary(rows, ["checkpoint_ms", "restore_ms"]),
             {"checkpoint_ms": 20.0, "restore_ms": 30.0},
         )
+
+    def test_compute_summary_aliases_maps_row_fields_to_summary_keys(self) -> None:
+        rows = [
+            {"recovery_ms_avg": 10.0, "success_ratio": 1.0},
+            {"recovery_ms_avg": 14.0, "success_ratio": 0.0},
+        ]
+        self.assertEqual(
+            compute_summary_aliases(rows, {"recovery_ms": "recovery_ms_avg", "success_ratio": "success_ratio"}),
+            {"recovery_ms": 12.0, "success_ratio": 0.5},
+        )
+
+    def test_compute_telemetry_summary_filters_by_run_id_and_attributes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            telemetry_path = Path(tmp) / "telemetry.jsonl"
+            telemetry_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "kind": "metric",
+                                "name": "benchmark.recovery_ms",
+                                "value": 12.0,
+                                "attributes": {"run_id": "run-a", "event_injected": 1},
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "kind": "metric",
+                                "name": "benchmark.recovery_ms",
+                                "value": 50.0,
+                                "attributes": {"run_id": "run-a", "event_injected": 0},
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "kind": "metric",
+                                "name": "benchmark.recovery_ms",
+                                "value": 99.0,
+                                "attributes": {"run_id": "run-b", "event_injected": 1},
+                            }
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            summary = compute_telemetry_summary(
+                telemetry_path,
+                {"recovery_ms": "benchmark.recovery_ms"},
+                run_id="run-a",
+                attribute_filters={"recovery_ms": {"event_injected": 1}},
+            )
+        self.assertEqual(summary, {"recovery_ms": 12.0})
 
     def test_parse_ipv4_route_networks_ignores_default_and_host_routes(self) -> None:
         self.assertEqual(

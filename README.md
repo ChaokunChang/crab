@@ -69,6 +69,47 @@ The default builder creates:
 
 Use direct `AgentCRSystem(...)` construction when you need custom runtime paths, real-host wiring, retention wrappers, or a non-default scheduler policy.
 
+## Telemetry
+
+Telemetry stays JSONL-based and is designed to be lightweight by default.
+
+- The default shape is still a stream of `event` and `metric` records.
+- New lifecycle instrumentation now emits correlated `*.start`, `*.finish`, and `*.duration_ms` records for:
+  - benchmark tasks and verification
+  - interceptor request handling and response-gate waits
+  - benchmark LLM service handling
+  - scheduler evaluation
+  - executor queueing and job execution
+  - checkpoint/restore flows and process/filesystem sub-steps
+  - `runc` and ZFS command execution
+- Correlation attributes are attached where available, including `run_id`, `sandbox_id`, `task_id`, `request_id`, `job_id`, `checkpoint_id`, `event_type`, and `component`.
+
+`TelemetryConfig` now supports a few knobs:
+
+```python
+from pathlib import Path
+
+from agent_cr import TelemetryConfig, build_default_system
+
+system = build_default_system(
+    storage_root=Path("tmp/agent-cr"),
+    telemetry_config=TelemetryConfig(
+        enabled=True,
+        jsonl_path=Path("tmp/agent-cr/telemetry.jsonl"),
+        keep_in_memory_copy=True,
+        detail_level="basic",  # or "detailed"
+        capture_command_output=False,
+        max_text_attribute_bytes=2048,
+    ),
+)
+```
+
+Notes:
+
+- `detail_level="basic"` is the default and is intended for normal benchmark runs.
+- `detail_level="detailed"` preserves the same event/metric model but allows richer attributes for deeper analysis.
+- `capture_command_output=False` avoids storing command stdout/stderr unless you explicitly want it.
+
 ## Checkpoint, Restore, And Recovery
 
 ### Manual Checkpoint
@@ -173,6 +214,12 @@ output: logs/tmp/out.csv
 log_file: logs/tmp/out.log
 log_file_mode: append | write
 benchmark_root: logs/tmp/benchmark-runs
+telemetry_output: logs/tmp/out.telemetry.jsonl  # legacy top-level form, still supported
+telemetry:
+  output: logs/tmp/out.telemetry.jsonl
+  detail_level: basic | detailed
+  capture_command_output: false
+  max_text_attribute_bytes: 2048
 zpool_size: 10G
 zpool_name: agentcrbench-cache
 zpool_image: logs/tmp/bench.zpool.img
@@ -183,6 +230,19 @@ work_dir_host_root: logs/tmp
 scenario_options: {}
 ```
 
+Benchmark artifacts now include both:
+
+- a CSV output with benchmark-level outcome fields such as `success_ratio` and `lost_actions`
+- a telemetry JSONL stream used for system timing analysis and summary reconstruction
+
+The benchmark runner is now telemetry-first for timing summaries:
+
+- if the telemetry file for the run contains the required timing metrics, printed summaries are computed from telemetry
+- if not, the runner falls back to row-based summary computation for compatibility
+- benchmark-derived outcome metrics such as `success_ratio_avg` and `lost_actions_avg_avg` are still preserved
+
+This removes the old replay-mode `avg of avg` summary issue for timing metrics like checkpoint, restore, and recovery latency.
+
 Logging notes:
 
 - `log_file` sends benchmark logs to a file instead of stderr/stdout.
@@ -191,6 +251,12 @@ Logging notes:
 - Use `log_file_mode: write` when you want each benchmark run to start with a fresh log file.
 - `benchmark_root` places each run under a timestamped subdirectory rooted at the configured path. If omitted, benchmarks use a temporary directory. `AGENTCR_BENCH_DIR` is still accepted as a fallback for older workflows.
 - `benchmark.run` now logs an explicit start marker and end marker for each run, and the final summary/artifact paths are logged as well as printed.
+- Benchmark YAML supports a nested `telemetry:` block for telemetry output and detail controls.
+- `telemetry.output` sets the JSONL artifact path. If omitted, the runner defaults to `<output>.telemetry.jsonl` or `<config>.telemetry.jsonl`.
+- `telemetry.detail_level` accepts `basic` or `detailed`.
+- `telemetry.capture_command_output` is `false` by default to avoid storing command stdout/stderr in normal runs.
+- `telemetry.max_text_attribute_bytes` bounds long text attributes when detailed capture is enabled.
+- The legacy top-level `telemetry_output` field is still accepted for compatibility, but `telemetry.output` is the preferred YAML form.
 - `zpool_size` controls the backing file size for ephemeral benchmark zpools.
 - `reuse_zpool: true` keeps the zpool across runs instead of recreating it every time.
 - When reusing a pool, set both `zpool_name` and `zpool_image` to stable values. Each run still destroys and recreates the `pool/agent-cr` dataset so the benchmark starts clean.
