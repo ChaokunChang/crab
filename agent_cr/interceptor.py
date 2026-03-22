@@ -447,11 +447,11 @@ class AgentCRRequestInterceptor:
                         "path": path,
                     },
                 )
-            self._request_state_store.mark_request_end(context)
-            self._hook.on_request_end(context)
+            self._hook.on_request_end(context) # record telemetry, etc
             self._notify(context.sandbox_id)
             if self._response_gate_registry is not None:
                 self._response_gate_registry.wait_for_release(context.sandbox_id, gate_generation)
+            self._request_state_store.mark_request_end(context)
 
     def _notify(self, sandbox_id: SandboxId) -> None:
         if self._on_state_change is not None:

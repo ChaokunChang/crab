@@ -1235,6 +1235,7 @@ class RealHostScenarioHarness:
         logger.info("Injecting fault into sandbox=%s", sandbox.sandbox_id)
         self.wait_for_fault_injection_window(sandbox)
         self._delete_runtime(sandbox.sandbox_id)
+        logger.info("Injected fault into sandbox=%s", sandbox.sandbox_id)
         self._set_sandbox_running_state(sandbox.sandbox_id, is_running=False)
 
     def destroy_sandbox_dataset(self, sandbox: SandboxHandle) -> None:

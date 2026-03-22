@@ -86,6 +86,7 @@ class RemoteSandboxInspector(SandboxInspector):
             if self._is_unknown_sandbox_error(exc):
                 with self._lock:
                     self._pending_reset_at[snapshot.sandbox_id] = reset_at
+                logger.debug(f"pending a sandbox reset for sandbox={snapshot.sandbox_id}")
                 return
             logger.debug(
                 "Failed to sync clean snapshot baseline for sandbox %s",
