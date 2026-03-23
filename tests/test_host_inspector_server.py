@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import io
 import os
+import subprocess
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+from agent_cr.host_inspector.fs_helper import LibbpfFilesystemMonitor
 from agent_cr.host_inspector.process_filter import ProcessIdentity
 from agent_cr.host_inspector.protocol import HelperEvent
 from agent_cr.host_inspector.runtime_resolver import ResolvedSandbox
@@ -78,6 +81,50 @@ def _event(
     )
 
 class HostInspectorServerTests(unittest.TestCase):
+    def test_filesystem_monitor_stop_kills_helper_after_terminate_timeout(self) -> None:
+        monitor = LibbpfFilesystemMonitor(helper_path="/bin/true")
+        stdout = Mock()
+        stderr = Mock()
+        stdin = Mock()
+        process = Mock()
+        process.pid = 12345
+        process.poll.side_effect = [None, None]
+        process.stdin = stdin
+        process.stdout = stdout
+        process.stderr = stderr
+        process.wait.side_effect = [subprocess.TimeoutExpired(["fs_monitor"], 5.0), 0]
+        monitor._process = process
+        stdout_thread = Mock()
+        stderr_thread = Mock()
+        monitor._stdout_thread = stdout_thread
+        monitor._stderr_thread = stderr_thread
+
+        monitor.stop()
+
+        stdin.close.assert_called_once()
+        process.terminate.assert_called_once()
+        process.kill.assert_called_once()
+        self.assertEqual(process.wait.call_count, 2)
+        stdout.close.assert_called_once()
+        stderr.close.assert_called_once()
+        stdout_thread.join.assert_called_once()
+        stderr_thread.join.assert_called_once()
+        self.assertIsNone(monitor._stdout_thread)
+        self.assertIsNone(monitor._stderr_thread)
+
+    def test_filesystem_monitor_reader_ignores_stream_close_during_shutdown(self) -> None:
+        class RaisingStream:
+            def __iter__(self):
+                raise ValueError("I/O operation on closed file")
+
+        monitor = LibbpfFilesystemMonitor(helper_path="/bin/true")
+        process = Mock()
+        process.stdout = RaisingStream()
+        process.stderr = io.StringIO("")
+        monitor._process = process
+
+        monitor._read_stdout()
+
     def test_register_reset_status_and_unregister(self) -> None:
         resolver = FakeResolver()
         fs_monitor = FakeFilesystemMonitor()

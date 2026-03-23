@@ -31,10 +31,8 @@ from agent_cr import (
     InMemoryTelemetrySink,
     LocalCheckpointManager,
     RequestContext,
-    RuncRuntimeAdapter,
+    RuncRuntime,
     RuncRuntimePaths,
-    RuncSandboxManager,
-    RuncSandboxManagerPaths,
     SandboxId,
     SandboxSnapshot,
     SchedulerConfig,
@@ -45,14 +43,39 @@ from agent_cr.models import JobStatus, RecoveryEvent, utc_now
 from integrations.llm_services.simulated.service import SimulatedLLMState, handle_request
 from agent_cr.runtime import CommandRunner
 
+RuncRuntimeAdapter = RuncRuntime
+RuncSandboxManager = RuncRuntime
+RuncSandboxManagerPaths = RuncRuntimePaths
+
 
 class FakeCommandRunner(CommandRunner):
     def __init__(self) -> None:
         self.commands: list[tuple[str, ...]] = []
+        self._running_sandboxes: set[str] = set()
 
     def run(self, command: list[str], *, cwd: Path | None = None):
         _ = cwd
         self.commands.append(tuple(command))
+        if "start" in command:
+            self._running_sandboxes.add(command[-1])
+        elif "delete" in command or "kill" in command:
+            self._running_sandboxes.discard(command[-2] if "kill" in command else command[-1])
+        elif "restore" in command:
+            self._running_sandboxes.add(command[-1])
+        elif "state" in command:
+            sandbox_id = command[-1]
+            if sandbox_id not in self._running_sandboxes:
+                return type(
+                    "Result",
+                    (),
+                    {"command": tuple(command), "returncode": 1, "stdout": "", "stderr": "container does not exist"},
+                )()
+            payload = {"status": "running", "pid": 123}
+            return type(
+                "Result",
+                (),
+                {"command": tuple(command), "returncode": 0, "stdout": json.dumps(payload), "stderr": ""},
+            )()
         return type(
             "Result",
             (),
@@ -68,6 +91,25 @@ class FailingRestoreRunner(FakeCommandRunner):
                 "Result",
                 (),
                 {"command": tuple(command), "returncode": 1, "stdout": "", "stderr": "restore failed"},
+            )()
+        return result
+
+
+class RestoreMissingRuntimeRunner(FakeCommandRunner):
+    def __init__(self) -> None:
+        super().__init__()
+        self._restore_attempted = False
+
+    def run(self, command: list[str], *, cwd: Path | None = None):
+        result = super().run(command, cwd=cwd)
+        if "restore" in command:
+            self._restore_attempted = True
+            return result
+        if self._restore_attempted and len(command) >= 2 and command[-2] == "state":
+            return type(
+                "Result",
+                (),
+                {"command": tuple(command), "returncode": 1, "stdout": "", "stderr": "container does not exist"},
             )()
         return result
 
@@ -147,7 +189,7 @@ class SystemIntegrationTests(unittest.TestCase):
             executor=executor,
             storage=storage,
             inspector=inspector,
-            sandbox_manager=sandbox_manager,
+            runtime=sandbox_manager,
             telemetry=telemetry,
             request_state_store=request_store,
             relaunch_handler=relaunch_handler,
@@ -208,7 +250,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 executor=executor,
                 storage=storage,
                 inspector=inspector,
-                sandbox_manager=sandbox_manager,
+                runtime=sandbox_manager,
                 telemetry=telemetry,
             )
 
@@ -259,8 +301,9 @@ class SystemIntegrationTests(unittest.TestCase):
             system.sandbox_manager.delete(sandbox_id)
 
             self.assertEqual(
-                runner.commands[:4],
+                runner.commands[:5],
                 [
+                    ("zfs", "destroy", "-r", "pool/agent-cr/sbx-int"),
                     ("zfs", "create", "-o", f"mountpoint={root / 'bundles' / 'sbx-int' / 'rootfs'}", "pool/agent-cr/sbx-int"),
                     (
                         "runc",
@@ -285,7 +328,7 @@ class SystemIntegrationTests(unittest.TestCase):
                     str(root / "checkpoints" / "sbx-int" / str(checkpoint_result.checkpoint_id) / "process"),
                     "--work-path",
                     str(root / "checkpoints" / "sbx-int" / str(checkpoint_result.checkpoint_id) / "work"),
-                    "--leave-running=true",
+                    "--leave-running=false",
                     "--tcp-established",
                     "--shell-job",
                     "--tcp-skip-in-flight",
@@ -448,7 +491,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 executor=executor,
                 storage=storage,
                 inspector=inspector,
-                sandbox_manager=sandbox_manager,
+                runtime=sandbox_manager,
                 telemetry=telemetry,
             )
             sandbox_id = system.sandbox_manager.launch(
@@ -537,7 +580,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 executor=executor,
                 storage=storage,
                 inspector=inspector,
-                sandbox_manager=sandbox_manager,
+                runtime=sandbox_manager,
                 telemetry=telemetry,
                 request_state_store=request_store,
             )
@@ -1002,7 +1045,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 executor=executor,
                 storage=storage,
                 inspector=inspector,
-                sandbox_manager=sandbox_manager,
+                runtime=sandbox_manager,
                 telemetry=telemetry,
                 request_state_store=request_store,
                 relaunch_handler=lambda sandbox_id, event_type: relaunched.append((sandbox_id, event_type)),
@@ -1048,6 +1091,46 @@ class SystemIntegrationTests(unittest.TestCase):
 
             self.assertEqual(record.status, "relaunched")
             self.assertEqual(relaunched, [(sandbox_id, "fault")])
+
+    def test_restore_once_fails_when_runtime_does_not_come_back(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
+            root = Path(tmp)
+            runner = RestoreMissingRuntimeRunner()
+            telemetry = InMemoryTelemetrySink()
+            collector = InMemoryEBPFEventCollector()
+            inspector = EBPFSandboxInspector(collector)
+            system, executor = self._build_runc_system(
+                root=root,
+                runner=runner,
+                telemetry=telemetry,
+                inspector=inspector,
+            )
+            sandbox_id = system.sandbox_manager.launch(
+                "runc",
+                {
+                    "sandbox_id": "sbx-restore-missing",
+                    "bundle_path": str(root / "bundles" / "sbx-restore-missing"),
+                },
+            )
+            inspector.upsert_snapshot(
+                SandboxSnapshot(
+                    sandbox_id=sandbox_id,
+                    runtime_name="runc",
+                    is_running=True,
+                    process_changed=True,
+                    filesystem_changed=True,
+                    observed_at=utc_now(),
+                )
+            )
+            checkpoint_result = system.checkpoint_if_due(sandbox_id)
+            self.assertIsNotNone(checkpoint_result)
+
+            result = system.restore_once(sandbox_id, checkpoint_result.checkpoint_id)
+            executor.shutdown()
+
+            self.assertEqual(result.status, JobStatus.FAILED)
+            self.assertEqual(result.failure_code, FailureCode.RUNTIME_ERROR)
+            self.assertIn("is not running", result.message or "")
 
     def test_preemption_notification_checkpoints_then_restores(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
@@ -1109,7 +1192,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 executor=executor,
                 storage=storage,
                 inspector=inspector,
-                sandbox_manager=sandbox_manager,
+                runtime=sandbox_manager,
                 telemetry=telemetry,
             )
             sandbox_id = system.sandbox_manager.launch(
@@ -1202,7 +1285,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 executor=executor,
                 storage=storage,
                 inspector=inspector,
-                sandbox_manager=sandbox_manager,
+                runtime=sandbox_manager,
                 telemetry=telemetry,
             )
             sandbox_id = system.sandbox_manager.launch(
@@ -1315,7 +1398,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 executor=executor,
                 storage=storage,
                 inspector=inspector,
-                sandbox_manager=sandbox_manager,
+                runtime=sandbox_manager,
                 telemetry=telemetry,
             )
             sandbox_id = system.sandbox_manager.launch(

@@ -556,6 +556,8 @@ class HostInspectorDaemon:
             "sandbox_id": record.sandbox_id,
             "runtime_name": record.runtime_name,
             "is_running": record.is_running,
+            # "process_changed": record.is_running, # record.process_changed,
+            # "filesystem_changed": record.is_running, # record.filesystem_changed,
             "process_changed": record.process_changed,
             "filesystem_changed": record.filesystem_changed,
             "observed_at": _isoformat(record.observed_at),
@@ -573,7 +575,10 @@ class HostInspectorServer:
         daemon: HostInspectorDaemon | None = None,
     ) -> None:
         self._daemon = daemon or HostInspectorDaemon()
-        self._server = ThreadingHTTPServer((host, port), self._build_handler())
+        class _ReusableThreadingHTTPServer(ThreadingHTTPServer):
+            allow_reuse_address = True
+
+        self._server = _ReusableThreadingHTTPServer((host, port), self._build_handler())
         self._thread: Thread | None = None
 
     @property
@@ -596,6 +601,9 @@ class HostInspectorServer:
     def _build_handler(self):
         daemon = self._daemon
 
+        class _ClientDisconnectedError(Exception):
+            pass
+
         class Handler(BaseHTTPRequestHandler):
             def _read_json(self) -> dict[str, Any]:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -606,17 +614,23 @@ class HostInspectorServer:
 
             def _write_json(self, code: int, payload: dict[str, Any]) -> None:
                 body = json.dumps(payload, sort_keys=True).encode("utf-8")
-                self.send_response(code)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.send_response(code)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError) as exc:
+                    raise _ClientDisconnectedError from exc
 
             def do_GET(self) -> None:  # noqa: N802
-                if self.path == "/healthz":
-                    self._write_json(HTTPStatus.OK, {"ok": True})
-                    return
-                self._write_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
+                try:
+                    if self.path == "/healthz":
+                        self._write_json(HTTPStatus.OK, {"ok": True})
+                        return
+                    self._write_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
+                except _ClientDisconnectedError:
+                    logger.debug("Host inspector client disconnected during GET response")
 
             def do_POST(self) -> None:  # noqa: N802
                 try:
@@ -634,7 +648,9 @@ class HostInspectorServer:
                     if self.path == "/get_proc_and_fs_status":
                         payload = self._read_json()
                         result = daemon.status(str(payload["sandbox_id"]))
-                        logger.debug(f"host-inspector: get_proc_and_fs_status {payload=} {result=}")
+                        def without_key(d, key):
+                            return {k: v for k, v in d.items() if k != key}
+                        logger.debug(f"host-inspector: get_proc_and_fs_status {payload=} result={without_key(result, 'metadata')}")
                         self._write_json(HTTPStatus.OK, {"ok": True, "status": result})
                         return
                     if self.path == "/reset":
@@ -652,9 +668,14 @@ class HostInspectorServer:
                     self._write_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
                 except KeyError as exc:
                     self._write_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": f"unknown sandbox: {exc.args[0]}"})
+                except _ClientDisconnectedError:
+                    logger.debug("Host inspector client disconnected during POST response")
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("Host inspector request failed")
-                    self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+                    try:
+                        self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+                    except _ClientDisconnectedError:
+                        logger.debug("Host inspector client disconnected while sending POST error response")
 
             def log_message(self, fmt: str, *args) -> None:
                 logger.debug("host-inspector: " + fmt, *args)

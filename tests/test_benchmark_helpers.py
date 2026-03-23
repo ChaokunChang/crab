@@ -22,24 +22,29 @@ from agent_cr import (
     SchedulerConfig,
 )
 from integrations.agents import BaseAgent, IFlowAgent, SandboxHandle, SimulatedAgent, TaskConfig, TaskDescription
+from integrations.agents.iflow import IFLOW_WRAPPER_ARG
 from integrations.sandboxes.runtime import bundle as sandbox_bundle
 from integrations.sandboxes.runtime import compose as sandbox_compose
 from integrations.sandboxes.runtime import image as sandbox_image
 from integrations.sandboxes.runtime import launcher as sandbox_launcher
 from integrations.sandboxes.runtime import network as sandbox_network
-from benchmarks.bench_agent_cr_sandbox_e2e import run_benchmark
+from benchmarks.config import BenchmarkConfig
+from benchmarks.scenarios.e2e import run_manual as run_e2e_manual
 from agent_cr.models import utc_now
-from benchmarks.bench_tree_search import choose_replay_steps
+from benchmarks.scenarios.tree import choose_replay_steps
 from benchmarks.support import (
     BenchmarkTaskRecord,
     TreeSearchCheckpointRecord,
     bounded_probability,
+    compute_summary_aliases,
+    compute_telemetry_summary,
     build_tree_search_checkpoint_index,
     compute_summary,
     resolve_checkpoint_copy_plan,
     resolve_work_dir_host_path,
     select_injected_indices,
     total_actions,
+    write_rows,
 )
 from benchmarks.real_host_scenario_base import (
     RealHostScenarioHarness,
@@ -74,6 +79,60 @@ class BenchmarkHelperTests(unittest.TestCase):
     def test_choose_replay_steps_is_deterministic(self) -> None:
         self.assertEqual(choose_replay_steps(6, 2), [1, 3])
         self.assertEqual(choose_replay_steps(4, 10), [1, 2, 3])
+
+    def test_write_rows_supports_nonuniform_field_sets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "rows.csv"
+
+            write_rows(
+                str(output_path),
+                [
+                    {"sandbox_id": "fault-0", "success_ratio": 1.0, "verification_status": "passed"},
+                    {
+                        "sandbox_id": "fault-1",
+                        "success_ratio": 0.0,
+                        "verification_status": "failed",
+                        "verification_stderr": "boom",
+                    },
+                ],
+            )
+
+            self.assertEqual(
+                output_path.read_text(encoding="utf-8").splitlines(),
+                [
+                    "sandbox_id,success_ratio,verification_status,verification_stderr",
+                    "fault-0,1.0,passed,",
+                    "fault-1,0.0,failed,boom",
+                ],
+            )
+
+    def test_ensure_zpool_reuses_existing_dataset_when_destroy_does_not_remove_it(self) -> None:
+        harness = RealHostScenarioHarness.__new__(RealHostScenarioHarness)
+        harness.root = Path("/tmp/bench-root")
+        harness.pool_name = "benchpool"
+        harness.configured_zpool_image = Path("/tmp/benchpool.img")
+        harness._zpool_image_path = None
+        harness.reuse_zpool = True
+        harness.zpool_size = "10G"
+
+        with (
+            patch("benchmarks.real_host_scenario_base._zpool_exists", return_value=True),
+            patch("benchmarks.real_host_scenario_base._zfs_dataset_exists", side_effect=[True, True]),
+            patch("benchmarks.real_host_scenario_base.subprocess.run") as run,
+        ):
+            harness._ensure_zpool()
+
+        self.assertEqual(
+            run.call_args_list,
+            [
+                unittest.mock.call(
+                    ["zfs", "destroy", "-r", "benchpool/agent-cr"],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            ],
+        )
 
     def test_build_tree_search_checkpoint_index_collects_steps(self) -> None:
         manifests = [
@@ -135,6 +194,58 @@ class BenchmarkHelperTests(unittest.TestCase):
             compute_summary(rows, ["checkpoint_ms", "restore_ms"]),
             {"checkpoint_ms": 20.0, "restore_ms": 30.0},
         )
+
+    def test_compute_summary_aliases_maps_row_fields_to_summary_keys(self) -> None:
+        rows = [
+            {"recovery_ms_avg": 10.0, "success_ratio": 1.0},
+            {"recovery_ms_avg": 14.0, "success_ratio": 0.0},
+        ]
+        self.assertEqual(
+            compute_summary_aliases(rows, {"recovery_ms": "recovery_ms_avg", "success_ratio": "success_ratio"}),
+            {"recovery_ms": 12.0, "success_ratio": 0.5},
+        )
+
+    def test_compute_telemetry_summary_filters_by_run_id_and_attributes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            telemetry_path = Path(tmp) / "telemetry.jsonl"
+            telemetry_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "kind": "metric",
+                                "name": "benchmark.recovery_ms",
+                                "value": 12.0,
+                                "attributes": {"run_id": "run-a", "event_injected": 1},
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "kind": "metric",
+                                "name": "benchmark.recovery_ms",
+                                "value": 50.0,
+                                "attributes": {"run_id": "run-a", "event_injected": 0},
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "kind": "metric",
+                                "name": "benchmark.recovery_ms",
+                                "value": 99.0,
+                                "attributes": {"run_id": "run-b", "event_injected": 1},
+                            }
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            summary = compute_telemetry_summary(
+                telemetry_path,
+                {"recovery_ms": "benchmark.recovery_ms"},
+                run_id="run-a",
+                attribute_filters={"recovery_ms": {"event_injected": 1}},
+            )
+        self.assertEqual(summary, {"recovery_ms": 12.0})
 
     def test_parse_ipv4_route_networks_ignores_default_and_host_routes(self) -> None:
         self.assertEqual(
@@ -604,6 +715,7 @@ class BenchmarkHelperTests(unittest.TestCase):
             "sbx-launch",
             agent_type="simulated",
             llm_service_type=None,
+            llm_service_config=None,
             task_description=task_description,
             task_config=task_config,
         )
@@ -693,16 +805,15 @@ class BenchmarkHelperTests(unittest.TestCase):
             TaskDescription("go"),
             TaskConfig(),
             runtime_state_root=Path("/tmp/runtime-root"),
+            sandbox_manager=SimpleNamespace(delete_runtime=Mock()),
         )
 
-        with patch("integrations.agents.base.subprocess.run") as run_mock:
-            agent.post_task_finish()
+        agent.post_task_finish()
 
-        run_mock.assert_called_once_with(
-            ["runc", "--root", "/tmp/runtime-root", "delete", "-f", "sbx-post-finish"],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        agent.sandbox_manager.delete_runtime.assert_called_once_with(
+            SandboxId("sbx-post-finish"),
+            force=True,
+            ignore_missing=True,
         )
 
     def test_simulated_agent_calls_post_task_finish_after_task_completion(self) -> None:
@@ -785,6 +896,8 @@ class BenchmarkHelperTests(unittest.TestCase):
         )
         harness.sandbox_manager = SimpleNamespace(
             describe=lambda sandbox_id: SimpleNamespace(metadata={"zfs_dataset": "", "bundle_path": "/tmp/bundle"}),
+            delete_runtime=Mock(),
+            destroy_filesystem_dataset=Mock(),
             launch=Mock(),
         )
         harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())
@@ -823,6 +936,8 @@ class BenchmarkHelperTests(unittest.TestCase):
         )
         harness.sandbox_manager = SimpleNamespace(
             describe=lambda sandbox_id: SimpleNamespace(metadata={"zfs_dataset": "", "bundle_path": "/tmp/bundle"}),
+            delete_runtime=Mock(),
+            destroy_filesystem_dataset=Mock(),
             launch=Mock(),
         )
         harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())
@@ -867,18 +982,28 @@ class BenchmarkHelperTests(unittest.TestCase):
         harness.interceptor = None
         harness.executor = None
         harness.runtime_state_root = None
+        events: list[str] = []
+        harness.runtime = SimpleNamespace(
+            delete_runtime=Mock(side_effect=lambda *args, **kwargs: events.append("delete_runtime"))
+        )
         harness.pool_name = None
         harness.llm_server = None
         harness.llm_thread = None
         harness.network_manager.cleanup = Mock()
         harness._stop_host_inspector_server = Mock()
-        harness._task_executor.shutdown = Mock()
+        harness._task_executor.shutdown = Mock(side_effect=lambda *args, **kwargs: events.append("shutdown"))
 
         harness.__exit__(None, None, None)
 
         sandbox.task_run.request_stop.assert_called_once()
+        harness.runtime.delete_runtime.assert_called_once_with(
+            SandboxId("sbx-exit"),
+            force=True,
+            ignore_missing=True,
+        )
         harness.network_manager.cleanup.assert_called_once_with()
         harness._task_executor.shutdown.assert_called_once_with(wait=True, cancel_futures=True)
+        self.assertEqual(events, ["delete_runtime", "shutdown"])
 
     def test_launch_sandbox_from_docker_compose_file_translates_supported_service(self) -> None:
         harness = RealHostScenarioHarness(
@@ -926,9 +1051,6 @@ services:
 """.strip(),
             encoding="utf-8",
         )
-        env_file = harness.root / ".env"
-        env_file.write_text("", encoding="utf-8")
-
         with patch.object(harness.network_manager, "allocate_lease", return_value=SimpleNamespace(guest_ip="10.250.0.2")):
             with patch.object(harness, "_prepare_sandbox_handle", return_value=(handle, None)):
                 with patch(
@@ -938,7 +1060,7 @@ services:
                     with patch("integrations.sandboxes.runtime.compose.export_image_rootfs", return_value=harness.root / "rootfs"):
                         result = harness.launch_sandbox_from_docker_compose_file(
                             compose_file,
-                            env_file,
+                            None,
                             sandbox_name="sbx-compose",
                             service_name="app",
                         )
@@ -947,6 +1069,82 @@ services:
         launch_mock.assert_called_once()
         metadata = launch_mock.call_args.args[1]
         self.assertEqual(metadata["compose_service_name"], "app")
+
+    def test_launch_sandbox_from_docker_compose_file_materializes_termnius_tests(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        harness.root = Path(tempfile.mkdtemp(prefix="agent_cr_compose_termnius_test_"))
+        harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())
+        launch_mock = Mock()
+        harness.system = SimpleNamespace(sandbox_manager=SimpleNamespace(launch=launch_mock))
+        config_dir = harness.root / "bundle"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "linux": {"namespaces": [], "cgroupsPath": ""},
+                    "mounts": [],
+                    "process": {"terminal": False, "cwd": "/", "args": [], "env": []},
+                    "root": {"path": "rootfs", "readonly": False},
+                }
+            ),
+            encoding="utf-8",
+        )
+        handle = SandboxHandle(
+            sandbox_id=SandboxId("sbx-compose-tests"),
+            bundle_dir=config_dir,
+            status_port=8123,
+            status_host="127.0.0.1",
+            last_status={},
+        )
+        compose_file = harness.root / "compose.yaml"
+        compose_file.write_text(
+            "\n".join(
+                [
+                    "services:",
+                    "  client:",
+                    "    image: alpine:3.20",
+                    "    command: \"echo hello\"",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        task_root = harness.root / "hello-world"
+        (task_root / "tests").mkdir(parents=True, exist_ok=True)
+        (task_root / "tests" / "test_outputs.py").write_text("", encoding="utf-8")
+        (task_root / "run-tests.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+        with patch.object(harness.network_manager, "allocate_lease", return_value=SimpleNamespace(guest_ip="10.250.0.2")):
+            with patch.object(harness, "_prepare_sandbox_handle", return_value=(handle, None)):
+                with patch(
+                    "integrations.sandboxes.runtime.compose.inspect_image_runtime_defaults",
+                    return_value=ImageRuntimeDefaults(),
+                ):
+                    with patch("integrations.sandboxes.runtime.compose.export_image_rootfs", return_value=harness.root / "rootfs"):
+                        harness.launch_sandbox_from_docker_compose_file(
+                            compose_file,
+                            None,
+                            sandbox_name="sbx-compose-tests",
+                            service_name="client",
+                            task_root=task_root,
+                        )
+
+        metadata = launch_mock.call_args.args[1]
+        self.assertIn(
+            {"source": str(task_root / "tests"), "destination": "/tests"},
+            metadata["rootfs_copy_paths"],
+        )
+        self.assertIn(
+            {"source": str(task_root / "run-tests.sh"), "destination": "/tests/run-tests.sh"},
+            metadata["rootfs_copy_paths"],
+        )
+        self.assertIn("tests", metadata["rootfs_init_dirs"])
 
     def test_launch_sandbox_from_docker_compose_file_inherits_image_env_workdir_and_user(self) -> None:
         harness = RealHostScenarioHarness(
@@ -1169,6 +1367,7 @@ services:
             network_lease=None,
             agent_type="simulated",
             llm_service_type="simulated",
+            llm_service_config=None,
             image_defaults=ImageRuntimeDefaults(),
             image_rootfs_dir=sandbox_image.exported_rootfs,
         )
@@ -1192,14 +1391,16 @@ services:
             exported_rootfs = harness.root / "image" / "simulated" / "rootfs"
             exported_rootfs.mkdir(parents=True, exist_ok=True)
 
-            def fake_build_image(*, tag: str, build_context: Path, dockerfile_path: Path) -> None:
+            def fake_build_image(*, tag: str, build_context: Path, dockerfile_path: Path, **kwargs) -> None:
                 del tag, build_context, dockerfile_path
+                del kwargs
                 with count_lock:
                     call_counts["build"] += 1
                 time.sleep(0.05)
 
-            def fake_export_image_rootfs(*, tag: str, output_dir: Path) -> Path:
+            def fake_export_image_rootfs(*, tag: str, output_dir: Path, **kwargs) -> Path:
                 del tag, output_dir
+                del kwargs
                 with count_lock:
                     call_counts["export"] += 1
                 time.sleep(0.05)
@@ -1238,8 +1439,12 @@ services:
         )
         harness.root = Path(tempfile.mkdtemp(prefix="agent_cr_handle_test_"))
         harness.interceptor = SimpleNamespace(port=43123)
+        harness.sandbox_manager = SimpleNamespace(write_bundle_spec=Mock())
         register_sandbox = Mock()
-        harness.llm_server = SimpleNamespace(benchmark_llm_router=SimpleNamespace(register_sandbox=register_sandbox))
+        harness.llm_server = SimpleNamespace(
+            server_address=("127.0.0.1", 45678),
+            benchmark_llm_router=SimpleNamespace(register_sandbox=register_sandbox),
+        )
 
         with patch(
             "integrations.sandboxes.runtime.launcher.prepare_bundle_launch",
@@ -1263,7 +1468,77 @@ services:
         register_sandbox.assert_called_once_with(
             sandbox_id="sbx-url",
             llm_service_type="simulated_for_iflow",
+            llm_service_config=None,
         )
+
+    def test_restore_llm_service_state_prefers_process_restore_trace_cursor(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        restore_sandbox = Mock()
+        harness.llm_server = SimpleNamespace(
+            benchmark_llm_router=SimpleNamespace(restore_sandbox=restore_sandbox),
+        )
+
+        harness._restore_llm_service_state(
+            SandboxId("sbx-replay"),
+            CheckpointManifest(
+                schema_version="v1",
+                checkpoint_id=CheckpointId("ckpt-1"),
+                sandbox_id=SandboxId("sbx-replay"),
+                created_at=utc_now(),
+                runtime_name="runc",
+                runtime_version=None,
+                process_artifacts=[],
+                filesystem_artifacts=[],
+                metadata={
+                    "process_restore_trace_cursor": 2,
+                    "benchmark_trace_cursor": 5,
+                    "filesystem_restore_trace_cursor": 4,
+                },
+            ).with_integrity(),
+        )
+
+        restore_sandbox.assert_called_once_with("sbx-replay", consumed_response_count=2)
+
+    def test_restore_llm_service_state_skips_restore_without_process_restore_trace_cursor(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        restore_sandbox = Mock()
+        harness.llm_server = SimpleNamespace(
+            benchmark_llm_router=SimpleNamespace(restore_sandbox=restore_sandbox),
+        )
+
+        harness._restore_llm_service_state(
+            SandboxId("sbx-replay"),
+            CheckpointManifest(
+                schema_version="v1",
+                checkpoint_id=CheckpointId("ckpt-1"),
+                sandbox_id=SandboxId("sbx-replay"),
+                created_at=utc_now(),
+                runtime_name="runc",
+                runtime_version=None,
+                process_artifacts=[],
+                filesystem_artifacts=[],
+                metadata={
+                    "benchmark_trace_cursor": 5,
+                    "filesystem_restore_trace_cursor": 4,
+                },
+            ).with_integrity(),
+        )
+
+        restore_sandbox.assert_not_called()
 
     def test_launch_sandbox_uses_benchmark_network_for_iflow_agents(self) -> None:
         harness = RealHostScenarioHarness(
@@ -1318,6 +1593,7 @@ services:
             network_lease=lease,
             agent_type="iflow",
             llm_service_type="simulated_for_iflow",
+            llm_service_config=None,
             image_defaults=ImageRuntimeDefaults(),
             image_rootfs_dir=sandbox_image.exported_rootfs,
         )
@@ -1334,6 +1610,7 @@ services:
         )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            harness.root = root
             compose_file = root / "compose.yaml"
             compose_file.write_text(
                 """
@@ -1354,6 +1631,24 @@ services:
                     sandbox_name="sbx-compose",
                     service_name="app",
                 )
+
+    def test_resolve_compose_image_ref_uses_explicit_image_name_for_build_service(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            compose_file = root / "compose.yaml"
+            build_dir = root / "context"
+            build_dir.mkdir(parents=True, exist_ok=True)
+            with patch("integrations.sandboxes.runtime.image.subprocess.run") as run_build:
+                run_build.return_value = SimpleNamespace(returncode=1, stdout="", stderr="")
+                image_ref = sandbox_compose.resolve_compose_image_ref(
+                    compose_file=compose_file,
+                    service_name="client",
+                    service={"build": {"context": str(build_dir)}, "image": "example/client:latest"},
+                    compose_image_tags=set(),
+                )
+
+        self.assertEqual(image_ref, "example/client:latest")
+        self.assertEqual(run_build.call_args.args[0][:4], ["docker", "build", "-t", "example/client:latest"])
 
     def test_iflow_agent_completes_from_existing_markers_without_live_sandbox(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1452,14 +1747,79 @@ services:
             payload = json.loads(config_path.read_text(encoding="utf-8"))
             self.assertEqual(payload["process"]["args"][:2], ["/bin/sh", "-lc"])
             self.assertIn("/opt/iflow-runtime/global/lib/node_modules/@iflow-ai/iflow-cli/bundle/entry.js", payload["process"]["args"][2])
-            self.assertIn("mkdir -p /data/iflow-task-logs", payload["process"]["args"][2])
-            self.assertIn("/data/iflow-task-logs/iflow.task.stdout", payload["process"]["args"][2])
-            self.assertIn("/data/iflow-task-logs/iflow.task.stderr", payload["process"]["args"][2])
             self.assertIn("/opt/iflow-logs/iflow.task.exit", payload["process"]["args"][2])
             self.assertIn("/opt/iflow-logs/iflow.task.done", payload["process"]["args"][2])
+            self.assertNotIn("/data/iflow-task-logs", payload["process"]["args"][2])
+            self.assertNotIn("rm -f /dev/null", payload["process"]["args"][2])
+            self.assertIn(">/dev/null 2>/dev/null", payload["process"]["args"][2])
             self.assertNotIn("exec >/dev/null 2>&1", payload["process"]["args"][2])
             self.assertIn("IMAGE_ONLY=1", payload["process"]["env"])
             self.assertIn("FOO=bar", payload["process"]["env"])
+
+    def test_iflow_configure_bundle_sets_compose_replay_wrapper_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = Path(tmp)
+            config_path = bundle_dir / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "linux": {"namespaces": [], "cgroupsPath": ""},
+                        "mounts": [],
+                        "process": {
+                            "terminal": False,
+                            "cwd": "/app",
+                            "args": ["sleep", "infinity"],
+                            "env": ["PATH=/usr/bin"],
+                        },
+                        "root": {"path": "rootfs", "readonly": False},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            sandbox = SandboxHandle(
+                sandbox_id=SandboxId("sbx-iflow-compose-replay"),
+                bundle_dir=bundle_dir,
+                status_port=8123,
+                last_status={},
+                llm_service_type="iflow_trace_replay",
+                launch_source="compose",
+                launch_metadata={
+                    "iflow": {
+                        "runtime_root": "/tmp/runtime-root",
+                        "iflow_home": "/tmp/iflow-home",
+                        "npm_home": "/tmp/npm-home",
+                        "logs_dir": "/tmp/logs",
+                        "entrypoint": "/opt/iflow-runtime/global/lib/node_modules/@iflow-ai/iflow-cli/bundle/entry.js",
+                    }
+                },
+            )
+            agent = IFlowAgent(sandbox, TaskDescription("do work"), TaskConfig(options={"FOO": "bar"}))
+
+            agent.configure_bundle()
+
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["process"]["cwd"], "/app")
+            self.assertEqual(payload["process"]["args"][:2], ["/bin/sh", "-lc"])
+            self.assertIn("export AGENT_CR_IFLOW_ENTRYPOINT=/opt/iflow-runtime/global/lib/node_modules/@iflow-ai/iflow-cli/bundle/entry.js", payload["process"]["args"][2])
+            self.assertIn("export AGENT_CR_IFLOW_CWD=/app", payload["process"]["args"][2])
+            self.assertIn("export AGENT_CR_IFLOW_KEEPALIVE_AFTER_TASK=true", payload["process"]["args"][2])
+            self.assertIn("cd /app", payload["process"]["args"][2])
+            self.assertIn("if [ -f /installed-agent/setup-env.sh ]; then . /installed-agent/setup-env.sh; fi", payload["process"]["args"][2])
+            self.assertIn(
+                "elif command -v apt-get >/dev/null 2>&1; then export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y curl git wget xz-utils openssh-client patch xauth build-essential dpkg-dev procps net-tools psmisc; fi",
+                payload["process"]["args"][2],
+            )
+            self.assertIn("exec /opt/iflow-runtime/node/bin/node -e", payload["process"]["args"][2])
+            self.assertIn(IFLOW_WRAPPER_ARG, payload["process"]["args"][2])
+            self.assertNotIn("/data/iflow-task-logs", payload["process"]["args"][2])
+            self.assertNotIn("rm -f /dev/null", payload["process"]["args"][2])
+            self.assertIn(">/dev/null 2>/dev/null", payload["process"]["args"][2])
+            self.assertIn("FOO=bar", payload["process"]["env"])
+            mounted_destinations = {mount["destination"] for mount in payload["mounts"]}
+            self.assertIn("/opt/iflow-runtime", mounted_destinations)
+            self.assertIn("/root/.iflow", mounted_destinations)
+            self.assertIn("/root/.npm", mounted_destinations)
+            self.assertIn("/opt/iflow-logs", mounted_destinations)
 
     def test_iflow_prepare_sandbox_uses_extended_benchmark_session_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1495,6 +1855,146 @@ services:
 
         self.assertEqual(prepare_state.call_args.kwargs["max_session_turns"], 4096)
         self.assertEqual(prepare_state.call_args.kwargs["base_url"], "http://10.250.9.1:4567/v1")
+
+    def test_iflow_agent_uses_replay_router_state_for_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = Path(tmp)
+            (bundle_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "linux": {"namespaces": [], "cgroupsPath": ""},
+                        "mounts": [],
+                        "process": {"terminal": False, "cwd": "/app", "args": ["sleep", "infinity"], "env": ["PATH=/usr/bin"]},
+                        "root": {"path": "rootfs", "readonly": False},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            sandbox = SandboxHandle(
+                sandbox_id=SandboxId("sbx-iflow-replay-progress"),
+                bundle_dir=bundle_dir,
+                status_port=8123,
+                last_status={},
+                llm_service_type="iflow_trace_replay",
+                llm_control_base_url="http://127.0.0.1:12345",
+                launch_source="compose",
+                launch_metadata={
+                    "iflow": {
+                        "runtime_root": "/tmp/runtime-root",
+                        "iflow_home": "/tmp/iflow-home",
+                        "npm_home": "/tmp/npm-home",
+                        "logs_dir": "/tmp/logs",
+                        "entrypoint": "/opt/iflow-runtime/entry.js",
+                    }
+                },
+            )
+            agent = IFlowAgent(sandbox, TaskDescription("do work"), TaskConfig())
+            agent._started_at_monotonic = time.monotonic()
+
+            state_payloads = [
+                {"state": {"state": {"trace_cursor": 1, "total_responses": 5, "is_complete": False}}},
+                {"state": {"state": {"trace_cursor": 2, "total_responses": 5, "is_complete": False}}},
+                {"state": {"state": {"trace_cursor": 2, "total_responses": 5, "is_complete": False}}},
+                {"state": {"state": {"trace_cursor": 2, "total_responses": 5, "is_complete": False}}},
+                {"state": {"state": {"trace_cursor": 3, "total_responses": 5, "is_complete": False}}},
+                {"state": {"state": {"trace_cursor": 3, "total_responses": 5, "is_complete": False}}},
+            ]
+
+            with patch.object(agent, "wait_for_http_json", side_effect=state_payloads):
+                payload = agent.wait_for_progress(minimum_actions=2)
+                delta_payload = agent.wait_for_action_delta(delta=1)
+
+        self.assertEqual(int(payload["total_actions"]), 2)
+        self.assertEqual(int(delta_payload["total_actions"]), 3)
+        self.assertEqual(sandbox.last_status, delta_payload)
+        self.assertEqual(len(agent._recorded_activity_events()), 6)
+
+    def test_iflow_replay_restore_clears_host_markers_before_resuming(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            logs_dir = Path(tmp) / "logs"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            (logs_dir / "iflow.task.done").write_text("done\n", encoding="utf-8")
+            (logs_dir / "iflow.task.exit").write_text("0\n", encoding="utf-8")
+            sandbox = SandboxHandle(
+                sandbox_id=SandboxId("sbx-iflow-replay-restore"),
+                bundle_dir=Path(tmp) / "bundle",
+                status_port=8123,
+                last_status={},
+                llm_service_type="iflow_trace_replay",
+                launch_source="compose",
+                launch_metadata={
+                    "iflow": {
+                        "runtime_root": "/tmp/runtime-root",
+                        "iflow_home": "/tmp/iflow-home",
+                        "npm_home": "/tmp/npm-home",
+                        "logs_dir": str(logs_dir),
+                        "entrypoint": "/opt/iflow-runtime/entry.js",
+                    }
+                },
+            )
+            agent = IFlowAgent(sandbox, TaskDescription("do work"), TaskConfig())
+
+            agent.on_restore_complete()
+
+        self.assertFalse((logs_dir / "iflow.task.done").exists())
+        self.assertFalse((logs_dir / "iflow.task.exit").exists())
+
+    def test_iflow_perform_task_in_compose_replay_mode_only_waits_on_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = Path(tmp)
+            (bundle_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "linux": {"namespaces": [], "cgroupsPath": ""},
+                        "mounts": [],
+                        "process": {
+                            "terminal": False,
+                            "cwd": "/app",
+                            "args": ["sleep", "infinity"],
+                            "env": ["PATH=/usr/bin", "HOME=/root"],
+                            "user": {"uid": 0, "gid": 0},
+                        },
+                        "root": {"path": "rootfs", "readonly": False},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            logs_dir = Path(tmp) / "logs"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            sandbox = SandboxHandle(
+                sandbox_id=SandboxId("sbx-iflow-replay-exec"),
+                bundle_dir=bundle_dir,
+                status_port=8123,
+                last_status={},
+                llm_service_type="iflow_trace_replay",
+                launch_source="compose",
+                launch_metadata={
+                    "iflow": {
+                        "runtime_root": "/tmp/runtime-root",
+                        "iflow_home": "/tmp/iflow-home",
+                        "npm_home": "/tmp/npm-home",
+                        "logs_dir": str(logs_dir),
+                        "entrypoint": "/opt/iflow-runtime/entry.js",
+                    }
+                },
+            )
+            agent = IFlowAgent(
+                sandbox,
+                TaskDescription("do work"),
+                TaskConfig(),
+                runtime_state_root=Path("/tmp/runtime"),
+            )
+            marker_paths = agent._task_marker_paths(logs_dir)
+            marker_paths["done"].write_text("done\n", encoding="utf-8")
+            marker_paths["exit"].write_text("0\n", encoding="utf-8")
+            completion_spy = Mock(wraps=agent._wait_for_task_completion)
+
+            with patch.object(agent, "_sandbox_is_live", return_value=True), patch.object(
+                agent, "_wait_for_task_completion", completion_spy
+            ):
+                agent.perform_task()
+
+        completion_spy.assert_called_once()
 
     def test_iflow_agent_exposes_synthetic_progress_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1657,6 +2157,34 @@ services:
                 with self.assertRaisesRegex(RuntimeError, "exit code 7"):
                     agent.perform_task()
 
+    def test_iflow_agent_treats_zero_exit_without_done_marker_as_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            logs_dir = Path(tmp)
+            sandbox = SandboxHandle(
+                sandbox_id=SandboxId("sbx-iflow-zero-exit"),
+                bundle_dir=Path("/tmp/sbx-iflow-zero-exit"),
+                status_port=8123,
+                last_status={},
+                launch_metadata={
+                    "iflow": {
+                        "entrypoint": "/opt/iflow-runtime/global/lib/node_modules/@iflow-ai/iflow-cli/bundle/entry.js",
+                        "logs_dir": str(logs_dir),
+                    }
+                },
+            )
+            agent = IFlowAgent(
+                sandbox,
+                TaskDescription("do work"),
+                TaskConfig(),
+                runtime_state_root=Path("/tmp/runtime"),
+            )
+
+            (logs_dir / "iflow.task.exit").write_text("0\n", encoding="utf-8")
+            with patch.object(agent, "_sandbox_is_live", return_value=True):
+                agent.perform_task()
+
+        self.assertEqual(agent.poll_status()["state"], "finished")
+
     def test_iflow_agent_uses_one_second_default_action_tick(self) -> None:
         sandbox = SandboxHandle(
             sandbox_id=SandboxId("sbx-iflow-default-tick"),
@@ -1671,6 +2199,30 @@ services:
         )
         agent = IFlowAgent(sandbox, TaskDescription("do work"), TaskConfig(), runtime_state_root=Path("/tmp/runtime"))
         self.assertEqual(agent._tick_seconds, 1.0)
+
+    def test_iflow_replay_action_wait_timeout_uses_task_budget(self) -> None:
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-iflow-replay-timeout"),
+            bundle_dir=Path("/tmp/sbx-iflow-replay-timeout"),
+            status_port=8123,
+            last_status={},
+            llm_service_type="iflow_trace_replay",
+            launch_source="compose",
+            launch_metadata={
+                "iflow": {
+                    "entrypoint": "/opt/iflow-runtime/global/lib/node_modules/@iflow-ai/iflow-cli/bundle/entry.js",
+                }
+            },
+        )
+        agent = IFlowAgent(
+            sandbox,
+            TaskDescription("do work"),
+            TaskConfig(options={"max_agent_timeout_sec": 360.0}),
+            runtime_state_root=Path("/tmp/runtime"),
+        )
+
+        self.assertEqual(agent._replay_action_wait_timeout_seconds(1), 360.0)
+        self.assertEqual(agent._replay_action_wait_timeout_seconds(50), 500.0)
 
     def test_iflow_agent_on_restore_complete_resumes_synthetic_progress(self) -> None:
         sandbox = SandboxHandle(
@@ -1744,6 +2296,48 @@ services:
         self.assertEqual(errors, [])
         self.assertEqual(agent.poll_status()["state"], "finished")
 
+    def test_iflow_restore_wait_keeps_waiting_until_sandbox_is_live(self) -> None:
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-iflow-restore-live"),
+            bundle_dir=Path("/tmp/sbx-iflow-restore-live"),
+            status_port=8123,
+            last_status={},
+            launch_metadata={
+                "iflow": {
+                    "entrypoint": "/opt/iflow-runtime/global/lib/node_modules/@iflow-ai/iflow-cli/bundle/entry.js",
+                }
+            },
+        )
+        agent = IFlowAgent(sandbox, TaskDescription("do work"), TaskConfig(), runtime_state_root=Path("/tmp/runtime"))
+        live_states = iter([False, False, True])
+
+        agent.on_restore_complete()
+
+        with patch.object(agent, "_sandbox_is_live", side_effect=lambda: next(live_states)):
+            self.assertTrue(agent._wait_for_restore_or_stop())
+
+        self.assertFalse(agent._restore_reactivation_pending.is_set())
+
+    def test_iflow_restore_wait_uses_pending_reactivation_without_new_signal(self) -> None:
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-iflow-restore-pending"),
+            bundle_dir=Path("/tmp/sbx-iflow-restore-pending"),
+            status_port=8123,
+            last_status={},
+            launch_metadata={
+                "iflow": {
+                    "entrypoint": "/opt/iflow-runtime/global/lib/node_modules/@iflow-ai/iflow-cli/bundle/entry.js",
+                }
+            },
+        )
+        agent = IFlowAgent(sandbox, TaskDescription("do work"), TaskConfig(), runtime_state_root=Path("/tmp/runtime"))
+        agent._restore_reactivation_pending.set()
+
+        with patch.object(agent, "_sandbox_is_live", side_effect=[False, True]):
+            self.assertTrue(agent._wait_for_restore_or_stop())
+
+        self.assertFalse(agent._restore_reactivation_pending.is_set())
+
     def test_iflow_poll_status_is_non_mutating_until_status_helpers_run(self) -> None:
         sandbox = SandboxHandle(
             sandbox_id=SandboxId("sbx-iflow-poll"),
@@ -1794,7 +2388,12 @@ services:
         )
         harness.root = Path("/tmp")
         harness.runtime = object()
-        harness.sandbox_manager = SimpleNamespace(_items={}, _persist=Mock())
+        harness.sandbox_manager = SimpleNamespace(
+            _items={},
+            _persist=Mock(),
+            dataset_name_for=lambda sandbox_id: f"pool/agent-cr/{sandbox_id}",
+            clone_filesystem_snapshot=Mock(return_value="pool/agent-cr/sbx-fork"),
+        )
         harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())
         harness.storage = SimpleNamespace(
             put_manifest=Mock(),
@@ -1858,9 +2457,12 @@ services:
         harness.root = Path("/tmp")
         persisted_descriptions: list[object] = []
         harness.runtime = object()
+        clone_snapshot = Mock(return_value="pool/agent-cr/sbx-fork")
         harness.sandbox_manager = SimpleNamespace(
             _items={},
             _persist=lambda description: persisted_descriptions.append(description),
+            dataset_name_for=lambda sandbox_id: f"pool/agent-cr/{sandbox_id}",
+            clone_filesystem_snapshot=clone_snapshot,
         )
         harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())
         harness.storage = SimpleNamespace(
@@ -1972,6 +2574,73 @@ services:
         sandbox.task_run.on_restore_complete.assert_called_once()
         self.assertEqual(record.checkpoint_id, CheckpointId("ckpt-1"))
 
+    def test_inject_fault_waits_for_quiescent_window(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-fault"),
+            bundle_dir=Path("/tmp/sbx-fault"),
+            status_port=8123,
+            last_status={},
+        )
+        state = {"request_in_flight": True, "checkpoint_active": True}
+        harness.request_state_store = SimpleNamespace(
+            get=lambda sandbox_id: SimpleNamespace(llm_request_in_flight=state["request_in_flight"])
+        )
+        harness.executor = SimpleNamespace(has_active_checkpoint=lambda sandbox_id: state["checkpoint_active"])
+        harness._delete_runtime = Mock()
+        harness._set_sandbox_running_state = Mock()
+
+        def _settle() -> None:
+            time.sleep(0.05)
+            state["request_in_flight"] = False
+            time.sleep(0.05)
+            state["checkpoint_active"] = False
+
+        thread = threading.Thread(target=_settle)
+        thread.start()
+        try:
+            harness.inject_fault(sandbox)
+        finally:
+            thread.join(timeout=1.0)
+
+        harness._delete_runtime.assert_called_once_with(sandbox.sandbox_id)
+        harness._set_sandbox_running_state.assert_called_once_with(sandbox.sandbox_id, is_running=False)
+
+    def test_inject_fault_times_out_when_quiescent_window_never_arrives(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-fault"),
+            bundle_dir=Path("/tmp/sbx-fault"),
+            status_port=8123,
+            last_status={},
+        )
+        harness.request_state_store = SimpleNamespace(
+            get=lambda sandbox_id: SimpleNamespace(llm_request_in_flight=True)
+        )
+        harness.executor = SimpleNamespace(has_active_checkpoint=lambda sandbox_id: True)
+        harness._delete_runtime = Mock()
+        harness._set_sandbox_running_state = Mock()
+
+        result = harness.wait_for_fault_injection_window(sandbox, timeout_s=0.05)
+        self.assertFalse(result)
+
+        harness._delete_runtime.assert_not_called()
+        harness._set_sandbox_running_state.assert_not_called()
+
     def test_load_dataset_normalizes_relative_paths_and_cycles_rows(self) -> None:
         harness = RealHostScenarioHarness(
             provider="openai",
@@ -1989,12 +2658,17 @@ services:
                     [
                         json.dumps(
                             {
+                                "task_id": "task-a",
                                 "agent_type": "simulated",
                                 "llm_service_type": "manual",
                                 "task_description": "task-a",
                                 "task_config": {"minimum_actions": 1},
                                 "docker_compose_file": "compose.yaml",
                                 "env_file": "task.env",
+                                "task_root": "tasks/task-a",
+                                "llm_service_config": {"trace_path": "traces/task-a.log"},
+                                "trace_response_count": 7,
+                                "trace_malformed_line_count": 2,
                             }
                         ),
                         json.dumps(
@@ -2009,9 +2683,17 @@ services:
             )
             records = harness.load_dataset(dataset_path)
             self.assertEqual(len(records), 2)
+            self.assertEqual(records[0].task_id, "task-a")
             self.assertEqual(records[0].llm_service_type, "manual")
             self.assertEqual(records[0].docker_compose_file, (root / "compose.yaml").resolve())
             self.assertEqual(records[0].env_file, (root / "task.env").resolve())
+            self.assertEqual(records[0].task_root, (root / "tasks" / "task-a").resolve())
+            self.assertEqual(
+                records[0].llm_service_config,
+                {"trace_path": str((root / "traces" / "task-a.log").resolve())},
+            )
+            self.assertEqual(records[0].trace_response_count, 7)
+            self.assertEqual(records[0].trace_malformed_line_count, 2)
             selected = harness.select_task_record(
                 records,
                 sandbox_index=3,
@@ -2072,23 +2754,24 @@ services:
             docker_compose_file=Path("/tmp/compose.yaml"),
             env_file=Path("/tmp/task.env"),
         )
-        with patch.object(harness, "launch_sandbox_from_docker_compose_file", return_value="compose-handle") as launch_compose:
+        handle = SandboxHandle(
+            sandbox_id=SandboxId("sbx-compose"),
+            bundle_dir=Path("/tmp/sbx-compose"),
+            status_port=8123,
+            last_status={},
+        )
+        with patch.object(harness, "launch_sandbox_from_docker_compose_file", return_value=handle) as launch_compose:
             result = harness.launch_task_record("sbx-compose", record)
 
-        self.assertEqual(result, "compose-handle")
+        self.assertIs(result, handle)
         launch_compose.assert_called_once()
+        self.assertEqual(result.launch_metadata["benchmark"]["task_id"], "sbx-compose")
 
     def test_e2e_benchmark_uses_shared_harness_launch_flow(self) -> None:
         task_run = SimpleNamespace(
             wait_for_progress=Mock(return_value={"total_actions": 6}),
         )
         harness = SimpleNamespace(
-            load_dataset=lambda path: [],
-            select_task_record=lambda *args, **kwargs: BenchmarkTaskRecord(
-                agent_type="simulated",
-                task_description=TaskDescription("task"),
-                task_config=TaskConfig(),
-            ),
             launch_task_record=Mock(
                 side_effect=lambda name, record: SandboxHandle(
                     sandbox_id=SandboxId(name),
@@ -2114,14 +2797,22 @@ services:
             ),
             set_snapshot_metadata=Mock(),
         )
-        rows = run_benchmark(
-            SimpleNamespace(
-                sandboxes=1,
-                iters=1,
+        rows = run_e2e_manual(
+            BenchmarkConfig(
+                config_path=Path("/tmp/bench.yaml"),
+                scenario="e2e",
+                mode="manual",
                 provider="openai",
-                agent_type="simulated",
-                llm_service_type="simulated",
-                dataset=None,
+                agent="simulated",
+                llm_service="simulated",
+                task_dataset=None,
+                sandboxes=1,
+                iterations=1,
+                output=None,
+                log_level="info",
+                transfer_delay_ms=0.0,
+                work_dir_host_root=None,
+                scenario_options={},
             ),
             harness,
         )

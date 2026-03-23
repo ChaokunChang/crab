@@ -7,6 +7,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Protocol
 from urllib.parse import parse_qs, urlparse
 
+from agent_cr.telemetry import start_operation
+
+from integrations.llm_services.iflow_trace_replay.service import TraceReplayLLMState
 from integrations.llm_services.manual.service import ManualLLMState, handle_control_request
 from integrations.llm_services.simulated.service import SimulatedLLMState, handle_request as handle_simulated_request
 from integrations.llm_services.simulated_for_iflow.service import (
@@ -34,8 +37,8 @@ def default_llm_service_type_for_agent(agent_type: str) -> str:
 
 
 def validate_llm_service_type(*, provider: str, llm_service_type: str) -> None:
-    openai_only = {"manual", "simulated_for_iflow"}
-    supported = {"simulated", "manual", "simulated_for_iflow"}
+    openai_only = {"manual", "simulated_for_iflow", "iflow_trace_replay"}
+    supported = {"simulated", "manual", "simulated_for_iflow", "iflow_trace_replay"}
     if llm_service_type not in supported:
         raise ValueError(f"unsupported llm service type: {llm_service_type}")
     if provider == "anthropic" and llm_service_type in openai_only:
@@ -47,9 +50,14 @@ class LLMServiceState(Protocol):
 
     def snapshot(self) -> dict[str, Any]: ...
 
+    def reset(self) -> None: ...
+
+    def restore(self, *, consumed_response_count: int) -> None: ...
+
 
 class SimulatedServiceState:
-    def __init__(self) -> None:
+    def __init__(self, *, llm_service_config: dict[str, object] | None = None) -> None:
+        _ = llm_service_config
         self._state = SimulatedLLMState()
 
     def handle_request(self, *, path: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
@@ -58,9 +66,17 @@ class SimulatedServiceState:
     def snapshot(self) -> dict[str, Any]:
         return {"turns": self._state.snapshot()}
 
+    def reset(self) -> None:
+        return
+
+    def restore(self, *, consumed_response_count: int) -> None:
+        _ = consumed_response_count
+        return
+
 
 class ManualServiceState:
-    def __init__(self) -> None:
+    def __init__(self, *, llm_service_config: dict[str, object] | None = None) -> None:
+        _ = llm_service_config
         self._state = ManualLLMState()
 
     def handle_request(self, *, path: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
@@ -72,9 +88,17 @@ class ManualServiceState:
     def snapshot(self) -> dict[str, Any]:
         return self._state.snapshot()
 
+    def reset(self) -> None:
+        return
+
+    def restore(self, *, consumed_response_count: int) -> None:
+        _ = consumed_response_count
+        return
+
 
 class SimulatedForIFlowServiceState:
-    def __init__(self) -> None:
+    def __init__(self, *, llm_service_config: dict[str, object] | None = None) -> None:
+        _ = llm_service_config
         self._state = SimulatedIFlowLLMState(
             response_delay_ms=250,
             max_tool_calls_before_finish=_IFLOW_BENCHMARK_MAX_TOOL_CALLS_BEFORE_FINISH,
@@ -86,12 +110,37 @@ class SimulatedForIFlowServiceState:
     def snapshot(self) -> dict[str, Any]:
         return self._state.snapshot()
 
+    def reset(self) -> None:
+        return
+
+    def restore(self, *, consumed_response_count: int) -> None:
+        _ = consumed_response_count
+        return
+
+
+class IFlowTraceReplayServiceState:
+    def __init__(self, *, llm_service_config: dict[str, object] | None = None) -> None:
+        self._state = TraceReplayLLMState(llm_service_config=llm_service_config)
+
+    def handle_request(self, *, path: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
+        return self._state.handle_request(path=path, headers=headers, payload=payload)
+
+    def snapshot(self) -> dict[str, Any]:
+        return self._state.snapshot()
+
+    def reset(self) -> None:
+        self._state.reset()
+
+    def restore(self, *, consumed_response_count: int) -> None:
+        self._state.restore(consumed_response_count=consumed_response_count)
+
 
 def build_llm_service_registry() -> dict[str, type[LLMServiceState]]:
     return {
         "manual": ManualServiceState,
         "simulated": SimulatedServiceState,
         "simulated_for_iflow": SimulatedForIFlowServiceState,
+        "iflow_trace_replay": IFlowTraceReplayServiceState,
     }
 
 
@@ -100,22 +149,31 @@ class RegisteredSandboxService:
     sandbox_id: str
     llm_service_type: str
     service_state: LLMServiceState
+    llm_service_config: dict[str, object] | None = None
 
 
 class BenchmarkLLMRouter:
-    def __init__(self, registry: dict[str, type[LLMServiceState]] | None = None) -> None:
+    def __init__(self, registry: dict[str, type[LLMServiceState]] | None = None, telemetry=None) -> None:
         self._registry = registry or build_llm_service_registry()
+        self._telemetry = telemetry
         self._lock = threading.Lock()
         self._services: dict[str, RegisteredSandboxService] = {}
 
-    def register_sandbox(self, *, sandbox_id: str, llm_service_type: str) -> None:
+    def register_sandbox(
+        self,
+        *,
+        sandbox_id: str,
+        llm_service_type: str,
+        llm_service_config: dict[str, object] | None = None,
+    ) -> None:
         if llm_service_type not in self._registry:
             raise ValueError(f"unsupported llm service type: {llm_service_type}")
         with self._lock:
             self._services[sandbox_id] = RegisteredSandboxService(
                 sandbox_id=sandbox_id,
                 llm_service_type=llm_service_type,
-                service_state=self._registry[llm_service_type](),
+                service_state=self._registry[llm_service_type](llm_service_config=llm_service_config),
+                llm_service_config=None if llm_service_config is None else dict(llm_service_config),
             )
 
     def unregister_sandbox(self, sandbox_id: str) -> None:
@@ -132,7 +190,28 @@ class BenchmarkLLMRouter:
     def handle_request(self, *, path: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
         sandbox_id = _sandbox_id_from_request(headers, payload)
         service = self.resolve_service(sandbox_id)
-        return service.service_state.handle_request(path=path, headers=headers, payload=payload)
+        request_id = headers.get("X-AgentCR-Request-Id", "").strip()
+        attributes = {
+            "component": "llm_service",
+            "request_id": request_id,
+            "sandbox_id": sandbox_id,
+            "path": path,
+            "llm_service_type": service.llm_service_type,
+        }
+        operation = None if self._telemetry is None else start_operation(
+            self._telemetry,
+            "llm.service.request",
+            attributes,
+        )
+        try:
+            response = service.service_state.handle_request(path=path, headers=headers, payload=payload)
+        except Exception:
+            if operation is not None:
+                operation.finish(status="failed")
+            raise
+        if operation is not None:
+            operation.finish(status="succeeded")
+        return response
 
     def handle_control_request(self, *, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         sandbox_id = str(payload.get("sandbox_id", "")).strip()
@@ -150,14 +229,29 @@ class BenchmarkLLMRouter:
             return {
                 sandbox_id: {
                     "llm_service_type": item.llm_service_type,
+                    "llm_service_config": item.llm_service_config,
                     "state": item.service_state.snapshot(),
                 }
                 for sandbox_id, item in self._services.items()
             }
 
+    def reset_sandbox(self, sandbox_id: str) -> None:
+        self.resolve_service(sandbox_id).service_state.reset()
 
-def serve_benchmark_llm_router(*, host: str, port: int, registry: dict[str, type[LLMServiceState]] | None = None) -> ThreadingHTTPServer:
-    router = BenchmarkLLMRouter(registry=registry)
+    def restore_sandbox(self, sandbox_id: str, *, consumed_response_count: int) -> None:
+        self.resolve_service(sandbox_id).service_state.restore(
+            consumed_response_count=consumed_response_count
+        )
+
+
+def serve_benchmark_llm_router(
+    *,
+    host: str,
+    port: int,
+    registry: dict[str, type[LLMServiceState]] | None = None,
+    telemetry=None,
+) -> ThreadingHTTPServer:
+    router = BenchmarkLLMRouter(registry=registry, telemetry=telemetry)
 
     class RouterHandler(BaseHTTPRequestHandler):
         benchmark_llm_router = router

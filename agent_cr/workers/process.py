@@ -4,39 +4,39 @@ import json
 import logging
 from pathlib import Path
 
-from ..contracts import ProcessCWorker, ProcessRWorker, SandboxRuntimeAdapter
+from ..contracts import ProcessCWorker, ProcessRWorker, Runtime
 from ..ids import CheckpointId
 from ..models import ArtifactKind, ArtifactPayload, CheckpointJob, CheckpointManifest, RestoreJob, WorkerStepResult
 
 logger = logging.getLogger(__name__)
 
 
-def _metadata_artifact(name: str, payload: dict[str, object], *, adapter_name: str) -> ArtifactPayload:
+def _metadata_artifact(name: str, payload: dict[str, object], *, runtime_name: str) -> ArtifactPayload:
     return ArtifactPayload(
         kind=ArtifactKind.PROCESS,
         name=name,
         data=json.dumps(payload, sort_keys=True, indent=2).encode("utf-8"),
-        metadata={"adapter": adapter_name},
+        metadata={"runtime": runtime_name},
     )
 
 
 class AdapterProcessCWorker(ProcessCWorker):
-    def __init__(self, adapter: SandboxRuntimeAdapter):
-        self._adapter = adapter
+    def __init__(self, runtime: Runtime):
+        self._runtime = runtime
 
     def checkpoint(self, job: CheckpointJob, checkpoint_id: CheckpointId) -> WorkerStepResult:
         logger.debug(
-            "Running process checkpoint worker for sandbox=%s checkpoint=%s adapter=%s",
+            "Running process checkpoint worker for sandbox=%s checkpoint=%s runtime=%s",
             job.sandbox_id,
             checkpoint_id,
-            self._adapter.name,
+            self._runtime.name,
         )
-        status = self._adapter.checkpoint_process(
+        status = self._runtime.checkpoint_process(
             job.sandbox_id,
             checkpoint_id,
             leave_running=job.leave_running,
         )
-        image_path = self._adapter.process_checkpoint_location(job.sandbox_id, checkpoint_id)
+        image_path = self._runtime.process_checkpoint_location(job.sandbox_id, checkpoint_id)
         payload = {
             "sandbox_id": str(job.sandbox_id),
             "checkpoint_id": str(checkpoint_id),
@@ -50,7 +50,7 @@ class AdapterProcessCWorker(ProcessCWorker):
                 "metadata": status.metadata,
             },
         }
-        artifacts = [_metadata_artifact("process_checkpoint.json", payload, adapter_name=self._adapter.name)]
+        artifacts = [_metadata_artifact("process_checkpoint.json", payload, runtime_name=self._runtime.name)]
         logger.debug(
             "Process checkpoint worker finished for sandbox=%s checkpoint=%s executed=%s artifacts=%d",
             job.sandbox_id,
@@ -62,8 +62,8 @@ class AdapterProcessCWorker(ProcessCWorker):
 
 
 class AdapterProcessRWorker(ProcessRWorker):
-    def __init__(self, adapter: SandboxRuntimeAdapter):
-        self._adapter = adapter
+    def __init__(self, runtime: Runtime):
+        self._runtime = runtime
 
     def restore(self, job: RestoreJob, manifest: CheckpointManifest) -> WorkerStepResult:
         restore_checkpoint_id = _restore_checkpoint_id(
@@ -71,14 +71,14 @@ class AdapterProcessRWorker(ProcessRWorker):
             metadata_key="process_restore_checkpoint_id",
             default=job.checkpoint_id,
         )
-        if self._adapter.capabilities().supports_custom_checkpoint_dir:
-            image_path = self._adapter.process_checkpoint_location(job.sandbox_id, restore_checkpoint_id)
+        if self._runtime.capabilities().supports_custom_checkpoint_dir:
+            image_path = self._runtime.process_checkpoint_location(job.sandbox_id, restore_checkpoint_id)
             if image_path is None:
-                raise ValueError("runtime adapter did not provide process checkpoint location for restore")
+                raise ValueError("runtime did not provide process checkpoint location for restore")
             checkpoint_dir = Path(str(image_path))
             if not checkpoint_dir.exists():
                 raise FileNotFoundError(f"process checkpoint directory not found: {checkpoint_dir}")
-        status = self._adapter.restore_process(job.sandbox_id, restore_checkpoint_id)
+        status = self._runtime.restore_process(job.sandbox_id, restore_checkpoint_id)
         logger.debug(
             "Process restore worker finished for sandbox=%s checkpoint=%s restore_checkpoint=%s executed=%s",
             job.sandbox_id,

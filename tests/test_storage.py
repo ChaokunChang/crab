@@ -271,6 +271,112 @@ class StorageTests(unittest.TestCase):
 
             self.assertEqual(mgr.list_checkpoints(sid), [CheckpointId("ckpt-1"), CheckpointId("ckpt-2")])
 
+    def test_latest_only_manager_keeps_safe_process_restore_dependency_for_latest_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+            sid = SandboxId("sbx-1")
+            base = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
+            mgr = LatestOnlyCheckpointManager(base)
+            m1 = CheckpointManifest(
+                schema_version="v1",
+                checkpoint_id=CheckpointId("ckpt-1"),
+                sandbox_id=sid,
+                created_at=utc_now(),
+                runtime_name="runc",
+                runtime_version=None,
+                process_artifacts=[self._reference(ArtifactKind.PROCESS, "p1")],
+                filesystem_artifacts=[],
+                metadata={"benchmark_trace_cursor": 4, "benchmark_latest_mutating_response_count": 4},
+            ).with_integrity()
+            m2 = CheckpointManifest(
+                schema_version="v1",
+                checkpoint_id=CheckpointId("ckpt-2"),
+                sandbox_id=sid,
+                created_at=utc_now() + timedelta(seconds=1),
+                runtime_name="runc",
+                runtime_version=None,
+                process_artifacts=[],
+                filesystem_artifacts=[self._reference(ArtifactKind.FILESYSTEM, "f2")],
+                metadata={
+                    "benchmark_trace_cursor": 10,
+                    "benchmark_latest_mutating_response_count": 4,
+                },
+            ).with_integrity()
+            m3 = CheckpointManifest(
+                schema_version="v1",
+                checkpoint_id=CheckpointId("ckpt-3"),
+                sandbox_id=sid,
+                created_at=utc_now() + timedelta(seconds=2),
+                runtime_name="runc",
+                runtime_version=None,
+                process_artifacts=[self._reference(ArtifactKind.PROCESS, "p3")],
+                filesystem_artifacts=[],
+                metadata={
+                    "benchmark_trace_cursor": 12,
+                    "benchmark_latest_mutating_response_count": 8,
+                    "benchmark_previous_mutating_response_count": 8,
+                    "captures_inflight_llm": True,
+                },
+            ).with_integrity()
+            for manifest in (m1, m2, m3):
+                mgr.put_manifest(manifest)
+                mgr.handle_checkpoint_complete(manifest)
+
+            self.assertEqual(
+                mgr.list_checkpoints(sid),
+                [CheckpointId("ckpt-1"), CheckpointId("ckpt-2"), CheckpointId("ckpt-3")],
+            )
+
+    def test_latest_only_manager_keeps_pinned_checkpoint_during_prune(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+            sid = SandboxId("sbx-1")
+            base = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
+            mgr = LatestOnlyCheckpointManager(base)
+            m1 = CheckpointManifest(
+                schema_version="v1",
+                checkpoint_id=CheckpointId("ckpt-1"),
+                sandbox_id=sid,
+                created_at=utc_now(),
+                runtime_name="runc",
+                runtime_version=None,
+                process_artifacts=[],
+                filesystem_artifacts=[],
+                metadata={},
+            ).with_integrity()
+            m2 = CheckpointManifest(
+                schema_version="v1",
+                checkpoint_id=CheckpointId("ckpt-2"),
+                sandbox_id=sid,
+                created_at=utc_now() + timedelta(seconds=1),
+                runtime_name="runc",
+                runtime_version=None,
+                process_artifacts=[],
+                filesystem_artifacts=[],
+                metadata={},
+            ).with_integrity()
+            m3 = CheckpointManifest(
+                schema_version="v1",
+                checkpoint_id=CheckpointId("ckpt-3"),
+                sandbox_id=sid,
+                created_at=utc_now() + timedelta(seconds=2),
+                runtime_name="runc",
+                runtime_version=None,
+                process_artifacts=[],
+                filesystem_artifacts=[],
+                metadata={},
+            ).with_integrity()
+            for manifest in (m1, m2):
+                mgr.put_manifest(manifest)
+                mgr.handle_checkpoint_complete(manifest)
+
+            self.assertTrue(mgr.pin_checkpoint(sid, CheckpointId("ckpt-2")))
+            mgr.put_manifest(m3)
+            mgr.handle_checkpoint_complete(m3)
+            self.assertEqual(mgr.list_checkpoints(sid), [CheckpointId("ckpt-2"), CheckpointId("ckpt-3")])
+
+            mgr.unpin_checkpoint(sid, CheckpointId("ckpt-2"))
+            mgr.handle_checkpoint_complete(m3)
+            self.assertEqual(mgr.list_checkpoints(sid), [CheckpointId("ckpt-3")])
+
     def test_delete_after_restore_manager_removes_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
             sid = SandboxId("sbx-1")

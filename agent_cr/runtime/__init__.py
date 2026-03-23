@@ -1,20 +1,22 @@
-from .docker import DockerRuntimeAdapter
+from ..contracts import Runtime
+from .base import CommandRunner, SubprocessCommandRunner
+from .in_memory import InMemoryRuntime
 from .runc import (
     RuncCheckpointOptions,
     RuncRestoreOptions,
-    RuncRuntimeAdapter,
+    RuncRuntime,
     RuncRuntimeOptions,
+    RuncRuntimePaths,
 )
-from .base import CommandRunner, SubprocessCommandRunner
-from .runc import RuncRuntimePaths
 
 __all__ = [
     "CommandRunner",
-    "DockerRuntimeAdapter",
+    "InMemoryRuntime",
     "RuncCheckpointOptions",
     "RuncRestoreOptions",
-    "RuncRuntimeAdapter",
+    "RuncRuntime",
     "RuncRuntimeOptions",
     "RuncRuntimePaths",
+    "Runtime",
     "SubprocessCommandRunner",
 ]

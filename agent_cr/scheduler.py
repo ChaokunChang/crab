@@ -7,10 +7,10 @@ from threading import Lock
 from typing import Protocol
 
 from .config import SchedulerConfig
-from .contracts import SandboxInspector, SandboxManager, SchedulerStateStore, TelemetrySink
+from .contracts import Runtime, SandboxInspector, SchedulerStateStore, TelemetrySink
 from .ids import SandboxId
 from .models import SandboxSnapshot, SchedulerCheckpointDecision, utc_now
-from .telemetry import NoopTelemetrySink
+from .telemetry import NoopTelemetrySink, start_operation
 
 logger = logging.getLogger(__name__)
 
@@ -63,8 +63,8 @@ class CheckpointingPolicy:
 
     def evaluate(self, snapshot: SandboxSnapshot) -> SchedulerCheckpointDecision:
         changed = snapshot.process_changed or snapshot.filesystem_changed
-        checkpoint_process = changed
-        checkpoint_filesystem = snapshot.filesystem_changed
+        checkpoint_process = snapshot.process_changed
+        checkpoint_filesystem = changed
 
         if not snapshot.is_running:
             return SchedulerCheckpointDecision(
@@ -77,6 +77,22 @@ class CheckpointingPolicy:
             )
 
         request_in_flight = bool(snapshot.metadata.get("llm_request_in_flight", False))
+
+        # Force a full baseline checkpoint before applying the normal change-driven policy.
+        if snapshot.last_checkpoint_at is None:
+            reason = "no_previous_checkpoint"
+            if self._config.prefer_checkpoint_during_llm_request and request_in_flight:
+                reason = "llm_request_window_available"
+            return SchedulerCheckpointDecision(
+                should_checkpoint=True,
+                checkpoint_process=True,
+                checkpoint_filesystem=True,
+                leave_running=False,
+                reason=reason,
+                policy_name=self.name,
+                metadata={"llm_request_in_flight": request_in_flight},
+            )
+
         if self._config.require_change_signal and not changed:
             return SchedulerCheckpointDecision(
                 should_checkpoint=False,
@@ -85,29 +101,6 @@ class CheckpointingPolicy:
                 leave_running=False,
                 reason="no_change_signal",
                 policy_name=self.name,
-            )
-
-        if snapshot.last_checkpoint_at is None:
-            if self._config.require_llm_request_for_checkpoint and not request_in_flight:
-                return SchedulerCheckpointDecision(
-                    should_checkpoint=False,
-                    checkpoint_process=False,
-                    checkpoint_filesystem=False,
-                    leave_running=False,
-                    reason="llm_request_required",
-                    policy_name=self.name,
-                )
-            reason = "no_previous_checkpoint"
-            if self._config.prefer_checkpoint_during_llm_request and request_in_flight:
-                reason = "llm_request_window_available"
-            return SchedulerCheckpointDecision(
-                should_checkpoint=True,
-                checkpoint_process=checkpoint_process,
-                checkpoint_filesystem=checkpoint_filesystem,
-                leave_running=False,
-                reason=reason,
-                policy_name=self.name,
-                metadata={"llm_request_in_flight": request_in_flight},
             )
 
         elapsed = (snapshot.observed_at - snapshot.last_checkpoint_at).total_seconds()
@@ -169,7 +162,7 @@ class FaultToleranceCheckpointingPolicy(CheckpointingPolicy):
     def evaluate(self, snapshot: SandboxSnapshot) -> SchedulerCheckpointDecision:
         decision = super().evaluate(snapshot)
         if not decision.should_checkpoint:
-            return decision
+            return replace(decision, policy_name=self.name)
         return replace(decision, leave_running=True, policy_name=self.name)
 
 
@@ -267,7 +260,7 @@ class CRScheduler:
         self,
         config: SchedulerConfig,
         inspector: SandboxInspector,
-        sandbox_manager: SandboxManager,
+        runtime: Runtime,
         state_store: SchedulerStateStore | None = None,
         telemetry: TelemetrySink | None = None,
         policy: SchedulerPolicy | None = None,
@@ -275,11 +268,20 @@ class CRScheduler:
         self._config = config
         self._policy = policy or CheckpointingPolicy(config)
         self._inspector = inspector
-        self._sandbox_manager = sandbox_manager
+        self._runtime = runtime
         self._state = state_store or InMemorySchedulerStateStore()
         self._telemetry = telemetry or NoopTelemetrySink()
 
     def evaluate(self, sandbox: SandboxSnapshot) -> SchedulerCheckpointDecision:
+        operation = start_operation(
+            self._telemetry,
+            "scheduler.evaluate",
+            {
+                "component": "scheduler",
+                "sandbox_id": str(sandbox.sandbox_id),
+                "policy": self._policy.name,
+            },
+        )
         hydrated = sandbox
         if hydrated.last_checkpoint_at is None:
             last = self._state.get_last_checkpoint(hydrated.sandbox_id)
@@ -293,11 +295,15 @@ class CRScheduler:
         decision = self._policy.evaluate(hydrated)
         log_fn = logger.info if decision.should_checkpoint else logger.debug
         log_fn(
-            "Scheduler evaluated sandbox %s with policy=%s should_checkpoint=%s reason=%s process=%s filesystem=%s leave_running=%s",
+            "Scheduler evaluated sandbox %s with policy=%s should_checkpoint=%s reason=%s "
+            "observed_process_changed=%s observed_filesystem_changed=%s "
+            "checkpoint_process=%s checkpoint_filesystem=%s leave_running=%s",
             hydrated.sandbox_id,
             self._policy.name,
             decision.should_checkpoint,
             decision.reason,
+            hydrated.process_changed,
+            hydrated.filesystem_changed,
             decision.checkpoint_process,
             decision.checkpoint_filesystem,
             decision.leave_running,
@@ -314,12 +320,23 @@ class CRScheduler:
                 "leave_running": decision.leave_running,
             },
         )
+        operation.finish(
+            status="succeeded",
+            attributes={
+                "sandbox_id": str(hydrated.sandbox_id),
+                "should_checkpoint": decision.should_checkpoint,
+                "reason": decision.reason,
+                "checkpoint_process": decision.checkpoint_process,
+                "checkpoint_filesystem": decision.checkpoint_filesystem,
+                "leave_running": decision.leave_running,
+            },
+        )
         return decision
 
     def query_checkpoint(self, sandbox_id: SandboxId) -> SchedulerCheckpointDecision:
         logger.debug("Querying scheduler for sandbox %s", sandbox_id)
         try:
-            self._sandbox_manager.pause(sandbox_id)
+            self._runtime.pause(sandbox_id)
         except Exception:
             snapshot = self._inspector.inspect(sandbox_id)
             if not snapshot.is_running:
@@ -333,12 +350,24 @@ class CRScheduler:
             raise
         try:
             snapshot = self._inspector.inspect(sandbox_id)
+            if not snapshot.is_running:
+                try:
+                    runtime_state = self._runtime.inspect_runtime(sandbox_id)
+                except Exception:
+                    runtime_state = None
+                if runtime_state is not None and runtime_state.is_running:
+                    logger.debug(
+                        "Using runtime state to keep sandbox %s marked running after successful pause; "
+                        "inspector snapshot was stale",
+                        sandbox_id,
+                    )
+                    snapshot = replace(snapshot, is_running=True)
             decision = self.evaluate(snapshot)
             if not decision.should_checkpoint:
                 if snapshot.is_running:
-                    self._sandbox_manager.resume(sandbox_id)
+                    self._runtime.resume(sandbox_id)
                 else:
-                    self._sandbox_manager.sync_runtime_state(sandbox_id, is_running=False)
+                    self._runtime.sync_runtime_state(sandbox_id, is_running=False)
                 logger.debug(
                     "Scheduler declined checkpoint for sandbox %s reason=%s",
                     sandbox_id,
@@ -346,9 +375,12 @@ class CRScheduler:
                 )
             else:
                 logger.info(
-                    "Scheduler selected checkpoint for sandbox %s reason=%s process=%s filesystem=%s leave_running=%s",
+                    "Scheduler selected checkpoint for sandbox %s reason=%s observed_process_changed=%s "
+                    "observed_filesystem_changed=%s checkpoint_process=%s checkpoint_filesystem=%s leave_running=%s",
                     sandbox_id,
                     decision.reason,
+                    snapshot.process_changed,
+                    snapshot.filesystem_changed,
                     decision.checkpoint_process,
                     decision.checkpoint_filesystem,
                     decision.leave_running,
@@ -361,9 +393,9 @@ class CRScheduler:
                 snapshot = None
             try:
                 if snapshot is not None and not snapshot.is_running:
-                    self._sandbox_manager.sync_runtime_state(sandbox_id, is_running=False)
+                    self._runtime.sync_runtime_state(sandbox_id, is_running=False)
                 else:
-                    self._sandbox_manager.resume(sandbox_id)
+                    self._runtime.resume(sandbox_id)
             except Exception:
                 logger.exception("Failed to resume sandbox %s after scheduler exception", sandbox_id)
             raise

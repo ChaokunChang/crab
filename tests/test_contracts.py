@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_cr import (
     AdapterFileSystemCWorker,
@@ -12,32 +14,38 @@ from agent_cr import (
     AdapterProcessRWorker,
     ArtifactKind,
     ArtifactPayload,
+    ArtifactReference,
     CheckpointId,
     CheckpointJob,
     CheckpointManager,
     DefaultCWorker,
     DefaultRWorker,
-    DockerRuntimeAdapter,
     EBPFSandboxInspector,
     EBPFEvent,
     EBPFEventKind,
     FailureCode,
+    InMemoryRuntime,
     InMemoryEBPFEventCollector,
+    InMemoryTelemetrySink,
     JobId,
     LocalCheckpointManager,
     RestoreJob,
     RuncCheckpointOptions,
-    RuncRuntimeAdapter,
+    RuncRuntime,
     RuncRuntimeOptions,
     RuncRuntimePaths,
     RuncRestoreOptions,
+    Runtime,
     SandboxId,
     SandboxSnapshot,
     StorageConfig,
 )
-from agent_cr.contracts import SandboxRuntimeAdapter
 from agent_cr.models import CheckpointManifest, RuntimeOperationStatus, WorkerStepResult, utc_now
 from agent_cr.runtime import CommandRunner
+
+DockerRuntimeAdapter = InMemoryRuntime
+RuncRuntimeAdapter = RuncRuntime
+SandboxRuntimeAdapter = Runtime
 
 
 class FakeCommandRunner(CommandRunner):
@@ -148,15 +156,24 @@ class RecordingCheckpointWorker:
 
 
 class RecordingCheckpointManager:
-    def __init__(self) -> None:
+    def __init__(self, existing_manifests: list[CheckpointManifest] | None = None) -> None:
         self.manifest: CheckpointManifest | None = None
         self.completed: list[CheckpointManifest] = []
+        self._manifests: dict[tuple[SandboxId, CheckpointId], CheckpointManifest] = {}
+        self._ordered: dict[SandboxId, list[CheckpointId]] = {}
+        for manifest in existing_manifests or []:
+            self._manifests[(manifest.sandbox_id, manifest.checkpoint_id)] = manifest
+            self._ordered.setdefault(manifest.sandbox_id, []).append(manifest.checkpoint_id)
 
     def put_manifest(self, manifest: CheckpointManifest) -> None:
         self.manifest = manifest
+        self._manifests[(manifest.sandbox_id, manifest.checkpoint_id)] = manifest
+        self._ordered.setdefault(manifest.sandbox_id, []).append(manifest.checkpoint_id)
 
     def get_manifest(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> CheckpointManifest:
-        _ = (sandbox_id, checkpoint_id)
+        manifest = self._manifests.get((sandbox_id, checkpoint_id))
+        if manifest is not None:
+            return manifest
         assert self.manifest is not None
         return self.manifest
 
@@ -176,8 +193,7 @@ class RecordingCheckpointManager:
         return b""
 
     def list_checkpoints(self, sandbox_id: SandboxId) -> list[CheckpointId]:
-        _ = sandbox_id
-        return []
+        return list(self._ordered.get(sandbox_id, []))
 
     def delete_checkpoint(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> None:
         _ = (sandbox_id, checkpoint_id)
@@ -506,7 +522,7 @@ class ContractTests(unittest.TestCase):
             process_worker=process_worker,
             filesystem_worker=filesystem_worker,
             checkpoint_manager=manager,
-            runtime_adapter=DockerRuntimeAdapter(),
+            runtime=DockerRuntimeAdapter(),
         )
         job = CheckpointJob(
             job_id=JobId("job-scoped"),
@@ -533,7 +549,7 @@ class ContractTests(unittest.TestCase):
             process_worker=process_worker,
             filesystem_worker=filesystem_worker,
             checkpoint_manager=manager,
-            runtime_adapter=DockerRuntimeAdapter(),
+            runtime=DockerRuntimeAdapter(),
             checkpoint_guard=lambda job: (False, f"{job.sandbox_id}:sandbox_not_running"),
         )
         job = CheckpointJob(
@@ -552,6 +568,71 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(process_worker.calls, [])
         self.assertEqual(filesystem_worker.calls, [])
         self.assertEqual(manager.completed, [])
+
+    def test_default_checkpoint_worker_promotes_first_filesystem_only_checkpoint(self) -> None:
+        manager = RecordingCheckpointManager()
+        process_worker = RecordingCheckpointWorker("process")
+        filesystem_worker = RecordingCheckpointWorker("filesystem")
+        worker = DefaultCWorker(
+            process_worker=process_worker,
+            filesystem_worker=filesystem_worker,
+            checkpoint_manager=manager,
+            runtime=DockerRuntimeAdapter(),
+        )
+        job = CheckpointJob(
+            job_id=JobId("job-fs-first"),
+            sandbox_id=SandboxId("sbx-1"),
+            requested_at=utc_now(),
+            checkpoint_process=False,
+            checkpoint_filesystem=True,
+        )
+
+        result = worker.checkpoint(job)
+
+        self.assertEqual(result.status.value, "succeeded")
+        self.assertEqual(len(process_worker.calls), 1)
+        self.assertEqual(len(filesystem_worker.calls), 1)
+        assert result.manifest is not None
+        self.assertTrue(result.manifest.metadata["promoted_process_checkpoint"])
+        self.assertEqual(result.manifest.metadata["promoted_process_checkpoint_reason"], "missing_process_ancestor")
+
+    def test_default_checkpoint_worker_keeps_filesystem_only_scope_with_process_ancestor(self) -> None:
+        sid = SandboxId("sbx-1")
+        prior_process = CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=CheckpointId("ckpt-1"),
+            sandbox_id=sid,
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version=None,
+            process_artifacts=[ArtifactReference(kind=ArtifactKind.PROCESS, name="process.json", relative_path="p", size_bytes=1, sha256="0" * 64, metadata={})],
+            filesystem_artifacts=[],
+            metadata={},
+        ).with_integrity()
+        manager = RecordingCheckpointManager(existing_manifests=[prior_process])
+        process_worker = RecordingCheckpointWorker("process")
+        filesystem_worker = RecordingCheckpointWorker("filesystem")
+        worker = DefaultCWorker(
+            process_worker=process_worker,
+            filesystem_worker=filesystem_worker,
+            checkpoint_manager=manager,
+            runtime=DockerRuntimeAdapter(),
+        )
+        job = CheckpointJob(
+            job_id=JobId("job-fs-next"),
+            sandbox_id=sid,
+            requested_at=utc_now(),
+            checkpoint_process=False,
+            checkpoint_filesystem=True,
+        )
+
+        result = worker.checkpoint(job)
+
+        self.assertEqual(result.status.value, "succeeded")
+        self.assertEqual(len(process_worker.calls), 0)
+        self.assertEqual(len(filesystem_worker.calls), 1)
+        assert result.manifest is not None
+        self.assertNotIn("promoted_process_checkpoint", result.manifest.metadata)
 
     def test_default_restore_worker_backfills_missing_process_from_previous_checkpoint(self) -> None:
         sid = SandboxId("sbx-1")
@@ -657,6 +738,334 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(fs_worker.manifests[0].metadata["filesystem_restore_checkpoint_id"], "ckpt-1")
         self.assertEqual(len(fs_worker.manifests[0].filesystem_artifacts), 1)
 
+    def test_default_restore_worker_keeps_later_process_when_only_inflight_mutation_is_missing(self) -> None:
+        sid = SandboxId("sbx-1")
+        manager = LocalCheckpointManager(StorageConfig(root_dir=Path(tempfile.mkdtemp())))
+        fs_ref = manager.put_artifact(sid, CheckpointId("ckpt-bootstrap-fs"), ArtifactPayload(kind=ArtifactKind.FILESYSTEM, name="filesystem.json", data=b"{}"))
+        process_ref = manager.put_artifact(sid, CheckpointId("ckpt-bootstrap-process"), ArtifactPayload(kind=ArtifactKind.PROCESS, name="process.json", data=b"{}"))
+        filesystem_manifest = CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=CheckpointId("ckpt-1"),
+            sandbox_id=sid,
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version=None,
+            process_artifacts=[],
+            filesystem_artifacts=[fs_ref],
+            metadata={"benchmark_trace_cursor": 3},
+        ).with_integrity()
+        process_manifest = CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=CheckpointId("ckpt-2"),
+            sandbox_id=sid,
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version=None,
+            process_artifacts=[process_ref],
+            filesystem_artifacts=[],
+            metadata={
+                "benchmark_trace_cursor": 6,
+                "benchmark_latest_mutating_response_count": 6,
+                "benchmark_previous_mutating_response_count": 0,
+                "captures_inflight_llm": True,
+            },
+        ).with_integrity()
+        fs_worker = RecordingRestoreWorker()
+        process_worker = RecordingRestoreWorker()
+        restore_worker = DefaultRWorker(
+            process_worker=process_worker,
+            filesystem_worker=fs_worker,
+            checkpoint_manager=ManifestCheckpointManager([filesystem_manifest, process_manifest]),
+        )
+
+        result = restore_worker.restore(
+            RestoreJob(
+                job_id=JobId("job-restore-safe-process"),
+                sandbox_id=sid,
+                checkpoint_id=CheckpointId("ckpt-2"),
+                requested_at=utc_now(),
+            )
+        )
+
+        self.assertEqual(result.status.value, "succeeded")
+        self.assertEqual(process_worker.manifests[0].metadata["process_restore_checkpoint_id"], "ckpt-2")
+        self.assertEqual(process_worker.manifests[0].metadata["filesystem_restore_checkpoint_id"], "ckpt-1")
+        self.assertEqual(process_worker.manifests[0].metadata["filesystem_restore_trace_cursor"], 3)
+
+    def test_default_restore_worker_rewinds_unsafe_newer_process_checkpoint(self) -> None:
+        sid = SandboxId("sbx-1")
+        manager = LocalCheckpointManager(StorageConfig(root_dir=Path(tempfile.mkdtemp())))
+        early_process_ref = manager.put_artifact(sid, CheckpointId("ckpt-bootstrap-process-1"), ArtifactPayload(kind=ArtifactKind.PROCESS, name="process.json", data=b"{}"))
+        fs_ref = manager.put_artifact(sid, CheckpointId("ckpt-bootstrap-fs"), ArtifactPayload(kind=ArtifactKind.FILESYSTEM, name="filesystem.json", data=b"{}"))
+        late_process_ref = manager.put_artifact(sid, CheckpointId("ckpt-bootstrap-process-2"), ArtifactPayload(kind=ArtifactKind.PROCESS, name="process.json", data=b"{}"))
+        early_process_manifest = CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=CheckpointId("ckpt-1"),
+            sandbox_id=sid,
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version=None,
+            process_artifacts=[early_process_ref],
+            filesystem_artifacts=[],
+            metadata={"benchmark_trace_cursor": 6},
+        ).with_integrity()
+        filesystem_manifest = CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=CheckpointId("ckpt-2"),
+            sandbox_id=sid,
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version=None,
+            process_artifacts=[],
+            filesystem_artifacts=[fs_ref],
+            metadata={"benchmark_trace_cursor": 6},
+        ).with_integrity()
+        late_process_manifest = CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=CheckpointId("ckpt-3"),
+            sandbox_id=sid,
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version=None,
+            process_artifacts=[late_process_ref],
+            filesystem_artifacts=[],
+            metadata={
+                "benchmark_trace_cursor": 12,
+                "benchmark_latest_mutating_response_count": 12,
+                "benchmark_previous_mutating_response_count": 10,
+                "captures_inflight_llm": True,
+            },
+        ).with_integrity()
+        fs_worker = RecordingRestoreWorker()
+        process_worker = RecordingRestoreWorker()
+        restore_worker = DefaultRWorker(
+            process_worker=process_worker,
+            filesystem_worker=fs_worker,
+            checkpoint_manager=ManifestCheckpointManager(
+                [early_process_manifest, filesystem_manifest, late_process_manifest]
+            ),
+        )
+
+        result = restore_worker.restore(
+            RestoreJob(
+                job_id=JobId("job-restore-unsafe-process"),
+                sandbox_id=sid,
+                checkpoint_id=CheckpointId("ckpt-3"),
+                requested_at=utc_now(),
+            )
+        )
+
+        self.assertEqual(result.status.value, "succeeded")
+        self.assertEqual(process_worker.manifests[0].metadata["process_restore_checkpoint_id"], "ckpt-1")
+        self.assertEqual(process_worker.manifests[0].metadata["filesystem_restore_checkpoint_id"], "ckpt-2")
+        self.assertEqual(process_worker.manifests[0].metadata["filesystem_restore_trace_cursor"], 6)
+
+    def test_default_restore_worker_rewinds_unsafe_newer_process_checkpoint_without_mutating_metadata(self) -> None:
+        sid = SandboxId("sbx-1")
+        manager = LocalCheckpointManager(StorageConfig(root_dir=Path(tempfile.mkdtemp())))
+        early_process_ref = manager.put_artifact(
+            sid,
+            CheckpointId("ckpt-bootstrap-process-1"),
+            ArtifactPayload(kind=ArtifactKind.PROCESS, name="process.json", data=b"{}"),
+        )
+        fs_ref = manager.put_artifact(
+            sid,
+            CheckpointId("ckpt-bootstrap-fs"),
+            ArtifactPayload(kind=ArtifactKind.FILESYSTEM, name="filesystem.json", data=b"{}"),
+        )
+        late_process_ref = manager.put_artifact(
+            sid,
+            CheckpointId("ckpt-bootstrap-process-2"),
+            ArtifactPayload(kind=ArtifactKind.PROCESS, name="process.json", data=b"{}"),
+        )
+        early_process_manifest = CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=CheckpointId("ckpt-1"),
+            sandbox_id=sid,
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version=None,
+            process_artifacts=[early_process_ref],
+            filesystem_artifacts=[],
+            metadata={"benchmark_trace_cursor": 6},
+        ).with_integrity()
+        filesystem_manifest = CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=CheckpointId("ckpt-2"),
+            sandbox_id=sid,
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version=None,
+            process_artifacts=[],
+            filesystem_artifacts=[fs_ref],
+            metadata={"benchmark_trace_cursor": 6},
+        ).with_integrity()
+        late_process_manifest = CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=CheckpointId("ckpt-3"),
+            sandbox_id=sid,
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version=None,
+            process_artifacts=[late_process_ref],
+            filesystem_artifacts=[],
+            metadata={
+                "benchmark_trace_cursor": 12,
+                "captures_inflight_llm": True,
+            },
+        ).with_integrity()
+        fs_worker = RecordingRestoreWorker()
+        process_worker = RecordingRestoreWorker()
+        restore_worker = DefaultRWorker(
+            process_worker=process_worker,
+            filesystem_worker=fs_worker,
+            checkpoint_manager=ManifestCheckpointManager(
+                [early_process_manifest, filesystem_manifest, late_process_manifest]
+            ),
+        )
+
+        result = restore_worker.restore(
+            RestoreJob(
+                job_id=JobId("job-restore-unsafe-process-no-mutating-metadata"),
+                sandbox_id=sid,
+                checkpoint_id=CheckpointId("ckpt-3"),
+                requested_at=utc_now(),
+            )
+        )
+
+        self.assertEqual(result.status.value, "succeeded")
+        self.assertEqual(process_worker.manifests[0].metadata["process_restore_checkpoint_id"], "ckpt-1")
+        self.assertEqual(process_worker.manifests[0].metadata["filesystem_restore_checkpoint_id"], "ckpt-2")
+        self.assertEqual(process_worker.manifests[0].metadata["filesystem_restore_trace_cursor"], 6)
+
+    def test_default_restore_worker_uses_committed_replay_count_for_inflight_filesystem_checkpoint(self) -> None:
+        sid = SandboxId("sbx-1")
+        manager = LocalCheckpointManager(StorageConfig(root_dir=Path(tempfile.mkdtemp())))
+        fs_ref = manager.put_artifact(
+            sid,
+            CheckpointId("ckpt-bootstrap-fs"),
+            ArtifactPayload(kind=ArtifactKind.FILESYSTEM, name="filesystem.json", data=b"{}"),
+        )
+        filesystem_manifest = CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=CheckpointId("ckpt-1"),
+            sandbox_id=sid,
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version=None,
+            process_artifacts=[],
+            filesystem_artifacts=[fs_ref],
+            metadata={
+                "benchmark_trace_cursor": 3,
+                "benchmark_latest_mutating_response_count": 3,
+                "benchmark_previous_mutating_response_count": 0,
+                "captures_inflight_llm": True,
+            },
+        ).with_integrity()
+        fs_worker = RecordingRestoreWorker()
+        process_worker = RecordingRestoreWorker()
+        restore_worker = DefaultRWorker(
+            process_worker=process_worker,
+            filesystem_worker=fs_worker,
+            checkpoint_manager=ManifestCheckpointManager([filesystem_manifest]),
+        )
+
+        result = restore_worker.restore(
+            RestoreJob(
+                job_id=JobId("job-restore-inflight-fs"),
+                sandbox_id=sid,
+                checkpoint_id=CheckpointId("ckpt-1"),
+                requested_at=utc_now(),
+            )
+        )
+
+        self.assertEqual(result.status.value, "succeeded")
+        self.assertEqual(fs_worker.manifests[0].metadata["filesystem_restore_checkpoint_id"], "ckpt-1")
+        self.assertEqual(fs_worker.manifests[0].metadata["filesystem_restore_trace_cursor"], 2)
+
+    def test_default_restore_worker_rewinds_process_when_filesystem_lacks_latest_mutation(self) -> None:
+        sid = SandboxId("sbx-1")
+        manager = LocalCheckpointManager(StorageConfig(root_dir=Path(tempfile.mkdtemp())))
+        early_process_ref = manager.put_artifact(
+            sid,
+            CheckpointId("ckpt-bootstrap-process-1"),
+            ArtifactPayload(kind=ArtifactKind.PROCESS, name="process.json", data=b"{}"),
+        )
+        fs_ref = manager.put_artifact(
+            sid,
+            CheckpointId("ckpt-bootstrap-fs"),
+            ArtifactPayload(kind=ArtifactKind.FILESYSTEM, name="filesystem.json", data=b"{}"),
+        )
+        late_process_ref = manager.put_artifact(
+            sid,
+            CheckpointId("ckpt-bootstrap-process-2"),
+            ArtifactPayload(kind=ArtifactKind.PROCESS, name="process.json", data=b"{}"),
+        )
+        early_process_manifest = CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=CheckpointId("ckpt-1"),
+            sandbox_id=sid,
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version=None,
+            process_artifacts=[early_process_ref],
+            filesystem_artifacts=[],
+            metadata={"benchmark_trace_cursor": 4, "benchmark_latest_mutating_response_count": 4},
+        ).with_integrity()
+        filesystem_manifest = CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=CheckpointId("ckpt-2"),
+            sandbox_id=sid,
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version=None,
+            process_artifacts=[],
+            filesystem_artifacts=[fs_ref],
+            metadata={
+                "benchmark_trace_cursor": 10,
+                "benchmark_latest_mutating_response_count": 4,
+                "captures_inflight_llm": False,
+            },
+        ).with_integrity()
+        late_process_manifest = CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=CheckpointId("ckpt-3"),
+            sandbox_id=sid,
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version=None,
+            process_artifacts=[late_process_ref],
+            filesystem_artifacts=[],
+            metadata={
+                "benchmark_trace_cursor": 12,
+                "benchmark_latest_mutating_response_count": 8,
+                "benchmark_previous_mutating_response_count": 8,
+                "captures_inflight_llm": True,
+            },
+        ).with_integrity()
+        fs_worker = RecordingRestoreWorker()
+        process_worker = RecordingRestoreWorker()
+        restore_worker = DefaultRWorker(
+            process_worker=process_worker,
+            filesystem_worker=fs_worker,
+            checkpoint_manager=ManifestCheckpointManager(
+                [early_process_manifest, filesystem_manifest, late_process_manifest]
+            ),
+        )
+
+        result = restore_worker.restore(
+            RestoreJob(
+                job_id=JobId("job-restore-missing-fs-mutation"),
+                sandbox_id=sid,
+                checkpoint_id=CheckpointId("ckpt-3"),
+                requested_at=utc_now(),
+            )
+        )
+
+        self.assertEqual(result.status.value, "succeeded")
+        self.assertEqual(process_worker.manifests[0].metadata["process_restore_checkpoint_id"], "ckpt-1")
+        self.assertEqual(process_worker.manifests[0].metadata["filesystem_restore_checkpoint_id"], "ckpt-2")
+
     def test_runc_runtime_executes_real_commands_via_runner(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_runc_runtime_") as tmp:
             runner = FakeCommandRunner()
@@ -683,6 +1092,41 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(runner.commands[0][0:3], ("runc", "--root", str(base / "state")))
             self.assertIn("--leave-running=true", runner.commands[0])
             self.assertEqual(runner.commands[1], ("zfs", "snapshot", "pool/agent-cr/sbx-1@ckpt-1"))
+
+    def test_runc_runtime_exec_emits_telemetry_without_deleted_helper(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_runc_exec_") as tmp:
+            base = Path(tmp)
+            telemetry = InMemoryTelemetrySink()
+            adapter = RuncRuntimeAdapter(
+                telemetry=telemetry,
+                paths=RuncRuntimePaths(
+                    state_root=base / "state",
+                    bundle_root=base / "bundles",
+                    checkpoint_root=base / "checkpoints",
+                    metadata_root=base / "metadata",
+                    zfs_dataset_prefix="pool/agent-cr",
+                ),
+            )
+
+            completed = subprocess.CompletedProcess(
+                args=["runc", "exec"],
+                returncode=0,
+                stdout="ok\n",
+                stderr="",
+            )
+            with patch("agent_cr.runtime.runc.subprocess.run", return_value=completed):
+                result = adapter.exec(
+                    SandboxId("sbx-1"),
+                    ["/bin/true"],
+                    cwd="/app",
+                    capture_output=True,
+                )
+
+            self.assertEqual(result.returncode, 0)
+            event_names = [name for name, _ in telemetry.events]
+            self.assertIn("sandbox.runtime_exec.start", event_names)
+            self.assertIn("sandbox.runtime_exec.finish", event_names)
+            self.assertIn("sandbox.command", event_names)
 
     def test_ebpf_inspector_uses_recorded_events(self) -> None:
         collector = InMemoryEBPFEventCollector()

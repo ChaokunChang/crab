@@ -81,6 +81,28 @@ class RuntimeOperationStatus:
 
 
 @dataclass(frozen=True)
+class SandboxRuntimeState:
+    sandbox_id: SandboxId
+    runtime_name: str
+    status: str
+    pid: int | None = None
+    bundle_path: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def is_running(self) -> bool:
+        return self.status.lower() in {"running", "paused", "created"} and self.pid is not None
+
+
+@dataclass(frozen=True)
+class SandboxExecResult:
+    args: tuple[str, ...]
+    returncode: int
+    stdout: str = ""
+    stderr: str = ""
+
+
+@dataclass(frozen=True)
 class EBPFEvent:
     sandbox_id: SandboxId
     kind: EBPFEventKind

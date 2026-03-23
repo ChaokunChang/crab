@@ -66,6 +66,7 @@ class BenchmarkNetworkManager:
         self._leases: dict[SandboxId, BenchmarkNetworkLease] = {}
         self._ip_to_sandbox: dict[str, SandboxId] = {}
         self._lock = threading.Lock()
+        self._nat_rules_configured = False
 
     @property
     def bridge_ip(self) -> str:
@@ -103,7 +104,51 @@ class BenchmarkNetworkManager:
             subprocess.run(["ip", "addr", "add", f"{self._bridge_ip}/24", "dev", bridge_name], check=True)
             subprocess.run(["ip", "link", "set", bridge_name, "up"], check=True)
             self._bridge_name = bridge_name
+            self._ensure_outbound_connectivity_rules(bridge_name)
             logger.info("Created benchmark bridge name=%s bridge_ip=%s", bridge_name, self._bridge_ip)
+
+    def _ensure_outbound_connectivity_rules(self, bridge_name: str) -> None:
+        subprocess.run(["sysctl", "-w", "net.ipv4.ip_forward=1"], check=True, stdout=subprocess.DEVNULL)
+        nat_rule = ["iptables", "-t", "nat", "-C", "POSTROUTING", "-s", self._network_cidr, "-j", "MASQUERADE"]
+        if subprocess.run(nat_rule, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
+            subprocess.run(
+                ["iptables", "-t", "nat", "-A", "POSTROUTING", "-s", self._network_cidr, "-j", "MASQUERADE"],
+                check=True,
+            )
+        forward_from_bridge = ["iptables", "-C", "FORWARD", "-i", bridge_name, "-j", "ACCEPT"]
+        if subprocess.run(forward_from_bridge, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
+            subprocess.run(["iptables", "-A", "FORWARD", "-i", bridge_name, "-j", "ACCEPT"], check=True)
+        forward_to_bridge = [
+            "iptables",
+            "-C",
+            "FORWARD",
+            "-o",
+            bridge_name,
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "RELATED,ESTABLISHED",
+            "-j",
+            "ACCEPT",
+        ]
+        if subprocess.run(forward_to_bridge, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
+            subprocess.run(
+                [
+                    "iptables",
+                    "-A",
+                    "FORWARD",
+                    "-o",
+                    bridge_name,
+                    "-m",
+                    "conntrack",
+                    "--ctstate",
+                    "RELATED,ESTABLISHED",
+                    "-j",
+                    "ACCEPT",
+                ],
+                check=True,
+            )
+        self._nat_rules_configured = True
 
     def allocate_lease(self, sandbox_id: SandboxId) -> BenchmarkNetworkLease:
         self.ensure_bridge()
@@ -194,6 +239,38 @@ class BenchmarkNetworkManager:
         for sandbox_id in sandbox_ids:
             self.release_lease(sandbox_id)
         if bridge_name is not None:
+            if self._nat_rules_configured:
+                subprocess.run(
+                    ["iptables", "-t", "nat", "-D", "POSTROUTING", "-s", self._network_cidr, "-j", "MASQUERADE"],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                subprocess.run(
+                    ["iptables", "-D", "FORWARD", "-i", bridge_name, "-j", "ACCEPT"],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                subprocess.run(
+                    [
+                        "iptables",
+                        "-D",
+                        "FORWARD",
+                        "-o",
+                        bridge_name,
+                        "-m",
+                        "conntrack",
+                        "--ctstate",
+                        "RELATED,ESTABLISHED",
+                        "-j",
+                        "ACCEPT",
+                    ],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                self._nat_rules_configured = False
             subprocess.run(["ip", "link", "delete", bridge_name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             with self._lock:
                 if self._bridge_name == bridge_name:

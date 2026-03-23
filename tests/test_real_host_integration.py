@@ -33,10 +33,8 @@ from agent_cr import (
     InMemoryTelemetrySink,
     LocalCheckpointManager,
     RequestAwareSandboxInspector,
-    RuncRuntimeAdapter,
+    RuncRuntime,
     RuncRuntimePaths,
-    RuncSandboxManager,
-    RuncSandboxManagerPaths,
     SandboxId,
     SandboxSnapshot,
     SchedulerConfig,
@@ -47,6 +45,10 @@ from agent_cr.models import JobStatus, utc_now
 from integrations.llm_services.simulated.service import serve
 from integrations.sandboxes.runtime.image import build_image, export_image_rootfs
 from integrations.sandboxes.simulated import DOCKERFILE_PATH as SIMULATED_DOCKERFILE_PATH
+
+RuncRuntimeAdapter = RuncRuntime
+RuncSandboxManager = RuncRuntime
+RuncSandboxManagerPaths = RuncRuntimePaths
 
 
 def _find_free_port() -> int:
@@ -198,7 +200,7 @@ class RealHostIntegrationTests(unittest.TestCase):
                 executor=executor,
                 storage=storage,
                 inspector=inspector,
-                sandbox_manager=sandbox_manager,
+                runtime=sandbox_manager,
                 telemetry=telemetry,
                 request_state_store=request_state_store,
             )

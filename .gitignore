@@ -19,3 +19,6 @@ logs/
 .DS_Store
 *.swp
 *.swo
+integrations/sandboxes/3rdparty/
+data/
+.cache/

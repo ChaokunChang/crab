@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import logging
+import os
 import random
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -13,11 +16,35 @@ from agent_cr import CheckpointId, CheckpointManifest
 from integrations.agents import TaskConfig, TaskDescription
 
 
-def configure_logging(level_name: str) -> None:
+def configure_logging(level_name: str, *, log_file: Path | None = None, log_file_mode: str = "a") -> None:
+    handlers: list[logging.Handler]
+    if log_file is not None:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        handlers = [logging.FileHandler(log_file, mode=log_file_mode, encoding="utf-8")]
+    else:
+        handlers = [logging.StreamHandler()]
     logging.basicConfig(
         level=getattr(logging, level_name.upper()),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=handlers,
+        force=True,
     )
+
+
+def benchmark_run_context(config_path: Path) -> dict[str, object]:
+    return {
+        "pid": os.getpid(),
+        "run_id": uuid.uuid4().hex,
+        "started_at_monotonic": time.perf_counter(),
+        "config_path": str(config_path.resolve()),
+    }
+
+
+def benchmark_run_duration_seconds(run_context: dict[str, object]) -> float:
+    started_at = run_context.get("started_at_monotonic")
+    if not isinstance(started_at, (int, float)):
+        return 0.0
+    return max(0.0, time.perf_counter() - float(started_at))
 
 
 def bounded_probability(raw: str) -> float:
@@ -30,7 +57,11 @@ def bounded_probability(raw: str) -> float:
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--provider", choices=["openai", "anthropic"], default="openai")
     parser.add_argument("--agent-type", choices=["simulated", "iflow"], default="simulated")
-    parser.add_argument("--llm-service-type", choices=["simulated", "manual", "simulated_for_iflow"], default=None)
+    parser.add_argument(
+        "--llm-service-type",
+        choices=["simulated", "manual", "simulated_for_iflow", "iflow_trace_replay"],
+        default=None,
+    )
     parser.add_argument("--dataset", type=Path, default=None)
     parser.add_argument("--out", default="")
     parser.add_argument("--transfer-delay-ms", type=float, default=0.0)
@@ -75,6 +106,79 @@ def compute_summary(rows: list[dict[str, object]], metric_keys: Iterable[str]) -
     for key in metric_keys:
         summary[key] = sum(float(row[key]) for row in rows) / len(rows)
     return summary
+
+
+def compute_summary_aliases(
+    rows: list[dict[str, object]],
+    metric_aliases: dict[str, str],
+) -> dict[str, float]:
+    summary: dict[str, float] = {}
+    if not rows:
+        return summary
+    for summary_key, row_key in metric_aliases.items():
+        summary[summary_key] = sum(float(row[row_key]) for row in rows) / len(rows)
+    return summary
+
+
+def compute_telemetry_summary(
+    telemetry_path: Path | None,
+    metric_aliases: dict[str, str | tuple[str, ...]],
+    *,
+    run_id: str | None = None,
+    required_keys: Iterable[str] | None = None,
+    attribute_filters: dict[str, dict[str, object]] | None = None,
+) -> dict[str, float]:
+    if telemetry_path is None or not telemetry_path.exists():
+        return {}
+    rows_by_summary: dict[str, list[float]] = {key: [] for key in metric_aliases}
+    required = set(metric_aliases if required_keys is None else required_keys)
+    filters = attribute_filters or {}
+    with telemetry_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            payload = json.loads(stripped)
+            if payload.get("kind") != "metric":
+                continue
+            attributes = payload.get("attributes", {})
+            if not isinstance(attributes, dict):
+                attributes = {}
+            if run_id and str(attributes.get("run_id", "")) != run_id:
+                continue
+            metric_name = str(payload.get("name", ""))
+            for summary_key, aliases in metric_aliases.items():
+                candidates = (aliases,) if isinstance(aliases, str) else tuple(aliases)
+                if metric_name not in candidates:
+                    continue
+                expected_attributes = filters.get(summary_key, {})
+                matches = True
+                for attr_name, expected_value in expected_attributes.items():
+                    if attributes.get(attr_name) != expected_value:
+                        matches = False
+                        break
+                if not matches:
+                    continue
+                try:
+                    rows_by_summary[summary_key].append(float(payload["value"]))
+                except (KeyError, TypeError, ValueError):
+                    pass
+                break
+    summary = {
+        key: sum(values) / len(values)
+        for key, values in rows_by_summary.items()
+        if values
+    }
+    if required and not required.issubset(summary.keys()):
+        return {}
+    return summary
+
+
+def average(values: Iterable[float]) -> float:
+    items = list(values)
+    if not items:
+        return 0.0
+    return sum(items) / len(items)
 
 
 def select_injected_indices(
@@ -187,17 +291,60 @@ class BenchmarkTaskRecord:
     agent_type: str
     task_description: TaskDescription
     task_config: TaskConfig
+    task_id: str | None = None
     llm_service_type: str | None = None
     docker_compose_file: Path | None = None
     env_file: Path | None = None
     service_name: str | None = None
+    task_root: Path | None = None
+    llm_service_config: dict[str, object] | None = None
+    trace_response_count: int | None = None
+    trace_malformed_line_count: int | None = None
+
+
+def is_replay_llm_service_type(llm_service_type: str | None) -> bool:
+    return llm_service_type == "iflow_trace_replay"
+
+
+def choose_replay_points(total_responses: int, limit: int) -> list[int]:
+    if total_responses <= 1 or limit <= 0:
+        return []
+    candidates = list(range(1, total_responses))
+    if limit >= len(candidates):
+        return candidates
+    stride = max(1, len(candidates) // limit)
+    return candidates[::stride][:limit]
+
+
+def task_timeout_seconds(task_config: TaskConfig, *, default: float = 900.0) -> float:
+    raw_value = task_config.options.get("max_agent_timeout_sec", default)
+    try:
+        return max(1.0, float(raw_value))
+    except (TypeError, ValueError):
+        return default
+
+
+def verification_timeout_seconds(task_config: TaskConfig, *, default: float = 180.0) -> float:
+    raw_value = task_config.options.get("max_test_timeout_sec", default)
+    try:
+        return max(1.0, float(raw_value))
+    except (TypeError, ValueError):
+        return default
 
 
 def write_rows(path: str, rows: list[dict[str, object]]) -> None:
     if not path or not rows:
         return
+    fieldnames: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for key in row.keys():
+            if key in seen:
+                continue
+            seen.add(key)
+            fieldnames.append(key)
     with open(path, "w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
             writer.writerow(row)

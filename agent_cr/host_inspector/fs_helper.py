@@ -50,18 +50,27 @@ class LibbpfFilesystemMonitor:
                 process.stdin.close()
         except BrokenPipeError:
             pass
-        process.terminate()
-        process.wait(timeout=5.0)
-        if process.stdout is not None:
-            process.stdout.close()
-        if process.stderr is not None:
-            process.stderr.close()
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                logger.warning("filesystem monitor helper did not exit after terminate; killing pid=%s", process.pid)
+                process.kill()
+                try:
+                    process.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    logger.error("filesystem monitor helper did not exit after kill; pid=%s", process.pid)
         if self._stdout_thread is not None:
             self._stdout_thread.join(timeout=1.0)
             self._stdout_thread = None
         if self._stderr_thread is not None:
             self._stderr_thread.join(timeout=1.0)
             self._stderr_thread = None
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
 
     def upsert_sandbox(self, sandbox_id: str, cgroup_id: int) -> None:
         self._send({"op": "upsert_sandbox", "sandbox_id": sandbox_id, "cgroup_id": cgroup_id})
@@ -78,19 +87,25 @@ class LibbpfFilesystemMonitor:
 
     def _read_stdout(self) -> None:
         assert self._process is not None and self._process.stdout is not None
-        for line in self._process.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = decode_event(line)
-            except Exception:
-                logger.exception("Failed to decode fs helper event: %s", line)
-                continue
-            if self._on_event is not None:
-                self._on_event(event)
+        try:
+            for line in self._process.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = decode_event(line)
+                except Exception:
+                    logger.exception("Failed to decode fs helper event: %s", line)
+                    continue
+                if self._on_event is not None:
+                    self._on_event(event)
+        except ValueError:
+            logger.debug("filesystem monitor stdout closed during shutdown")
 
     def _read_stderr(self) -> None:
         assert self._process is not None and self._process.stderr is not None
-        for line in self._process.stderr:
-            logger.debug("fs helper: %s", line.rstrip())
+        try:
+            for line in self._process.stderr:
+                logger.debug("fs helper: %s", line.rstrip())
+        except ValueError:
+            logger.debug("filesystem monitor stderr closed during shutdown")

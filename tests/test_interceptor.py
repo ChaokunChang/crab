@@ -169,6 +169,8 @@ class InterceptorTests(unittest.TestCase):
         self.assertEqual(request_state_store.get(SandboxId("fork-1")).total_llm_requests, 1)
         self.assertEqual(request_state_store.get(SandboxId("source-1")).total_llm_requests, 0)
         self.assertEqual(forwarded_headers["X-Agent-Sandbox-Id"], "fork-1")
+        self.assertEqual(forwarded_headers["X-Request-Id"], "req-1")
+        self.assertEqual(forwarded_headers["X-AgentCR-Request-Id"], "req-1")
 
     def test_interceptor_notifies_system_scheduler(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_interceptor_") as tmp:

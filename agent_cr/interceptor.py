@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -15,6 +16,7 @@ import logging
 from .contracts import RequestInterceptorHook, SandboxInspector, TelemetrySink
 from .ids import SandboxId
 from .models import RequestContext, RequestState, RequestStateChange, SandboxSnapshot, utc_now
+from .telemetry import start_operation
 
 
 logger = logging.getLogger(__name__)
@@ -369,6 +371,7 @@ class AgentCRRequestInterceptor:
         upstream_transport: Callable[[str, dict[str, str], bytes], tuple[int, list[tuple[str, str]], bytes]],
         request_state_store: InMemoryRequestStateStore,
         hook: RequestInterceptorHook | None = None,
+        telemetry: TelemetrySink | None = None,
         on_state_change: Callable[[SandboxId], None] | None = None,
         response_gate_registry: SandboxResponseGateRegistry | None = None,
         sandbox_id_resolver: Callable[[str | None, dict[str, str], bytes], str | None] | None = None,
@@ -376,6 +379,7 @@ class AgentCRRequestInterceptor:
         self._upstream_transport = upstream_transport
         self._request_state_store = request_state_store
         self._hook = hook or CompositeRequestInterceptorHook()
+        self._telemetry = telemetry
         self._on_state_change = on_state_change
         self._response_gate_registry = response_gate_registry
         self._sandbox_id_resolver = sandbox_id_resolver
@@ -400,11 +404,22 @@ class AgentCRRequestInterceptor:
         upstream_headers["X-Agent-Sandbox-Id"] = sandbox_id_raw
         provider = "openai" if path == "/v1/chat/completions" else "anthropic"
         context = RequestContext(
-            request_id=headers.get("X-Request-Id", "").strip() or str(uuid.uuid4()),
+            request_id=upstream_headers.get("X-Request-Id", "").strip() or str(uuid.uuid4()),
             sandbox_id=SandboxId(sandbox_id_raw),
             started_at=utc_now(),
             metadata={"provider": provider, "path": path},
         )
+        upstream_headers["X-Request-Id"] = context.request_id
+        upstream_headers["X-AgentCR-Request-Id"] = context.request_id
+        request_attributes = {
+            "component": "interceptor",
+            "request_id": context.request_id,
+            "sandbox_id": str(context.sandbox_id),
+            "provider": provider,
+            "path": path,
+        }
+        if self._telemetry is not None:
+            self._telemetry.emit_event("interceptor.request.received", request_attributes)
         logger.debug(
             "Intercepting request start: request_id=%s sandbox_id=%s provider=%s path=%s client_host=%s body_bytes=%s",
             context.request_id,
@@ -417,13 +432,28 @@ class AgentCRRequestInterceptor:
         self._hook.on_request_start(context)
         self._request_state_store.mark_request_start(context)
         gate_generation = None
+        request_started = time.perf_counter()
+        upstream_response_received_at: float | None = None
         if self._response_gate_registry is not None:
             gate_generation = self._response_gate_registry.arm(context.sandbox_id, context.request_id)
         self._notify(context.sandbox_id)
         try:
-            response = self._upstream_transport(path, upstream_headers, body)
-            if self._response_gate_registry is not None:
-                self._response_gate_registry.wait_for_release(context.sandbox_id, gate_generation)
+            forward_operation = None if self._telemetry is None else start_operation(
+                self._telemetry,
+                "interceptor.request.forward",
+                request_attributes,
+            )
+            try:
+                response = self._upstream_transport(path, upstream_headers, body)
+            finally:
+                if forward_operation is not None:
+                    forward_operation.finish()
+            upstream_response_received_at = time.perf_counter()
+            if self._telemetry is not None:
+                self._telemetry.emit_event(
+                    "interceptor.request.upstream_response_received",
+                    request_attributes,
+                )
             logger.debug(
                 "Intercepting request complete: request_id=%s sandbox_id=%s status_code=%s response_bytes=%s",
                 context.request_id,
@@ -431,11 +461,49 @@ class AgentCRRequestInterceptor:
                 response[0],
                 len(response[2]),
             )
+            logger.debug(f"Intercepted request response of request_id={context.request_id}: {response}")
             return response
         finally:
-            self._request_state_store.mark_request_end(context)
-            self._hook.on_request_end(context)
+            gate_wait_ms = 0.0
+            if self._response_gate_registry is not None:
+                gate_operation = None if self._telemetry is None else start_operation(
+                    self._telemetry,
+                    "interceptor.response_gate.wait",
+                    request_attributes,
+                )
+                wait_started = time.perf_counter()
+                self._response_gate_registry.wait_for_release(context.sandbox_id, gate_generation)
+                gate_wait_ms = (time.perf_counter() - wait_started) * 1000.0
+                if gate_operation is not None:
+                    gate_operation.finish()
+            if self._telemetry is not None:
+                if upstream_response_received_at is not None:
+                    self._telemetry.emit_metric(
+                        "llm.gate_wait_ms",
+                        gate_wait_ms,
+                        request_attributes,
+                    )
+                    self._telemetry.emit_metric(
+                        "llm.agentcr_delay_ms",
+                        max(0.0, (time.perf_counter() - upstream_response_received_at) * 1000.0),
+                        request_attributes,
+                    )
+                self._telemetry.emit_event("interceptor.response.released", request_attributes)
+            if self._telemetry is not None:
+                total_ms = (time.perf_counter() - request_started) * 1000.0
+                self._telemetry.emit_metric(
+                    "llm.request_total_ms",
+                    total_ms,
+                    request_attributes,
+                )
+                self._telemetry.emit_metric(
+                    "llm.interceptor_total_ms",
+                    total_ms,
+                    request_attributes,
+                )
+            self._hook.on_request_end(context) # record telemetry, etc
             self._notify(context.sandbox_id)
+            self._request_state_store.mark_request_end(context)
 
     def _notify(self, sandbox_id: SandboxId) -> None:
         if self._on_state_change is not None:
@@ -453,21 +521,26 @@ class AgentCRRequestInterceptorServer:
         upstream_url: str,
         request_state_store: InMemoryRequestStateStore,
         hook: RequestInterceptorHook | None = None,
+        telemetry: TelemetrySink | None = None,
         on_state_change: Callable[[SandboxId], None] | None = None,
         response_gate_registry: SandboxResponseGateRegistry | None = None,
         sandbox_id_resolver: Callable[[str | None, dict[str, str], bytes], str | None] | None = None,
         host: str = "127.0.0.1",
         port: int = 0,
+        upstream_timeout_seconds: float = 3600.0,
     ) -> None:
         self._upstream_url = upstream_url.rstrip("/")
+        self._upstream_timeout_seconds = upstream_timeout_seconds
         self._interceptor = AgentCRRequestInterceptor(
             upstream_transport=self._forward,
             request_state_store=request_state_store,
             hook=hook,
+            telemetry=telemetry,
             on_state_change=on_state_change,
             response_gate_registry=response_gate_registry,
             sandbox_id_resolver=sandbox_id_resolver,
         )
+        self._telemetry = telemetry
         self._server = ThreadingHTTPServer((host, port), self._build_handler())
         self._thread: threading.Thread | None = None
 
@@ -583,6 +656,12 @@ class AgentCRRequestInterceptorServer:
             for key, value in headers.items()
             if key.lower() not in {"host", "content-length"}
         }
+        request_id = headers.get("X-AgentCR-Request-Id", "").strip()
+        request_attributes = {
+            "component": "interceptor",
+            "request_id": request_id,
+            "path": path,
+        }
         logger.debug(
             "Forwarding request upstream: path=%s header_count=%s payload_bytes=%s upstream_url=%s",
             path,
@@ -596,8 +675,15 @@ class AgentCRRequestInterceptorServer:
             headers=headers,
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=30.0) as resp:
+        started = time.perf_counter()
+        with urllib.request.urlopen(req, timeout=self._upstream_timeout_seconds) as resp:
             response_body = resp.read()
+            if self._telemetry is not None:
+                self._telemetry.emit_metric(
+                    "llm.upstream_latency_ms",
+                    (time.perf_counter() - started) * 1000.0,
+                    {**request_attributes, "status_code": int(resp.status)},
+                )
             logger.debug(
                 "Received upstream response: path=%s status_code=%s response_bytes=%s",
                 path,

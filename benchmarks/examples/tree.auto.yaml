@@ -1,0 +1,15 @@
+scenario: tree
+mode: auto
+provider: openai
+agent: simulated
+llm_service: simulated
+sandboxes: 3
+iterations: 1
+output: ../../logs/tmp/tree.auto.csv
+log_file: ../../logs/tmp/tree.auto.log
+log_level: info
+scenario_options:
+  source_steps: 10
+  branch_points: 3
+  fork_steps: 7
+  replay_mode: concurrent

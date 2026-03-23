@@ -24,20 +24,26 @@ class SimulatedAgent(BaseAgent):
         return self.wait_for_http_json(self.sandbox.status_url)
 
     def wait_for_progress(self, *, minimum_actions: int) -> dict[str, object]:
-        self.wait_for_condition(
+        reached = self.wait_for_condition(
             lambda: self._enough_progress(self.poll_status(), minimum_actions=minimum_actions),
             timeout_s=45.0,
+            raise_on_timeout=False,
         )
+        if not reached:
+            return dict(self.sandbox.last_status)
         payload = self.poll_status()
         self._record_activity(payload)
         return payload
 
     def wait_for_action_delta(self, *, delta: int) -> dict[str, object]:
         baseline = self._total_actions(self.sandbox.last_status)
-        self.wait_for_condition(
+        reached = self.wait_for_condition(
             lambda: self._total_actions(self.poll_status()) >= baseline + delta,
             timeout_s=45.0,
+            raise_on_timeout=False,
         )
+        if not reached:
+            return dict(self.sandbox.last_status)
         payload = self.poll_status()
         self._record_activity(payload)
         return payload

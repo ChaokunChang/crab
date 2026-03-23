@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 
-from ..contracts import FileSystemCWorker, FileSystemRWorker, SandboxRuntimeAdapter
+from ..contracts import FileSystemCWorker, FileSystemRWorker, Runtime
 from ..ids import CheckpointId
 from ..models import ArtifactKind, ArtifactPayload, CheckpointJob, CheckpointManifest, RestoreJob, WorkerStepResult
 
@@ -11,18 +11,18 @@ logger = logging.getLogger(__name__)
 
 
 class AdapterFileSystemCWorker(FileSystemCWorker):
-    def __init__(self, adapter: SandboxRuntimeAdapter):
-        self._adapter = adapter
+    def __init__(self, runtime: Runtime):
+        self._runtime = runtime
 
     def checkpoint(self, job: CheckpointJob, checkpoint_id: CheckpointId) -> WorkerStepResult:
         logger.debug(
-            "Running filesystem checkpoint worker for sandbox=%s checkpoint=%s adapter=%s",
+            "Running filesystem checkpoint worker for sandbox=%s checkpoint=%s runtime=%s",
             job.sandbox_id,
             checkpoint_id,
-            self._adapter.name,
+            self._runtime.name,
         )
-        status = self._adapter.checkpoint_filesystem(job.sandbox_id, checkpoint_id)
-        metadata = self._adapter.filesystem_checkpoint_metadata(job.sandbox_id, checkpoint_id)
+        status = self._runtime.checkpoint_filesystem(job.sandbox_id, checkpoint_id)
+        metadata = self._runtime.filesystem_checkpoint_metadata(job.sandbox_id, checkpoint_id)
         payload = {
             "sandbox_id": str(job.sandbox_id),
             "checkpoint_id": str(checkpoint_id),
@@ -38,7 +38,7 @@ class AdapterFileSystemCWorker(FileSystemCWorker):
             kind=ArtifactKind.FILESYSTEM,
             name="filesystem_checkpoint.json",
             data=json.dumps(payload, sort_keys=True, indent=2).encode("utf-8"),
-            metadata={"adapter": self._adapter.name},
+            metadata={"runtime": self._runtime.name},
         )
         logger.debug(
             "Filesystem checkpoint worker finished for sandbox=%s checkpoint=%s executed=%s",
@@ -50,8 +50,8 @@ class AdapterFileSystemCWorker(FileSystemCWorker):
 
 
 class AdapterFileSystemRWorker(FileSystemRWorker):
-    def __init__(self, adapter: SandboxRuntimeAdapter):
-        self._adapter = adapter
+    def __init__(self, runtime: Runtime):
+        self._runtime = runtime
 
     def restore(self, job: RestoreJob, manifest: CheckpointManifest) -> WorkerStepResult:
         restore_checkpoint_id = _restore_checkpoint_id(
@@ -59,7 +59,7 @@ class AdapterFileSystemRWorker(FileSystemRWorker):
             metadata_key="filesystem_restore_checkpoint_id",
             default=job.checkpoint_id,
         )
-        status = self._adapter.restore_filesystem(job.sandbox_id, restore_checkpoint_id)
+        status = self._runtime.restore_filesystem(job.sandbox_id, restore_checkpoint_id)
         logger.debug(
             "Filesystem restore worker finished for sandbox=%s checkpoint=%s restore_checkpoint=%s executed=%s",
             job.sandbox_id,

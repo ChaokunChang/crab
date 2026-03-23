@@ -86,7 +86,8 @@ class RemoteInspectorTests(unittest.TestCase):
         self.assertTrue(snapshot.process_changed)
         self.assertFalse(snapshot.filesystem_changed)
         self.assertEqual(snapshot.metadata["object_id"], "abc")
-        self.assertEqual(snapshot.last_checkpoint_at, datetime(2026, 3, 11, 11, 55, tzinfo=timezone.utc))
+        self.assertEqual(snapshot.metadata["host_last_reset_at"], "2026-03-11T11:55:00+00:00")
+        self.assertIsNone(snapshot.last_checkpoint_at)
 
     def test_remote_inspector_degrades_to_all_true_on_read_failure(self) -> None:
         inspector = RemoteSandboxInspector(FailingServiceClient())
@@ -140,7 +141,36 @@ class RemoteInspectorTests(unittest.TestCase):
         self.assertFalse(synced.filesystem_changed)
         self.assertTrue(synced.metadata["seeded"])
         self.assertEqual(synced.metadata["object_id"], "sbx-seeded")
-        self.assertEqual(synced.last_checkpoint_at, observed_at)
+        self.assertEqual(synced.metadata["host_last_reset_at"], observed_at.isoformat())
+        self.assertIsNone(synced.last_checkpoint_at)
+
+    def test_remote_inspector_preserves_real_checkpoint_timestamp_from_local_state(self) -> None:
+        client = DeferredResetServiceClient()
+        client.registered = True
+        inspector = RemoteSandboxInspector(client)
+        sandbox_id = SandboxId("sbx-checkpointed")
+        observed_at = datetime(2026, 3, 11, 12, 0, tzinfo=timezone.utc)
+        checkpoint_at = datetime(2026, 3, 11, 12, 5, tzinfo=timezone.utc)
+
+        inspector.upsert_snapshot(
+            SandboxSnapshot(
+                sandbox_id=sandbox_id,
+                runtime_name="runc",
+                is_running=True,
+                process_changed=True,
+                filesystem_changed=True,
+                observed_at=observed_at,
+                metadata={"seeded": True},
+            )
+        )
+
+        inspector.mark_checkpoint_complete(sandbox_id, process=True, filesystem=True, at=checkpoint_at)
+        snapshot = inspector.inspect(sandbox_id)
+
+        self.assertEqual(snapshot.last_checkpoint_at, checkpoint_at)
+        self.assertEqual(snapshot.metadata["host_last_reset_at"], checkpoint_at.isoformat())
+        self.assertFalse(snapshot.process_changed)
+        self.assertFalse(snapshot.filesystem_changed)
 
 
 if __name__ == "__main__":

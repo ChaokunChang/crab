@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import shutil
 import socket
-import subprocess
+from typing import Callable
 
 from integrations.sandboxes.runtime.bundle import write_bundle_config
 from integrations.sandboxes.runtime.image import ImageRuntimeDefaults
@@ -39,13 +39,16 @@ def prepare_bundle_launch(
     network_namespace_path: Path | None = None,
     image_defaults: ImageRuntimeDefaults | None = None,
     image_rootfs_dir: Path | None = None,
+    bundle_spec_writer: Callable[[Path], None] | None = None,
 ) -> PreparedBundleLaunch:
     resolved_status_port = find_free_port() if status_port is None else status_port
     bundle_dir = bundle_root / sandbox_name
     if bundle_dir.exists():
         shutil.rmtree(bundle_dir, ignore_errors=True)
     bundle_dir.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["runc", "spec"], cwd=bundle_dir, check=True)
+    if bundle_spec_writer is None:
+        raise ValueError("bundle_spec_writer is required")
+    bundle_spec_writer(bundle_dir)
     llm_base_url = f"http://{interceptor_host}:{interceptor_port}/v1"
     write_bundle_config(
         bundle_dir=bundle_dir,
