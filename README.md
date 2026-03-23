@@ -209,6 +209,12 @@ agent: simulated | iflow
 llm_service: simulated | manual | simulated_for_iflow | iflow_trace_replay
 task_dataset: path/to/tasks.jsonl
 sandboxes: 1
+max_workers: 32  # legacy fallback for all phases when phase_workers is omitted
+phase_workers:
+  build: 16
+  prepare: 16
+  run: 32
+  verification: 8
 iterations: 5
 output: logs/tmp/out.csv
 log_file: logs/tmp/out.log
@@ -230,6 +236,34 @@ work_dir_host_root: logs/tmp
 scenario_options: {}
 llm_service_options: {}  # merged into per-task llm_service_config
 ```
+
+Benchmark runs now use a four-phase pipeline:
+
+- `build`: shared image/materialization work
+- `prepare`: bundle/rootfs/workdir/network setup before `runc` starts
+- `run`: sandbox start plus scenario workload/recovery logic
+- `verification`: post-run validation
+
+The runner enforces two barriers:
+
+- all sandboxes must finish `build` and `prepare` before any sandbox enters `run`
+- all sandboxes must finish `run` before any sandbox enters `verification`
+
+`phase_workers` lets each phase use a different concurrency limit. When `phase_workers` is omitted, or when a phase key is missing, that phase falls back to `max_workers` and then to `sandboxes`.
+
+Example:
+
+```yaml
+sandboxes: 100
+max_workers: 32
+phase_workers:
+  build: 16
+  prepare: 16
+  run: 32
+  verification: 8
+```
+
+This prepares all 100 sandboxes first, then starts the run phase with at most 32 concurrent run workers, and only starts verification after every run-phase task is complete.
 
 Benchmark artifacts now include both:
 
@@ -275,6 +309,8 @@ Logging notes:
 - `telemetry.capture_command_output` is `false` by default to avoid storing command stdout/stderr in normal runs.
 - `telemetry.max_text_attribute_bytes` bounds long text attributes when detailed capture is enabled.
 - The legacy top-level `telemetry_output` field is still accepted for compatibility, but `telemetry.output` is the preferred YAML form.
+- `phase_workers` overrides concurrency per benchmark phase. Missing phase keys fall back to `max_workers`.
+- Phase telemetry now emits distinct phase-qualified records such as `benchmark.phase.build.*`, `benchmark.phase.prepare.*`, `benchmark.phase.run.*`, `benchmark.phase.verification.*`, and `benchmark.phase.<phase>.item.*` so JSONL output shows phase timing and configured concurrency.
 - `zpool_size` controls the backing file size for ephemeral benchmark zpools.
 - `reuse_zpool: true` keeps the zpool across runs instead of recreating it every time.
 - When reusing a pool, set both `zpool_name` and `zpool_image` to stable values. Each run still destroys and recreates the `pool/agent-cr` dataset so the benchmark starts clean.

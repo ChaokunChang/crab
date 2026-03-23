@@ -332,15 +332,28 @@ Important:
 
 Benchmark telemetry is the preferred source for benchmark-level summary metrics when available.
 
+### Phase Lifecycle
+
+The benchmark harness now runs four explicit phases: `build`, `prepare`, `run`, and `verification`.
+
+| Name | Meaning |
+| --- | --- |
+| `benchmark.phase.build.start` / `finish` / `duration_ms` | Whole-run timing for the `build` phase. Carries `phase`, `phase_scope="run"`, `sandbox_count`, and `configured_max_workers`. |
+| `benchmark.phase.prepare.start` / `finish` / `duration_ms` | Whole-run timing for the `prepare` phase. Carries `phase`, `phase_scope="run"`, `sandbox_count`, and `configured_max_workers`. |
+| `benchmark.phase.run.start` / `finish` / `duration_ms` | Whole-run timing for the `run` phase. Carries `phase`, `phase_scope="run"`, `sandbox_count`, and `configured_max_workers`. |
+| `benchmark.phase.verification.start` / `finish` / `duration_ms` | Whole-run timing for the `verification` phase. Carries `phase`, `phase_scope="run"`, `sandbox_count`, and `configured_max_workers`. |
+| `benchmark.phase.<phase>.item.start` / `finish` / `duration_ms` | Per-sandbox timing inside a phase. Carries `phase`, `phase_scope="sandbox"`, plus benchmark sandbox/task attributes. |
+| `benchmark.phase.<phase>.configured_max_workers` | Configured worker cap emitted once per phase. Carries `phase` and `phase_scope="run"`. |
+
 ### Task Lifecycle
 
 | Name | Meaning |
 | --- | --- |
-| `benchmark.task.start` | Benchmark submitted the task future. |
+| `benchmark.task.start` | Benchmark submitted the task future during the `run` phase. |
 | `benchmark.task.finish` | Task future completed. |
 | `benchmark.task.duration_ms` | Task end-to-end latency from benchmark task start to task future completion. |
 | `benchmark.task.ready` | Sandbox task reported ready after launch or recovery. |
-| `benchmark.task.verify.start` / `finish` / `duration_ms` | Verification script execution. |
+| `benchmark.task.verify.start` / `finish` / `duration_ms` | Verification script execution during the `verification` phase. |
 | `benchmark.task.success_ratio` | Benchmark success ratio emitted as telemetry. |
 
 ### Scenario Row Metrics

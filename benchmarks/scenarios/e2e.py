@@ -8,10 +8,15 @@ from integrations.agents import TaskConfig, TaskDescription
 from benchmarks.config import BenchmarkConfig
 from benchmarks.core import (
     annotate_row,
+    benchmark_phase_item_attributes,
+    benchmark_phase_map,
+    build_task_records_phase,
     emit_row_telemetry,
-    launch_task_records,
+    make_benchmark_sandbox_specs,
     poll_sandbox_status,
+    prepare_task_records_phase,
     resolve_task_records,
+    start_prepared_task_record,
     trace_response_count_for_sandbox,
 )
 from benchmarks.scenarios import HarnessSettings, ScenarioDefinition
@@ -51,18 +56,13 @@ def build_harness_settings(config: BenchmarkConfig) -> HarnessSettings:
     )
 
 
-def _run_replay_accuracy_sandbox(
+def _run_replay_accuracy_sandbox_run(
     config: BenchmarkConfig,
     harness,
     sandbox,
 ) -> dict[str, object]:
     task_started = time.perf_counter()
     task_error = ""
-    verification = {
-        "verification_status": "task_failed",
-        "verification_exit_code": -1,
-        "verification_ms": 0.0,
-    }
     try:
         harness.wait_for_task_completion(
             sandbox,
@@ -72,6 +72,29 @@ def _run_replay_accuracy_sandbox(
         task_error = str(exc)
     task_completion_ms = (time.perf_counter() - task_started) * 1000.0
 
+    status = poll_sandbox_status(sandbox)
+    return {
+        "config": config,
+        "harness": harness,
+        "sandbox": sandbox,
+        "task_error": task_error,
+        "task_completion_ms": task_completion_ms,
+        "status": status,
+    }
+
+
+def _verify_replay_accuracy_sandbox(run_result: dict[str, object]) -> dict[str, object]:
+    config = run_result["config"]
+    harness = run_result["harness"]
+    sandbox = run_result["sandbox"]
+    task_error = str(run_result["task_error"])
+    task_completion_ms = float(run_result["task_completion_ms"])
+    status = dict(run_result["status"])
+    verification = {
+        "verification_status": "task_failed",
+        "verification_exit_code": -1,
+        "verification_ms": 0.0,
+    }
     if not task_error:
         try:
             verification = harness.verify_task_accuracy(
@@ -87,8 +110,6 @@ def _run_replay_accuracy_sandbox(
                 "verification_stderr": str(exc),
                 "verification_command": "",
             }
-
-    status = poll_sandbox_status(sandbox)
     success_ratio = 1.0 if verification["verification_status"] == "passed" else 0.0
     row = annotate_row(
         config,
@@ -117,19 +138,66 @@ def run_manual(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
         default_task_description=benchmark_task_description(),
         default_task_config=default_task_config(),
     )
-    sandboxes = launch_task_records(
-        harness,
+    specs = make_benchmark_sandbox_specs(
         sandbox_name_prefix="sandbox",
         records=records,
-        max_workers=config.effective_max_workers,
     )
-    if sandboxes and any(is_replay_llm_service_type(sandbox.llm_service_type) for sandbox in sandboxes):
-        rows = [
-            _run_replay_accuracy_sandbox(config, harness, sandbox)
-            for sandbox in sandboxes
-        ]
+    build_task_records_phase(
+        harness,
+        specs=specs,
+        max_workers=config.effective_phase_workers.build,
+    )
+    prepared = prepare_task_records_phase(
+        harness,
+        specs=specs,
+        max_workers=config.effective_phase_workers.prepare,
+    )
+    if records and any(is_replay_llm_service_type(record.llm_service_type) for record in records):
+        run_results = benchmark_phase_map(
+            prepared,
+            lambda item: _run_replay_accuracy_sandbox_run(
+                config,
+                harness,
+                start_prepared_task_record(harness, item),
+            ),
+            phase="run",
+            max_workers=config.effective_phase_workers.run,
+            harness=harness,
+            item_attributes=lambda item: benchmark_phase_item_attributes(
+                harness,
+                phase="run",
+                sandbox_name=item.sandbox_name,
+                sandbox=item.handle,
+            ),
+        )
+        rows = benchmark_phase_map(
+            run_results,
+            _verify_replay_accuracy_sandbox,
+            phase="verification",
+            max_workers=config.effective_phase_workers.verification,
+            harness=harness,
+            item_attributes=lambda item: benchmark_phase_item_attributes(
+                harness,
+                phase="verification",
+                sandbox_name=str(item["sandbox"].sandbox_id),
+                sandbox=item["sandbox"],
+            ),
+        )
         return sorted(rows, key=lambda row: str(row["sandbox_id"]))
 
+    sandboxes = benchmark_phase_map(
+        prepared,
+        lambda item: start_prepared_task_record(harness, item),
+        phase="run",
+        max_workers=config.effective_phase_workers.run,
+        harness=harness,
+        item_attributes=lambda item: benchmark_phase_item_attributes(
+            harness,
+            phase="run",
+            sandbox_name=item.sandbox_name,
+            sandbox=item.handle,
+        ),
+    )
     rows: list[dict[str, object]] = []
     for iteration in range(1, config.iterations + 1):
         checkpoint_results = []

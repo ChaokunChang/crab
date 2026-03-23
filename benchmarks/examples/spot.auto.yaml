@@ -4,6 +4,11 @@ provider: openai
 agent: simulated
 llm_service: simulated
 sandboxes: 10
+phase_workers:
+  build: 4
+  prepare: 4
+  run: 10
+  verification: 4
 iterations: 10
 output: ../../logs/tmp/spot.auto.csv
 log_file: ../../logs/tmp/spot.auto.log

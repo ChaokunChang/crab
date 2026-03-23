@@ -166,6 +166,18 @@ class AgentSandboxImage:
     image_defaults: sandbox_image.ImageRuntimeDefaults
 
 
+@dataclass
+class PreparedBenchmarkSandbox:
+    handle: SandboxHandle
+    sandbox_name: str
+    task_record: benchmark_support.BenchmarkTaskRecord
+    prelaunch_task_run: BaseAgent | None = None
+    work_dir_host_path: Path | None = None
+    wait_for_ready_before_task_start: bool = False
+    wait_for_ready_after_task_start: bool = False
+    emit_ready_event: bool = True
+
+
 class RealHostScenarioHarness:
     @property
     def _active_runtime(self):
@@ -602,6 +614,16 @@ class RealHostScenarioHarness:
             self._sandbox_images[agent_type] = built
             return built
 
+    def build_task_record(
+        self,
+        sandbox_name: str,
+        task_record: benchmark_support.BenchmarkTaskRecord,
+    ) -> None:
+        _ = sandbox_name
+        if task_record.docker_compose_file is not None:
+            return
+        self.ensure_sandbox_image(task_record.agent_type)
+
     def get_sandbox_handle(self, sandbox_id: str | SandboxId) -> SandboxHandle:
         target = SandboxId(str(sandbox_id))
         return self._sandbox_by_id[target]
@@ -863,12 +885,220 @@ class RealHostScenarioHarness:
         self.launch_task(agent_type, task_description, task_config, str(handle.sandbox_id))
         return handle
 
+    def prepare_task_record(
+        self,
+        sandbox_name: str,
+        task_record: benchmark_support.BenchmarkTaskRecord,
+    ) -> PreparedBenchmarkSandbox:
+        if task_record.docker_compose_file is not None:
+            prepared = self._prepare_compose_task_record(
+                sandbox_name=sandbox_name,
+                task_record=task_record,
+            )
+        else:
+            prepared = self._prepare_runc_task_record(
+                sandbox_name=sandbox_name,
+                task_record=task_record,
+            )
+        self._set_benchmark_launch_metadata(prepared.handle, sandbox_name=sandbox_name, task_record=task_record)
+        return prepared
+
+    def _set_benchmark_launch_metadata(
+        self,
+        handle: SandboxHandle,
+        *,
+        sandbox_name: str,
+        task_record: benchmark_support.BenchmarkTaskRecord,
+    ) -> None:
+        handle.launch_metadata["benchmark"] = {
+            "task_id": task_record.task_id or (task_record.task_root.name if task_record.task_root is not None else sandbox_name),
+            "trace_response_count": task_record.trace_response_count,
+            "trace_malformed_line_count": task_record.trace_malformed_line_count,
+            "llm_service_config": None if task_record.llm_service_config is None else dict(task_record.llm_service_config),
+        }
+
+    def _prepare_runc_task_record(
+        self,
+        *,
+        sandbox_name: str,
+        task_record: benchmark_support.BenchmarkTaskRecord,
+    ) -> PreparedBenchmarkSandbox:
+        assert self.base_inspector is not None
+        assert self.system is not None
+        assert self.interceptor is not None
+        sandbox_image = self.ensure_sandbox_image(task_record.agent_type)
+        resolved_llm_service_type = self.resolve_llm_service_type(
+            agent_type=task_record.agent_type,
+            llm_service_type=task_record.llm_service_type,
+        )
+        network_lease = (
+            self.network_manager.allocate_lease(SandboxId(sandbox_name))
+            if self._agent_requires_benchmark_network(task_record.agent_type)
+            else None
+        )
+        handle, work_dir_host_path = self._prepare_sandbox_handle(
+            sandbox_name,
+            interceptor_host=self.network_manager.bridge_ip if network_lease is not None else "127.0.0.1",
+            network_lease=network_lease,
+            agent_type=task_record.agent_type,
+            llm_service_type=resolved_llm_service_type,
+            llm_service_config=task_record.llm_service_config,
+            image_defaults=sandbox_image.image_defaults,
+            image_rootfs_dir=sandbox_image.exported_rootfs,
+        )
+        handle.task_description = task_record.task_description
+        handle.task_config = task_record.task_config
+        prelaunch_task_run = self.build_task_run(
+            task_record.agent_type,
+            handle,
+            task_record.task_description,
+            task_record.task_config,
+        )
+        prelaunch_task_run.prepare_sandbox()
+        prelaunch_task_run.configure_bundle()
+        handle.launch_metadata = {
+            "sandbox_id": sandbox_name,
+            "bundle_path": str(handle.bundle_dir),
+            "work_dir_host_path": None if work_dir_host_path is None else str(work_dir_host_path),
+            "rootfs_init_dirs": prelaunch_task_run.rootfs_init_dirs(),
+            "rootfs_copy_paths": [{"source": str(sandbox_image.exported_rootfs), "destination": "/"}],
+            **prelaunch_task_run.extra_launch_metadata(),
+            **handle.launch_metadata.get("runtime", {}),
+        }
+        return PreparedBenchmarkSandbox(
+            handle=handle,
+            sandbox_name=sandbox_name,
+            task_record=task_record,
+            prelaunch_task_run=prelaunch_task_run,
+            work_dir_host_path=work_dir_host_path,
+            wait_for_ready_before_task_start=True,
+        )
+
+    def _prepare_compose_task_record(
+        self,
+        *,
+        sandbox_name: str,
+        task_record: benchmark_support.BenchmarkTaskRecord,
+    ) -> PreparedBenchmarkSandbox:
+        assert task_record.docker_compose_file is not None
+        compose_env = self._build_termnius_compose_env(
+            sandbox_name=sandbox_name,
+            task_root=task_record.task_root,
+        )
+        service_name, service = sandbox_compose.load_compose_service(
+            compose_file=task_record.docker_compose_file,
+            env_file=task_record.env_file,
+            extra_env=compose_env,
+            service_name=task_record.service_name,
+        )
+        network_lease = self.network_manager.allocate_lease(SandboxId(sandbox_name))
+        handle, work_dir_host_path = self._prepare_sandbox_handle(
+            sandbox_name,
+            interceptor_host=self.network_manager.bridge_ip,
+            network_lease=network_lease,
+            agent_type=task_record.agent_type,
+            llm_service_type=self.resolve_llm_service_type(
+                agent_type=task_record.agent_type,
+                llm_service_type=task_record.llm_service_type,
+            ),
+            llm_service_config=task_record.llm_service_config,
+            status_host=network_lease.guest_ip,
+        )
+        handle.task_description = task_record.task_description
+        handle.task_config = task_record.task_config
+        prelaunch_task_run = self.build_task_run(
+            task_record.agent_type,
+            handle,
+            task_record.task_description,
+            task_record.task_config,
+        )
+        prelaunch_task_run.prepare_sandbox()
+        translation = sandbox_compose.translate_compose_service(
+            compose_file=task_record.docker_compose_file,
+            service_name=service_name,
+            service=service,
+            bundle_dir=handle.bundle_dir,
+            sandbox_id=str(handle.sandbox_id),
+            work_dir_host_path=work_dir_host_path,
+            compose_image_root=self.image_cache_root,
+            compose_image_tags=self._compose_image_tags,
+            telemetry=self.telemetry,
+        )
+        handle.launch_source = "compose"
+        handle.launch_metadata["runtime"] = dict(translation.runtime_launch_metadata)
+        handle.launch_metadata["compose"] = dict(translation.compose_launch_metadata)
+        if task_record.task_root is not None:
+            handle.launch_metadata["task_root"] = str(task_record.task_root)
+            self._extend_termnius_rootfs_materialization(handle.launch_metadata["runtime"], task_record.task_root)
+        self._ensure_termnius_dns_materialization(handle.launch_metadata["runtime"])
+        self._configure_termnius_bundle_privileges(handle.bundle_dir)
+        runtime_metadata = handle.launch_metadata["runtime"]
+        runtime_metadata["rootfs_init_dirs"] = sorted(
+            set(runtime_metadata.get("rootfs_init_dirs", [])) | set(prelaunch_task_run.rootfs_init_dirs())
+        )
+        runtime_metadata.update(prelaunch_task_run.extra_launch_metadata())
+        prelaunch_task_run.configure_bundle()
+        return PreparedBenchmarkSandbox(
+            handle=handle,
+            sandbox_name=sandbox_name,
+            task_record=task_record,
+            prelaunch_task_run=prelaunch_task_run,
+            work_dir_host_path=work_dir_host_path,
+            wait_for_ready_after_task_start=True,
+        )
+
+    def run_prepared_task_record(
+        self,
+        prepared: PreparedBenchmarkSandbox,
+    ) -> SandboxHandle:
+        assert self.base_inspector is not None
+        runtime = self._active_runtime
+        if runtime is None:
+            raise RuntimeError("runtime is not initialized")
+        handle = prepared.handle
+        network_lease = self.network_manager.lease_for(handle.sandbox_id)
+        if network_lease is not None:
+            self.network_manager.register_guest_ip(network_lease.guest_ip, handle.sandbox_id)
+        self.base_inspector.upsert_snapshot(
+            SandboxSnapshot(
+                sandbox_id=handle.sandbox_id,
+                runtime_name="runc",
+                is_running=True,
+                process_changed=False,
+                filesystem_changed=False,
+                observed_at=utc_now(),
+            )
+        )
+        runtime_metadata = handle.launch_metadata.get("runtime", handle.launch_metadata)
+        runtime.launch("runc", runtime_metadata)
+        handle.last_status = {}
+        if prepared.prelaunch_task_run is not None and prepared.wait_for_ready_before_task_start:
+            prepared.prelaunch_task_run.wait_for_task_ready()
+            if prepared.emit_ready_event:
+                self.emit_benchmark_event("benchmark.task.ready", handle)
+        if handle.task_description is not None and handle.task_config is not None:
+            self.launch_task(
+                handle.agent_type,
+                handle.task_description,
+                handle.task_config,
+                str(handle.sandbox_id),
+            )
+        if prepared.wait_for_ready_after_task_start and handle.task_run is not None:
+            try:
+                handle.task_run.wait_for_task_ready()
+            except RuntimeError:
+                pass
+            else:
+                if prepared.emit_ready_event:
+                    self.emit_benchmark_event("benchmark.task.ready", handle)
+        return handle
+
     def launch_task_record(
         self,
         sandbox_name: str,
         task_record: benchmark_support.BenchmarkTaskRecord,
     ) -> SandboxHandle:
-        if task_record.docker_compose_file is not None:
+        if task_record.docker_compose_file is not None and self.root is None:
             handle = self.launch_sandbox_from_docker_compose_file(
                 task_record.docker_compose_file,
                 task_record.env_file,
@@ -881,21 +1111,12 @@ class RealHostScenarioHarness:
                 task_config=task_record.task_config,
                 task_root=task_record.task_root,
             )
-        else:
-            handle = self.launch_sandbox_and_task(
-                sandbox_name,
-                agent_type=task_record.agent_type,
-                llm_service_type=task_record.llm_service_type,
-                llm_service_config=task_record.llm_service_config,
-                task_description=task_record.task_description,
-                task_config=task_record.task_config,
-            )
-        handle.launch_metadata["benchmark"] = {
-            "task_id": task_record.task_id or (task_record.task_root.name if task_record.task_root is not None else sandbox_name),
-            "trace_response_count": task_record.trace_response_count,
-            "trace_malformed_line_count": task_record.trace_malformed_line_count,
-            "llm_service_config": None if task_record.llm_service_config is None else dict(task_record.llm_service_config),
-        }
+            self._set_benchmark_launch_metadata(handle, sandbox_name=sandbox_name, task_record=task_record)
+            return handle
+        self.build_task_record(sandbox_name, task_record)
+        prepared = self.prepare_task_record(sandbox_name, task_record)
+        handle = self.run_prepared_task_record(prepared)
+        self._set_benchmark_launch_metadata(handle, sandbox_name=sandbox_name, task_record=task_record)
         return handle
 
     def launch_sandbox_from_docker_compose_file(

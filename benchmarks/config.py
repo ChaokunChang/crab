@@ -18,6 +18,7 @@ _PROVIDERS = {"openai", "anthropic"}
 _LOG_LEVELS = {"debug", "info", "warning", "error", "critical"}
 _LOG_FILE_MODES = {"append": "a", "write": "w"}
 _TELEMETRY_DETAIL_LEVELS = {"basic", "detailed"}
+_BENCHMARK_PHASES = ("build", "prepare", "run", "verification")
 _SUPPORTED_MODES = {
     "e2e": {"manual"},
     "fault": {"manual", "auto"},
@@ -33,6 +34,38 @@ _DEFAULT_ITERATIONS = {
 
 
 @dataclass(frozen=True)
+class BenchmarkPhaseWorkers:
+    build: int | None = None
+    prepare: int | None = None
+    run: int | None = None
+    verification: int | None = None
+
+    def resolve(self, *, default: int) -> "ResolvedBenchmarkPhaseWorkers":
+        return ResolvedBenchmarkPhaseWorkers(
+            build=default if self.build is None else int(self.build),
+            prepare=default if self.prepare is None else int(self.prepare),
+            run=default if self.run is None else int(self.run),
+            verification=default if self.verification is None else int(self.verification),
+        )
+
+
+@dataclass(frozen=True)
+class ResolvedBenchmarkPhaseWorkers:
+    build: int
+    prepare: int
+    run: int
+    verification: int
+
+    def for_phase(self, phase: str) -> int:
+        if phase not in _BENCHMARK_PHASES:
+            raise KeyError(f"unknown benchmark phase {phase!r}")
+        return int(getattr(self, phase))
+
+    def as_dict(self) -> dict[str, int]:
+        return {phase: self.for_phase(phase) for phase in _BENCHMARK_PHASES}
+
+
+@dataclass(frozen=True)
 class BenchmarkConfig:
     config_path: Path
     scenario: str
@@ -43,6 +76,7 @@ class BenchmarkConfig:
     task_dataset: Path | None = None
     sandboxes: int = 1
     max_workers: int | None = None
+    phase_workers: BenchmarkPhaseWorkers | None = None
     iterations: int = 1
     output: Path | None = None
     telemetry_output: Path | None = None
@@ -72,6 +106,11 @@ class BenchmarkConfig:
         configured = self.max_workers if self.max_workers is not None else self.sandboxes
         return max(1, min(self.sandboxes, configured))
 
+    @property
+    def effective_phase_workers(self) -> ResolvedBenchmarkPhaseWorkers:
+        overrides = self.phase_workers or BenchmarkPhaseWorkers()
+        return overrides.resolve(default=self.effective_max_workers)
+
 
 def _resolve_optional_path(base_dir: Path, raw_value: object) -> Path | None:
     if raw_value is None:
@@ -88,6 +127,28 @@ def _require_object(payload: object, *, label: str) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise ValueError(f"{label} must be a mapping")
     return dict(payload)
+
+
+def _load_phase_workers(payload: object) -> BenchmarkPhaseWorkers | None:
+    if payload is None:
+        return None
+    data = _require_object(payload, label="phase_workers")
+    unknown = sorted(set(data) - set(_BENCHMARK_PHASES))
+    if unknown:
+        raise ValueError(
+            f"phase_workers contains unknown phases {unknown}; expected only {list(_BENCHMARK_PHASES)}"
+        )
+    values: dict[str, int | None] = {}
+    for phase in _BENCHMARK_PHASES:
+        raw_value = data.get(phase)
+        if raw_value is None:
+            values[phase] = None
+            continue
+        value = int(raw_value)
+        if value <= 0:
+            raise ValueError(f"phase_workers.{phase} must be positive, got {value}")
+        values[phase] = value
+    return BenchmarkPhaseWorkers(**values)
 
 
 def load_config(path: Path) -> BenchmarkConfig:
@@ -124,6 +185,7 @@ def load_config(path: Path) -> BenchmarkConfig:
     max_workers = None if raw_max_workers is None else int(raw_max_workers)
     if max_workers is not None and max_workers <= 0:
         raise ValueError(f"max_workers must be positive when provided, got {max_workers}")
+    phase_workers = _load_phase_workers(data.get("phase_workers"))
 
     iterations = int(data.get("iterations", _DEFAULT_ITERATIONS[scenario]))
     if iterations <= 0:
@@ -181,6 +243,7 @@ def load_config(path: Path) -> BenchmarkConfig:
         task_dataset=_resolve_optional_path(base_dir, data.get("task_dataset")),
         sandboxes=sandboxes,
         max_workers=max_workers,
+        phase_workers=phase_workers,
         iterations=iterations,
         output=_resolve_optional_path(base_dir, data.get("output")),
         telemetry_output=telemetry_output,
