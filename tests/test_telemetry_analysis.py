@@ -164,5 +164,216 @@ class TelemetryAnalysisTests(unittest.TestCase):
             self.assertTrue((root / "report" / "slow_operations.csv").exists())
 
 
+    def test_exclude_failed_tasks_filters_sandboxes_with_zero_success_ratio(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_telemetry_filter_") as tmp:
+            path = Path(tmp) / "telemetry.jsonl"
+            records = [
+                # Sandbox sbx-1 succeeds (success_ratio=1.0)
+                {
+                    "timestamp": "2026-03-23T01:00:00+08:00",
+                    "kind": "metric",
+                    "name": "benchmark.task.duration_ms",
+                    "value": 100.0,
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "sbx-1",
+                        "task_id": "task-1",
+                        "component": "benchmark",
+                        "agent_type": "iflow",
+                        "llm_service_type": "iflow_trace_replay",
+                        "status": "succeeded",
+                    },
+                },
+                {
+                    "timestamp": "2026-03-23T01:00:01+08:00",
+                    "kind": "metric",
+                    "name": "benchmark.task.success_ratio",
+                    "value": 1.0,
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "sbx-1",
+                        "task_id": "task-1",
+                        "component": "benchmark",
+                    },
+                },
+                # Sandbox sbx-2 fails (success_ratio=0.0)
+                {
+                    "timestamp": "2026-03-23T01:00:02+08:00",
+                    "kind": "metric",
+                    "name": "benchmark.task.duration_ms",
+                    "value": 200.0,
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "sbx-2",
+                        "task_id": "task-1",
+                        "component": "benchmark",
+                        "agent_type": "iflow",
+                        "llm_service_type": "iflow_trace_replay",
+                        "status": "succeeded",
+                    },
+                },
+                {
+                    "timestamp": "2026-03-23T01:00:03+08:00",
+                    "kind": "metric",
+                    "name": "benchmark.task.success_ratio",
+                    "value": 0.0,
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "sbx-2",
+                        "task_id": "task-1",
+                        "component": "benchmark",
+                    },
+                },
+                # Sandbox sbx-3 succeeds with a different task
+                {
+                    "timestamp": "2026-03-23T01:00:04+08:00",
+                    "kind": "event",
+                    "name": "checkpoint.flow.start",
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "sbx-3",
+                        "task_id": "task-2",
+                    },
+                },
+                {
+                    "timestamp": "2026-03-23T01:00:05+08:00",
+                    "kind": "event",
+                    "name": "checkpoint.flow.finish",
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "sbx-3",
+                        "task_id": "task-2",
+                        "status": "succeeded",
+                    },
+                },
+                {
+                    "timestamp": "2026-03-23T01:00:05+08:00",
+                    "kind": "metric",
+                    "name": "benchmark.task.duration_ms",
+                    "value": 80.0,
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "sbx-3",
+                        "task_id": "task-2",
+                        "component": "benchmark",
+                        "agent_type": "iflow",
+                        "llm_service_type": "iflow_trace_replay",
+                    },
+                },
+                {
+                    "timestamp": "2026-03-23T01:00:06+08:00",
+                    "kind": "metric",
+                    "name": "benchmark.task.success_ratio",
+                    "value": 1.0,
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "sbx-3",
+                        "task_id": "task-2",
+                        "component": "benchmark",
+                    },
+                },
+            ]
+            path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+
+            # Without filtering: all 3 sandboxes appear
+            analysis_all = analyze_telemetry_file(path, exclude_failed_tasks=False)
+            self.assertEqual(analysis_all.distinct_sandboxes, 3)
+            self.assertFalse(analysis_all.exclude_failed_tasks)
+            self.assertEqual(len(analysis_all.excluded_sandbox_task_pairs), 0)
+            all_task_ids = {t.task_id for t in analysis_all.task_summaries}
+            self.assertIn("task-1", all_task_ids)
+
+            # With filtering: sbx-2 is excluded
+            analysis_filtered = analyze_telemetry_file(path, exclude_failed_tasks=True)
+            self.assertTrue(analysis_filtered.exclude_failed_tasks)
+            self.assertEqual(len(analysis_filtered.excluded_sandbox_task_pairs), 1)
+            self.assertEqual(analysis_filtered.excluded_sandbox_task_pairs[0], ("sbx-2", "task-1"))
+            self.assertEqual(analysis_filtered.distinct_sandboxes, 2)
+            self.assertNotIn("sbx-2", {
+                sid
+                for task in analysis_filtered.task_summaries
+                for sid in task.sandbox_ids
+            })
+            # task-1 still appears from sbx-1
+            filtered_task_ids = {t.task_id for t in analysis_filtered.task_summaries}
+            self.assertIn("task-1", filtered_task_ids)
+            self.assertIn("task-2", filtered_task_ids)
+            # task-1 duration should be 100 (from sbx-1 only), not averaged with sbx-2's 200
+            task1 = next(t for t in analysis_filtered.task_summaries if t.task_id == "task-1")
+            self.assertAlmostEqual(task1.metrics["benchmark.task.duration_ms"], 100.0)
+
+    def test_exclude_failed_tasks_report_bundle_includes_exclusion_info(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_telemetry_filter_report_") as tmp:
+            root = Path(tmp)
+            path = root / "telemetry.jsonl"
+            records = [
+                {
+                    "timestamp": "2026-03-23T01:00:00+08:00",
+                    "kind": "metric",
+                    "name": "benchmark.task.duration_ms",
+                    "value": 50.0,
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "sbx-1",
+                        "task_id": "task-1",
+                        "component": "benchmark",
+                    },
+                },
+                {
+                    "timestamp": "2026-03-23T01:00:01+08:00",
+                    "kind": "metric",
+                    "name": "benchmark.task.success_ratio",
+                    "value": 0.0,
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "sbx-1",
+                        "task_id": "task-1",
+                        "component": "benchmark",
+                    },
+                },
+                {
+                    "timestamp": "2026-03-23T01:00:02+08:00",
+                    "kind": "metric",
+                    "name": "benchmark.task.duration_ms",
+                    "value": 30.0,
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "sbx-2",
+                        "task_id": "task-2",
+                        "component": "benchmark",
+                    },
+                },
+                {
+                    "timestamp": "2026-03-23T01:00:03+08:00",
+                    "kind": "metric",
+                    "name": "benchmark.task.success_ratio",
+                    "value": 1.0,
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "sbx-2",
+                        "task_id": "task-2",
+                        "component": "benchmark",
+                    },
+                },
+            ]
+            path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+
+            analysis = generate_report_bundle(
+                path, output_dir=root / "report", exclude_failed_tasks=True,
+            )
+
+            self.assertTrue(analysis.exclude_failed_tasks)
+            self.assertEqual(len(analysis.excluded_sandbox_task_pairs), 1)
+            self.assertEqual(analysis.distinct_sandboxes, 1)
+            # Check report HTML contains exclusion info
+            html = (root / "report" / "report.html").read_text(encoding="utf-8")
+            self.assertIn("Excluded Failed Sandboxes", html)
+            self.assertIn("sbx-1", html)
+            # Check summary JSON
+            summary = json.loads((root / "report" / "summary.json").read_text(encoding="utf-8"))
+            self.assertTrue(summary["exclude_failed_tasks"])
+            self.assertEqual(len(summary["excluded_sandbox_task_pairs"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

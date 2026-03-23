@@ -5,6 +5,7 @@ import csv
 from dataclasses import asdict
 from html import escape
 import json
+import math
 from pathlib import Path
 from typing import Iterable
 
@@ -25,28 +26,90 @@ def _format_metric_label(metric_name: str) -> str:
     return metric_name.replace(".duration_ms", "").replace("_", " ")
 
 
-def _svg_bar_chart(title: str, rows: list[tuple[str, float]], *, width: int = 900, row_height: int = 24) -> str:
+def _svg_bar_chart(
+    title: str,
+    rows: list[tuple[str, float]],
+    *,
+    width: int = 900,
+    row_height: int = 28,
+    log_scale: bool = False,
+) -> str:
     if not rows:
         return f"<section><h3>{escape(title)}</h3><p>No data.</p></section>"
     max_label = max(len(label) for label, _ in rows)
-    left_pad = min(340, max(140, max_label * 7))
-    bar_width = width - left_pad - 100
-    max_value = max(value for _, value in rows) or 1.0
-    height = 40 + row_height * len(rows)
+    left_pad = min(380, max(160, max_label * 8))
+    max_value_text_len = max(len(_format_number(value)) for _, value in rows)
+    value_text_reserve = max(110, max_value_text_len * 9 + 28)
+    bar_area = max(40, width - left_pad - value_text_reserve)
+    height = 44 + row_height * len(rows)
+
+    if log_scale:
+        log_values = [math.log10(1.0 + v) for _, v in rows]
+        max_log = max(log_values) or 1.0
+    else:
+        max_value = max(value for _, value in rows) or 1.0
+        # Determine a crop threshold: if the top value is more than 5x the
+        # median, we cap the bar at a visible fraction so that smaller bars
+        # remain readable.  The actual numeric label still shows the real value.
+        sorted_values = sorted((v for _, v in rows), reverse=True)
+        median_value = sorted_values[len(sorted_values) // 2] if sorted_values else max_value
+        crop_threshold = max(median_value * 5.0, max_value * 0.15) if median_value > 0 else max_value
+        use_crop = max_value > crop_threshold and crop_threshold > 0
+
     pieces = [
         f"<section><h3>{escape(title)}</h3>",
-        f"<svg width='{width}' height='{height}' viewBox='0 0 {width} {height}' role='img' aria-label='{escape(title)}'>",
-        "<style>.axis-label{font:12px sans-serif;fill:#334155}.bar{fill:#2563eb}.bar-text{font:11px sans-serif;fill:#0f172a}</style>",
+        f"<svg style='width:100%;max-width:{width}px;height:auto' viewBox='0 0 {width} {height}' preserveAspectRatio='xMinYMin meet' role='img' aria-label='{escape(title)}'>",
+        "<defs><pattern id='crop-hatch' width='6' height='6' patternUnits='userSpaceOnUse' patternTransform='rotate(45)'>"
+        "<rect width='2' height='6' fill='#93c5fd'/></pattern></defs>",
+        "<style>"
+        ".axis-label{font:14px sans-serif;fill:#334155}"
+        ".bar{fill:#2563eb}"
+        ".bar-cropped{fill:url(#crop-hatch);stroke:#2563eb;stroke-width:0.5}"
+        ".bar-text{font:13px sans-serif;fill:#0f172a}"
+        "</style>",
     ]
-    y = 24
-    for label, value in rows:
-        scaled = 0.0 if max_value <= 0 else (value / max_value) * bar_width
+    y = 28
+    for i, (label, value) in enumerate(rows):
+        if log_scale:
+            scaled = 0.0 if max_log <= 0 else (math.log10(1.0 + value) / max_log) * bar_area
+            cropped = False
+        else:
+            if use_crop and value > crop_threshold:
+                # Draw the bar at full width but mark the overflow portion with hatching.
+                scaled = bar_area
+                cropped = True
+            else:
+                reference = crop_threshold if use_crop else max_value
+                scaled = 0.0 if reference <= 0 else (value / reference) * bar_area
+                cropped = False
+
         pieces.append(f"<text class='axis-label' x='8' y='{y}'>{escape(label)}</text>")
-        pieces.append(f"<rect class='bar' x='{left_pad}' y='{y - 11}' width='{scaled:.2f}' height='14' rx='3'></rect>")
+        if cropped:
+            # Draw the proportional portion as a solid bar, then the remainder as hatched.
+            solid_frac = crop_threshold / value if value > 0 else 1.0
+            solid_w = bar_area * solid_frac
+            pieces.append(
+                f"<rect class='bar' x='{left_pad}' y='{y - 13}' width='{solid_w:.2f}' height='16' rx='3'></rect>"
+            )
+            pieces.append(
+                f"<rect class='bar-cropped' x='{left_pad + solid_w:.2f}' y='{y - 13}'"
+                f" width='{bar_area - solid_w:.2f}' height='16' rx='0 3 3 0'></rect>"
+            )
+        else:
+            pieces.append(
+                f"<rect class='bar' x='{left_pad}' y='{y - 13}' width='{scaled:.2f}' height='16' rx='3'></rect>"
+            )
+        text_x = left_pad + scaled + 8
         pieces.append(
-            f"<text class='bar-text' x='{left_pad + scaled + 8:.2f}' y='{y}'>{escape(_format_number(value))}</text>"
+            f"<text class='bar-text' x='{text_x:.2f}' y='{y}'>{escape(_format_number(value))}</text>"
         )
         y += row_height
+
+    if log_scale:
+        pieces.append(
+            f"<text x='{width - 8}' y='{height - 4}' text-anchor='end'"
+            f" style='font:11px sans-serif;fill:#94a3b8'>log\u2081\u2080 scale</text>"
+        )
     pieces.append("</svg></section>")
     return "".join(pieces)
 
@@ -80,23 +143,27 @@ def _task_latency_rows(tasks: list[TaskSummary]) -> list[tuple[str, float]]:
     return rows
 
 
-def render_report_html(analysis: TelemetryAnalysis) -> str:
+def render_report_html(analysis: TelemetryAnalysis, *, log_scale: bool = False) -> str:
     top_total = _svg_bar_chart(
         "Top Operations By Cumulative Time (ms)",
         _operation_rows(analysis.top_total_time_operations[:15]),
+        log_scale=log_scale,
     )
     top_count = _svg_bar_chart(
         "Top Operations By Invocation Count",
         [(_format_metric_label(item.metric_name), float(item.count)) for item in analysis.top_invocation_operations[:15]],
+        log_scale=log_scale,
     )
     top_tail = _svg_bar_chart(
         "Top Operations By P95 Latency (ms)",
         _operation_tail_rows(analysis.top_tail_latency_operations[:15]),
+        log_scale=log_scale,
     )
     task_chart = _svg_bar_chart(
         "Task End-To-End Latency (ms)",
         _task_latency_rows(analysis.task_summaries[:20]),
         width=980,
+        log_scale=log_scale,
     )
 
     llm_breakdown_rows = [(name, value) for name, value in analysis.llm_breakdown.items()]
@@ -105,30 +172,36 @@ def render_report_html(analysis: TelemetryAnalysis) -> str:
     llm_breakdown_chart = _svg_bar_chart(
         "Average LLM Path Breakdown (ms)",
         [(_format_metric_label(name), value) for name, value in llm_breakdown_rows],
+        log_scale=log_scale,
     )
     checkpoint_breakdown_chart = _svg_bar_chart(
         "Average Checkpoint/Restore Breakdown (ms)",
         [(_format_metric_label(name), value) for name, value in checkpoint_breakdown_rows],
         width=980,
+        log_scale=log_scale,
     )
 
-    summary_table = _html_table(
-        ["Field", "Value"],
-        [
-            ("Input", analysis.input_path),
-            ("Run ID", analysis.run_id),
-            ("Started", analysis.started_at),
-            ("Finished", analysis.finished_at),
-            ("Records", analysis.total_records),
-            ("Events", analysis.total_events),
-            ("Metrics", analysis.total_metrics),
-            ("Sandboxes", analysis.distinct_sandboxes),
-            ("Tasks", analysis.distinct_tasks),
-            ("Requests", analysis.distinct_requests),
-            ("Checkpoint IDs", analysis.distinct_checkpoints),
-            ("Job IDs", analysis.distinct_jobs),
-        ],
-    )
+    summary_rows = [
+        ("Input", analysis.input_path),
+        ("Run ID", analysis.run_id),
+        ("Started", analysis.started_at),
+        ("Finished", analysis.finished_at),
+        ("Records", analysis.total_records),
+        ("Events", analysis.total_events),
+        ("Metrics", analysis.total_metrics),
+        ("Sandboxes", analysis.distinct_sandboxes),
+        ("Tasks", analysis.distinct_tasks),
+        ("Requests", analysis.distinct_requests),
+        ("Checkpoint IDs", analysis.distinct_checkpoints),
+        ("Job IDs", analysis.distinct_jobs),
+    ]
+    if analysis.exclude_failed_tasks:
+        excluded_count = len(analysis.excluded_sandbox_task_pairs)
+        excluded_detail = ", ".join(
+            f"{sid}:{tid}" for sid, tid in analysis.excluded_sandbox_task_pairs
+        ) if analysis.excluded_sandbox_task_pairs else "none"
+        summary_rows.append(("Excluded Failed Sandboxes", f"{excluded_count} ({excluded_detail})"))
+    summary_table = _html_table(["Field", "Value"], summary_rows)
 
     operation_table = _html_table(
         [
@@ -239,6 +312,7 @@ def render_report_html(analysis: TelemetryAnalysis) -> str:
       padding: 20px;
       margin: 0 0 20px;
       box-shadow: 0 10px 30px rgba(15, 23, 42, 0.06);
+      overflow-x: auto;
     }}
     .grid {{
       display: grid;
@@ -377,13 +451,17 @@ def generate_report_bundle(
     output_dir: Path,
     run_id: str | None = None,
     top_k: int = 25,
+    exclude_failed_tasks: bool = False,
+    log_scale: bool = False,
 ) -> TelemetryAnalysis:
-    analysis = analyze_telemetry_file(telemetry_path, run_id=run_id, top_k=top_k)
+    analysis = analyze_telemetry_file(
+        telemetry_path, run_id=run_id, top_k=top_k, exclude_failed_tasks=exclude_failed_tasks,
+    )
     target_dir = output_dir.expanduser().resolve()
     target_dir.mkdir(parents=True, exist_ok=True)
 
     (target_dir / "summary.json").write_text(json.dumps(analysis.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
-    (target_dir / "report.html").write_text(render_report_html(analysis), encoding="utf-8")
+    (target_dir / "report.html").write_text(render_report_html(analysis, log_scale=log_scale), encoding="utf-8")
 
     _write_csv(
         target_dir / "operation_summary.csv",
@@ -473,6 +551,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory for report artifacts")
     parser.add_argument("--run-id", default=None, help="Optional run_id filter; defaults to dominant run in file")
     parser.add_argument("--top-k", type=int, default=25, help="Top-K operations/outliers to keep")
+    parser.add_argument(
+        "--exclude-failed-tasks",
+        action="store_true",
+        default=False,
+        help="Exclude sandboxes whose benchmark.task.success_ratio is 0 from analysis",
+    )
+    parser.add_argument(
+        "--log-scale-charts",
+        action="store_true",
+        default=False,
+        help="Use log10 scale for bar chart widths instead of linear",
+    )
     return parser.parse_args()
 
 
@@ -483,6 +573,8 @@ def main() -> None:
         output_dir=args.output_dir,
         run_id=args.run_id,
         top_k=max(5, int(args.top_k)),
+        exclude_failed_tasks=args.exclude_failed_tasks,
+        log_scale=args.log_scale_charts,
     )
     print(f"run_id: {analysis.run_id}")
     print(f"report: {(args.output_dir.expanduser().resolve() / 'report.html')}")

@@ -460,7 +460,29 @@ Use:
 
 Do not use `sandbox_id` alone when a finer-grained key exists.
 
-## 6. Lifecycle Count Matching
+## 6. Exclude Failed Task Runs
+
+When `--exclude-failed-tasks` is passed to the report CLI (or `exclude_failed_tasks=True` is passed to `analyze_telemetry_file`), the analyzer performs a first-pass scan to identify sandboxes where `benchmark.task.success_ratio` equals `0`. All telemetry records from those sandboxes are then excluded from analysis.
+
+Filtering is at the **sandbox level**: if the same task is solved by multiple sandboxes (e.g., using different trajectories or models), only the sandboxes that actually failed are excluded. Sandboxes that succeeded on the same task are retained.
+
+The analysis result includes:
+
+- `exclude_failed_tasks` — whether filtering was enabled.
+- `excluded_sandbox_task_pairs` — list of `(sandbox_id, task_id)` pairs that were excluded.
+
+These fields appear in the HTML report summary table and in `summary.json`.
+
+CLI usage:
+
+```bash
+python3 -m agent_cr.telemetry_analysis.report \
+    --input telemetry.jsonl \
+    --output-dir report/ \
+    --exclude-failed-tasks
+```
+
+## 7. Lifecycle Count Matching
 
 For operations emitted via `start_operation(...)`, analysis code can validate telemetry consistency with:
 

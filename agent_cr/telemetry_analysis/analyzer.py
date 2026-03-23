@@ -212,6 +212,8 @@ class TelemetryAnalysis:
     slowest_records: list[SlowRecord]
     llm_breakdown: dict[str, float]
     checkpoint_breakdown: dict[str, float]
+    exclude_failed_tasks: bool = False
+    excluded_sandbox_task_pairs: list[tuple[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -239,6 +241,11 @@ class TelemetryAnalysis:
             "slowest_records": [asdict(item) for item in self.slowest_records],
             "llm_breakdown": dict(self.llm_breakdown),
             "checkpoint_breakdown": dict(self.checkpoint_breakdown),
+            "exclude_failed_tasks": self.exclude_failed_tasks,
+            "excluded_sandbox_task_pairs": [
+                {"sandbox_id": sid, "task_id": tid}
+                for sid, tid in self.excluded_sandbox_task_pairs
+            ],
         }
 
 
@@ -411,6 +418,28 @@ def detect_primary_run_id(path: Path) -> str:
     return run_ids.most_common(1)[0][0]
 
 
+def _detect_failed_sandboxes(
+    path: Path,
+    run_id: str,
+) -> set[str]:
+    """First-pass scan: collect sandbox_ids where benchmark.task.success_ratio == 0."""
+    failed: set[str] = set()
+    for payload in _iter_jsonl(path):
+        if payload.get("name") != "benchmark.task.success_ratio":
+            continue
+        attributes = payload.get("attributes")
+        if not isinstance(attributes, dict):
+            continue
+        if _maybe_str(attributes.get("run_id")) != run_id:
+            continue
+        value = _safe_float(payload.get("value"))
+        if value is not None and value == 0.0:
+            sandbox_id = _maybe_str(attributes.get("sandbox_id"))
+            if sandbox_id:
+                failed.add(sandbox_id)
+    return failed
+
+
 def _select_operation_summaries(raw_metrics: dict[str, _MetricAccumulator]) -> list[MetricSummary]:
     used_sources: set[str] = set()
     summaries: list[MetricSummary] = []
@@ -447,16 +476,23 @@ def analyze_telemetry_file(
     *,
     run_id: str | None = None,
     top_k: int = DEFAULT_TOP_K,
+    exclude_failed_tasks: bool = False,
 ) -> TelemetryAnalysis:
     path = telemetry_path.expanduser().resolve()
     if not path.exists():
         raise FileNotFoundError(path)
     selected_run_id = run_id or detect_primary_run_id(path)
 
+    # When filtering is enabled, first-pass detects sandbox_ids with failed tasks.
+    failed_sandbox_ids: set[str] = set()
+    if exclude_failed_tasks:
+        failed_sandbox_ids = _detect_failed_sandboxes(path, selected_run_id)
+
     metric_accumulators: dict[str, _MetricAccumulator] = {}
     lifecycle_accumulators: dict[str, _LifecycleAccumulator] = {}
     task_accumulators: dict[str, _TaskAccumulator] = {}
     sandbox_to_task: dict[str, str] = {}
+    excluded_sandbox_to_task: dict[str, str] = {}
     event_name_counts: Counter[str] = Counter()
     metric_name_counts: Counter[str] = Counter()
     sandbox_ids: set[str] = set()
@@ -475,6 +511,14 @@ def analyze_telemetry_file(
         if not isinstance(attributes, dict):
             attributes = {}
         if _maybe_str(attributes.get("run_id")) != selected_run_id:
+            continue
+
+        # Track sandbox-to-task mapping for excluded sandboxes before skipping.
+        sandbox_id_raw = _maybe_str(attributes.get("sandbox_id"))
+        task_id_raw = _maybe_str(attributes.get("task_id"))
+        if sandbox_id_raw and sandbox_id_raw in failed_sandbox_ids:
+            if task_id_raw:
+                excluded_sandbox_to_task[sandbox_id_raw] = task_id_raw
             continue
         total_records += 1
         timestamp = _record_timestamp(payload)
@@ -606,6 +650,11 @@ def analyze_telemetry_file(
         if metric_name in summary_by_name
     }
 
+    excluded_pairs = sorted(
+        (sid, excluded_sandbox_to_task.get(sid, ""))
+        for sid in failed_sandbox_ids
+    )
+
     return TelemetryAnalysis(
         input_path=str(path),
         run_id=selected_run_id,
@@ -631,4 +680,6 @@ def analyze_telemetry_file(
         slowest_records=slowest_records,
         llm_breakdown=llm_breakdown,
         checkpoint_breakdown=checkpoint_breakdown,
+        exclude_failed_tasks=exclude_failed_tasks,
+        excluded_sandbox_task_pairs=excluded_pairs,
     )
