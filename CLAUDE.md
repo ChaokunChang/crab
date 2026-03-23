@@ -16,6 +16,8 @@ python3 -m unittest tests.test_system_integration tests.test_interceptor -v
 python3 -m unittest tests.test_system_integration.TestSystemIntegration.test_name -v
 ```
 
+Never run Full test suite, it is very slow, and there are some known issues.
+
 ### Benchmarks
 ```bash
 # Microbenchmark
