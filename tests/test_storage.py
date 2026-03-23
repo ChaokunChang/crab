@@ -285,7 +285,7 @@ class StorageTests(unittest.TestCase):
                 runtime_version=None,
                 process_artifacts=[self._reference(ArtifactKind.PROCESS, "p1")],
                 filesystem_artifacts=[],
-                metadata={"benchmark_replay_action_count": 4, "benchmark_latest_mutating_response_count": 4},
+                metadata={"benchmark_trace_cursor": 4, "benchmark_latest_mutating_response_count": 4},
             ).with_integrity()
             m2 = CheckpointManifest(
                 schema_version="v1",
@@ -297,7 +297,7 @@ class StorageTests(unittest.TestCase):
                 process_artifacts=[],
                 filesystem_artifacts=[self._reference(ArtifactKind.FILESYSTEM, "f2")],
                 metadata={
-                    "benchmark_replay_action_count": 10,
+                    "benchmark_trace_cursor": 10,
                     "benchmark_latest_mutating_response_count": 4,
                 },
             ).with_integrity()
@@ -311,7 +311,7 @@ class StorageTests(unittest.TestCase):
                 process_artifacts=[self._reference(ArtifactKind.PROCESS, "p3")],
                 filesystem_artifacts=[],
                 metadata={
-                    "benchmark_replay_action_count": 12,
+                    "benchmark_trace_cursor": 12,
                     "benchmark_latest_mutating_response_count": 8,
                     "benchmark_previous_mutating_response_count": 8,
                     "captures_inflight_llm": True,

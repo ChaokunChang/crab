@@ -180,7 +180,7 @@ class IFlowTraceReplayTests(unittest.TestCase):
         self.assertIn("/dev/null", replayed_command)
         self.assertEqual(reset_command, 'sh -lc "echo first >/tmp/first.txt"')
 
-    def test_trace_replay_state_snapshot_reports_matched_response_count(self) -> None:
+    def test_trace_replay_state_snapshot_reports_consumed_response_count(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "trace.log"
             trace_path.write_text(
@@ -198,8 +198,8 @@ class IFlowTraceReplayTests(unittest.TestCase):
 
         self.assertEqual(first_index, 1)
         self.assertEqual(first["choices"][0]["message"]["content"], "first")
-        self.assertEqual(snapshot["matched_response_count"], 1)
-        self.assertEqual(snapshot["next_response_index"], 1)
+        self.assertEqual(snapshot["consumed_response_count"], 1)
+        self.assertEqual(snapshot["trace_cursor"], 1)
 
     def test_trace_replay_state_matches_escape_only_formatting_differences(self) -> None:
         trace_content = 'If potentially_problematic_new_string is console.log("Hello\nWorld"), fix it.'
@@ -257,8 +257,8 @@ class IFlowTraceReplayTests(unittest.TestCase):
         self.assertEqual(first["choices"][0]["message"]["content"], "first")
         self.assertEqual(second_index, 2)
         self.assertEqual(second["choices"][0]["message"]["content"], "second")
-        self.assertEqual(snapshot["matched_response_count"], 2)
-        self.assertEqual(snapshot["next_response_index"], 2)
+        self.assertEqual(snapshot["consumed_response_count"], 2)
+        self.assertEqual(snapshot["trace_cursor"], 2)
         self.assertEqual(snapshot["events"][0]["response_kind"], "cursor_fallback")
 
     def test_trace_replay_state_restore_after_cursor_fallback_preserves_prefix_progress(self) -> None:
@@ -281,7 +281,7 @@ class IFlowTraceReplayTests(unittest.TestCase):
                 payload={"model": "trace-model", "messages": [{"role": "user", "content": "unmatched"}], "tools": []},
             )
 
-            state.restore(matched_response_count=2)
+            state.restore(consumed_response_count=2)
             restored_index, restored = state.next_response(
                 path="/v1/chat/completions",
                 headers={"X-Agent-Sandbox-Id": "sbx"},
@@ -324,7 +324,7 @@ class IFlowTraceReplayTests(unittest.TestCase):
                 },
             )
 
-            state.restore(matched_response_count=1)
+            state.restore(consumed_response_count=1)
             restored_index, restored = state.next_response(
                 path="/v1/chat/completions",
                 headers={"X-Agent-Sandbox-Id": "sbx"},
@@ -364,7 +364,7 @@ class IFlowTraceReplayTests(unittest.TestCase):
                 },
             )
 
-            state.restore(matched_response_count=1)
+            state.restore(consumed_response_count=1)
             replayed_index, replayed = state.next_response(
                 path="/v1/chat/completions",
                 headers={"X-Agent-Sandbox-Id": "sbx"},
@@ -472,9 +472,9 @@ class IFlowTraceReplayTests(unittest.TestCase):
             duplicate_response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
         )["command"]
         self.assertIn("/dev/null", duplicate_command)
-        self.assertEqual(snapshot["matched_response_count"], 1)
+        self.assertEqual(snapshot["consumed_response_count"], 1)
         self.assertEqual(snapshot["duplicate_response_count"], 1)
-        self.assertEqual(snapshot["next_response_index"], 1)
+        self.assertEqual(snapshot["trace_cursor"], 1)
 
     def test_trace_replay_state_duplicate_tool_request_keeps_followup_request_matchable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1307,7 +1307,7 @@ class IFlowTraceReplayTests(unittest.TestCase):
         self.assertEqual(second_index, 2)
         self.assertEqual(second["choices"][0]["message"]["content"], "real-final")
         self.assertEqual(snapshot["total_responses"], 2)
-        self.assertEqual(snapshot["matched_response_count"], 2)
+        self.assertEqual(snapshot["consumed_response_count"], 2)
 
     def test_generate_dataset_builds_expected_replay_row(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

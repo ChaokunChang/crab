@@ -103,7 +103,7 @@ def _run_replay_accuracy_sandbox(
             "fs_actions": int(status.get("filesystem_actions", status.get("total_actions", 0))),
             "process_actions": int(status.get("process_actions", status.get("total_actions", 0))),
             "network_actions": int(status.get("network_actions", status.get("total_actions", 0))),
-            "replay_final_index": int(status.get("replay_next_response_index", status.get("total_actions", 0))),
+            "replay_final_trace_cursor": int(status.get("replay_trace_cursor", status.get("total_actions", 0))),
             **verification,
         },
     )

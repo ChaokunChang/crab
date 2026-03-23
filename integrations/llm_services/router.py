@@ -52,7 +52,7 @@ class LLMServiceState(Protocol):
 
     def reset(self) -> None: ...
 
-    def restore(self, *, matched_response_count: int) -> None: ...
+    def restore(self, *, consumed_response_count: int) -> None: ...
 
 
 class SimulatedServiceState:
@@ -69,8 +69,8 @@ class SimulatedServiceState:
     def reset(self) -> None:
         return
 
-    def restore(self, *, matched_response_count: int) -> None:
-        _ = matched_response_count
+    def restore(self, *, consumed_response_count: int) -> None:
+        _ = consumed_response_count
         return
 
 
@@ -91,8 +91,8 @@ class ManualServiceState:
     def reset(self) -> None:
         return
 
-    def restore(self, *, matched_response_count: int) -> None:
-        _ = matched_response_count
+    def restore(self, *, consumed_response_count: int) -> None:
+        _ = consumed_response_count
         return
 
 
@@ -113,8 +113,8 @@ class SimulatedForIFlowServiceState:
     def reset(self) -> None:
         return
 
-    def restore(self, *, matched_response_count: int) -> None:
-        _ = matched_response_count
+    def restore(self, *, consumed_response_count: int) -> None:
+        _ = consumed_response_count
         return
 
 
@@ -131,8 +131,8 @@ class IFlowTraceReplayServiceState:
     def reset(self) -> None:
         self._state.reset()
 
-    def restore(self, *, matched_response_count: int) -> None:
-        self._state.restore(matched_response_count=matched_response_count)
+    def restore(self, *, consumed_response_count: int) -> None:
+        self._state.restore(consumed_response_count=consumed_response_count)
 
 
 def build_llm_service_registry() -> dict[str, type[LLMServiceState]]:
@@ -238,9 +238,9 @@ class BenchmarkLLMRouter:
     def reset_sandbox(self, sandbox_id: str) -> None:
         self.resolve_service(sandbox_id).service_state.reset()
 
-    def restore_sandbox(self, sandbox_id: str, *, matched_response_count: int) -> None:
+    def restore_sandbox(self, sandbox_id: str, *, consumed_response_count: int) -> None:
         self.resolve_service(sandbox_id).service_state.restore(
-            matched_response_count=matched_response_count
+            consumed_response_count=consumed_response_count
         )
 
 

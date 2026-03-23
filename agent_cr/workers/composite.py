@@ -34,9 +34,9 @@ from ..telemetry import NoopTelemetrySink, start_operation
 logger = logging.getLogger(__name__)
 
 _PROCESS_RESTORE_CHECKPOINT_ID = "process_restore_checkpoint_id"
-_PROCESS_RESTORE_REPLAY_ACTION_COUNT = "process_restore_replay_action_count"
+_PROCESS_RESTORE_TRACE_CURSOR = "process_restore_trace_cursor"
 _FILESYSTEM_RESTORE_CHECKPOINT_ID = "filesystem_restore_checkpoint_id"
-_FILESYSTEM_RESTORE_REPLAY_ACTION_COUNT = "filesystem_restore_replay_action_count"
+_FILESYSTEM_RESTORE_TRACE_CURSOR = "filesystem_restore_trace_cursor"
 _CAPTURES_INFLIGHT_LLM = "captures_inflight_llm"
 _CAPTURED_REQUEST_ID = "captured_request_id"
 _CAPTURED_REQUEST_PROVIDER = "captured_request_provider"
@@ -71,12 +71,12 @@ def resolve_restore_manifest(
     metadata = dict(current_candidate.metadata)
     if process_manifest is not None:
         metadata[_PROCESS_RESTORE_CHECKPOINT_ID] = str(process_manifest.checkpoint_id)
-        metadata[_PROCESS_RESTORE_REPLAY_ACTION_COUNT] = _committed_replay_action_count(
+        metadata[_PROCESS_RESTORE_TRACE_CURSOR] = _committed_trace_cursor(
             process_manifest.metadata
         )
     if filesystem_manifest is not None:
         metadata[_FILESYSTEM_RESTORE_CHECKPOINT_ID] = str(filesystem_manifest.checkpoint_id)
-        metadata[_FILESYSTEM_RESTORE_REPLAY_ACTION_COUNT] = _committed_replay_action_count(
+        metadata[_FILESYSTEM_RESTORE_TRACE_CURSOR] = _committed_trace_cursor(
             filesystem_manifest.metadata
         )
     _copy_process_restore_metadata(metadata, {} if process_manifest is None else process_manifest.metadata)
@@ -100,19 +100,19 @@ def _latest_manifest_with_artifacts(
     return None
 
 
-def _replay_action_count(metadata: dict[str, object]) -> int:
-    raw_value = metadata.get("benchmark_replay_action_count", 0)
+def _trace_cursor_from_metadata(metadata: dict[str, object]) -> int:
+    raw_value = metadata.get("benchmark_trace_cursor", 0)
     try:
         return max(0, int(raw_value))
     except (TypeError, ValueError):
         return 0
 
 
-def _committed_replay_action_count(metadata: dict[str, object]) -> int:
-    replay_action_count = _replay_action_count(metadata)
+def _committed_trace_cursor(metadata: dict[str, object]) -> int:
+    trace_cursor = _trace_cursor_from_metadata(metadata)
     if bool(metadata.get(_CAPTURES_INFLIGHT_LLM, False)):
-        return max(0, replay_action_count - 1)
-    return replay_action_count
+        return max(0, trace_cursor - 1)
+    return trace_cursor
 
 
 def _copy_process_restore_metadata(target: dict[str, object], source: dict[str, object]) -> None:

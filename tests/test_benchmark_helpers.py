@@ -23,7 +23,6 @@ from agent_cr import (
 )
 from integrations.agents import BaseAgent, IFlowAgent, SandboxHandle, SimulatedAgent, TaskConfig, TaskDescription
 from integrations.agents.iflow import IFLOW_WRAPPER_ARG
-from integrations.sandboxes.iflow.harness import IFLOW_TOOL_OUTPUT_LIMIT_ENV
 from integrations.sandboxes.runtime import bundle as sandbox_bundle
 from integrations.sandboxes.runtime import compose as sandbox_compose
 from integrations.sandboxes.runtime import image as sandbox_image
@@ -1472,7 +1471,7 @@ services:
             llm_service_config=None,
         )
 
-    def test_restore_llm_service_state_prefers_process_restore_replay_action_count(self) -> None:
+    def test_restore_llm_service_state_prefers_process_restore_trace_cursor(self) -> None:
         harness = RealHostScenarioHarness(
             provider="openai",
             transfer_delay_ms=0.0,
@@ -1498,16 +1497,16 @@ services:
                 process_artifacts=[],
                 filesystem_artifacts=[],
                 metadata={
-                    "process_restore_replay_action_count": 2,
-                    "benchmark_replay_action_count": 5,
-                    "filesystem_restore_replay_action_count": 4,
+                    "process_restore_trace_cursor": 2,
+                    "benchmark_trace_cursor": 5,
+                    "filesystem_restore_trace_cursor": 4,
                 },
             ).with_integrity(),
         )
 
-        restore_sandbox.assert_called_once_with("sbx-replay", matched_response_count=2)
+        restore_sandbox.assert_called_once_with("sbx-replay", consumed_response_count=2)
 
-    def test_restore_llm_service_state_skips_restore_without_process_replay_action_count(self) -> None:
+    def test_restore_llm_service_state_skips_restore_without_process_restore_trace_cursor(self) -> None:
         harness = RealHostScenarioHarness(
             provider="openai",
             transfer_delay_ms=0.0,
@@ -1533,8 +1532,8 @@ services:
                 process_artifacts=[],
                 filesystem_artifacts=[],
                 metadata={
-                    "benchmark_replay_action_count": 5,
-                    "filesystem_restore_replay_action_count": 4,
+                    "benchmark_trace_cursor": 5,
+                    "filesystem_restore_trace_cursor": 4,
                 },
             ).with_integrity(),
         )
@@ -1815,7 +1814,6 @@ services:
             self.assertNotIn("/data/iflow-task-logs", payload["process"]["args"][2])
             self.assertNotIn("rm -f /dev/null", payload["process"]["args"][2])
             self.assertIn(">/dev/null 2>/dev/null", payload["process"]["args"][2])
-            self.assertIn(f"{IFLOW_TOOL_OUTPUT_LIMIT_ENV}=1024", payload["process"]["env"])
             self.assertIn("FOO=bar", payload["process"]["env"])
             mounted_destinations = {mount["destination"] for mount in payload["mounts"]}
             self.assertIn("/opt/iflow-runtime", mounted_destinations)
@@ -1894,12 +1892,12 @@ services:
             agent._started_at_monotonic = time.monotonic()
 
             state_payloads = [
-                {"state": {"state": {"next_response_index": 1, "total_responses": 5, "is_complete": False}}},
-                {"state": {"state": {"next_response_index": 2, "total_responses": 5, "is_complete": False}}},
-                {"state": {"state": {"next_response_index": 2, "total_responses": 5, "is_complete": False}}},
-                {"state": {"state": {"next_response_index": 2, "total_responses": 5, "is_complete": False}}},
-                {"state": {"state": {"next_response_index": 3, "total_responses": 5, "is_complete": False}}},
-                {"state": {"state": {"next_response_index": 3, "total_responses": 5, "is_complete": False}}},
+                {"state": {"state": {"trace_cursor": 1, "total_responses": 5, "is_complete": False}}},
+                {"state": {"state": {"trace_cursor": 2, "total_responses": 5, "is_complete": False}}},
+                {"state": {"state": {"trace_cursor": 2, "total_responses": 5, "is_complete": False}}},
+                {"state": {"state": {"trace_cursor": 2, "total_responses": 5, "is_complete": False}}},
+                {"state": {"state": {"trace_cursor": 3, "total_responses": 5, "is_complete": False}}},
+                {"state": {"state": {"trace_cursor": 3, "total_responses": 5, "is_complete": False}}},
             ]
 
             with patch.object(agent, "wait_for_http_json", side_effect=state_payloads):

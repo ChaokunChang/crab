@@ -752,7 +752,7 @@ class ContractTests(unittest.TestCase):
             runtime_version=None,
             process_artifacts=[],
             filesystem_artifacts=[fs_ref],
-            metadata={"benchmark_replay_action_count": 3},
+            metadata={"benchmark_trace_cursor": 3},
         ).with_integrity()
         process_manifest = CheckpointManifest(
             schema_version="v1",
@@ -764,7 +764,7 @@ class ContractTests(unittest.TestCase):
             process_artifacts=[process_ref],
             filesystem_artifacts=[],
             metadata={
-                "benchmark_replay_action_count": 6,
+                "benchmark_trace_cursor": 6,
                 "benchmark_latest_mutating_response_count": 6,
                 "benchmark_previous_mutating_response_count": 0,
                 "captures_inflight_llm": True,
@@ -790,7 +790,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(result.status.value, "succeeded")
         self.assertEqual(process_worker.manifests[0].metadata["process_restore_checkpoint_id"], "ckpt-2")
         self.assertEqual(process_worker.manifests[0].metadata["filesystem_restore_checkpoint_id"], "ckpt-1")
-        self.assertEqual(process_worker.manifests[0].metadata["filesystem_restore_replay_action_count"], 3)
+        self.assertEqual(process_worker.manifests[0].metadata["filesystem_restore_trace_cursor"], 3)
 
     def test_default_restore_worker_rewinds_unsafe_newer_process_checkpoint(self) -> None:
         sid = SandboxId("sbx-1")
@@ -807,7 +807,7 @@ class ContractTests(unittest.TestCase):
             runtime_version=None,
             process_artifacts=[early_process_ref],
             filesystem_artifacts=[],
-            metadata={"benchmark_replay_action_count": 6},
+            metadata={"benchmark_trace_cursor": 6},
         ).with_integrity()
         filesystem_manifest = CheckpointManifest(
             schema_version="v1",
@@ -818,7 +818,7 @@ class ContractTests(unittest.TestCase):
             runtime_version=None,
             process_artifacts=[],
             filesystem_artifacts=[fs_ref],
-            metadata={"benchmark_replay_action_count": 6},
+            metadata={"benchmark_trace_cursor": 6},
         ).with_integrity()
         late_process_manifest = CheckpointManifest(
             schema_version="v1",
@@ -830,7 +830,7 @@ class ContractTests(unittest.TestCase):
             process_artifacts=[late_process_ref],
             filesystem_artifacts=[],
             metadata={
-                "benchmark_replay_action_count": 12,
+                "benchmark_trace_cursor": 12,
                 "benchmark_latest_mutating_response_count": 12,
                 "benchmark_previous_mutating_response_count": 10,
                 "captures_inflight_llm": True,
@@ -858,7 +858,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(result.status.value, "succeeded")
         self.assertEqual(process_worker.manifests[0].metadata["process_restore_checkpoint_id"], "ckpt-1")
         self.assertEqual(process_worker.manifests[0].metadata["filesystem_restore_checkpoint_id"], "ckpt-2")
-        self.assertEqual(process_worker.manifests[0].metadata["filesystem_restore_replay_action_count"], 6)
+        self.assertEqual(process_worker.manifests[0].metadata["filesystem_restore_trace_cursor"], 6)
 
     def test_default_restore_worker_rewinds_unsafe_newer_process_checkpoint_without_mutating_metadata(self) -> None:
         sid = SandboxId("sbx-1")
@@ -887,7 +887,7 @@ class ContractTests(unittest.TestCase):
             runtime_version=None,
             process_artifacts=[early_process_ref],
             filesystem_artifacts=[],
-            metadata={"benchmark_replay_action_count": 6},
+            metadata={"benchmark_trace_cursor": 6},
         ).with_integrity()
         filesystem_manifest = CheckpointManifest(
             schema_version="v1",
@@ -898,7 +898,7 @@ class ContractTests(unittest.TestCase):
             runtime_version=None,
             process_artifacts=[],
             filesystem_artifacts=[fs_ref],
-            metadata={"benchmark_replay_action_count": 6},
+            metadata={"benchmark_trace_cursor": 6},
         ).with_integrity()
         late_process_manifest = CheckpointManifest(
             schema_version="v1",
@@ -910,7 +910,7 @@ class ContractTests(unittest.TestCase):
             process_artifacts=[late_process_ref],
             filesystem_artifacts=[],
             metadata={
-                "benchmark_replay_action_count": 12,
+                "benchmark_trace_cursor": 12,
                 "captures_inflight_llm": True,
             },
         ).with_integrity()
@@ -936,7 +936,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(result.status.value, "succeeded")
         self.assertEqual(process_worker.manifests[0].metadata["process_restore_checkpoint_id"], "ckpt-1")
         self.assertEqual(process_worker.manifests[0].metadata["filesystem_restore_checkpoint_id"], "ckpt-2")
-        self.assertEqual(process_worker.manifests[0].metadata["filesystem_restore_replay_action_count"], 6)
+        self.assertEqual(process_worker.manifests[0].metadata["filesystem_restore_trace_cursor"], 6)
 
     def test_default_restore_worker_uses_committed_replay_count_for_inflight_filesystem_checkpoint(self) -> None:
         sid = SandboxId("sbx-1")
@@ -956,7 +956,7 @@ class ContractTests(unittest.TestCase):
             process_artifacts=[],
             filesystem_artifacts=[fs_ref],
             metadata={
-                "benchmark_replay_action_count": 3,
+                "benchmark_trace_cursor": 3,
                 "benchmark_latest_mutating_response_count": 3,
                 "benchmark_previous_mutating_response_count": 0,
                 "captures_inflight_llm": True,
@@ -981,7 +981,7 @@ class ContractTests(unittest.TestCase):
 
         self.assertEqual(result.status.value, "succeeded")
         self.assertEqual(fs_worker.manifests[0].metadata["filesystem_restore_checkpoint_id"], "ckpt-1")
-        self.assertEqual(fs_worker.manifests[0].metadata["filesystem_restore_replay_action_count"], 2)
+        self.assertEqual(fs_worker.manifests[0].metadata["filesystem_restore_trace_cursor"], 2)
 
     def test_default_restore_worker_rewinds_process_when_filesystem_lacks_latest_mutation(self) -> None:
         sid = SandboxId("sbx-1")
@@ -1010,7 +1010,7 @@ class ContractTests(unittest.TestCase):
             runtime_version=None,
             process_artifacts=[early_process_ref],
             filesystem_artifacts=[],
-            metadata={"benchmark_replay_action_count": 4, "benchmark_latest_mutating_response_count": 4},
+            metadata={"benchmark_trace_cursor": 4, "benchmark_latest_mutating_response_count": 4},
         ).with_integrity()
         filesystem_manifest = CheckpointManifest(
             schema_version="v1",
@@ -1022,7 +1022,7 @@ class ContractTests(unittest.TestCase):
             process_artifacts=[],
             filesystem_artifacts=[fs_ref],
             metadata={
-                "benchmark_replay_action_count": 10,
+                "benchmark_trace_cursor": 10,
                 "benchmark_latest_mutating_response_count": 4,
                 "captures_inflight_llm": False,
             },
@@ -1037,7 +1037,7 @@ class ContractTests(unittest.TestCase):
             process_artifacts=[late_process_ref],
             filesystem_artifacts=[],
             metadata={
-                "benchmark_replay_action_count": 12,
+                "benchmark_trace_cursor": 12,
                 "benchmark_latest_mutating_response_count": 8,
                 "benchmark_previous_mutating_response_count": 8,
                 "captures_inflight_llm": True,

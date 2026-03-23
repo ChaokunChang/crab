@@ -14,7 +14,6 @@ REQUIRED_CACHE_FILES = (
     "iflow-ai-iflow-cli-for-roll-0-4-4-v4.tgz",
 )
 IFLOW_WRAPPER_ARG = "--agent-cr-iflow-wrapper"
-IFLOW_TOOL_OUTPUT_LIMIT_ENV = "AGENT_CR_IFLOW_TOOL_OUTPUT_LIMIT"
 RUNTIME_MOUNT_PATH = "/opt/iflow-runtime"
 IFLOW_HOME_MOUNT_PATH = "/root/.iflow"
 NPM_HOME_MOUNT_PATH = "/root/.npm"

@@ -58,11 +58,11 @@ def replay_status_is_complete(status: dict[str, object], *, trace_response_count
     return total_actions(status) >= trace_response_count
 
 
-def manifest_replay_next_response_index(manifest) -> int:
+def manifest_trace_cursor(manifest) -> int:
     metadata = getattr(manifest, "metadata", {})
     if not isinstance(metadata, dict):
         return 0
-    raw_value = metadata.get("benchmark_replay_action_count", 0)
+    raw_value = metadata.get("benchmark_trace_cursor", 0)
     try:
         return max(0, int(raw_value))
     except (TypeError, ValueError):
@@ -81,7 +81,7 @@ def wait_for_auto_replay_checkpoint(
     while time.monotonic() < deadline:
         manifests = harness.list_checkpoint_manifests(sandbox.sandbox_id)
         for manifest in reversed(manifests):
-            checkpoint_actions = manifest_replay_next_response_index(manifest)
+            checkpoint_actions = manifest_trace_cursor(manifest)
             if checkpoint_actions < minimum_actions:
                 continue
             return manifest, checkpoint_actions
@@ -123,14 +123,14 @@ def finalize_replay_row(
         verification = {}
     status = poll_sandbox_status(sandbox)
     replay_is_complete = replay_status_is_complete(status, trace_response_count=trace_response_count)
-    raw_replay_final_index = int(status.get("replay_next_response_index", status.get("total_actions", 0)))
-    replay_final_index = raw_replay_final_index
+    raw_replay_final_trace_cursor = int(status.get("replay_trace_cursor", status.get("total_actions", 0)))
+    replay_final_trace_cursor = raw_replay_final_trace_cursor
     if replay_is_complete and trace_response_count > 0:
-        replay_final_index = min(replay_final_index, trace_response_count)
+        replay_final_trace_cursor = min(replay_final_trace_cursor, trace_response_count)
     if not task_error and str(status.get("state", "")) == "finished" and not replay_is_complete:
         task_error = (
             "replay task finished before reaching the end of the trace "
-            f"(replay_final_index={raw_replay_final_index}, trace_response_count={trace_response_count})"
+            f"(replay_final_trace_cursor={raw_replay_final_trace_cursor}, trace_response_count={trace_response_count})"
         )
         if verify_task_accuracy_result:
             verification = {
@@ -141,7 +141,7 @@ def finalize_replay_row(
     row_payload = {
         **row,
         "trace_response_count": trace_response_count,
-        "replay_final_index": replay_final_index,
+        "replay_final_trace_cursor": replay_final_trace_cursor,
         "replay_is_complete": replay_is_complete,
         **verification,
     }

@@ -242,7 +242,7 @@ class _BaseScenarioHarness:
         payload = {
             "state": "finished",
             "total_actions": final_actions,
-            "replay_next_response_index": final_actions,
+            "replay_trace_cursor": final_actions,
             "replay_is_complete": True,
         }
         self._statuses[sandbox_id] = payload
@@ -338,7 +338,7 @@ class FaultScenarioTests(unittest.TestCase):
                     payload = {
                         "state": "running",
                         "total_actions": 42,
-                        "replay_next_response_index": 42,
+                        "replay_trace_cursor": 42,
                         "replay_is_complete": False,
                     }
                     self._sandbox.last_status = dict(payload)
@@ -346,7 +346,7 @@ class FaultScenarioTests(unittest.TestCase):
                 self._sandbox.last_status = {
                     "state": "finished",
                     "total_actions": 30,
-                    "replay_next_response_index": 30,
+                    "replay_trace_cursor": 30,
                     "replay_is_complete": False,
                 }
                 raise RuntimeError(
@@ -358,7 +358,7 @@ class FaultScenarioTests(unittest.TestCase):
                 payload = {
                     "state": "running",
                     "total_actions": int(self._sandbox.last_status.get("total_actions", 0)) + delta,
-                    "replay_next_response_index": int(self._sandbox.last_status.get("replay_next_response_index", 0)) + delta,
+                    "replay_trace_cursor": int(self._sandbox.last_status.get("replay_trace_cursor", 0)) + delta,
                     "replay_is_complete": False,
                 }
                 self._sandbox.last_status = dict(payload)
@@ -411,14 +411,14 @@ class FaultScenarioTests(unittest.TestCase):
                 if self.calls < 2:
                     return []
                 return [
-                    SimpleNamespace(metadata={"benchmark_replay_action_count": 4}),
+                    SimpleNamespace(metadata={"benchmark_trace_cursor": 4}),
                 ]
 
         sandbox = SandboxHandle(
             sandbox_id=SandboxId("fault-0"),
             bundle_dir=Path("/tmp/fault-0"),
             status_port=20000,
-            last_status={"total_actions": 4, "replay_next_response_index": 4},
+            last_status={"total_actions": 4, "replay_trace_cursor": 4},
         )
         sandbox.task_run = SimpleNamespace(poll_status=lambda: dict(sandbox.last_status))
 
@@ -441,7 +441,7 @@ class FaultScenarioTests(unittest.TestCase):
             def get_manifest(self, sandbox_id, checkpoint_id):
                 _ = sandbox_id
                 if checkpoint_id == CheckpointId("ckpt-1"):
-                    return SimpleNamespace(checkpoint_id=checkpoint_id, metadata={"benchmark_replay_action_count": 1})
+                    return SimpleNamespace(checkpoint_id=checkpoint_id, metadata={"benchmark_trace_cursor": 1})
                 raise FileNotFoundError("manifest pruned")
 
         harness = RealHostScenarioHarness.__new__(RealHostScenarioHarness)
@@ -477,7 +477,7 @@ class FaultScenarioTests(unittest.TestCase):
 
         with mock.patch(
             "benchmarks.scenarios.fault.wait_for_auto_replay_checkpoint",
-            return_value=(SimpleNamespace(metadata={"benchmark_replay_action_count": 2}), 2),
+            return_value=(SimpleNamespace(metadata={"benchmark_trace_cursor": 2}), 2),
         ):
             row = run_replay_auto_sandbox(
                 config,
@@ -491,7 +491,7 @@ class FaultScenarioTests(unittest.TestCase):
         self.assertEqual(row["success_ratio"], 1.0)
         self.assertEqual(row["verification_status"], "passed")
         self.assertEqual(row["verification_stdout"], "ok\n")
-        self.assertEqual(row["replay_final_index"], 10)
+        self.assertEqual(row["replay_final_trace_cursor"], 10)
         self.assertTrue(bool(row["replay_is_complete"]))
         self.assertEqual(harness.wait_for_task_completion_calls, ["fault-0"])
         self.assertEqual(harness.verify_task_accuracy_calls, ["fault-0"])
@@ -506,21 +506,21 @@ class FaultScenarioTests(unittest.TestCase):
                     payload = {
                         "state": "running",
                         "total_actions": 5,
-                        "replay_next_response_index": 5,
+                        "replay_trace_cursor": 5,
                         "replay_is_complete": False,
                     }
                 elif minimum_actions <= 10:
                     payload = {
                         "state": "running",
                         "total_actions": 24,
-                        "replay_next_response_index": 24,
+                        "replay_trace_cursor": 24,
                         "replay_is_complete": True,
                     }
                 else:
                     payload = {
                         "state": "finished",
                         "total_actions": 24,
-                        "replay_next_response_index": 24,
+                        "replay_trace_cursor": 24,
                         "replay_is_complete": True,
                     }
                 self._sandbox.last_status = dict(payload)
@@ -553,7 +553,7 @@ class FaultScenarioTests(unittest.TestCase):
 
         with mock.patch(
             "benchmarks.scenarios.fault.wait_for_auto_replay_checkpoint",
-            return_value=(SimpleNamespace(metadata={"benchmark_replay_action_count": 10}), 10),
+            return_value=(SimpleNamespace(metadata={"benchmark_trace_cursor": 10}), 10),
         ):
             row = run_replay_auto_sandbox(
                 config,

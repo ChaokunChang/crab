@@ -1181,9 +1181,11 @@ class RealHostScenarioHarness:
         *,
         event_type: str,
         observed_after,
-        timeout_s: float = 60.0,
+        timeout_s: float | None = None,
     ):
         assert self.system is not None
+        if timeout_s is None:
+            timeout_s = max(60.0, benchmark_support.task_timeout_seconds(sandbox.task_config or TaskConfig()))
 
         def _matching_record():
             record = self.system.get_last_recovery_record(sandbox.sandbox_id)
@@ -1884,10 +1886,14 @@ class RealHostScenarioHarness:
         if not isinstance(state, dict):
             return {}
         try:
-            matched_response_count = max(0, int(state.get("matched_response_count", 0)))
+            consumed_response_count = max(0, int(state.get("consumed_response_count", 0)))
         except (TypeError, ValueError):
             return {}
-        return {"benchmark_replay_action_count": matched_response_count}
+        try:
+            trace_cursor = max(0, int(state.get("trace_cursor", consumed_response_count)))
+        except (TypeError, ValueError):
+            trace_cursor = consumed_response_count
+        return {"benchmark_trace_cursor": trace_cursor}
 
     def _reset_llm_service_state(self, sandbox_id: SandboxId) -> None:
         if self.llm_server is None:
@@ -1901,25 +1907,27 @@ class RealHostScenarioHarness:
         if self.llm_server is None:
             return
         metadata = manifest.metadata if isinstance(manifest.metadata, dict) else {}
-        raw_value_p = metadata.get("process_restore_replay_action_count")
+        raw_value_p = metadata.get("process_restore_trace_cursor")
+        raw_value_f = metadata.get("filesystem_restore_trace_cursor")
         try:
-            matched_response_count = max(0, int(raw_value_p))
+            raw_value = max(int(raw_value_p), int(raw_value_f))
+            consumed_response_count = max(0, int(raw_value))
         except (TypeError, ValueError):
             logger.warning(
-                "Skipping llm service state restore for sandbox=%s because process_restore_replay_action_count is missing or invalid",
+                "Skipping llm service state restore for sandbox=%s because process_restore_trace_cursor and filesystem_restore_trace_cursor is missing or invalid",
                 sandbox_id,
             )
             return
         try:
             self.llm_server.benchmark_llm_router.restore_sandbox(  # type: ignore[attr-defined]
                 str(sandbox_id),
-                matched_response_count=matched_response_count,
+                consumed_response_count=consumed_response_count,
             )
         except Exception:
             logger.exception(
-                "Failed to restore llm service state for sandbox=%s matched_response_count=%s",
+                "Failed to restore llm service state for sandbox=%s consumed_response_count=%s",
                 sandbox_id,
-                matched_response_count,
+                consumed_response_count,
             )
 
     def _set_sandbox_running_state(self, sandbox_id: SandboxId, *, is_running: bool) -> None:
