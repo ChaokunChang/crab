@@ -2635,8 +2635,8 @@ services:
         harness._delete_runtime = Mock()
         harness._set_sandbox_running_state = Mock()
 
-        with self.assertRaisesRegex(RuntimeError, "fault injection window"):
-            harness.wait_for_fault_injection_window(sandbox, timeout_s=0.05)
+        result = harness.wait_for_fault_injection_window(sandbox, timeout_s=0.05)
+        self.assertFalse(result)
 
         harness._delete_runtime.assert_not_called()
         harness._set_sandbox_running_state.assert_not_called()

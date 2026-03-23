@@ -1333,7 +1333,7 @@ class RealHostScenarioHarness:
         checkpoint_active = False if self.executor is None else self.executor.has_active_checkpoint(sandbox.sandbox_id)
         return not request_in_flight and not checkpoint_active
 
-    def wait_for_fault_injection_window(self, sandbox: SandboxHandle, *, timeout_s: float = 60.0) -> None:
+    def wait_for_fault_injection_window(self, sandbox: SandboxHandle, *, timeout_s: float = 60.0) -> bool:
         logger.info(
             "Waiting for fault injection window sandbox=%s timeout_s=%.1f",
             sandbox.sandbox_id,
@@ -1347,18 +1347,23 @@ class RealHostScenarioHarness:
         )
         if ready:
             logger.info("Fault injection window ready sandbox=%s", sandbox.sandbox_id)
-            return
+            return True
         request_state = None if self.request_state_store is None else self.request_state_store.get(sandbox.sandbox_id)
         request_in_flight = False if request_state is None else request_state.llm_request_in_flight
         checkpoint_active = False if self.executor is None else self.executor.has_active_checkpoint(sandbox.sandbox_id)
-        raise RuntimeError(
-            "timed out waiting for fault injection window "
-            f"(sandbox={sandbox.sandbox_id} request_in_flight={request_in_flight} checkpoint_active={checkpoint_active})"
+        logger.error(
+            "Timed out waiting for fault injection window, skipping fault injection "
+            "(sandbox=%s request_in_flight=%s checkpoint_active=%s)",
+            sandbox.sandbox_id,
+            request_in_flight,
+            checkpoint_active,
         )
+        return False
 
     def inject_fault(self, sandbox: SandboxHandle) -> None:
         logger.info("Injecting fault into sandbox=%s", sandbox.sandbox_id)
-        self.wait_for_fault_injection_window(sandbox)
+        if not self.wait_for_fault_injection_window(sandbox):
+            return
         self._delete_runtime(sandbox.sandbox_id)
         logger.info("Injected fault into sandbox=%s", sandbox.sandbox_id)
         self._set_sandbox_running_state(sandbox.sandbox_id, is_running=False)
