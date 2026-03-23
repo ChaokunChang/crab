@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -96,6 +97,21 @@ def select_task_record(
     )
 
 
+def _apply_llm_service_options(
+    record: BenchmarkTaskRecord,
+    llm_service_options: dict[str, object],
+) -> BenchmarkTaskRecord:
+    if not llm_service_options:
+        return record
+    if record.llm_service_config is None:
+        return record
+    merged = dict(record.llm_service_config)
+    for key, value in llm_service_options.items():
+        if key not in merged:
+            merged[key] = value
+    return dataclasses.replace(record, llm_service_config=merged)
+
+
 def resolve_task_records(
     config: BenchmarkConfig,
     *,
@@ -103,7 +119,7 @@ def resolve_task_records(
     default_task_config: TaskConfig,
 ) -> list[BenchmarkTaskRecord]:
     dataset = load_task_dataset(config.task_dataset) if config.task_dataset is not None else None
-    return [
+    records = [
         select_task_record(
             dataset,
             sandbox_index=index,
@@ -114,6 +130,9 @@ def resolve_task_records(
         )
         for index in range(config.sandboxes)
     ]
+    if config.llm_service_options:
+        records = [_apply_llm_service_options(r, config.llm_service_options) for r in records]
+    return records
 
 
 def parallel_map(

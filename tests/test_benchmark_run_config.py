@@ -8,8 +8,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from benchmarks.config import BenchmarkConfig, load_config
+from benchmarks.core import resolve_task_records
 from benchmarks.run import run_benchmark_config
 from benchmarks.scenarios import HarnessSettings, ScenarioDefinition
+from integrations.agents import TaskConfig, TaskDescription
 
 
 class BenchmarkConfigTests(unittest.TestCase):
@@ -115,6 +117,66 @@ class BenchmarkConfigTests(unittest.TestCase):
                 config.telemetry_output,
                 (root / "results" / "nested.telemetry.jsonl").resolve(),
             )
+
+    def test_resolve_task_records_merges_llm_service_options_without_overriding_dataset_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset_path = root / "tasks.jsonl"
+            dataset_path.write_text(
+                "\n".join(
+                    [
+                        (
+                            '{"agent_type":"iflow","llm_service_type":"iflow_trace_replay",'
+                            '"task_description":{"prompt":"task-a"},"task_config":{},'
+                            '"llm_service_config":{"trace_path":"trace-a.log","response_delay_policy":"fixed"}}'
+                        )
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config_path = root / "bench.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "scenario: fault",
+                        "mode: auto",
+                        "agent: iflow",
+                        "llm_service: iflow_trace_replay",
+                        "task_dataset: tasks.jsonl",
+                        "llm_service_options:",
+                        "  response_delay_policy: trace_replay",
+                        "  response_delay_scaling_factor: 0.5",
+                        "  response_delay_ms: 77",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+            records = resolve_task_records(
+                config,
+                default_task_description=TaskDescription("ignored"),
+                default_task_config=TaskConfig(),
+            )
+
+        self.assertEqual(
+            config.llm_service_options,
+            {
+                "response_delay_policy": "trace_replay",
+                "response_delay_scaling_factor": 0.5,
+                "response_delay_ms": 77,
+            },
+        )
+        self.assertEqual(
+            records[0].llm_service_config,
+            {
+                "trace_path": str((root / "trace-a.log").resolve()),
+                "response_delay_policy": "fixed",
+                "response_delay_scaling_factor": 0.5,
+                "response_delay_ms": 77,
+            },
+        )
 
     def test_load_config_rejects_invalid_log_file_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

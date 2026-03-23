@@ -62,6 +62,9 @@ _IFLOW_CONTEXT_ACK_MESSAGES = {
 }
 
 
+_RESPONSE_DELAY_POLICIES = {"fixed", "trace_replay"}
+
+
 @dataclass(frozen=True)
 class ReplayExchange:
     path: str
@@ -69,6 +72,15 @@ class ReplayExchange:
     response: dict[str, Any]
     response_index: int
     lookup_key: str
+    request_timestamp: float | None = None
+    response_timestamp: float | None = None
+
+    @property
+    def trace_delay_ms(self) -> float | None:
+        if self.request_timestamp is not None and self.response_timestamp is not None:
+            delay = (self.response_timestamp - self.request_timestamp) * 1000.0
+            return max(0.0, delay)
+        return None
 
 
 @dataclass(frozen=True)
@@ -428,7 +440,8 @@ def parse_replay_trace(trace_path: Path) -> ParsedReplayTrace:
             if payload is None:
                 malformed_lines.append(line_number)
                 continue
-            pending_request = ("/v1/chat/completions", payload)
+            request_ts = entry.get("timestamp")
+            pending_request = ("/v1/chat/completions", payload, request_ts if isinstance(request_ts, (int, float)) else None)
             continue
         if entry_type != "response":
             continue
@@ -439,7 +452,9 @@ def parse_replay_trace(trace_path: Path) -> ParsedReplayTrace:
         if pending_request is None:
             responses.append(payload)
             continue
-        path, request = pending_request
+        path, request, request_ts = pending_request
+        response_ts = entry.get("timestamp")
+        response_ts = response_ts if isinstance(response_ts, (int, float)) else None
         responses.append(payload)
         lookup_key, _ = _lookup_stats(path, request)
         fingerprint = _response_fingerprint(payload)
@@ -456,6 +471,8 @@ def parse_replay_trace(trace_path: Path) -> ParsedReplayTrace:
                 response=payload,
                 response_index=len(exchanges),
                 lookup_key=lookup_key,
+                request_timestamp=request_ts,
+                response_timestamp=response_ts,
             )
         )
         pending_request = None
@@ -477,19 +494,29 @@ class TraceReplayLLMState:
         if not isinstance(trace_path_value, str) or not trace_path_value:
             raise ValueError(
                 "iflow_trace_replay requires llm_service_config.trace_path")
+        raw_policy = str(config.get("response_delay_policy", "fixed")).strip().lower()
+        if raw_policy not in _RESPONSE_DELAY_POLICIES:
+            raise ValueError(
+                f"response_delay_policy must be one of {sorted(_RESPONSE_DELAY_POLICIES)}, got {raw_policy!r}")
         raw_delay_ms = config.get(
             "response_delay_ms", _DEFAULT_RESPONSE_DELAY_MS)
         try:
             response_delay_ms = int(raw_delay_ms)
         except (TypeError, ValueError):
             response_delay_ms = _DEFAULT_RESPONSE_DELAY_MS
+        try:
+            scaling_factor = float(config.get("response_delay_scaling_factor", 1.0))
+        except (TypeError, ValueError):
+            scaling_factor = 1.0
         parsed = parse_replay_trace(Path(trace_path_value))
         if not parsed.exchanges:
             raise ValueError(
                 f"trace {parsed.trace_path} did not contain any replayable request/response pairs")
         self._trace = parsed
         self._lock = threading.Lock()
+        self._response_delay_policy = raw_policy
         self._response_delay_ms = max(0, response_delay_ms)
+        self._response_delay_scaling_factor = max(0.0, scaling_factor)
         self._events: list[dict[str, Any]] = []
         self._consumed_response_count = 0
         self._duplicate_response_count = 0
@@ -627,16 +654,27 @@ class TraceReplayLLMState:
                     "lookup_key_matched": True,
                 }
             )
-        if self._response_delay_ms > 0:
-            time.sleep(self._response_delay_ms / 1000.0)
+        effective_delay_ms = self._compute_delay_ms(exchange)
+        if effective_delay_ms > 0:
+            time.sleep(effective_delay_ms / 1000.0)
         return consumed_response_count, copy.deepcopy(response)
+
+    def _compute_delay_ms(self, exchange: ReplayExchange) -> float:
+        if self._response_delay_policy == "trace_replay":
+            trace_delay = exchange.trace_delay_ms
+            if trace_delay is not None:
+                return trace_delay * self._response_delay_scaling_factor
+            return float(self._response_delay_ms)
+        return float(self._response_delay_ms)
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             consumed_response_count = self._consumed_response_count
             return {
                 "trace_path": str(self._trace.trace_path),
+                "response_delay_policy": self._response_delay_policy,
                 "response_delay_ms": self._response_delay_ms,
+                "response_delay_scaling_factor": self._response_delay_scaling_factor,
                 "total_responses": self._total_progress_responses,
                 "consumed_response_count": consumed_response_count,
                 "duplicate_response_count": self._duplicate_response_count,

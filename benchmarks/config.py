@@ -61,6 +61,7 @@ class BenchmarkConfig:
     transfer_delay_ms: float = 0.0
     work_dir_host_root: Path | None = None
     scenario_options: dict[str, object] = field(default_factory=dict)
+    llm_service_options: dict[str, object] = field(default_factory=dict)
 
     @property
     def config_dir(self) -> Path:
@@ -133,6 +134,11 @@ def load_config(path: Path) -> BenchmarkConfig:
         scenario_options = {}
     scenario_options = _require_object(scenario_options, label="scenario_options")
 
+    llm_service_options = data.get("llm_service_options", {})
+    if llm_service_options is None:
+        llm_service_options = {}
+    llm_service_options = _require_object(llm_service_options, label="llm_service_options")
+
     base_dir = config_path.parent
     telemetry_options = data.get("telemetry", {})
     if telemetry_options is None:
@@ -193,4 +199,5 @@ def load_config(path: Path) -> BenchmarkConfig:
         transfer_delay_ms=float(data.get("transfer_delay_ms", 0.0)),
         work_dir_host_root=_resolve_optional_path(base_dir, data.get("work_dir_host_root")),
         scenario_options=scenario_options,
+        llm_service_options=llm_service_options,
     )

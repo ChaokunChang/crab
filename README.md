@@ -228,6 +228,7 @@ log_level: info
 transfer_delay_ms: 0.0
 work_dir_host_root: logs/tmp
 scenario_options: {}
+llm_service_options: {}  # merged into per-task llm_service_config
 ```
 
 Benchmark artifacts now include both:
@@ -277,6 +278,26 @@ Logging notes:
 - `zpool_size` controls the backing file size for ephemeral benchmark zpools.
 - `reuse_zpool: true` keeps the zpool across runs instead of recreating it every time.
 - When reusing a pool, set both `zpool_name` and `zpool_image` to stable values. Each run still destroys and recreates the `pool/agent-cr` dataset so the benchmark starts clean.
+
+### LLM Service Options
+
+`llm_service_options` is a top-level YAML block whose keys are merged into each task's `llm_service_config` (dataset-level values take precedence). This is useful for controlling replay behavior globally without editing the dataset JSONL.
+
+For `iflow_trace_replay`, the following options control how response delays are simulated:
+
+- `response_delay_policy`: selects how the replay service simulates LLM response latency.
+  - `fixed` (default): uses a constant delay of `response_delay_ms` milliseconds (default 250ms).
+  - `trace_replay`: uses the actual request-to-response timestamps recorded in the trajectory, scaled by `response_delay_scaling_factor`.
+- `response_delay_ms`: constant delay in milliseconds, used by the `fixed` policy and as a fallback when `trace_replay` timestamps are unavailable (default 250).
+- `response_delay_scaling_factor`: multiplier applied to trace-derived delays when `response_delay_policy` is `trace_replay` (default 1.0). A value of 0.5 replays at 2× speed; 2.0 replays at half speed.
+
+Example YAML:
+
+```yaml
+llm_service_options:
+  response_delay_policy: trace_replay
+  response_delay_scaling_factor: 1.0
+```
 
 The per-scenario knobs live under `scenario_options`:
 
