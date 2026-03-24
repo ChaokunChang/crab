@@ -157,10 +157,20 @@ That harness:
 
 - Builds the simulated agent image
 - Creates a temporary ZFS pool
-- Launches `runc` sandboxes
+- Prepares sandbox bundles and rootfs state before launch
+- Launches `runc` sandboxes through an explicit phased pipeline
 - Runs an interceptor server in front of the simulated LLM service
 - Wires `AgentCRSystem` with policy-specific retention and recovery settings
 - Exposes helpers for checkpoint, restore, fault injection, preemption injection, and checkpoint cloning for tree-search fan-out
+
+The benchmark runner now coordinates four phases across the whole run:
+
+1. `build`
+2. `prepare`
+3. `run`
+4. `verification`
+
+`run` does not begin until all sandboxes finish `build` and `prepare`, and `verification` does not begin until all sandboxes finish `run`. Each phase has its own configurable worker limit from benchmark YAML.
 
 The main benchmark entrypoints and configuration surface are:
 

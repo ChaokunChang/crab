@@ -10,7 +10,17 @@ from agent_cr.models import utc_now
 from integrations.agents import SandboxHandle, TaskConfig, TaskDescription
 
 from benchmarks.config import BenchmarkConfig
-from benchmarks.core import annotate_row, emit_row_telemetry, parallel_map, resolve_task_records
+from benchmarks.core import (
+    annotate_row,
+    benchmark_phase_item_attributes,
+    benchmark_phase_map,
+    build_task_records_phase,
+    emit_row_telemetry,
+    make_benchmark_sandbox_specs,
+    prepare_task_records_phase,
+    resolve_task_records,
+    start_prepared_task_record,
+)
 from benchmarks.scenarios import HarnessSettings, ScenarioDefinition
 from benchmarks.scenarios.common import (
     choose_replay_chunk_targets,
@@ -225,6 +235,24 @@ def run_replay_manual_sandbox(
     sandbox: SandboxHandle,
     options: SpotOptions,
 ) -> dict[str, object]:
+    run_result = _run_replay_manual_sandbox_run(
+        config,
+        harness,
+        sandbox_index=sandbox_index,
+        sandbox=sandbox,
+        options=options,
+    )
+    return _finalize_replay_run_result(run_result)
+
+
+def _run_replay_manual_sandbox_run(
+    config: BenchmarkConfig,
+    harness,
+    *,
+    sandbox_index: int,
+    sandbox: SandboxHandle,
+    options: SpotOptions,
+) -> dict[str, object]:
     replay_chunk_targets = choose_replay_chunk_targets(sandbox, config.iterations)
     emit_metric = getattr(harness, "emit_benchmark_metric", None)
     rng = random.Random(sandbox_index)
@@ -304,11 +332,11 @@ def run_replay_manual_sandbox(
     except Exception as exc:
         task_error = str(exc)
 
-    return finalize_replay_row(
-        config,
-        harness,
-        sandbox,
-        row={
+    return {
+        "config": config,
+        "harness": harness,
+        "sandbox": sandbox,
+        "row": {
             "event_type": "preemption",
             "chunks_planned": len(replay_chunk_targets),
             "chunks_completed": chunks_completed,
@@ -327,13 +355,31 @@ def run_replay_manual_sandbox(
             "retained_checkpoints": len(harness.storage.list_checkpoints(sandbox.sandbox_id)),
             "skipped_no_replay_checkpoint": 1 if not replay_chunk_targets else 0,
         },
-        task_error=task_error,
-        verify_task_accuracy_result=False,
-        success_ratio=1.0 if not task_error and recoveries_succeeded == events_injected else 0.0,
-    )
+        "task_error": task_error,
+        "verify_task_accuracy_result": False,
+        "success_ratio": 1.0 if not task_error and recoveries_succeeded == events_injected else 0.0,
+    }
 
 
 def run_replay_auto_sandbox(
+    config: BenchmarkConfig,
+    harness,
+    *,
+    sandbox_index: int,
+    sandbox: SandboxHandle,
+    options: SpotOptions,
+) -> dict[str, object]:
+    run_result = _run_replay_auto_sandbox_run(
+        config,
+        harness,
+        sandbox_index=sandbox_index,
+        sandbox=sandbox,
+        options=options,
+    )
+    return _finalize_replay_run_result(run_result)
+
+
+def _run_replay_auto_sandbox_run(
     config: BenchmarkConfig,
     harness,
     *,
@@ -409,11 +455,11 @@ def run_replay_auto_sandbox(
     except Exception as exc:
         task_error = str(exc)
 
-    return finalize_replay_row(
-        config,
-        harness,
-        sandbox,
-        row={
+    return {
+        "config": config,
+        "harness": harness,
+        "sandbox": sandbox,
+        "row": {
             "event_type": "preemption",
             "chunks_planned": len(replay_chunk_targets),
             "chunks_completed": chunks_completed,
@@ -432,10 +478,89 @@ def run_replay_auto_sandbox(
             "retained_checkpoints": len(harness.storage.list_checkpoints(sandbox.sandbox_id)),
             "skipped_no_replay_checkpoint": 1 if not replay_chunk_targets else 0,
         },
-        task_error=task_error,
-        verify_task_accuracy_result=False,
-        success_ratio=1.0 if not task_error and recoveries_succeeded == events_injected else 0.0,
+        "task_error": task_error,
+        "verify_task_accuracy_result": False,
+        "success_ratio": 1.0 if not task_error and recoveries_succeeded == events_injected else 0.0,
+    }
+
+
+def _finalize_replay_run_result(run_result: dict[str, object]) -> dict[str, object]:
+    return finalize_replay_row(
+        run_result["config"],
+        run_result["harness"],
+        run_result["sandbox"],
+        row=dict(run_result["row"]),
+        task_error=str(run_result["task_error"]),
+        verify_task_accuracy_result=bool(run_result["verify_task_accuracy_result"]),
+        success_ratio=float(run_result["success_ratio"]),
     )
+
+
+def _finalize_run_rows(run_result: dict[str, object]) -> list[dict[str, object]]:
+    if run_result["kind"] == "replay":
+        return [_finalize_replay_run_result(run_result["payload"])]
+    return list(run_result["rows"])
+
+
+def _item_phase_attributes(harness, *, phase: str, prepared) -> dict[str, object]:
+    return benchmark_phase_item_attributes(
+        harness,
+        phase=phase,
+        sandbox_name=prepared.sandbox_name,
+        sandbox=prepared.handle,
+    )
+
+
+def _run_prepared_manual_spot_sandbox(
+    config: BenchmarkConfig,
+    harness,
+    *,
+    sandbox_index: int,
+    prepared,
+    options: SpotOptions,
+) -> dict[str, object]:
+    sandbox = start_prepared_task_record(harness, prepared)
+    if is_replay_llm_service_type(sandbox.llm_service_type):
+        return {
+            "kind": "replay",
+            "payload": _run_replay_manual_sandbox_run(
+                config,
+                harness,
+                sandbox_index=sandbox_index,
+                sandbox=sandbox,
+                options=options,
+            ),
+        }
+    return {
+        "kind": "rows",
+        "rows": run_manual_sandbox(config, harness, sandbox=sandbox, options=options),
+    }
+
+
+def _run_prepared_auto_spot_sandbox(
+    config: BenchmarkConfig,
+    harness,
+    *,
+    sandbox_index: int,
+    prepared,
+    options: SpotOptions,
+) -> dict[str, object]:
+    sandbox = start_prepared_task_record(harness, prepared)
+    if is_replay_llm_service_type(sandbox.llm_service_type):
+        return {
+            "kind": "replay",
+            "payload": _run_replay_auto_sandbox_run(
+                config,
+                harness,
+                sandbox_index=sandbox_index,
+                sandbox=sandbox,
+                options=options,
+            ),
+        }
+    return {
+        "kind": "rows",
+        "rows": run_auto_sandbox(config, harness, sandbox_index=sandbox_index, sandbox=sandbox, options=options),
+    }
 
 
 def run_manual(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
@@ -445,22 +570,55 @@ def run_manual(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
         default_task_config=default_task_config(),
     )
     options = parse_spot_options(config)
-    indexed_records = list(enumerate(records))
-    rows: list[dict[str, object]] = []
-    for sandbox_index, task_record in indexed_records:
-        sandbox = harness.launch_task_record(f"spot-{sandbox_index}", task_record)
-        if is_replay_llm_service_type(sandbox.llm_service_type):
-            rows.append(
-                run_replay_manual_sandbox(
-                    config,
-                    harness,
-                    sandbox_index=sandbox_index,
-                    sandbox=sandbox,
-                    options=options,
-                )
-            )
-        else:
-            rows.extend(run_manual_sandbox(config, harness, sandbox=sandbox, options=options))
+    specs = make_benchmark_sandbox_specs(
+        sandbox_name_prefix="spot",
+        records=records,
+    )
+    build_task_records_phase(
+        harness,
+        specs=specs,
+        max_workers=config.effective_phase_workers.build,
+    )
+    prepared = prepare_task_records_phase(
+        harness,
+        specs=specs,
+        max_workers=config.effective_phase_workers.prepare,
+    )
+    indexed_prepared = list(enumerate(prepared))
+    run_results = benchmark_phase_map(
+        indexed_prepared,
+        lambda item: _run_prepared_manual_spot_sandbox(
+            config,
+            harness,
+            sandbox_index=item[0],
+            prepared=item[1],
+            options=options,
+        ),
+        phase="run",
+        max_workers=config.effective_phase_workers.run,
+        harness=harness,
+        item_attributes=lambda item: _item_phase_attributes(
+            harness,
+            phase="run",
+            prepared=item[1],
+        ),
+    )
+    row_groups = benchmark_phase_map(
+        run_results,
+        _finalize_run_rows,
+        phase="verification",
+        max_workers=config.effective_phase_workers.verification,
+        harness=harness,
+        item_attributes=lambda item: benchmark_phase_item_attributes(
+            harness,
+            phase="verification",
+            sandbox_name=str(item["payload"]["sandbox"].sandbox_id)
+            if item["kind"] == "replay"
+            else str(item["rows"][0]["sandbox_id"]) if item["rows"] else "",
+            sandbox=item["payload"]["sandbox"] if item["kind"] == "replay" else None,
+        ),
+    )
+    rows = [row for group in row_groups for row in group]
     return sorted(rows, key=lambda row: (int(row["iteration"]), str(row["sandbox_id"])))
 
 
@@ -471,27 +629,55 @@ def run_auto(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
         default_task_config=default_task_config(),
     )
     options = parse_spot_options(config)
-    indexed_records = list(enumerate(records))
-    def launch_and_run(item: tuple[int, object]) -> list[dict[str, object]]:
-        sandbox_index, task_record = item
-        sandbox = harness.launch_task_record(f"spot-{sandbox_index}", task_record)
-        if is_replay_llm_service_type(sandbox.llm_service_type):
-            return [
-                run_replay_auto_sandbox(
-                    config,
-                    harness,
-                    sandbox_index=sandbox_index,
-                    sandbox=sandbox,
-                    options=options,
-                )
-            ]
-        return run_auto_sandbox(config, harness, sandbox_index=sandbox_index, sandbox=sandbox, options=options)
-
-    rows = [
-        row
-        for group in parallel_map(indexed_records, launch_and_run, max_workers=config.effective_max_workers)
-        for row in group
-    ]
+    specs = make_benchmark_sandbox_specs(
+        sandbox_name_prefix="spot",
+        records=records,
+    )
+    build_task_records_phase(
+        harness,
+        specs=specs,
+        max_workers=config.effective_phase_workers.build,
+    )
+    prepared = prepare_task_records_phase(
+        harness,
+        specs=specs,
+        max_workers=config.effective_phase_workers.prepare,
+    )
+    indexed_prepared = list(enumerate(prepared))
+    run_results = benchmark_phase_map(
+        indexed_prepared,
+        lambda item: _run_prepared_auto_spot_sandbox(
+            config,
+            harness,
+            sandbox_index=item[0],
+            prepared=item[1],
+            options=options,
+        ),
+        phase="run",
+        max_workers=config.effective_phase_workers.run,
+        harness=harness,
+        item_attributes=lambda item: _item_phase_attributes(
+            harness,
+            phase="run",
+            prepared=item[1],
+        ),
+    )
+    row_groups = benchmark_phase_map(
+        run_results,
+        _finalize_run_rows,
+        phase="verification",
+        max_workers=config.effective_phase_workers.verification,
+        harness=harness,
+        item_attributes=lambda item: benchmark_phase_item_attributes(
+            harness,
+            phase="verification",
+            sandbox_name=str(item["payload"]["sandbox"].sandbox_id)
+            if item["kind"] == "replay"
+            else str(item["rows"][0]["sandbox_id"]) if item["rows"] else "",
+            sandbox=item["payload"]["sandbox"] if item["kind"] == "replay" else None,
+        ),
+    )
+    rows = [row for group in row_groups for row in group]
     return sorted(rows, key=lambda row: (int(row["iteration"]), str(row["sandbox_id"])))
 
 

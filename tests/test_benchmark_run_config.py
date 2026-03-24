@@ -54,6 +54,7 @@ class BenchmarkConfigTests(unittest.TestCase):
             self.assertEqual(config.log_file, (root / "results" / "out.log").resolve())
             self.assertEqual(config.max_workers, 3)
             self.assertEqual(config.effective_max_workers, 3)
+            self.assertEqual(config.effective_phase_workers.as_dict(), {"build": 3, "prepare": 3, "run": 3, "verification": 3})
             self.assertEqual(config.log_file_mode, "write")
             self.assertEqual(config.benchmark_root, (root / "benchmark-runs").resolve())
             self.assertEqual(config.zpool_size, "32G")
@@ -210,6 +211,65 @@ class BenchmarkConfigTests(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(ValueError, "max_workers"):
+                load_config(config_path)
+
+    def test_load_config_parses_phase_workers_with_fallbacks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "bench.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "scenario: fault",
+                        "mode: auto",
+                        "sandboxes: 8",
+                        "max_workers: 4",
+                        "phase_workers:",
+                        "  build: 2",
+                        "  run: 3",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+        self.assertEqual(config.effective_phase_workers.as_dict(), {"build": 2, "prepare": 4, "run": 3, "verification": 4})
+
+    def test_load_config_rejects_unknown_phase_worker_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "bench.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "scenario: fault",
+                        "mode: auto",
+                        "phase_workers:",
+                        "  build: 1",
+                        "  deploy: 2",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "unknown phases"):
+                load_config(config_path)
+
+    def test_load_config_rejects_non_positive_phase_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "bench.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "scenario: fault",
+                        "mode: auto",
+                        "phase_workers:",
+                        "  verification: 0",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "phase_workers.verification"):
                 load_config(config_path)
 
     def test_load_config_rejects_invalid_scenario_mode_pair(self) -> None:

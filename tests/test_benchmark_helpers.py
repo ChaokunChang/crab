@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stdout
+import io
 import ipaddress
 import json
 import subprocess
@@ -18,6 +20,7 @@ from agent_cr import (
     CheckpointId,
     CheckpointManifest,
     EBPFEventKind,
+    InMemoryTelemetrySink,
     SandboxId,
     SchedulerConfig,
 )
@@ -29,6 +32,7 @@ from integrations.sandboxes.runtime import image as sandbox_image
 from integrations.sandboxes.runtime import launcher as sandbox_launcher
 from integrations.sandboxes.runtime import network as sandbox_network
 from benchmarks.config import BenchmarkConfig
+from benchmarks.core import benchmark_phase_map
 from benchmarks.scenarios.e2e import run_manual as run_e2e_manual
 from agent_cr.models import utc_now
 from benchmarks.scenarios.tree import choose_replay_steps
@@ -1471,7 +1475,7 @@ services:
             llm_service_config=None,
         )
 
-    def test_restore_llm_service_state_prefers_process_restore_trace_cursor(self) -> None:
+    def test_restore_llm_service_state_uses_max_restore_trace_cursor(self) -> None:
         harness = RealHostScenarioHarness(
             provider="openai",
             transfer_delay_ms=0.0,
@@ -1504,7 +1508,7 @@ services:
             ).with_integrity(),
         )
 
-        restore_sandbox.assert_called_once_with("sbx-replay", consumed_response_count=2)
+        restore_sandbox.assert_called_once_with("sbx-replay", consumed_response_count=4)
 
     def test_restore_llm_service_state_skips_restore_without_process_restore_trace_cursor(self) -> None:
         harness = RealHostScenarioHarness(
@@ -2766,6 +2770,77 @@ services:
         self.assertIs(result, handle)
         launch_compose.assert_called_once()
         self.assertEqual(result.launch_metadata["benchmark"]["task_id"], "sbx-compose")
+
+    def test_launch_task_record_uses_staged_harness_methods(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        record = BenchmarkTaskRecord(
+            agent_type="simulated",
+            task_description=TaskDescription("task"),
+            task_config=TaskConfig(),
+        )
+        handle = SandboxHandle(
+            sandbox_id=SandboxId("sbx-staged"),
+            bundle_dir=Path("/tmp/sbx-staged"),
+            status_port=8123,
+            last_status={},
+        )
+        prepared = SimpleNamespace(handle=handle)
+
+        with (
+            patch.object(harness, "build_task_record") as build_task_record,
+            patch.object(harness, "prepare_task_record", return_value=prepared) as prepare_task_record,
+            patch.object(harness, "run_prepared_task_record", return_value=handle) as run_prepared_task_record,
+            patch.object(harness, "_set_benchmark_launch_metadata") as set_benchmark_launch_metadata,
+        ):
+            result = harness.launch_task_record("sbx-staged", record)
+
+        self.assertIs(result, handle)
+        build_task_record.assert_called_once_with("sbx-staged", record)
+        prepare_task_record.assert_called_once_with("sbx-staged", record)
+        run_prepared_task_record.assert_called_once_with(prepared)
+        set_benchmark_launch_metadata.assert_called_once_with(handle, sandbox_name="sbx-staged", task_record=record)
+
+    def test_benchmark_phase_map_emits_phase_telemetry(self) -> None:
+        telemetry = InMemoryTelemetrySink()
+        harness = SimpleNamespace(telemetry=telemetry)
+
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            results = benchmark_phase_map(
+                [1, 2],
+                lambda value: value * 2,
+                phase="prepare",
+                max_workers=2,
+                harness=harness,
+                item_attributes=lambda value: {
+                    "component": "benchmark",
+                    "sandbox_id": f"sbx-{value}",
+                    "task_id": f"task-{value}",
+                    "phase": "prepare",
+                    "phase_scope": "sandbox",
+                },
+            )
+
+        self.assertEqual(results, [2, 4])
+        output = buffer.getvalue()
+        self.assertIn("benchmark.phase.prepare start sandboxes=2 max_workers=2", output)
+        self.assertIn("benchmark.phase.prepare end sandboxes=2 max_workers=2 duration_s=", output)
+        event_names = [name for name, _ in telemetry.events]
+        metric_names = [name for name, _, _ in telemetry.metrics]
+        self.assertIn("benchmark.phase.prepare.start", event_names)
+        self.assertIn("benchmark.phase.prepare.finish", event_names)
+        self.assertIn("benchmark.phase.prepare.item.start", event_names)
+        self.assertIn("benchmark.phase.prepare.item.finish", event_names)
+        self.assertIn("benchmark.phase.prepare.duration_ms", metric_names)
+        self.assertIn("benchmark.phase.prepare.item.duration_ms", metric_names)
+        self.assertIn("benchmark.phase.prepare.configured_max_workers", metric_names)
 
     def test_e2e_benchmark_uses_shared_harness_launch_flow(self) -> None:
         task_run = SimpleNamespace(

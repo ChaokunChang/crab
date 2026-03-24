@@ -236,6 +236,7 @@ Defined in `benchmarks/config.py`. Loaded from YAML via `load_config()`.
 | `task_dataset` | `path \| null` | `null` | Path to a task dataset file (relative to config file). |
 | `sandboxes` | `int` | `1` | Number of concurrent sandboxes. Must be > 0. |
 | `max_workers` | `int \| null` | `null` | Max worker threads. Defaults to `sandboxes` count. |
+| `phase_workers` | `mapping \| null` | `null` | Per-phase worker overrides for `build`, `prepare`, `run`, and `verification`. Missing keys fall back to `max_workers`. |
 | `iterations` | `int` | scenario-dependent | Number of iterations. Defaults: e2e=5, fault=3, spot=3, tree=1. |
 | `output` | `path \| null` | `null` | Path for CSV output file. |
 | `log_file` | `path \| null` | `null` | Path for log file. |
@@ -249,6 +250,20 @@ Defined in `benchmarks/config.py`. Loaded from YAML via `load_config()`.
 | `image_cache_root` | `path \| null` | `null` | Cache directory for Docker images. Default: `.cache/agent-cr/images`. |
 | `transfer_delay_ms` | `float` | `0.0` | Simulated transfer delay (ms) applied as `recovery_delay_seconds` during auto-recovery. |
 | `work_dir_host_root` | `path \| null` | `null` | Host-side working directory root for sandboxes. |
+
+### Phase Worker YAML Block (`phase_workers:`)
+
+| YAML Key | Type | Default | Description |
+|---|---|---|---|
+| `phase_workers.build` | `int \| null` | `max_workers` | Worker cap for the build phase. Must be > 0 when provided. |
+| `phase_workers.prepare` | `int \| null` | `max_workers` | Worker cap for the prepare phase. Must be > 0 when provided. |
+| `phase_workers.run` | `int \| null` | `max_workers` | Worker cap for the run phase. Must be > 0 when provided. |
+| `phase_workers.verification` | `int \| null` | `max_workers` | Worker cap for the verification phase. Must be > 0 when provided. |
+
+The benchmark harness executes all runs in four phases with hard barriers between them:
+
+- all sandboxes finish `build` and `prepare` before `run`
+- all sandboxes finish `run` before `verification`
 
 ### Telemetry YAML Block (`telemetry:`)
 

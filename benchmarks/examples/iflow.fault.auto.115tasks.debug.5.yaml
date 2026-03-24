@@ -10,12 +10,12 @@ phase_workers:
   build: 16
   prepare: 16
   run: 32
-  verification: 8
+  verification: 16
 iterations: 10
-output: ../../logs/iflow.fault.auto.115tasks.4.debug.csv
-log_file: ../../logs/iflow.fault.auto.115tasks.4.debug.log
+output: ../../logs/iflow.fault.auto.115tasks.5.debug.csv
+log_file: ../../logs/iflow.fault.auto.115tasks.5.debug.log
 telemetry:
-  output: ../../logs/iflow.fault.auto.115tasks.debug.4.telemetry.jsonl
+  output: ../../logs/iflow.fault.auto.115tasks.debug.5.telemetry.jsonl
   detail_level: detailed
   capture_command_output: false
   max_text_attribute_bytes: 2048

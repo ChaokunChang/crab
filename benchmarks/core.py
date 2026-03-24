@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Iterable, Sequence, TypeVar
 
+from agent_cr.telemetry import start_operation
 from integrations.agents import SandboxHandle, TaskConfig, TaskDescription
 
 from benchmarks.config import BenchmarkConfig
@@ -19,6 +21,19 @@ from benchmarks.support import (
 
 T = TypeVar("T")
 R = TypeVar("R")
+
+
+@dataclasses.dataclass(frozen=True)
+class BenchmarkSandboxSpec:
+    sandbox_name: str
+    task_record: BenchmarkTaskRecord
+
+
+@dataclasses.dataclass(frozen=True)
+class LegacyPreparedSandbox:
+    sandbox_name: str
+    task_record: BenchmarkTaskRecord
+    handle: SandboxHandle
 
 
 def _resolve_dataset_service_config(
@@ -145,6 +160,242 @@ def parallel_map(
         return []
     with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
         return list(executor.map(fn, items))
+
+
+def sandbox_name_for_index(prefix: str, index: int) -> str:
+    return f"{prefix}-{index}"
+
+
+def make_benchmark_sandbox_specs(
+    *,
+    sandbox_name_prefix: str,
+    records: Sequence[BenchmarkTaskRecord],
+) -> list[BenchmarkSandboxSpec]:
+    return [
+        BenchmarkSandboxSpec(
+            sandbox_name=sandbox_name_for_index(sandbox_name_prefix, index),
+            task_record=record,
+        )
+        for index, record in enumerate(records)
+    ]
+
+
+def benchmark_phase_run_attributes(
+    *,
+    phase: str,
+    sandbox_count: int,
+    configured_max_workers: int,
+) -> dict[str, object]:
+    return {
+        "component": "benchmark",
+        "phase": phase,
+        "phase_scope": "run",
+        "sandbox_count": int(sandbox_count),
+        "configured_max_workers": int(configured_max_workers),
+    }
+
+
+def benchmark_phase_item_attributes(
+    harness,
+    *,
+    phase: str,
+    sandbox_name: str,
+    task_record: BenchmarkTaskRecord | None = None,
+    sandbox: SandboxHandle | None = None,
+) -> dict[str, object]:
+    if sandbox is not None and hasattr(harness, "benchmark_telemetry_attributes"):
+        attributes = harness.benchmark_telemetry_attributes(sandbox)
+    else:
+        task_id = sandbox_name
+        agent_type = ""
+        llm_service_type = ""
+        if task_record is not None:
+            if task_record.task_id:
+                task_id = task_record.task_id
+            agent_type = task_record.agent_type
+            llm_service_type = task_record.llm_service_type or ""
+        attributes = {
+            "component": "benchmark",
+            "sandbox_id": sandbox_name,
+            "task_id": task_id,
+            "agent_type": agent_type,
+            "llm_service_type": llm_service_type,
+            "task_attempt": 0,
+        }
+    return {
+        **attributes,
+        "phase": phase,
+        "phase_scope": "sandbox",
+    }
+
+
+def _emit_phase_progress(
+    *,
+    phase: str,
+    status: str,
+    sandbox_count: int,
+    configured_max_workers: int,
+    duration_seconds: float | None = None,
+) -> None:
+    line = (
+        f"benchmark.phase.{phase} {status} "
+        f"sandboxes={int(sandbox_count)} max_workers={int(configured_max_workers)}"
+    )
+    if duration_seconds is not None:
+        line = f"{line} duration_s={duration_seconds:.3f}"
+    print(line, flush=True)
+
+
+def benchmark_phase_map(
+    items: Sequence[T],
+    fn: Callable[[T], R],
+    *,
+    phase: str,
+    max_workers: int,
+    harness,
+    item_attributes: Callable[[T], dict[str, object]] | None = None,
+) -> list[R]:
+    if not items:
+        return []
+    worker_count = max(1, max_workers)
+    telemetry = getattr(harness, "telemetry", None)
+    run_attributes = benchmark_phase_run_attributes(
+        phase=phase,
+        sandbox_count=len(items),
+        configured_max_workers=worker_count,
+    )
+    phase_started_at = time.perf_counter()
+    _emit_phase_progress(
+        phase=phase,
+        status="start",
+        sandbox_count=len(items),
+        configured_max_workers=worker_count,
+    )
+    phase_operation = None
+    if telemetry is not None:
+        telemetry.emit_metric(
+            f"benchmark.phase.{phase}.configured_max_workers",
+            float(worker_count),
+            run_attributes,
+        )
+        phase_operation = start_operation(
+            telemetry,
+            f"benchmark.phase.{phase}",
+            run_attributes,
+        )
+
+    def _invoke(item: T) -> R:
+        item_operation = None
+        if telemetry is not None and item_attributes is not None:
+            item_operation = start_operation(
+                telemetry,
+                f"benchmark.phase.{phase}.item",
+                item_attributes(item),
+            )
+        try:
+            result = fn(item)
+        except Exception:
+            if item_operation is not None:
+                item_operation.finish(status="failed")
+            raise
+        if item_operation is not None:
+            item_operation.finish(status="succeeded")
+        return result
+
+    try:
+        results = parallel_map(items, _invoke, max_workers=worker_count)
+    except Exception:
+        if phase_operation is not None:
+            phase_operation.finish(status="failed")
+        _emit_phase_progress(
+            phase=phase,
+            status="failed",
+            sandbox_count=len(items),
+            configured_max_workers=worker_count,
+            duration_seconds=max(0.0, time.perf_counter() - phase_started_at),
+        )
+        raise
+    if phase_operation is not None:
+        phase_operation.finish(status="succeeded")
+    _emit_phase_progress(
+        phase=phase,
+        status="end",
+        sandbox_count=len(items),
+        configured_max_workers=worker_count,
+        duration_seconds=max(0.0, time.perf_counter() - phase_started_at),
+    )
+    return results
+
+
+def build_task_records_phase(
+    harness,
+    *,
+    specs: Sequence[BenchmarkSandboxSpec],
+    max_workers: int,
+) -> None:
+    build_task_record = getattr(harness, "build_task_record", None)
+    if not callable(build_task_record):
+        return
+    benchmark_phase_map(
+        specs,
+        lambda spec: build_task_record(spec.sandbox_name, spec.task_record),
+        phase="build",
+        max_workers=max_workers,
+        harness=harness,
+        item_attributes=lambda spec: benchmark_phase_item_attributes(
+            harness,
+            phase="build",
+            sandbox_name=spec.sandbox_name,
+            task_record=spec.task_record,
+        ),
+    )
+
+
+def prepare_task_records_phase(
+    harness,
+    *,
+    specs: Sequence[BenchmarkSandboxSpec],
+    max_workers: int,
+):
+    prepare_task_record = getattr(harness, "prepare_task_record", None)
+    if not callable(prepare_task_record):
+        return benchmark_phase_map(
+            specs,
+            lambda spec: LegacyPreparedSandbox(
+                sandbox_name=spec.sandbox_name,
+                task_record=spec.task_record,
+                handle=harness.launch_task_record(spec.sandbox_name, spec.task_record),
+            ),
+            phase="prepare",
+            max_workers=max_workers,
+            harness=harness,
+            item_attributes=lambda spec: benchmark_phase_item_attributes(
+                harness,
+                phase="prepare",
+                sandbox_name=spec.sandbox_name,
+                task_record=spec.task_record,
+            ),
+        )
+    return benchmark_phase_map(
+        specs,
+        lambda spec: prepare_task_record(spec.sandbox_name, spec.task_record),
+        phase="prepare",
+        max_workers=max_workers,
+        harness=harness,
+        item_attributes=lambda spec: benchmark_phase_item_attributes(
+            harness,
+            phase="prepare",
+            sandbox_name=spec.sandbox_name,
+            task_record=spec.task_record,
+        ),
+    )
+
+
+def start_prepared_task_record(harness, prepared) -> SandboxHandle:
+    run_prepared_task_record = getattr(harness, "run_prepared_task_record", None)
+    if callable(run_prepared_task_record):
+        return run_prepared_task_record(prepared)
+    return prepared.handle
 
 
 def launch_task_records(

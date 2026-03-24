@@ -15,7 +15,18 @@ from agent_cr import (
 from integrations.agents import SandboxHandle, TaskConfig, TaskDescription
 
 from benchmarks.config import BenchmarkConfig
-from benchmarks.core import annotate_row, emit_row_telemetry, launch_task_records, parallel_map, resolve_task_records
+from benchmarks.core import (
+    annotate_row,
+    benchmark_phase_item_attributes,
+    benchmark_phase_map,
+    build_task_records_phase,
+    emit_row_telemetry,
+    make_benchmark_sandbox_specs,
+    parallel_map,
+    prepare_task_records_phase,
+    resolve_task_records,
+    start_prepared_task_record,
+)
 from benchmarks.scenarios import HarnessSettings, ScenarioDefinition
 from benchmarks.support import (
     TreeSearchCheckpointRecord,
@@ -455,42 +466,60 @@ def run_auto_source(
         harness.destroy_sandbox_dataset(source)
 
 
-def _launch_sources(config: BenchmarkConfig, harness) -> list[SandboxHandle]:
+def _prepare_source_specs(config: BenchmarkConfig, harness):
     records = resolve_task_records(
         config,
         default_task_description=benchmark_task_description(),
         default_task_config=default_task_config(),
     )
-    return launch_task_records(
-        harness,
+    specs = make_benchmark_sandbox_specs(
         sandbox_name_prefix="tree-source",
         records=records,
-        max_workers=config.effective_max_workers,
+    )
+    build_task_records_phase(
+        harness,
+        specs=specs,
+        max_workers=config.effective_phase_workers.build,
+    )
+    return prepare_task_records_phase(
+        harness,
+        specs=specs,
+        max_workers=config.effective_phase_workers.prepare,
     )
 
 
 def run_manual(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
     options = parse_tree_options(config)
     replay_steps = choose_replay_steps(options.source_steps, options.branch_points)
-    sources = _launch_sources(config, harness)
-    indexed_sources = list(enumerate(sources))
-    try:
-        row_groups = parallel_map(
-            indexed_sources,
-            lambda item: run_manual_source(
-                config,
-                harness,
-                options=options,
-                source_index=item[0],
-                source=item[1],
-                replay_steps=replay_steps,
-            ),
-            max_workers=min(config.effective_max_workers, max(1, len(indexed_sources))),
-        )
-    finally:
-        for source in sources:
-            harness.storage.delete_all_checkpoints(source.sandbox_id)
-            harness.destroy_sandbox_dataset(source)
+    prepared_sources = _prepare_source_specs(config, harness)
+    indexed_sources = list(enumerate(prepared_sources))
+    row_groups = benchmark_phase_map(
+        indexed_sources,
+        lambda item: run_manual_source(
+            config,
+            harness,
+            options=options,
+            source_index=item[0],
+            source=start_prepared_task_record(harness, item[1]),
+            replay_steps=replay_steps,
+        ),
+        phase="run",
+        max_workers=min(config.effective_phase_workers.run, max(1, len(indexed_sources))),
+        harness=harness,
+        item_attributes=lambda item: benchmark_phase_item_attributes(
+            harness,
+            phase="run",
+            sandbox_name=item[1].sandbox_name,
+            sandbox=item[1].handle,
+        ),
+    )
+    row_groups = benchmark_phase_map(
+        row_groups,
+        lambda group: group,
+        phase="verification",
+        max_workers=min(config.effective_phase_workers.verification, max(1, len(row_groups))),
+        harness=harness,
+    )
     rows = [row for group in row_groups for row in group]
     return sorted(rows, key=lambda row: (int(row["source_index"]), int(row["replay_step"]), str(row["fork_sandbox_id"])))
 
@@ -498,29 +527,41 @@ def run_manual(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
 def run_auto(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
     options = parse_tree_options(config)
     replay_steps = choose_replay_steps(options.source_steps, options.branch_points)
-    sources = _launch_sources(config, harness)
-    indexed_sources = list(enumerate(sources))
+    prepared_sources = _prepare_source_specs(config, harness)
+    indexed_sources = list(enumerate(prepared_sources))
     if hasattr(harness, "drain_request_state_changes"):
         harness.drain_request_state_changes()
     try:
-        row_groups = parallel_map(
+        row_groups = benchmark_phase_map(
             indexed_sources,
             lambda item: run_auto_source(
                 config,
                 harness,
                 options=options,
                 source_index=item[0],
-                source=item[1],
+                source=start_prepared_task_record(harness, item[1]),
                 replay_steps=replay_steps,
             ),
-            max_workers=min(config.effective_max_workers, max(1, len(indexed_sources))),
+            phase="run",
+            max_workers=min(config.effective_phase_workers.run, max(1, len(indexed_sources))),
+            harness=harness,
+            item_attributes=lambda item: benchmark_phase_item_attributes(
+                harness,
+                phase="run",
+                sandbox_name=item[1].sandbox_name,
+                sandbox=item[1].handle,
+            ),
         )
     finally:
         if hasattr(harness, "drain_request_state_changes"):
             harness.drain_request_state_changes()
-        for source in sources:
-            harness.storage.delete_all_checkpoints(source.sandbox_id)
-            harness.destroy_sandbox_dataset(source)
+    row_groups = benchmark_phase_map(
+        row_groups,
+        lambda group: group,
+        phase="verification",
+        max_workers=min(config.effective_phase_workers.verification, max(1, len(row_groups))),
+        harness=harness,
+    )
     rows = [row for group in row_groups for row in group]
     return sorted(rows, key=lambda row: (int(row["source_index"]), int(row["replay_step"]), str(row["fork_sandbox_id"])))
 

@@ -130,7 +130,7 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
     )
     run_context = benchmark_run_context(config.config_path)
     logger.info(
-        "========== benchmark.run start config=%s scenario=%s mode=%s provider=%s agent=%s llm_service=%s sandboxes=%d max_workers=%d iterations=%d pid=%s ==========",
+        "========== benchmark.run start config=%s scenario=%s mode=%s provider=%s agent=%s llm_service=%s sandboxes=%d max_workers=%d phase_workers=%s iterations=%d pid=%s ==========",
         config.config_path.resolve(),
         config.scenario,
         config.mode,
@@ -139,6 +139,7 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
         config.llm_service or "",
         config.sandboxes,
         config.effective_max_workers,
+        config.effective_phase_workers.as_dict(),
         config.iterations,
         run_context["pid"],
     )
@@ -156,7 +157,7 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
             scheduler_config=settings.scheduler_config,
             scheduler_policy=settings.scheduler_policy,
             checkpoint_manager_factory=settings.checkpoint_manager_factory,
-            max_workers=settings.max_workers,
+            max_workers=max(settings.max_workers, config.effective_phase_workers.run),
             auto_cr=config.mode == "auto",
             work_dir_host_root=config.work_dir_host_root,
             telemetry_output=telemetry_output,
