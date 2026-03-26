@@ -8,6 +8,7 @@ import logging
 import os
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -42,12 +43,8 @@ from agent_cr import (
     HostInspectorServiceClient,
     RemoteSandboxInspector,
     ExecutorConfig,
-    CompositeTelemetrySink,
-    ConfiguredTelemetrySink,
     InMemoryRequestStateStore,
     InMemorySchedulerStateStore,
-    InMemoryTelemetrySink,
-    JsonlTelemetrySink,
     LocalCheckpointManager,
     RequestInterceptorHook,
     RequestAwareSandboxInspector,
@@ -59,8 +56,10 @@ from agent_cr import (
     SandboxSnapshot,
     SchedulerConfig,
     StorageConfig,
+    TelemetryConfig,
     TelemetrySink,
     TelemetryRequestInterceptorHook,
+    build_configured_telemetry_sink,
 )
 from agent_cr.models import ArtifactPayload, utc_now
 from agent_cr.telemetry import start_operation
@@ -69,6 +68,7 @@ from agent_cr.host_inspector.runtime_resolver import RuntimeResolver
 from agent_cr.host_inspector.server import HostInspectorDaemon, HostInspectorServer
 from integrations.agents import BaseAgent, SandboxHandle, TaskConfig, TaskDescription, build_agent_registry
 from integrations.llm_services import (
+    BenchmarkLLMRouterClient,
     default_llm_service_type_for_agent,
     serve_benchmark_llm_router,
     validate_llm_service_type,
@@ -81,6 +81,7 @@ from integrations.sandboxes.runtime import image as sandbox_image
 from integrations.sandboxes.iflow import DOCKERFILE_PATH as IFLOW_DOCKERFILE_PATH
 from integrations.sandboxes.simulated import DOCKERFILE_PATH as SIMULATED_DOCKERFILE_PATH
 from benchmarks import core as benchmark_core
+from benchmarks.monitoring import BenchmarkResourceMonitor
 from benchmarks import support as benchmark_support
 
 logger = logging.getLogger(__name__)
@@ -137,6 +138,12 @@ def wait_for_http_json(url: str, *, timeout_s: float = 30.0) -> dict[str, object
             last_exc = exc
             time.sleep(0.2)
     raise RuntimeError(f"timed out waiting for {url}: {last_exc}")
+
+
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 def _zpool_exists(pool_name: str) -> bool:
@@ -207,12 +214,20 @@ class RealHostScenarioHarness:
         scheduler_policy,
         checkpoint_manager_factory,
         max_workers: int,
+        executor_config: ExecutorConfig | None = None,
         auto_cr: bool = False,
         work_dir_host_root: Path | None = None,
         telemetry_output: Path | None = None,
         telemetry_detail_level: str = "basic",
         telemetry_capture_command_output: bool = False,
         telemetry_max_text_attribute_bytes: int = 2048,
+        telemetry_keep_in_memory_copy: bool | None = None,
+        telemetry_writer_mode: str = "async",
+        telemetry_queue_capacity: int = 16384,
+        telemetry_batch_max_records: int = 256,
+        telemetry_flush_interval_ms: int = 50,
+        telemetry_overflow_policy: str = "drop_new",
+        telemetry_serializer: str = "auto",
         benchmark_root: Path | None = None,
         zpool_size: str = "10G",
         zpool_name: str | None = None,
@@ -220,6 +235,15 @@ class RealHostScenarioHarness:
         reuse_zpool: bool = False,
         image_cache_root: Path | None = None,
         run_id: str | None = None,
+        monitoring_enabled: bool = True,
+        monitoring_sample_interval_ms: int = 1000,
+        monitoring_include_host: bool = True,
+        monitoring_include_sandboxes: bool = True,
+        llm_server_launch_mode: str = "process",
+        host_inspector_launch_mode: str = "process",
+        runtime_root: Path | None = None,
+        storage_root: Path | None = None,
+        agent_host_root: Path | None = None,
     ) -> None:
         self.provider = provider
         self.transfer_delay_ms = transfer_delay_ms
@@ -227,27 +251,52 @@ class RealHostScenarioHarness:
         self.scheduler_policy = scheduler_policy
         self.checkpoint_manager_factory = checkpoint_manager_factory
         self.max_workers = max_workers
+        self.executor_config = executor_config or ExecutorConfig(max_workers=max(1, self.max_workers))
         self.auto_cr = auto_cr
         self.work_dir_host_root = work_dir_host_root
         self.telemetry_output = telemetry_output
         self.telemetry_detail_level = telemetry_detail_level
         self.telemetry_capture_command_output = telemetry_capture_command_output
         self.telemetry_max_text_attribute_bytes = telemetry_max_text_attribute_bytes
+        self.telemetry_keep_in_memory_copy = telemetry_keep_in_memory_copy
+        self.telemetry_writer_mode = telemetry_writer_mode
+        self.telemetry_queue_capacity = telemetry_queue_capacity
+        self.telemetry_batch_max_records = telemetry_batch_max_records
+        self.telemetry_flush_interval_ms = telemetry_flush_interval_ms
+        self.telemetry_overflow_policy = telemetry_overflow_policy
+        self.telemetry_serializer = telemetry_serializer
         self.configured_benchmark_root = None if benchmark_root is None else benchmark_root.expanduser().resolve()
+        self.configured_runtime_root = None if runtime_root is None else runtime_root.expanduser().resolve()
+        self.configured_storage_root = None if storage_root is None else storage_root.expanduser().resolve()
+        self.configured_agent_host_root = None if agent_host_root is None else agent_host_root.expanduser().resolve()
         self.zpool_size = zpool_size
         self.configured_zpool_name = zpool_name
         self.configured_zpool_image = zpool_image
         self.reuse_zpool = reuse_zpool
         self.image_cache_root = (image_cache_root or _DEFAULT_IMAGE_CACHE_ROOT).resolve()
         self.run_id = "" if run_id is None else str(run_id)
+        self.monitoring_enabled = monitoring_enabled
+        self.monitoring_sample_interval_ms = monitoring_sample_interval_ms
+        self.monitoring_include_host = monitoring_include_host
+        self.monitoring_include_sandboxes = monitoring_include_sandboxes
+        self.llm_server_launch_mode = llm_server_launch_mode
+        self.host_inspector_launch_mode = host_inspector_launch_mode
         self._tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self.root: Path | None = None
+        self.runtime_root: Path | None = None
+        self.storage_root: Path | None = None
+        self.agent_host_root: Path | None = None
+        self.runtime_bundle_root: Path | None = None
+        self.runtime_checkpoint_root: Path | None = None
+        self.runtime_metadata_root: Path | None = None
         self.pool_name = ""
         self.runtime_state_root: Path | None = None
         self.host_inspector_url: str = ""
         self._host_inspector_server: HostInspectorServer | None = None
+        self._host_inspector_process: subprocess.Popen[str] | None = None
         self.host_inspector_client: HostInspectorServiceClient = None
         self.telemetry: TelemetrySink | None = None
+        self.telemetry_path: Path | None = None
         self.request_state_store: InMemoryRequestStateStore | None = None
         self.base_inspector: EBPFSandboxInspector | None = None
         self.inspector: RequestAwareSandboxInspector | None = None
@@ -259,6 +308,9 @@ class RealHostScenarioHarness:
         self.interceptor_hook = CompositeRequestInterceptorHook()
         self.llm_server = None
         self.llm_thread: threading.Thread | None = None
+        self.llm_process: subprocess.Popen[str] | None = None
+        self.llm_server_base_url: str = ""
+        self.llm_router_client: BenchmarkLLMRouterClient | None = None
         self.sandboxes: list[SandboxHandle] = []
         self._sandbox_by_id: dict[SandboxId, SandboxHandle] = {}
         self.network_manager = sandbox_network.BenchmarkNetworkManager()
@@ -269,17 +321,78 @@ class RealHostScenarioHarness:
         self._task_executor = ThreadPoolExecutor(max_workers=max(1, self.max_workers))
         self._zpool_image_path: Path | None = None
         self._task_attempts: dict[str, int] = {}
+        self._resource_monitor: BenchmarkResourceMonitor | None = None
 
     @property
     def benchmark_bridge_ip(self) -> str:
         return self.network_manager.bridge_ip
 
+    def _effective_runtime_root(self) -> Path:
+        if self.runtime_root is not None:
+            return self.runtime_root
+        if self.root is not None:
+            return self.root
+        raise AssertionError("runtime root is not initialized")
+
+    def _effective_runtime_bundle_root(self) -> Path:
+        if self.runtime_bundle_root is not None:
+            return self.runtime_bundle_root
+        return self._effective_runtime_root() / "bundles"
+
+    def _effective_runtime_checkpoint_root(self) -> Path:
+        if self.runtime_checkpoint_root is not None:
+            return self.runtime_checkpoint_root
+        return self._effective_runtime_root() / "checkpoints"
+
+    def _effective_agent_host_root(self) -> Path:
+        if self.agent_host_root is not None:
+            return self.agent_host_root
+        if self.root is not None:
+            return self.root
+        return self._effective_runtime_root()
+
+    def _resolve_runtime_plane_root(self, *, zpool_image_path: Path) -> Path:
+        _ = zpool_image_path
+        if self.configured_runtime_root is not None:
+            return self.configured_runtime_root
+        assert self.root is not None
+        return self.root
+
     def _start_host_inspector_server(self) -> str:
         assert self.runtime_state_root is not None
         if self._host_inspector_server is not None:
             return f"http://{_HOST_INSPECTOR_HOST}:{self._host_inspector_server.port}"
+        if self.host_inspector_launch_mode not in {"process", "thread"}:
+            raise ValueError(
+                f"unsupported host_inspector_launch_mode={self.host_inspector_launch_mode!r}; expected 'process' or 'thread'"
+            )
 
         self.runtime_state_root.mkdir(parents=True, exist_ok=True)
+        if self.host_inspector_launch_mode == "process":
+            port = _find_free_port()
+            self._host_inspector_process = subprocess.Popen(
+                self._host_inspector_subprocess_command(port=port),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            url = f"http://{_HOST_INSPECTOR_HOST}:{port}"
+            try:
+                wait_for_http_json(f"{url}/healthz")
+            except Exception as exc:
+                if self._host_inspector_process is not None and self._host_inspector_process.poll() is not None:
+                    returncode = self._host_inspector_process.returncode
+                    stderr_output = (
+                        "" if self._host_inspector_process.stderr is None else self._host_inspector_process.stderr.read()
+                    )
+                    self._stop_host_inspector_server()
+                    raise RuntimeError(
+                        f"host inspector failed to start exit_code={returncode} stderr={stderr_output.strip()}"
+                    ) from exc
+                self._stop_host_inspector_server()
+                raise
+            return url
+
         daemon = HostInspectorDaemon(
             resolver=RuntimeResolver(runc_state_root=self.runtime_state_root),
             fs_monitor=LibbpfFilesystemMonitor(),
@@ -289,6 +402,7 @@ class RealHostScenarioHarness:
                 host=_HOST_INSPECTOR_HOST,
                 port=_HOST_INSPECTOR_PORT,
                 daemon=daemon,
+                max_workers=max(1, self.max_workers),
             )
         except OSError as exc:
             if exc.errno != errno.EADDRINUSE:
@@ -301,6 +415,7 @@ class RealHostScenarioHarness:
                 host=_HOST_INSPECTOR_HOST,
                 port=0,
                 daemon=daemon,
+                max_workers=max(1, self.max_workers),
             )
         logger.info(
             "Starting host inspector server in-process host=%s port=%d runc_state_root=%s",
@@ -320,9 +435,16 @@ class RealHostScenarioHarness:
     def _stop_host_inspector_server(self) -> None:
         server = self._host_inspector_server
         self._host_inspector_server = None
-        if server is None:
-            return
-        server.stop()
+        if server is not None:
+            server.stop()
+        if self._host_inspector_process is not None:
+            self._host_inspector_process.terminate()
+            try:
+                self._host_inspector_process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                self._host_inspector_process.kill()
+                self._host_inspector_process.wait(timeout=5.0)
+            self._host_inspector_process = None
 
     def __enter__(self) -> "RealHostScenarioHarness":
         require_binaries()
@@ -345,23 +467,37 @@ class RealHostScenarioHarness:
             self.root = Path(self._tmpdir.name)
         unique_suffix = uuid.uuid4().hex[:10]
         self.pool_name = self.configured_zpool_name or f"agentcrbench{unique_suffix}"
-        self.runtime_state_root = self.root / "runtime-state"
+        zpool_image_path = self.configured_zpool_image or (self.root / "zpool.img")
+        self.runtime_root = self._resolve_runtime_plane_root(zpool_image_path=zpool_image_path)
+        self.runtime_state_root = self.runtime_root / "runtime-state"
+        self.runtime_bundle_root = self.runtime_root / "bundles"
+        self.runtime_checkpoint_root = self.runtime_root / "checkpoints"
+        self.runtime_metadata_root = self.runtime_root / "sandbox-meta"
+        self.storage_root = self.configured_storage_root or (self.root / "storage")
+        self.agent_host_root = self.configured_agent_host_root or self.root
         self.host_inspector_url = self._start_host_inspector_server()
-        telemetry_sinks: list[TelemetrySink] = [InMemoryTelemetrySink()]
         telemetry_path = self.telemetry_output or (self.root / "telemetry.jsonl")
-        telemetry_sinks.append(JsonlTelemetrySink(telemetry_path))
-        self.telemetry = ConfiguredTelemetrySink(
-            CompositeTelemetrySink(telemetry_sinks),
+        self.telemetry_path = telemetry_path
+        self.telemetry = build_configured_telemetry_sink(
+            TelemetryConfig(
+                enabled=True,
+                jsonl_path=telemetry_path,
+                keep_in_memory_copy=self.telemetry_keep_in_memory_copy,
+                detail_level=self.telemetry_detail_level,
+                capture_command_output=self.telemetry_capture_command_output,
+                max_text_attribute_bytes=self.telemetry_max_text_attribute_bytes,
+                writer_mode=self.telemetry_writer_mode,
+                queue_capacity=self.telemetry_queue_capacity,
+                batch_max_records=self.telemetry_batch_max_records,
+                flush_interval_ms=self.telemetry_flush_interval_ms,
+                overflow_policy=self.telemetry_overflow_policy,
+                serializer=self.telemetry_serializer,
+            ),
             default_attributes={"run_id": self.run_id} if self.run_id else None,
-            detail_level=self.telemetry_detail_level,
-            capture_command_output=self.telemetry_capture_command_output,
-            max_text_attribute_bytes=self.telemetry_max_text_attribute_bytes,
+            keep_in_memory_fallback=False,
         )
         self.request_state_store = InMemoryRequestStateStore()
-        self.llm_server = serve_benchmark_llm_router(host="127.0.0.1", port=0, telemetry=self.telemetry)
-        self.llm_thread = threading.Thread(target=self.llm_server.serve_forever, daemon=True)
-        self.llm_thread.start()
-        wait_for_http_json(f"http://127.0.0.1:{self.llm_server.server_address[1]}/healthz")
+        self._start_llm_server()
         self._ensure_zpool()
 
         self.host_inspector_client = HostInspectorServiceClient(self.host_inspector_url)
@@ -370,18 +506,18 @@ class RealHostScenarioHarness:
         self.runtime = RuncRuntime(
             paths=RuncRuntimePaths(
                 state_root=self.runtime_state_root,
-                bundle_root=self.root / "bundles",
-                checkpoint_root=self.root / "checkpoints",
-                metadata_root=self.root / "sandbox-meta",
+                bundle_root=self.runtime_bundle_root,
+                checkpoint_root=self.runtime_checkpoint_root,
+                metadata_root=self.runtime_metadata_root,
                 zfs_dataset_prefix=f"{self.pool_name}/agent-cr",
             ),
             host_inspector_client=self.host_inspector_client,
             telemetry=self.telemetry,
         )
-        base_storage = LocalCheckpointManager(StorageConfig(root_dir=self.root / "storage"))
+        base_storage = LocalCheckpointManager(StorageConfig(root_dir=self.storage_root))
         self.storage = self.checkpoint_manager_factory(base_storage)
         self.executor = CRExecutor(
-            ExecutorConfig(max_workers=max(1, self.max_workers)),
+            self.executor_config,
             DefaultCWorker(
                 AdapterProcessCWorker(self.runtime),
                 AdapterFileSystemCWorker(self.runtime),
@@ -389,6 +525,7 @@ class RealHostScenarioHarness:
                 self.runtime,
                 checkpoint_guard=checkpoint_guard_from_inspector(self.inspector),
                 telemetry=self.telemetry,
+                step_workers=self.executor_config.resolved_composite_step_workers,
             ),
             DefaultRWorker(
                 AdapterProcessRWorker(self.runtime),
@@ -418,9 +555,19 @@ class RealHostScenarioHarness:
             restore_metadata_handler=self._restore_llm_service_state,
             recovery_delay_seconds=self.transfer_delay_ms / 1000.0 if self.auto_cr else 0.0,
         )
+        if self.telemetry is not None and self.runtime is not None and self.monitoring_enabled:
+            self._resource_monitor = BenchmarkResourceMonitor(
+                telemetry=self.telemetry,
+                runtime=self.runtime,
+                sandboxes=lambda: list(self.sandboxes),
+                sample_interval_ms=self.monitoring_sample_interval_ms,
+                include_host=self.monitoring_include_host,
+                include_sandboxes=self.monitoring_include_sandboxes,
+            )
+            self._resource_monitor.start()
         self.interceptor_hook.add_hook(TelemetryRequestInterceptorHook(self.telemetry))
         self.interceptor = AgentCRRequestInterceptorServer(
-            upstream_url=f"http://127.0.0.1:{self.llm_server.server_address[1]}",
+            upstream_url=self.llm_server_base_url,
             request_state_store=self.request_state_store,
             hook=self.interceptor_hook,
             telemetry=self.telemetry,
@@ -429,6 +576,7 @@ class RealHostScenarioHarness:
             sandbox_id_resolver=self.resolve_interceptor_sandbox_id,
             host="0.0.0.0",
             port=0,
+            max_workers=max(1, self.max_workers),
         )
         self.interceptor.start()
         wait_for_http_json(f"http://127.0.0.1:{self.interceptor.port}/healthz")
@@ -438,6 +586,9 @@ class RealHostScenarioHarness:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         # input("wait for signal to cleanup")
+        if self._resource_monitor is not None:
+            self._resource_monitor.stop()
+            self._resource_monitor = None
         for sandbox in self.sandboxes:
             if sandbox.task_run is not None:
                 sandbox.task_run.request_stop()
@@ -451,10 +602,16 @@ class RealHostScenarioHarness:
         self._task_executor.shutdown(wait=True, cancel_futures=True)
         if self.executor is not None:
             self.executor.shutdown()
+        if self.storage is not None:
+            flush_storage = getattr(self.storage, "flush", None)
+            if callable(flush_storage):
+                flush_storage()
+            close_storage = getattr(self.storage, "close", None)
+            if callable(close_storage):
+                close_storage()
         self.network_manager.cleanup()
         for sandbox in self.sandboxes:
-            if self.llm_server is not None:
-                self.llm_server.benchmark_llm_router.unregister_sandbox(str(sandbox.sandbox_id))  # type: ignore[attr-defined]
+            self._unregister_llm_service(sandbox.sandbox_id)
         # for image in self._sandbox_images.values():
             # subprocess.run(
             #     ["docker", "rmi", "-f", image.image_tag],
@@ -484,14 +641,199 @@ class RealHostScenarioHarness:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
+        self._stop_llm_server()
+        self._stop_host_inspector_server()
+        if self.host_inspector_client is not None:
+            self.host_inspector_client.close()
+            self.host_inspector_client = None
+        if self.telemetry is not None:
+            self.telemetry.close()
+        if self._tmpdir is not None:
+            self._tmpdir.cleanup()
+
+    def _llm_router_subprocess_command(self, *, port: int) -> list[str]:
+        command = [
+            sys.executable,
+            "-m",
+            "integrations.llm_services.router",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--telemetry-detail-level",
+            self.telemetry_detail_level,
+            "--telemetry-max-text-attribute-bytes",
+            str(self.telemetry_max_text_attribute_bytes),
+            "--telemetry-writer-mode",
+            self.telemetry_writer_mode,
+            "--telemetry-queue-capacity",
+            str(self.telemetry_queue_capacity),
+            "--telemetry-batch-max-records",
+            str(self.telemetry_batch_max_records),
+            "--telemetry-flush-interval-ms",
+            str(self.telemetry_flush_interval_ms),
+            "--telemetry-overflow-policy",
+            self.telemetry_overflow_policy,
+            "--telemetry-serializer",
+            self.telemetry_serializer,
+            "--max-workers",
+            str(max(1, self.max_workers)),
+        ]
+        if self.telemetry_path is not None:
+            command.extend(["--telemetry-jsonl", str(self.telemetry_path)])
+        if self.run_id:
+            command.extend(["--run-id", self.run_id])
+        if self.telemetry_capture_command_output:
+            command.append("--telemetry-capture-command-output")
+        if self.telemetry_keep_in_memory_copy:
+            command.append("--telemetry-keep-in-memory-copy")
+        return command
+
+    def _host_inspector_subprocess_command(self, *, port: int) -> list[str]:
+        assert self.runtime_state_root is not None
+        return [
+            sys.executable,
+            "-m",
+            "agent_cr.host_inspector.server",
+            "--host",
+            _HOST_INSPECTOR_HOST,
+            "--port",
+            str(port),
+            "--runc-state-root",
+            str(self.runtime_state_root),
+            "--max-workers",
+            str(max(1, self.max_workers)),
+        ]
+
+    def _start_llm_server(self) -> None:
+        if self.llm_server_launch_mode not in {"process", "thread"}:
+            raise ValueError(
+                f"unsupported llm_server_launch_mode={self.llm_server_launch_mode!r}; expected 'process' or 'thread'"
+            )
+        if self.llm_server_launch_mode == "thread":
+            self.llm_server = serve_benchmark_llm_router(
+                host="127.0.0.1",
+                port=0,
+                telemetry=self.telemetry,
+                max_workers=max(1, self.max_workers),
+            )
+            self.llm_thread = threading.Thread(target=self.llm_server.serve_forever, daemon=True)
+            self.llm_thread.start()
+            port = int(self.llm_server.server_address[1])
+        else:
+            port = _find_free_port()
+            self.llm_process = subprocess.Popen(
+                self._llm_router_subprocess_command(port=port),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        self.llm_server_base_url = f"http://127.0.0.1:{port}"
+        self.llm_router_client = BenchmarkLLMRouterClient(self.llm_server_base_url)
+        try:
+            wait_for_http_json(f"{self.llm_server_base_url}/healthz")
+        except Exception as exc:
+            if self.llm_process is not None and self.llm_process.poll() is not None:
+                returncode = self.llm_process.returncode
+                stderr_output = "" if self.llm_process.stderr is None else self.llm_process.stderr.read()
+                self._stop_llm_server()
+                raise RuntimeError(
+                    f"benchmark llm router failed to start exit_code={returncode} stderr={stderr_output.strip()}"
+                ) from exc
+            self._stop_llm_server()
+            raise
+
+    def _stop_llm_server(self) -> None:
+        if self.llm_router_client is not None:
+            self.llm_router_client.close()
+        self.llm_router_client = None
+        self.llm_server_base_url = ""
         if self.llm_server is not None:
             self.llm_server.shutdown()
             self.llm_server.server_close()
+            self.llm_server = None
         if self.llm_thread is not None:
             self.llm_thread.join(timeout=5.0)
-        self._stop_host_inspector_server()
-        if self._tmpdir is not None:
-            self._tmpdir.cleanup()
+            self.llm_thread = None
+        if self.llm_process is not None:
+            self.llm_process.terminate()
+            try:
+                self.llm_process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                self.llm_process.kill()
+                self.llm_process.wait(timeout=5.0)
+            self.llm_process = None
+
+    def _register_llm_service(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        llm_service_type: str,
+        llm_service_config: dict[str, object] | None = None,
+    ) -> None:
+        if self.llm_router_client is not None:
+            self.llm_router_client.register_sandbox(
+                sandbox_id=str(sandbox_id),
+                llm_service_type=llm_service_type,
+                llm_service_config=llm_service_config,
+            )
+            return
+        if self.llm_server is not None:
+            self.llm_server.benchmark_llm_router.register_sandbox(  # type: ignore[attr-defined]
+                sandbox_id=str(sandbox_id),
+                llm_service_type=llm_service_type,
+                llm_service_config=llm_service_config,
+            )
+            return
+        raise RuntimeError("llm router is not initialized")
+
+    def _unregister_llm_service(self, sandbox_id: SandboxId) -> None:
+        try:
+            if self.llm_router_client is not None:
+                self.llm_router_client.unregister_sandbox(str(sandbox_id))
+            elif self.llm_server is not None:
+                self.llm_server.benchmark_llm_router.unregister_sandbox(str(sandbox_id))  # type: ignore[attr-defined]
+        except Exception:
+            logger.debug("Failed to unregister llm service for sandbox=%s", sandbox_id, exc_info=True)
+
+    def _llm_control_base_url(self) -> str:
+        if self.llm_server_base_url:
+            return self.llm_server_base_url
+        if self.llm_server is not None:
+            return f"http://127.0.0.1:{self.llm_server.server_address[1]}"
+        return ""
+
+    def _snapshot_llm_services(self) -> dict[str, object] | None:
+        if self.llm_router_client is not None:
+            return self.llm_router_client.snapshot()
+        if self.llm_server is not None:
+            snapshot = self.llm_server.benchmark_llm_router.snapshot()  # type: ignore[attr-defined]
+            return None if snapshot is None else dict(snapshot)
+        return None
+
+    def _reset_llm_router_state(self, sandbox_id: SandboxId) -> None:
+        if self.llm_router_client is not None:
+            self.llm_router_client.reset_sandbox(str(sandbox_id))
+            return
+        if self.llm_server is not None:
+            self.llm_server.benchmark_llm_router.reset_sandbox(str(sandbox_id))  # type: ignore[attr-defined]
+            return
+        raise RuntimeError("llm router is not initialized")
+
+    def _restore_llm_router_state(self, sandbox_id: SandboxId, *, consumed_response_count: int) -> None:
+        if self.llm_router_client is not None:
+            self.llm_router_client.restore_sandbox(
+                str(sandbox_id),
+                consumed_response_count=consumed_response_count,
+            )
+            return
+        if self.llm_server is not None:
+            self.llm_server.benchmark_llm_router.restore_sandbox(  # type: ignore[attr-defined]
+                str(sandbox_id),
+                consumed_response_count=consumed_response_count,
+            )
+            return
+        raise RuntimeError("llm router is not initialized")
 
     def _ensure_zpool(self) -> None:
         assert self.root is not None
@@ -545,14 +887,13 @@ class RealHostScenarioHarness:
         task_description: TaskDescription,
         task_config: TaskConfig,
     ) -> BaseAgent:
-        assert self.root is not None
         return self.get_agent_class(agent_type)(
             sandbox,
             task_description,
             task_config,
             runtime_state_root=self.runtime_state_root,
             runtime=self.runtime,
-            agent_host_dir=self.root / agent_type / str(sandbox.sandbox_id),
+            agent_host_dir=self._effective_agent_host_root() / agent_type / str(sandbox.sandbox_id),
             llm_base_url=sandbox.llm_base_url,
         )
 
@@ -582,7 +923,6 @@ class RealHostScenarioHarness:
         return f"agent-cr-{sandbox_image.docker_tag_component(agent_type)}-bench:workspace"
 
     def ensure_sandbox_image(self, agent_type: str) -> AgentSandboxImage:
-        assert self.root is not None
         with self._sandbox_image_lock:
             cached = self._sandbox_images.get(agent_type)
             if cached is not None:
@@ -601,7 +941,7 @@ class RealHostScenarioHarness:
             )
             exported_rootfs = sandbox_image.export_image_rootfs(
                 tag=image_tag,
-                output_dir=self.root / "image" / agent_type,
+                output_dir=self._effective_runtime_root() / "image" / agent_type,
                 cache_root=self.image_cache_root,
                 telemetry=self.telemetry,
             )
@@ -614,7 +954,7 @@ class RealHostScenarioHarness:
             self._sandbox_images[agent_type] = built
             return built
 
-    def build_task_record(
+    def _ensure_task_record_inputs(
         self,
         sandbox_name: str,
         task_record: benchmark_support.BenchmarkTaskRecord,
@@ -859,7 +1199,6 @@ class RealHostScenarioHarness:
         task_run = self.build_task_run(agent_type, handle, task_description, task_config)
         handle.task_run = task_run
         self._task_attempts[str(handle.sandbox_id)] = self._task_attempts.get(str(handle.sandbox_id), 0) + 1
-        self.emit_benchmark_event("benchmark.task.start", handle)
         handle.task_future = self._task_executor.submit(task_run.perform_task)
         self._bind_task_future_telemetry(handle, handle.task_future)
         return task_run
@@ -885,11 +1224,12 @@ class RealHostScenarioHarness:
         self.launch_task(agent_type, task_description, task_config, str(handle.sandbox_id))
         return handle
 
-    def prepare_task_record(
+    def setup_task_record(
         self,
         sandbox_name: str,
         task_record: benchmark_support.BenchmarkTaskRecord,
     ) -> PreparedBenchmarkSandbox:
+        self._ensure_task_record_inputs(sandbox_name, task_record)
         if task_record.docker_compose_file is not None:
             prepared = self._prepare_compose_task_record(
                 sandbox_name=sandbox_name,
@@ -901,6 +1241,7 @@ class RealHostScenarioHarness:
                 task_record=task_record,
             )
         self._set_benchmark_launch_metadata(prepared.handle, sandbox_name=sandbox_name, task_record=task_record)
+        self._launch_prepared_runtime(prepared)
         return prepared
 
     def _set_benchmark_launch_metadata(
@@ -1051,6 +1392,28 @@ class RealHostScenarioHarness:
         self,
         prepared: PreparedBenchmarkSandbox,
     ) -> SandboxHandle:
+        handle = prepared.handle
+        if handle.task_description is not None and handle.task_config is not None:
+            self.launch_task(
+                handle.agent_type,
+                handle.task_description,
+                handle.task_config,
+                str(handle.sandbox_id),
+            )
+        if prepared.wait_for_ready_after_task_start and handle.task_run is not None:
+            try:
+                handle.task_run.wait_for_task_ready()
+            except RuntimeError:
+                pass
+            else:
+                if prepared.emit_ready_event:
+                    self.emit_benchmark_event("benchmark.task.ready", handle)
+        return handle
+
+    def _launch_prepared_runtime(
+        self,
+        prepared: PreparedBenchmarkSandbox,
+    ) -> None:
         assert self.base_inspector is not None
         runtime = self._active_runtime
         if runtime is None:
@@ -1076,22 +1439,6 @@ class RealHostScenarioHarness:
             prepared.prelaunch_task_run.wait_for_task_ready()
             if prepared.emit_ready_event:
                 self.emit_benchmark_event("benchmark.task.ready", handle)
-        if handle.task_description is not None and handle.task_config is not None:
-            self.launch_task(
-                handle.agent_type,
-                handle.task_description,
-                handle.task_config,
-                str(handle.sandbox_id),
-            )
-        if prepared.wait_for_ready_after_task_start and handle.task_run is not None:
-            try:
-                handle.task_run.wait_for_task_ready()
-            except RuntimeError:
-                pass
-            else:
-                if prepared.emit_ready_event:
-                    self.emit_benchmark_event("benchmark.task.ready", handle)
-        return handle
 
     def launch_task_record(
         self,
@@ -1113,10 +1460,8 @@ class RealHostScenarioHarness:
             )
             self._set_benchmark_launch_metadata(handle, sandbox_name=sandbox_name, task_record=task_record)
             return handle
-        self.build_task_record(sandbox_name, task_record)
-        prepared = self.prepare_task_record(sandbox_name, task_record)
+        prepared = self.setup_task_record(sandbox_name, task_record)
         handle = self.run_prepared_task_record(prepared)
-        self._set_benchmark_launch_metadata(handle, sandbox_name=sandbox_name, task_record=task_record)
         return handle
 
     def launch_sandbox_from_docker_compose_file(
@@ -1224,9 +1569,8 @@ class RealHostScenarioHarness:
         sandbox_name: str,
         task_root: Path | None,
     ) -> dict[str, str]:
-        assert self.root is not None
         task_id = "task" if task_root is None else task_root.name
-        host_logs_root = self.root / "termnius-logs" / sandbox_name
+        host_logs_root = self._effective_agent_host_root() / "termnius-logs" / sandbox_name
         task_logs_path = host_logs_root / "logs"
         task_agent_logs_path = host_logs_root / "agent-logs"
         task_logs_path.mkdir(parents=True, exist_ok=True)
@@ -1595,14 +1939,12 @@ class RealHostScenarioHarness:
         try:
             self.runtime.describe(sandbox.sandbox_id)
         except KeyError:
-            if self.llm_server is not None:
-                self.llm_server.benchmark_llm_router.unregister_sandbox(str(sandbox.sandbox_id))  # type: ignore[attr-defined]
+            self._unregister_llm_service(sandbox.sandbox_id)
             self.network_manager.release_lease(sandbox.sandbox_id)
             self._sandbox_by_id.pop(sandbox.sandbox_id, None)
             return
         self._destroy_filesystem_dataset(sandbox.sandbox_id)
-        if self.llm_server is not None:
-            self.llm_server.benchmark_llm_router.unregister_sandbox(str(sandbox.sandbox_id))  # type: ignore[attr-defined]
+        self._unregister_llm_service(sandbox.sandbox_id)
         self.network_manager.release_lease(sandbox.sandbox_id)
         self._sandbox_by_id.pop(sandbox.sandbox_id, None)
 
@@ -2056,12 +2398,13 @@ class RealHostScenarioHarness:
         image_defaults: sandbox_image.ImageRuntimeDefaults | None = None,
         image_rootfs_dir: Path | None = None,
     ) -> tuple[SandboxHandle, Path | None]:
-        assert self.root is not None
         assert self.interceptor is not None
-        assert self.llm_server is not None
+        llm_control_base_url = self._llm_control_base_url()
+        if not llm_control_base_url:
+            raise RuntimeError("llm router is not initialized")
         work_dir_host_path = benchmark_support.resolve_work_dir_host_path(self.work_dir_host_root, sandbox_name)
         prepared = sandbox_launcher.prepare_bundle_launch(
-            bundle_root=self.root / "bundles",
+            bundle_root=self._effective_runtime_bundle_root(),
             sandbox_name=sandbox_name,
             provider=self.provider,
             pool_name=self.pool_name,
@@ -2084,24 +2427,24 @@ class RealHostScenarioHarness:
             agent_type=agent_type,
             llm_service_type=llm_service_type,
             llm_base_url=prepared.llm_base_url,
-            llm_control_base_url=f"http://127.0.0.1:{self.llm_server.server_address[1]}",
+            llm_control_base_url=llm_control_base_url,
         )
         self.sandboxes.append(handle)
         self._sandbox_by_id[handle.sandbox_id] = handle
-        self.llm_server.benchmark_llm_router.register_sandbox(  # type: ignore[attr-defined]
-            sandbox_id=str(handle.sandbox_id),
+        self._register_llm_service(
+            handle.sandbox_id,
             llm_service_type=llm_service_type,
             llm_service_config=llm_service_config,
         )
         return handle, prepared.work_dir_host_path
 
     def _llm_service_checkpoint_metadata(self, sandbox_id: SandboxId) -> dict[str, object]:
-        if self.llm_server is None:
-            return {}
         try:
-            snapshot = self.llm_server.benchmark_llm_router.snapshot()  # type: ignore[attr-defined]
+            snapshot = self._snapshot_llm_services()
         except Exception:
             logger.exception("Failed to capture llm service checkpoint metadata for sandbox=%s", sandbox_id)
+            return {}
+        if snapshot is None:
             return {}
         sandbox_snapshot = snapshot.get(str(sandbox_id))
         if not isinstance(sandbox_snapshot, dict):
@@ -2122,15 +2465,15 @@ class RealHostScenarioHarness:
         return {"benchmark_trace_cursor": trace_cursor}
 
     def _reset_llm_service_state(self, sandbox_id: SandboxId) -> None:
-        if self.llm_server is None:
+        if self.llm_router_client is None and self.llm_server is None:
             return
         try:
-            self.llm_server.benchmark_llm_router.reset_sandbox(str(sandbox_id))  # type: ignore[attr-defined]
+            self._reset_llm_router_state(sandbox_id)
         except Exception:
             logger.exception("Failed to reset llm service state for sandbox=%s", sandbox_id)
 
     def _restore_llm_service_state(self, sandbox_id: SandboxId, manifest: CheckpointManifest) -> None:
-        if self.llm_server is None:
+        if self.llm_router_client is None and self.llm_server is None:
             return
         metadata = manifest.metadata if isinstance(manifest.metadata, dict) else {}
         raw_value_p = metadata.get("process_restore_trace_cursor")
@@ -2145,8 +2488,8 @@ class RealHostScenarioHarness:
             )
             return
         try:
-            self.llm_server.benchmark_llm_router.restore_sandbox(  # type: ignore[attr-defined]
-                str(sandbox_id),
+            self._restore_llm_router_state(
+                sandbox_id,
                 consumed_response_count=consumed_response_count,
             )
         except Exception:
@@ -2174,10 +2517,12 @@ class RealHostScenarioHarness:
         target_sandbox_id: SandboxId,
         checkpoint_id: CheckpointId,
     ) -> bytes:
+        bundle_root = self._effective_runtime_bundle_root()
+        checkpoint_root = self._effective_runtime_checkpoint_root()
         data = json.loads(payload.decode("utf-8"))
-        process_root = self.root / "checkpoints" / str(target_sandbox_id) / str(checkpoint_id)
+        process_root = checkpoint_root / str(target_sandbox_id) / str(checkpoint_id)
         shutil.copytree(
-            self.root / "checkpoints" / str(source_sandbox_id) / str(checkpoint_id),
+            checkpoint_root / str(source_sandbox_id) / str(checkpoint_id),
             process_root,
             dirs_exist_ok=True,
         )
@@ -2189,7 +2534,7 @@ class RealHostScenarioHarness:
             if isinstance(metadata, dict):
                 metadata["sandbox_id"] = str(target_sandbox_id)
                 metadata["checkpoint_id"] = str(checkpoint_id)
-                metadata["bundle_path"] = str(self.root / "bundles" / str(target_sandbox_id))
+                metadata["bundle_path"] = str(bundle_root / str(target_sandbox_id))
                 metadata["image_path"] = str(process_root / "process")
                 metadata["work_path"] = str(process_root / "work")
         return json.dumps(data, sort_keys=True, indent=2).encode("utf-8")
@@ -2202,13 +2547,14 @@ class RealHostScenarioHarness:
         checkpoint_id: CheckpointId,
     ) -> bytes:
         _ = source_sandbox_id
+        bundle_root = self._effective_runtime_bundle_root()
         data = json.loads(payload.decode("utf-8"))
         target_snapshot = f"{self.pool_name}/agent-cr/{target_sandbox_id}@{checkpoint_id}"
         filesystem = data.get("filesystem", {})
         if isinstance(filesystem, dict):
             filesystem["dataset"] = f"{self.pool_name}/agent-cr/{target_sandbox_id}"
             filesystem["snapshot"] = target_snapshot
-            filesystem["mountpoint"] = str(self.root / "bundles" / str(target_sandbox_id) / "rootfs")
+            filesystem["mountpoint"] = str(bundle_root / str(target_sandbox_id) / "rootfs")
         status = data.get("status", {})
         if isinstance(status, dict):
             metadata = status.get("metadata", {})
@@ -2217,6 +2563,6 @@ class RealHostScenarioHarness:
                 metadata["checkpoint_id"] = str(checkpoint_id)
                 metadata["dataset"] = f"{self.pool_name}/agent-cr/{target_sandbox_id}"
                 metadata["snapshot"] = target_snapshot
-                metadata["mountpoint"] = str(self.root / "bundles" / str(target_sandbox_id) / "rootfs")
+                metadata["mountpoint"] = str(bundle_root / str(target_sandbox_id) / "rootfs")
         data["sandbox_id"] = str(target_sandbox_id)
         return json.dumps(data, sort_keys=True, indent=2).encode("utf-8")

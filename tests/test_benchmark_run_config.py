@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import io
+import json
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from benchmarks.config import BenchmarkConfig, load_config
+from benchmarks.config import BenchmarkConfig, BenchmarkStoragePlanesConfig, load_config
 from benchmarks.core import resolve_task_records
 from benchmarks.run import run_benchmark_config
 from benchmarks.scenarios import HarnessSettings, ScenarioDefinition
@@ -35,6 +36,10 @@ class BenchmarkConfigTests(unittest.TestCase):
                         "zpool_name: benchcache",
                         "zpool_image: cache/bench.zpool.img",
                         "reuse_zpool: true",
+                        "storage_planes:",
+                        "  runtime_root: runtime-plane",
+                        "  storage_root: storage-plane",
+                        "  agent_host_root: agent-plane",
                         "telemetry_output: results/out.telemetry.jsonl",
                         "image_cache_root: cache/images",
                         "work_dir_host_root: workdirs",
@@ -54,13 +59,16 @@ class BenchmarkConfigTests(unittest.TestCase):
             self.assertEqual(config.log_file, (root / "results" / "out.log").resolve())
             self.assertEqual(config.max_workers, 3)
             self.assertEqual(config.effective_max_workers, 3)
-            self.assertEqual(config.effective_phase_workers.as_dict(), {"build": 3, "prepare": 3, "run": 3, "verification": 3})
+            self.assertEqual(config.effective_phase_workers.as_dict(), {"setup": 3, "run": 3, "verification": 3})
             self.assertEqual(config.log_file_mode, "write")
             self.assertEqual(config.benchmark_root, (root / "benchmark-runs").resolve())
             self.assertEqual(config.zpool_size, "32G")
             self.assertEqual(config.zpool_name, "benchcache")
             self.assertEqual(config.zpool_image, (root / "cache" / "bench.zpool.img").resolve())
             self.assertTrue(config.reuse_zpool)
+            self.assertEqual(config.storage_planes.runtime_root, (root / "runtime-plane").resolve())
+            self.assertEqual(config.storage_planes.storage_root, (root / "storage-plane").resolve())
+            self.assertEqual(config.storage_planes.agent_host_root, (root / "agent-plane").resolve())
             self.assertEqual(config.telemetry_output, (root / "results" / "out.telemetry.jsonl").resolve())
             self.assertEqual(config.image_cache_root, (root / "cache" / "images").resolve())
             self.assertEqual(config.work_dir_host_root, (root / "workdirs").resolve())
@@ -80,6 +88,13 @@ class BenchmarkConfigTests(unittest.TestCase):
                         "  detail_level: detailed",
                         "  capture_command_output: true",
                         "  max_text_attribute_bytes: 512",
+                        "  keep_in_memory_copy: false",
+                        "  writer_mode: sync",
+                        "  queue_capacity: 99",
+                        "  batch_max_records: 7",
+                        "  flush_interval_ms: 11",
+                        "  overflow_policy: block",
+                        "  serializer: stdlib",
                     ]
                 ),
                 encoding="utf-8",
@@ -94,6 +109,55 @@ class BenchmarkConfigTests(unittest.TestCase):
             self.assertEqual(config.telemetry_detail_level, "detailed")
             self.assertTrue(config.telemetry_capture_command_output)
             self.assertEqual(config.telemetry_max_text_attribute_bytes, 512)
+            self.assertFalse(config.telemetry_keep_in_memory_copy)
+            self.assertEqual(config.telemetry_writer_mode, "sync")
+            self.assertEqual(config.telemetry_queue_capacity, 99)
+            self.assertEqual(config.telemetry_batch_max_records, 7)
+            self.assertEqual(config.telemetry_flush_interval_ms, 11)
+            self.assertEqual(config.telemetry_overflow_policy, "block")
+            self.assertEqual(config.telemetry_serializer, "stdlib")
+            self.assertTrue(config.telemetry_report.enabled)
+            self.assertIsNone(config.telemetry_report.output_dir)
+            self.assertEqual(config.monitoring.sample_interval_ms, 1000)
+
+    def test_load_config_supports_report_and_monitoring_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "bench.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "scenario: fault",
+                        "mode: auto",
+                        "telemetry:",
+                        "  output: results/out.telemetry.jsonl",
+                        "  report:",
+                        "    enabled: true",
+                        "    output_dir: results/report-dir",
+                        "    top_k: 17",
+                        "    log_scale_charts: true",
+                        "    export_svg: false",
+                        "monitoring:",
+                        "  enabled: true",
+                        "  sample_interval_ms: 250",
+                        "  include_host: true",
+                        "  include_sandboxes: false",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+            self.assertTrue(config.telemetry_report.enabled)
+            self.assertEqual(config.telemetry_report.output_dir, (root / "results" / "report-dir").resolve())
+            self.assertEqual(config.telemetry_report.top_k, 17)
+            self.assertTrue(config.telemetry_report.log_scale_charts)
+            self.assertFalse(config.telemetry_report.export_svg)
+            self.assertTrue(config.monitoring.enabled)
+            self.assertEqual(config.monitoring.sample_interval_ms, 250)
+            self.assertTrue(config.monitoring.include_host)
+            self.assertFalse(config.monitoring.include_sandboxes)
 
     def test_load_config_nested_telemetry_output_overrides_legacy_field(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -118,6 +182,65 @@ class BenchmarkConfigTests(unittest.TestCase):
                 config.telemetry_output,
                 (root / "results" / "nested.telemetry.jsonl").resolve(),
             )
+
+    def test_load_config_supports_executor_scheduler_and_llm_server_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "bench.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "scenario: fault",
+                        "mode: auto",
+                        "executor:",
+                        "  checkpoint_workers: 7",
+                        "  restore_workers: 9",
+                        "  coordination_workers: 5",
+                        "  composite_step_workers: 11",
+                        "  checkpoint_queue_size: 123",
+                        "  max_retries: 2",
+                        "  retry_backoff_seconds: 0.25",
+                        "scheduler:",
+                        "  min_checkpoint_interval_seconds: 1.5",
+                        "  force_checkpoint_after_seconds: 9.0",
+                        "  require_change_signal: false",
+                        "  checkpoint_full_baseline_on_first_checkpoint: false",
+                        "  prefer_checkpoint_during_llm_request: false",
+                        "  require_llm_request_for_checkpoint: true",
+                        "  inspect_without_pause: true",
+                        "llm_server:",
+                        "  launch_mode: thread",
+                        "host_inspector:",
+                        "  launch_mode: thread",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+            resolved_executor = config.executor.resolve(default_workers=3)
+
+            self.assertEqual(config.executor.checkpoint_workers, 7)
+            self.assertEqual(config.executor.restore_workers, 9)
+            self.assertEqual(config.executor.coordination_workers, 5)
+            self.assertEqual(config.executor.composite_step_workers, 11)
+            self.assertEqual(config.executor.checkpoint_queue_size, 123)
+            self.assertEqual(config.executor.max_retries, 2)
+            self.assertEqual(config.executor.retry_backoff_seconds, 0.25)
+            self.assertEqual(resolved_executor.resolved_checkpoint_workers, 7)
+            self.assertEqual(resolved_executor.resolved_restore_workers, 9)
+            self.assertEqual(resolved_executor.resolved_coordination_workers, 5)
+            self.assertEqual(resolved_executor.resolved_composite_step_workers, 11)
+            self.assertEqual(resolved_executor.max_checkpoint_queue_size, 123)
+            self.assertEqual(config.scheduler.min_checkpoint_interval_seconds, 1.5)
+            self.assertEqual(config.scheduler.force_checkpoint_after_seconds, 9.0)
+            self.assertFalse(config.scheduler.require_change_signal)
+            self.assertFalse(config.scheduler.checkpoint_full_baseline_on_first_checkpoint)
+            self.assertFalse(config.scheduler.prefer_checkpoint_during_llm_request)
+            self.assertTrue(config.scheduler.require_llm_request_for_checkpoint)
+            self.assertTrue(config.scheduler.inspect_without_pause)
+            self.assertEqual(config.llm_server.launch_mode, "thread")
+            self.assertEqual(config.host_inspector.launch_mode, "thread")
 
     def test_resolve_task_records_merges_llm_service_options_without_overriding_dataset_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -224,7 +347,7 @@ class BenchmarkConfigTests(unittest.TestCase):
                         "sandboxes: 8",
                         "max_workers: 4",
                         "phase_workers:",
-                        "  build: 2",
+                        "  setup: 2",
                         "  run: 3",
                     ]
                 ),
@@ -233,7 +356,7 @@ class BenchmarkConfigTests(unittest.TestCase):
 
             config = load_config(config_path)
 
-        self.assertEqual(config.effective_phase_workers.as_dict(), {"build": 2, "prepare": 4, "run": 3, "verification": 4})
+        self.assertEqual(config.effective_phase_workers.as_dict(), {"setup": 2, "run": 3, "verification": 4})
 
     def test_load_config_rejects_unknown_phase_worker_keys(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -244,7 +367,7 @@ class BenchmarkConfigTests(unittest.TestCase):
                         "scenario: fault",
                         "mode: auto",
                         "phase_workers:",
-                        "  build: 1",
+                        "  setup: 1",
                         "  deploy: 2",
                     ]
                 ),
@@ -270,6 +393,25 @@ class BenchmarkConfigTests(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(ValueError, "phase_workers.verification"):
+                load_config(config_path)
+
+    def test_load_config_rejects_legacy_build_and_prepare_phase_worker_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "bench.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "scenario: fault",
+                        "mode: auto",
+                        "phase_workers:",
+                        "  build: 2",
+                        "  prepare: 2",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "unknown phases"):
                 load_config(config_path)
 
     def test_load_config_rejects_invalid_scenario_mode_pair(self) -> None:
@@ -476,6 +618,166 @@ class BenchmarkRunDispatchTests(unittest.TestCase):
         self.assertEqual(calls[0]["telemetry_detail_level"], "detailed")
         self.assertTrue(calls[0]["telemetry_capture_command_output"])
         self.assertEqual(calls[0]["telemetry_max_text_attribute_bytes"], 512)
+
+    def test_run_benchmark_config_passes_storage_plane_roots_to_harness(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        class _HarnessContext:
+            def __init__(self, **kwargs) -> None:
+                calls.append(kwargs)
+
+            def __enter__(self):
+                return {"kind": "fake-harness"}
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                _ = (exc_type, exc, tb)
+
+        scenario = ScenarioDefinition(
+            name="fake",
+            supported_modes=frozenset({"manual"}),
+            build_harness_settings=lambda config: HarnessSettings(
+                scheduler_config={"mode": config.mode},
+                scheduler_policy=None,
+                checkpoint_manager_factory=lambda base: base,
+                max_workers=1,
+            ),
+            run_manual=lambda config, harness: [],
+            run_auto=None,
+            summarize=lambda config, rows: {},
+        )
+        config = BenchmarkConfig(
+            config_path=Path("/tmp/bench.yaml"),
+            scenario="fake",
+            mode="manual",
+            provider="openai",
+            agent="simulated",
+            llm_service="simulated",
+            benchmark_root=Path("/tmp/bench-root"),
+            zpool_size="10G",
+            storage_planes=BenchmarkStoragePlanesConfig(
+                runtime_root=Path("/tmp/runtime-plane"),
+                storage_root=Path("/tmp/storage-plane"),
+                agent_host_root=Path("/tmp/agent-plane"),
+            ),
+        )
+
+        with patch("benchmarks.run.RealHostScenarioHarness", _HarnessContext), patch.dict(
+            "benchmarks.run.SCENARIOS",
+            {"fake": scenario},
+            clear=True,
+        ):
+            run_benchmark_config(config)
+
+        self.assertEqual(calls[0]["runtime_root"], Path("/tmp/runtime-plane"))
+        self.assertEqual(calls[0]["storage_root"], Path("/tmp/storage-plane"))
+        self.assertEqual(calls[0]["agent_host_root"], Path("/tmp/agent-plane"))
+
+    def test_run_benchmark_config_passes_monitoring_settings_to_harness(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        class _HarnessContext:
+            def __init__(self, **kwargs) -> None:
+                calls.append(kwargs)
+
+            def __enter__(self):
+                return {"kind": "fake-harness"}
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                _ = (exc_type, exc, tb)
+
+        scenario = ScenarioDefinition(
+            name="fake",
+            supported_modes=frozenset({"manual"}),
+            build_harness_settings=lambda config: HarnessSettings(
+                scheduler_config={"mode": config.mode},
+                scheduler_policy=None,
+                checkpoint_manager_factory=lambda base: base,
+                max_workers=1,
+            ),
+            run_manual=lambda config, harness: [],
+            run_auto=None,
+            summarize=lambda config, rows: {},
+        )
+        config = self._config("manual")
+        config = config.__class__(**{**config.__dict__, "scenario": "fake"})
+
+        with patch("benchmarks.run.RealHostScenarioHarness", _HarnessContext), patch.dict(
+            "benchmarks.run.SCENARIOS",
+            {"fake": scenario},
+            clear=True,
+        ):
+            run_benchmark_config(config)
+
+        self.assertTrue(calls[0]["monitoring_enabled"])
+        self.assertEqual(calls[0]["monitoring_sample_interval_ms"], 1000)
+        self.assertTrue(calls[0]["monitoring_include_host"])
+        self.assertTrue(calls[0]["monitoring_include_sandboxes"])
+
+    def test_run_benchmark_config_auto_generates_report_bundle(self) -> None:
+        calls: list[dict[str, object]] = []
+        report_calls: list[dict[str, object]] = []
+
+        class _HarnessContext:
+            def __init__(self, **kwargs) -> None:
+                calls.append(kwargs)
+
+            def __enter__(self):
+                telemetry_output = calls[-1]["telemetry_output"]
+                assert isinstance(telemetry_output, Path)
+                telemetry_output.parent.mkdir(parents=True, exist_ok=True)
+                telemetry_output.write_text(
+                    json.dumps(
+                        {
+                            "timestamp": "2026-03-24T00:00:00+08:00",
+                            "kind": "metric",
+                            "name": "benchmark.task.duration_ms",
+                            "value": 10.0,
+                            "attributes": {
+                                "run_id": "run-x",
+                                "sandbox_id": "sbx-1",
+                                "task_id": "task-1",
+                                "component": "benchmark",
+                            },
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                return {"kind": "fake-harness"}
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                _ = (exc_type, exc, tb)
+
+        scenario = ScenarioDefinition(
+            name="fake",
+            supported_modes=frozenset({"manual"}),
+            build_harness_settings=lambda config: HarnessSettings(
+                scheduler_config={"mode": config.mode},
+                scheduler_policy=None,
+                checkpoint_manager_factory=lambda base: base,
+                max_workers=1,
+            ),
+            run_manual=lambda config, harness: [],
+            run_auto=None,
+            summarize=lambda config, rows: {},
+        )
+        config = self._config("manual")
+        config = config.__class__(**{**config.__dict__, "scenario": "fake", "telemetry_output": Path("/tmp/auto.telemetry.jsonl")})
+
+        def _fake_report_bundle(*args, **kwargs):
+            report_calls.append({"args": args, "kwargs": kwargs})
+            return None
+
+        with patch("benchmarks.run.RealHostScenarioHarness", _HarnessContext), patch.dict(
+            "benchmarks.run.SCENARIOS",
+            {"fake": scenario},
+            clear=True,
+        ), patch("benchmarks.telemetry_analysis.generate_report_bundle", side_effect=_fake_report_bundle):
+            run_benchmark_config(config)
+
+        self.assertEqual(len(report_calls), 1)
+        self.assertEqual(report_calls[0]["args"][0], Path("/tmp/auto.telemetry.jsonl"))
+        self.assertEqual(report_calls[0]["kwargs"]["output_dir"], Path("/tmp/auto.telemetry.report"))
 
     def test_run_benchmark_config_logs_run_markers_and_summary_to_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

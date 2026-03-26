@@ -7,8 +7,7 @@ task_dataset: /root/workspace/agent-cr/results/datasets/termnius_iflow_replay_x1
 sandboxes: 115
 max_workers: 48
 phase_workers:
-  build: 32
-  prepare: 32
+  setup: 32
   run: 48
   verification: 32
 iterations: 10

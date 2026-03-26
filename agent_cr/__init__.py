@@ -74,7 +74,16 @@ from .storage import (
     LocalCheckpointManager,
 )
 from .system import AgentCRSystem, build_default_system
-from .telemetry import CompositeTelemetrySink, ConfiguredTelemetrySink, InMemoryTelemetrySink, JsonlTelemetrySink, NoopTelemetrySink
+from .telemetry import (
+    AsyncJsonlTelemetrySink,
+    CompositeTelemetrySink,
+    ConfiguredTelemetrySink,
+    InMemoryTelemetrySink,
+    JsonlTelemetrySink,
+    NoopTelemetrySink,
+    build_configured_telemetry_sink,
+    start_operation,
+)
 from .workers import (
     AdapterFileSystemCWorker,
     AdapterFileSystemRWorker,
@@ -160,6 +169,7 @@ __all__ = [
     "AdapterProcessRWorker",
     "AdapterFileSystemCWorker",
     "AdapterFileSystemRWorker",
+    "AsyncJsonlTelemetrySink",
     "CompositeRequestInterceptorHook",
     "AgentCRRequestInterceptor",
     "InMemoryRequestStateStore",
@@ -169,4 +179,6 @@ __all__ = [
     "TelemetryRequestInterceptorHook",
     "TreeSearchCheckpointingPolicy",
     "AgentCRRequestInterceptorServer",
+    "build_configured_telemetry_sink",
+    "start_operation",
 ]

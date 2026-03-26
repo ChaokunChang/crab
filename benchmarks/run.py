@@ -30,6 +30,10 @@ SCENARIOS = {
 logger = logging.getLogger(__name__)
 
 
+def _default_report_output_dir(telemetry_output: Path) -> Path:
+    return telemetry_output.with_suffix(".report")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Unified Agent-CR benchmark runner")
     parser.add_argument("--config", type=Path, required=True)
@@ -40,14 +44,42 @@ def _summary_lines(summary: dict[str, float]) -> list[str]:
     return [f"{key}_avg: {value:.3f}" for key, value in summary.items()]
 
 
+def _failed_sandbox_lines(rows: list[dict[str, object]]) -> list[str]:
+    seen: set[str] = set()
+    lines: list[str] = []
+    for row in rows:
+        sandbox_id = str(row.get("sandbox_id", ""))
+        if sandbox_id in seen:
+            continue
+        task_error = str(row.get("task_error", ""))
+        success = float(row.get("success_ratio", 1.0))
+        if success >= 1.0 and not task_error:
+            continue
+        seen.add(sandbox_id)
+        task_id = str(row.get("task_id", ""))
+        lines.append(f"FAILED sandbox={sandbox_id} task={task_id} error={task_error}")
+    if lines:
+        lines.insert(0, f"--- Failed sandboxes ({len(lines)}) ---")
+    return lines
+
+
 def _telemetry_metric_aliases(config: BenchmarkConfig, rows: list[dict[str, object]]) -> tuple[dict[str, str | tuple[str, ...]], dict[str, dict[str, object]]]:
+    """Map summary keys to telemetry metric names for post-run aggregation.
+
+    The telemetry summary intentionally *overrides* the row-based summary
+    (via ``{**summary, **telemetry_summary}``) so there is no double-counting.
+    This allows worker-level metrics (e.g. ``checkpoint.total_ms``) from the
+    telemetry stream to replace row-based placeholders when the scenario does
+    not measure them directly (e.g. auto mode).  The tuple form means
+    "try the first metric name, fall back to the second".
+    """
     aliases: dict[str, str | tuple[str, ...]] = {}
     attribute_filters: dict[str, dict[str, object]] = {}
     if config.scenario == "fault":
         aliases.update(
             {
-                "checkpoint_ms": "benchmark.checkpoint_ms",
-                "restore_ms": "benchmark.restore_ms",
+                "checkpoint_ms": ("checkpoint.total_ms", "benchmark.checkpoint_ms"),
+                "restore_ms": ("restore.total_ms", "benchmark.restore_ms"),
                 "recovery_ms": "benchmark.recovery_ms",
                 "readiness_ms": "benchmark.readiness_ms",
                 "end_to_end_recovery_ms": "benchmark.end_to_end_recovery_ms",
@@ -55,13 +87,13 @@ def _telemetry_metric_aliases(config: BenchmarkConfig, rows: list[dict[str, obje
             }
         )
         if config.mode == "auto" and not (rows and ("verification_status" in rows[0] or "chunks_planned" in rows[0] or "iterations_planned" in rows[0])):
-            for key in ("checkpoint_ms", "restore_ms", "recovery_ms", "readiness_ms", "end_to_end_recovery_ms", "workload_resume_ms"):
+            for key in ("recovery_ms", "readiness_ms", "end_to_end_recovery_ms", "workload_resume_ms"):
                 attribute_filters[key] = {"event_injected": 1}
     elif config.scenario == "spot":
         aliases.update(
             {
-                "checkpoint_ms": "benchmark.checkpoint_ms",
-                "restore_ms": "benchmark.restore_ms",
+                "checkpoint_ms": ("checkpoint.total_ms", "benchmark.checkpoint_ms"),
+                "restore_ms": ("restore.total_ms", "benchmark.restore_ms"),
                 "recovery_ms": "benchmark.recovery_ms",
                 "readiness_ms": "benchmark.readiness_ms",
                 "end_to_end_recovery_ms": "benchmark.end_to_end_recovery_ms",
@@ -70,7 +102,7 @@ def _telemetry_metric_aliases(config: BenchmarkConfig, rows: list[dict[str, obje
             }
         )
         if config.mode == "auto" and not (rows and ("verification_status" in rows[0] or "chunks_planned" in rows[0] or "iterations_planned" in rows[0])):
-            for key in aliases:
+            for key in ("recovery_ms", "readiness_ms", "end_to_end_recovery_ms", "migration_ms", "budget_slack_ms"):
                 attribute_filters[key] = {"event_injected": 1}
     elif config.scenario == "e2e":
         if rows and "verification_status" in rows[0]:
@@ -150,6 +182,8 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
             if config.output is not None
             else config.config_path.with_suffix(".telemetry.jsonl")
         )
+    executor_default_workers = max(settings.max_workers, config.effective_phase_workers.run)
+    executor_config = config.executor.resolve(default_workers=executor_default_workers)
     try:
         with RealHostScenarioHarness(
             provider=config.provider,
@@ -157,13 +191,21 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
             scheduler_config=settings.scheduler_config,
             scheduler_policy=settings.scheduler_policy,
             checkpoint_manager_factory=settings.checkpoint_manager_factory,
-            max_workers=max(settings.max_workers, config.effective_phase_workers.run),
+            executor_config=executor_config,
+            max_workers=executor_default_workers,
             auto_cr=config.mode == "auto",
             work_dir_host_root=config.work_dir_host_root,
             telemetry_output=telemetry_output,
             telemetry_detail_level=config.telemetry_detail_level,
             telemetry_capture_command_output=config.telemetry_capture_command_output,
             telemetry_max_text_attribute_bytes=config.telemetry_max_text_attribute_bytes,
+            telemetry_keep_in_memory_copy=config.telemetry_keep_in_memory_copy,
+            telemetry_writer_mode=config.telemetry_writer_mode,
+            telemetry_queue_capacity=config.telemetry_queue_capacity,
+            telemetry_batch_max_records=config.telemetry_batch_max_records,
+            telemetry_flush_interval_ms=config.telemetry_flush_interval_ms,
+            telemetry_overflow_policy=config.telemetry_overflow_policy,
+            telemetry_serializer=config.telemetry_serializer,
             benchmark_root=config.benchmark_root,
             zpool_size=config.zpool_size,
             zpool_name=config.zpool_name,
@@ -171,6 +213,15 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
             reuse_zpool=config.reuse_zpool,
             image_cache_root=config.image_cache_root,
             run_id=str(run_context["run_id"]),
+            monitoring_enabled=config.monitoring.enabled,
+            monitoring_sample_interval_ms=config.monitoring.sample_interval_ms,
+            monitoring_include_host=config.monitoring.include_host,
+            monitoring_include_sandboxes=config.monitoring.include_sandboxes,
+            llm_server_launch_mode=config.llm_server.launch_mode,
+            host_inspector_launch_mode=config.host_inspector.launch_mode,
+            runtime_root=config.storage_planes.runtime_root,
+            storage_root=config.storage_planes.storage_root,
+            agent_host_root=config.storage_planes.agent_host_root,
         ) as harness:
             if scenario.prepare_harness is not None:
                 scenario.prepare_harness(config, harness)
@@ -189,14 +240,37 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
             )
             if telemetry_summary:
                 summary = {**summary, **telemetry_summary}
+        report_dir: Path | None = None
+        if config.telemetry_report.enabled and telemetry_output.exists():
+            report_dir = config.telemetry_report.output_dir or _default_report_output_dir(telemetry_output)
+            try:
+                from benchmarks.telemetry_analysis import generate_report_bundle
+
+                generate_report_bundle(
+                    telemetry_output,
+                    output_dir=report_dir,
+                    top_k=max(5, int(config.telemetry_report.top_k)),
+                    log_scale=config.telemetry_report.log_scale_charts,
+                    export_svg=config.telemetry_report.export_svg,
+                )
+            except Exception:
+                logger.exception(
+                    "Telemetry report generation failed for telemetry_output=%s output_dir=%s",
+                    telemetry_output,
+                    report_dir,
+                )
         _emit_lines(_summary_lines(summary))
-        _emit_lines(
-            _artifact_lines(
-                log_file=config.log_file,
-                output=config.output,
-                telemetry_output=telemetry_output,
-            )
+        failed_lines = _failed_sandbox_lines(rows)
+        if failed_lines:
+            _emit_lines(failed_lines)
+        artifact_lines = _artifact_lines(
+            log_file=config.log_file,
+            output=config.output,
+            telemetry_output=telemetry_output,
         )
+        if report_dir is not None:
+            artifact_lines.append(f"telemetry_report: {report_dir.resolve()}")
+        _emit_lines(artifact_lines)
         logger.info(
             "========== benchmark.run end status=completed config=%s duration_s=%.3f ==========",
             config.config_path.resolve(),

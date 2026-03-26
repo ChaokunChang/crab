@@ -62,6 +62,23 @@ class FakeCommandRunner(CommandRunner):
         )()
 
 
+class MappingCommandRunner(CommandRunner):
+    def __init__(self, responses: dict[tuple[str, ...], tuple[int, str, str]] | None = None) -> None:
+        self.responses = responses or {}
+        self.commands: list[tuple[str, ...]] = []
+
+    def run(self, command: list[str], *, cwd: Path | None = None):
+        _ = cwd
+        key = tuple(command)
+        self.commands.append(key)
+        returncode, stdout, stderr = self.responses.get(key, (0, "", ""))
+        return type(
+            "Result",
+            (),
+            {"command": key, "returncode": returncode, "stdout": stdout, "stderr": stderr},
+        )()
+
+
 class RecordingRestoreWorker:
     def __init__(self) -> None:
         self.jobs = []
@@ -1093,6 +1110,40 @@ class ContractTests(unittest.TestCase):
             self.assertIn("--leave-running=true", runner.commands[0])
             self.assertEqual(runner.commands[1], ("zfs", "snapshot", "pool/agent-cr/sbx-1@ckpt-1"))
 
+    def test_runc_runtime_checkpoint_reports_process_size_and_snapshot_stats(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_runc_runtime_stats_") as tmp:
+            base = Path(tmp)
+            process_dir = base / "checkpoints" / "sbx-1" / "ckpt-1" / "process"
+            process_dir.mkdir(parents=True, exist_ok=True)
+            (process_dir / "pages-1.img").write_bytes(b"a" * 32)
+            (process_dir / "inventory.img").write_bytes(b"b" * 16)
+            runner = MappingCommandRunner(
+                responses={
+                    ("zfs", "get", "-Hp", "-o", "property,value", "written,used", "pool/agent-cr/sbx-1@ckpt-1"): (
+                        0,
+                        "written\t128\nused\t512\n",
+                        "",
+                    )
+                }
+            )
+            adapter = RuncRuntimeAdapter(
+                command_runner=runner,
+                paths=RuncRuntimePaths(
+                    state_root=base / "state",
+                    bundle_root=base / "bundles",
+                    checkpoint_root=base / "checkpoints",
+                    zfs_dataset_prefix="pool/agent-cr",
+                ),
+            )
+
+            process_status = adapter.checkpoint_process(SandboxId("sbx-1"), CheckpointId("ckpt-1"), leave_running=False)
+            fs_status = adapter.checkpoint_filesystem(SandboxId("sbx-1"), CheckpointId("ckpt-1"))
+
+            self.assertEqual(process_status.metadata["process_checkpoint_size_bytes"], 48)
+            self.assertEqual(process_status.metadata["process_checkpoint_file_count"], 2)
+            self.assertEqual(fs_status.metadata["filesystem_checkpoint_written_bytes"], 128)
+            self.assertEqual(fs_status.metadata["filesystem_checkpoint_used_bytes"], 512)
+
     def test_runc_runtime_exec_emits_telemetry_without_deleted_helper(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_runc_exec_") as tmp:
             base = Path(tmp)
@@ -1127,6 +1178,73 @@ class ContractTests(unittest.TestCase):
             self.assertIn("sandbox.runtime_exec.start", event_names)
             self.assertIn("sandbox.runtime_exec.finish", event_names)
             self.assertIn("sandbox.command", event_names)
+
+    def test_restore_worker_emits_restore_gap_and_mixed_source_metrics(self) -> None:
+        sid = SandboxId("sbx-1")
+        process_manifest = CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=CheckpointId("ckpt-1"),
+            sandbox_id=sid,
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version=None,
+            process_artifacts=[ArtifactReference(kind=ArtifactKind.PROCESS, name="proc", relative_path="p", size_bytes=1, sha256="b")],
+            filesystem_artifacts=[],
+            metadata={
+                "benchmark_trace_cursor": 3,
+                "process_checkpoint_size_bytes": 64,
+            },
+        ).with_integrity()
+        filesystem_manifest = CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=CheckpointId("ckpt-2"),
+            sandbox_id=sid,
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version=None,
+            process_artifacts=[],
+            filesystem_artifacts=[ArtifactReference(kind=ArtifactKind.FILESYSTEM, name="fs", relative_path="x", size_bytes=1, sha256="a")],
+            metadata={
+                "benchmark_trace_cursor": 5,
+                "filesystem_checkpoint_written_bytes": 128,
+            },
+        ).with_integrity()
+        restore_manifest = CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=CheckpointId("ckpt-3"),
+            sandbox_id=sid,
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version=None,
+            process_artifacts=[],
+            filesystem_artifacts=[],
+            metadata={},
+        ).with_integrity()
+        telemetry = InMemoryTelemetrySink()
+        fs_worker = RecordingRestoreWorker()
+        process_worker = RecordingRestoreWorker()
+        restore_worker = DefaultRWorker(
+            process_worker=process_worker,
+            filesystem_worker=fs_worker,
+            checkpoint_manager=ManifestCheckpointManager([process_manifest, filesystem_manifest, restore_manifest]),
+            telemetry=telemetry,
+        )
+
+        restore_worker.restore(
+            RestoreJob(
+                job_id=JobId("job-restore-gap"),
+                sandbox_id=sid,
+                checkpoint_id=CheckpointId("ckpt-3"),
+                requested_at=utc_now(),
+            )
+        )
+
+        metric_by_name = {name: value for name, value, _ in telemetry.metrics}
+        self.assertIn("restore.source_gap.turns", metric_by_name)
+        self.assertIn("restore.source_gap.ms", metric_by_name)
+        self.assertIn("restore.estimated_io_bytes", metric_by_name)
+        total_metric = next(item for item in telemetry.metrics if item[0] == "restore.total_ms")
+        self.assertTrue(total_metric[2]["restore.mixed_sources"])
 
     def test_ebpf_inspector_uses_recorded_events(self) -> None:
         collector = InMemoryEBPFEventCollector()

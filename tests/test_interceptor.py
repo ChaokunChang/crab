@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import tempfile
 import threading
+import time
 import unittest
+import urllib.request
 from pathlib import Path
 
 from agent_cr import (
     AgentCRRequestInterceptor,
+    AgentCRRequestInterceptorServer,
     CompositeRequestInterceptorHook,
     InMemoryRequestStateStore,
     InMemoryTelemetrySink,
@@ -20,6 +23,21 @@ from agent_cr import (
 )
 from agent_cr.models import utc_now
 from integrations.llm_services.simulated.service import SimulatedLLMState, handle_request
+
+
+class SlowRecordingTelemetrySink(InMemoryTelemetrySink):
+    def emit_event(self, name: str, attributes: dict[str, object]) -> None:
+        time.sleep(0.02)
+        super().emit_event(name, attributes)
+
+    def emit_metric(
+        self,
+        name: str,
+        value: float,
+        attributes: dict[str, object] | None = None,
+    ) -> None:
+        time.sleep(0.02)
+        super().emit_metric(name, value, attributes)
 
 
 class InterceptorTests(unittest.TestCase):
@@ -56,7 +74,7 @@ class InterceptorTests(unittest.TestCase):
         self.assertEqual(pending.request_id, "req-1")
         self.assertEqual(pending.generation, 1)
 
-    def test_response_gate_registry_targeted_release_does_not_release_newer_request(self) -> None:
+    def test_response_gate_registry_targeted_release_releases_older_request_without_releasing_newer_request(self) -> None:
         registry = SandboxResponseGateRegistry()
         sandbox_id = SandboxId("sbx-gate")
         registry.enable()
@@ -64,7 +82,7 @@ class InterceptorTests(unittest.TestCase):
         first_generation = registry.arm(sandbox_id, "req-1")
         second_generation = registry.arm(sandbox_id, "req-2")
 
-        self.assertFalse(
+        self.assertTrue(
             registry.release_pending(sandbox_id, request_id="req-1", generation=first_generation),
         )
         pending = registry.get_pending(sandbox_id)
@@ -129,7 +147,7 @@ class InterceptorTests(unittest.TestCase):
         self.assertEqual(state.last_llm_provider, "openai")
         event_names = [name for name, _ in telemetry.events]
         self.assertEqual(event_names.count("request.start"), 1)
-        self.assertEqual(event_names.count("request.end"), 1)
+        self.assertEqual(event_names.count("request.finish"), 1)
 
     def test_interceptor_resolves_sandbox_id_from_client_host_and_overrides_forwarded_header(self) -> None:
         request_state_store = InMemoryRequestStateStore()
@@ -418,6 +436,135 @@ class InterceptorTests(unittest.TestCase):
         self.assertIn("payload", response_body)
         state = request_state_store.get(SandboxId("sbx-restore"))
         self.assertEqual(state.completed_llm_requests, 1)
+
+    def test_interceptor_keeps_newer_overlapping_request_gated_until_its_generation_releases(self) -> None:
+        request_state_store = InMemoryRequestStateStore()
+        response_gate_registry = SandboxResponseGateRegistry()
+        response_gate_registry.enable()
+        interceptor = AgentCRRequestInterceptor(
+            upstream_transport=lambda path, headers, body: (200, [("Content-Type", "application/json")], b"{}"),
+            request_state_store=request_state_store,
+            response_gate_registry=response_gate_registry,
+        )
+
+        finished: list[str] = []
+
+        def _run_request(request_id: str) -> None:
+            interceptor.intercept(
+                path="/v1/chat/completions",
+                headers={"Content-Type": "application/json", "X-Agent-Sandbox-Id": "sbx-overlap", "X-Request-Id": request_id},
+                body=b"{}",
+            )
+            finished.append(request_id)
+
+        first = threading.Thread(target=_run_request, args=("req-1",))
+        second = threading.Thread(target=_run_request, args=("req-2",))
+        first.start()
+        pending_first = None
+        for _ in range(50):
+            pending_first = response_gate_registry.find_pending_request(SandboxId("sbx-overlap"), "req-1")
+            if pending_first is not None:
+                break
+            time.sleep(0.01)
+        self.assertIsNotNone(pending_first)
+        second.start()
+        pending_second = None
+        for _ in range(50):
+            pending_second = response_gate_registry.find_pending_request(SandboxId("sbx-overlap"), "req-2")
+            if pending_second is not None:
+                break
+            time.sleep(0.01)
+        self.assertIsNotNone(pending_second)
+        assert pending_first is not None
+        assert pending_second is not None
+
+        self.assertTrue(
+            response_gate_registry.release_pending(
+                SandboxId("sbx-overlap"),
+                request_id="req-1",
+                generation=pending_first.generation,
+            )
+        )
+        first.join(timeout=2.0)
+        self.assertFalse(first.is_alive())
+        second.join(timeout=0.05)
+        self.assertTrue(second.is_alive())
+        self.assertEqual(finished, ["req-1"])
+        self.assertTrue(
+            response_gate_registry.release_pending(
+                SandboxId("sbx-overlap"),
+                request_id="req-2",
+                generation=pending_second.generation,
+            )
+        )
+        second.join(timeout=2.0)
+        self.assertFalse(second.is_alive())
+        self.assertEqual(finished, ["req-1", "req-2"])
+
+    def test_interceptor_gate_metrics_are_sampled_before_telemetry_writes(self) -> None:
+        request_state_store = InMemoryRequestStateStore()
+        response_gate_registry = SandboxResponseGateRegistry()
+        response_gate_registry.enable()
+        telemetry = SlowRecordingTelemetrySink()
+        interceptor = AgentCRRequestInterceptor(
+            upstream_transport=lambda path, headers, body: (200, [("Content-Type", "application/json")], b"{}"),
+            request_state_store=request_state_store,
+            response_gate_registry=response_gate_registry,
+            telemetry=telemetry,
+        )
+
+        def _release_gate() -> None:
+            pending = None
+            for _ in range(100):
+                pending = response_gate_registry.find_pending_request(SandboxId("sbx-metrics"), "req-metrics")
+                if pending is not None:
+                    break
+                time.sleep(0.005)
+            assert pending is not None
+            time.sleep(0.03)
+            response_gate_registry.release_pending(
+                SandboxId("sbx-metrics"),
+                request_id="req-metrics",
+                generation=pending.generation,
+            )
+
+        releaser = threading.Thread(target=_release_gate)
+        releaser.start()
+        interceptor.intercept(
+            path="/v1/chat/completions",
+            headers={"Content-Type": "application/json", "X-Agent-Sandbox-Id": "sbx-metrics", "X-Request-Id": "req-metrics"},
+            body=b"{}",
+        )
+        releaser.join(timeout=2.0)
+
+        metric_map = {
+            name: value
+            for name, value, attributes in telemetry.metrics
+            if attributes.get("request_id") == "req-metrics"
+        }
+        gate_wait = metric_map["llm.gate_wait_ms"]
+        gate_operation = metric_map["interceptor.response_gate.wait.duration_ms"]
+        agentcr_delay = metric_map["llm.agentcr_delay_ms"]
+
+        self.assertLess(abs(gate_operation - gate_wait), 25.0)
+        self.assertLess(abs(agentcr_delay - gate_wait), 25.0)
+
+    def test_interceptor_server_healthz_returns_json(self) -> None:
+        server = AgentCRRequestInterceptorServer(
+            upstream_url="http://127.0.0.1:9999",
+            request_state_store=InMemoryRequestStateStore(),
+            port=0,
+        )
+        server.start()
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{server.port}/healthz", timeout=2.0) as response:
+                self.assertEqual(response.status, 200)
+                payload = json.loads(response.read().decode("utf-8"))
+        finally:
+            server.stop()
+
+        self.assertEqual(payload["ok"], True)
+        self.assertEqual(payload["upstream_url"], "http://127.0.0.1:9999")
 
 
 if __name__ == "__main__":

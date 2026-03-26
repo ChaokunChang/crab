@@ -60,6 +60,62 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(decision.checkpoint_filesystem)
         self.assertFalse(decision.leave_running)
 
+    def test_no_full_baseline_checkpoint_when_first_checkpoint_option_disabled(self) -> None:
+        policy = CheckpointingPolicy(
+            SchedulerConfig(
+                min_checkpoint_interval_seconds=0.0,
+                force_checkpoint_after_seconds=0.0,
+                require_change_signal=True,
+                checkpoint_full_baseline_on_first_checkpoint=False,
+            )
+        )
+        snapshot = SandboxSnapshot(
+            sandbox_id=SandboxId("sbx-1"),
+            runtime_name="docker",
+            is_running=True,
+            process_changed=False,
+            filesystem_changed=False,
+            observed_at=utc_now(),
+            last_checkpoint_at=None,
+        )
+
+        decision = policy.evaluate(snapshot)
+
+        self.assertFalse(decision.should_checkpoint)
+        self.assertEqual(decision.reason, "no_change_signal")
+        self.assertFalse(decision.checkpoint_process)
+        self.assertFalse(decision.checkpoint_filesystem)
+        self.assertFalse(decision.leave_running)
+
+    def test_first_checkpoint_without_baseline_uses_normal_policy_when_changes_exist(self) -> None:
+        policy = CheckpointingPolicy(
+            SchedulerConfig(
+                min_checkpoint_interval_seconds=0.0,
+                force_checkpoint_after_seconds=0.0,
+                require_change_signal=True,
+                checkpoint_full_baseline_on_first_checkpoint=False,
+                prefer_checkpoint_during_llm_request=True,
+            )
+        )
+        snapshot = SandboxSnapshot(
+            sandbox_id=SandboxId("sbx-1"),
+            runtime_name="docker",
+            is_running=True,
+            process_changed=True,
+            filesystem_changed=False,
+            observed_at=utc_now(),
+            last_checkpoint_at=None,
+            metadata={"llm_request_in_flight": True},
+        )
+
+        decision = policy.evaluate(snapshot)
+
+        self.assertTrue(decision.should_checkpoint)
+        self.assertTrue(decision.checkpoint_process)
+        self.assertTrue(decision.checkpoint_filesystem)
+        self.assertEqual(decision.reason, "llm_request_window_available")
+        self.assertFalse(decision.leave_running)
+
     def test_no_checkpoint_without_change_signal(self) -> None:
         policy = CheckpointingPolicy(
             SchedulerConfig(
@@ -178,7 +234,7 @@ class PolicyTests(unittest.TestCase):
         )
         decision = policy.evaluate(snapshot)
         self.assertTrue(decision.should_checkpoint)
-        self.assertEqual(decision.reason, "llm_request_window_available")
+        self.assertEqual(decision.reason, "no_previous_checkpoint")
         self.assertFalse(decision.leave_running)
 
     def test_requires_llm_request_when_configured(self) -> None:
@@ -251,7 +307,7 @@ class PolicyTests(unittest.TestCase):
         decision = policy.evaluate(snapshot)
 
         self.assertTrue(decision.should_checkpoint)
-        self.assertEqual(decision.reason, "llm_request_window_available")
+        self.assertEqual(decision.reason, "no_previous_checkpoint")
         self.assertTrue(decision.checkpoint_process)
         self.assertTrue(decision.checkpoint_filesystem)
         self.assertTrue(decision.leave_running)
@@ -281,7 +337,7 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(decision.should_checkpoint)
         self.assertTrue(decision.checkpoint_process)
         self.assertTrue(decision.checkpoint_filesystem)
-        self.assertEqual(decision.reason, "llm_request_window_available")
+        self.assertEqual(decision.reason, "no_previous_checkpoint")
         self.assertTrue(decision.leave_running)
         self.assertEqual(decision.policy_name, "fault-tolerance")
 
@@ -309,7 +365,7 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(decision.should_checkpoint)
         self.assertTrue(decision.checkpoint_process)
         self.assertTrue(decision.checkpoint_filesystem)
-        self.assertEqual(decision.reason, "llm_request_window_available")
+        self.assertEqual(decision.reason, "no_previous_checkpoint")
         self.assertTrue(decision.leave_running)
         self.assertEqual(decision.policy_name, "fault-tolerance")
 

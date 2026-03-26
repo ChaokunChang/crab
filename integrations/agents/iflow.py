@@ -95,6 +95,7 @@ class IFlowAgent(BaseAgent):
     DEFAULT_ACTION_TICK_SECONDS = 1
     DEFAULT_MAX_SESSION_TURNS = 4096
     TASK_POLL_INTERVAL_SECONDS = 0.1
+    SANDBOX_LIVENESS_REFRESH_SECONDS = 1.0
 
     def __init__(
         self,
@@ -487,13 +488,21 @@ class IFlowAgent(BaseAgent):
 
     def _wait_for_task_completion(self, *, exit_path: Path, done_path: Path) -> None:
         saw_live = False
+        next_liveness_check_at = 0.0
         while True:
             if self._stop_requested.is_set():
                 logger.info("Stopping iflow task wait loop sandbox=%s", self.sandbox.sandbox_id)
                 return
             if self._task_markers_indicate_completion(exit_path=exit_path, done_path=done_path):
                 return
-            if self._sandbox_is_live():
+            sandbox_is_live = True
+            now = time.monotonic()
+            if not saw_live or now >= next_liveness_check_at:
+                sandbox_is_live = self._sandbox_is_live()
+                if sandbox_is_live:
+                    saw_live = True
+                    next_liveness_check_at = time.monotonic() + self.SANDBOX_LIVENESS_REFRESH_SECONDS
+            if sandbox_is_live:
                 saw_live = True
                 time.sleep(min(self.TASK_POLL_INTERVAL_SECONDS, self._tick_seconds))
                 continue
@@ -515,6 +524,7 @@ class IFlowAgent(BaseAgent):
             )
             if not self._wait_for_restore_or_stop():
                 return
+            next_liveness_check_at = 0.0
 
     def _task_markers_indicate_completion(self, *, exit_path: Path, done_path: Path) -> bool:
         done_raw = self._read_marker_text(done_path)

@@ -19,12 +19,11 @@ from benchmarks.core import (
     annotate_row,
     benchmark_phase_item_attributes,
     benchmark_phase_map,
-    build_task_records_phase,
     emit_row_telemetry,
     make_benchmark_sandbox_specs,
     parallel_map,
-    prepare_task_records_phase,
     resolve_task_records,
+    setup_task_records_phase,
     start_prepared_task_record,
 )
 from benchmarks.scenarios import HarnessSettings, ScenarioDefinition
@@ -78,10 +77,12 @@ def parse_tree_options(config: BenchmarkConfig) -> TreeOptions:
 
 def build_harness_settings(config: BenchmarkConfig) -> HarnessSettings:
     options = parse_tree_options(config)
-    scheduler_config = SchedulerConfig(
-        min_checkpoint_interval_seconds=0.0,
-        force_checkpoint_after_seconds=0.0,
-        require_change_signal=False,
+    scheduler_config = config.scheduler.apply(
+        SchedulerConfig(
+            min_checkpoint_interval_seconds=0.0,
+            force_checkpoint_after_seconds=0.0,
+            require_change_signal=False,
+        )
     )
     return HarnessSettings(
         scheduler_config=scheduler_config,
@@ -466,7 +467,7 @@ def run_auto_source(
         harness.destroy_sandbox_dataset(source)
 
 
-def _prepare_source_specs(config: BenchmarkConfig, harness):
+def _setup_source_specs(config: BenchmarkConfig, harness):
     records = resolve_task_records(
         config,
         default_task_description=benchmark_task_description(),
@@ -476,22 +477,17 @@ def _prepare_source_specs(config: BenchmarkConfig, harness):
         sandbox_name_prefix="tree-source",
         records=records,
     )
-    build_task_records_phase(
+    return setup_task_records_phase(
         harness,
         specs=specs,
-        max_workers=config.effective_phase_workers.build,
-    )
-    return prepare_task_records_phase(
-        harness,
-        specs=specs,
-        max_workers=config.effective_phase_workers.prepare,
+        max_workers=config.effective_phase_workers.setup,
     )
 
 
 def run_manual(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
     options = parse_tree_options(config)
     replay_steps = choose_replay_steps(options.source_steps, options.branch_points)
-    prepared_sources = _prepare_source_specs(config, harness)
+    prepared_sources = _setup_source_specs(config, harness)
     indexed_sources = list(enumerate(prepared_sources))
     row_groups = benchmark_phase_map(
         indexed_sources,
@@ -527,7 +523,7 @@ def run_manual(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
 def run_auto(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
     options = parse_tree_options(config)
     replay_steps = choose_replay_steps(options.source_steps, options.branch_points)
-    prepared_sources = _prepare_source_specs(config, harness)
+    prepared_sources = _setup_source_specs(config, harness)
     indexed_sources = list(enumerate(prepared_sources))
     if hasattr(harness, "drain_request_state_changes"):
         harness.drain_request_state_changes()

@@ -356,6 +356,12 @@ class TelemetrySink(ABC):
     ) -> None:
         raise NotImplementedError
 
+    def flush(self) -> None:
+        return
+
+    def close(self) -> None:
+        return
+
 
 class CompositeCheckpointWorker(ABC):
     @abstractmethod

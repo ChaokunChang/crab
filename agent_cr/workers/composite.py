@@ -37,6 +37,12 @@ _PROCESS_RESTORE_CHECKPOINT_ID = "process_restore_checkpoint_id"
 _PROCESS_RESTORE_TRACE_CURSOR = "process_restore_trace_cursor"
 _FILESYSTEM_RESTORE_CHECKPOINT_ID = "filesystem_restore_checkpoint_id"
 _FILESYSTEM_RESTORE_TRACE_CURSOR = "filesystem_restore_trace_cursor"
+_PROCESS_RESTORE_CREATED_AT = "process_restore_created_at"
+_FILESYSTEM_RESTORE_CREATED_AT = "filesystem_restore_created_at"
+_RESTORE_SOURCE_GAP_TURNS = "restore_source_gap_turns"
+_RESTORE_SOURCE_GAP_MS = "restore_source_gap_ms"
+_RESTORE_ESTIMATED_IO_BYTES = "restore_estimated_io_bytes"
+_RESTORE_MIXED_SOURCES = "restore_mixed_sources"
 _CAPTURES_INFLIGHT_LLM = "captures_inflight_llm"
 _CAPTURED_REQUEST_ID = "captured_request_id"
 _CAPTURED_REQUEST_PROVIDER = "captured_request_provider"
@@ -61,10 +67,7 @@ def resolve_restore_manifest(
         candidates,
         include=lambda candidate: bool(candidate.filesystem_artifacts),
     )
-    process_manifest = _latest_manifest_with_artifacts(
-        candidates,
-        include=lambda candidate: bool(candidate.process_artifacts),
-    )
+    process_manifest = _latest_process_manifest_for_restore(candidates, filesystem_manifest)
 
     process_artifacts = [] if process_manifest is None else list(process_manifest.process_artifacts)
     filesystem_artifacts = [] if filesystem_manifest is None else list(filesystem_manifest.filesystem_artifacts)
@@ -74,11 +77,34 @@ def resolve_restore_manifest(
         metadata[_PROCESS_RESTORE_TRACE_CURSOR] = _committed_trace_cursor(
             process_manifest.metadata
         )
+        metadata[_PROCESS_RESTORE_CREATED_AT] = process_manifest.created_at.isoformat()
     if filesystem_manifest is not None:
         metadata[_FILESYSTEM_RESTORE_CHECKPOINT_ID] = str(filesystem_manifest.checkpoint_id)
         metadata[_FILESYSTEM_RESTORE_TRACE_CURSOR] = _committed_trace_cursor(
             filesystem_manifest.metadata
         )
+        metadata[_FILESYSTEM_RESTORE_CREATED_AT] = filesystem_manifest.created_at.isoformat()
+    if process_manifest is not None and filesystem_manifest is not None:
+        metadata[_RESTORE_SOURCE_GAP_TURNS] = abs(
+            _committed_trace_cursor(process_manifest.metadata) - _committed_trace_cursor(filesystem_manifest.metadata)
+        )
+        metadata[_RESTORE_SOURCE_GAP_MS] = abs(
+            (filesystem_manifest.created_at - process_manifest.created_at).total_seconds() * 1000.0
+        )
+        metadata[_RESTORE_MIXED_SOURCES] = str(process_manifest.checkpoint_id) != str(filesystem_manifest.checkpoint_id)
+        estimated_io_bytes = 0
+        has_estimate = False
+        for candidate in (process_manifest, filesystem_manifest):
+            raw_process_size = candidate.metadata.get("process_checkpoint_size_bytes")
+            raw_fs_written = candidate.metadata.get("filesystem_checkpoint_written_bytes")
+            for raw_value in (raw_process_size, raw_fs_written):
+                try:
+                    estimated_io_bytes += int(raw_value)
+                    has_estimate = True
+                except (TypeError, ValueError):
+                    continue
+        if has_estimate:
+            metadata[_RESTORE_ESTIMATED_IO_BYTES] = estimated_io_bytes
     _copy_process_restore_metadata(metadata, {} if process_manifest is None else process_manifest.metadata)
 
     return replace(
@@ -98,6 +124,24 @@ def _latest_manifest_with_artifacts(
         if include(candidate):
             return candidate
     return None
+
+
+def _latest_process_manifest_for_restore(
+    manifests: list[CheckpointManifest],
+    filesystem_manifest: CheckpointManifest | None,
+) -> CheckpointManifest | None:
+    filesystem_trace_cursor = None if filesystem_manifest is None else _committed_trace_cursor(filesystem_manifest.metadata)
+    latest_with_artifacts: CheckpointManifest | None = None
+    for candidate in reversed(manifests):
+        if not candidate.process_artifacts:
+            continue
+        if latest_with_artifacts is None:
+            latest_with_artifacts = candidate
+        if filesystem_trace_cursor is None:
+            return candidate
+        if _committed_trace_cursor(candidate.metadata) <= filesystem_trace_cursor:
+            return candidate
+    return latest_with_artifacts
 
 
 def _trace_cursor_from_metadata(metadata: dict[str, object]) -> int:
@@ -134,6 +178,7 @@ class DefaultCWorker(CompositeCheckpointWorker):
         runtime: Runtime,
         checkpoint_guard: Callable[[CheckpointJob], tuple[bool, str | None]] | None = None,
         telemetry: TelemetrySink | None = None,
+        step_workers: int | None = None,
     ):
         self._process_worker = process_worker
         self._filesystem_worker = filesystem_worker
@@ -141,22 +186,19 @@ class DefaultCWorker(CompositeCheckpointWorker):
         self._runtime = runtime
         self._checkpoint_guard = checkpoint_guard
         self._telemetry = telemetry or NoopTelemetrySink()
+        self._step_pool = ThreadPoolExecutor(
+            max_workers=max(2, 2 if step_workers is None else int(step_workers)),
+            thread_name_prefix="agent-cr-ckpt-step",
+        )
+
+    def close(self) -> None:
+        self._step_pool.shutdown(wait=True, cancel_futures=True)
 
     def checkpoint(self, job: CheckpointJob) -> CheckpointResult:
         job = self._ensure_restorable_checkpoint(job)
         started = utc_now()
         checkpoint_id = CheckpointId(str(job.metadata.get("checkpoint_id", CheckpointId.new())))
-        operation = start_operation(
-            self._telemetry,
-            "checkpoint.flow",
-            {
-                "component": "checkpoint",
-                "job_id": str(job.job_id),
-                "sandbox_id": str(job.sandbox_id),
-                "checkpoint_id": str(checkpoint_id),
-                "reason": job.reason,
-            },
-        )
+        checkpoint_scope = _checkpoint_scope(job)
         if self._checkpoint_guard is not None:
             allowed, message = self._checkpoint_guard(job)
             if not allowed:
@@ -167,7 +209,6 @@ class DefaultCWorker(CompositeCheckpointWorker):
                     checkpoint_id,
                     "" if message is None else message,
                 )
-                operation.finish(status="failed", attributes={"failure_code": FailureCode.VALIDATION_ERROR.value})
                 return CheckpointResult(
                     job_id=job.job_id,
                     sandbox_id=job.sandbox_id,
@@ -191,11 +232,10 @@ class DefaultCWorker(CompositeCheckpointWorker):
         process_duration_ms = 0.0
         filesystem_duration_ms = 0.0
         if job.checkpoint_process and job.checkpoint_filesystem:
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                process_future = pool.submit(self._timed_checkpoint_process, job, checkpoint_id)
-                fs_future = pool.submit(self._timed_checkpoint_filesystem, job, checkpoint_id)
-                process_step, process_duration_ms = process_future.result()
-                fs_step, filesystem_duration_ms = fs_future.result()
+            process_future = self._step_pool.submit(self._timed_checkpoint_process, job, checkpoint_id)
+            fs_future = self._step_pool.submit(self._timed_checkpoint_filesystem, job, checkpoint_id)
+            process_step, process_duration_ms = process_future.result()
+            fs_step, filesystem_duration_ms = fs_future.result()
         elif job.checkpoint_process:
             process_step, process_duration_ms = self._timed_checkpoint_process(job, checkpoint_id)
         elif job.checkpoint_filesystem:
@@ -224,8 +264,15 @@ class DefaultCWorker(CompositeCheckpointWorker):
         operation_statuses = tuple(
             step.operation_status for step in (process_step, fs_step) if step is not None
         )
+        process_size_bytes = _safe_int(None if process_step is None else process_step.operation_status.metadata.get("process_checkpoint_size_bytes"))
+        process_file_count = _safe_int(None if process_step is None else process_step.operation_status.metadata.get("process_checkpoint_file_count"))
+        filesystem_written_bytes = _safe_int(None if fs_step is None else fs_step.operation_status.metadata.get("filesystem_checkpoint_written_bytes"))
+        filesystem_used_bytes = _safe_int(None if fs_step is None else fs_step.operation_status.metadata.get("filesystem_checkpoint_used_bytes"))
+        estimated_io_bytes = _checkpoint_estimated_io_bytes(
+            process_size_bytes=process_size_bytes,
+            filesystem_written_bytes=filesystem_written_bytes,
+        )
         if failed_step is not None:
-            operation.finish(status="failed", attributes={"failure_code": failed_step.failure_code.value})
             return CheckpointResult(
                 job_id=job.job_id,
                 sandbox_id=job.sandbox_id,
@@ -288,6 +335,12 @@ class DefaultCWorker(CompositeCheckpointWorker):
                 "job_id": str(job.job_id),
                 "reason": job.reason,
                 "leave_running": job.leave_running,
+                "checkpoint_scope": checkpoint_scope,
+                "process_checkpoint_size_bytes": process_size_bytes,
+                "process_checkpoint_file_count": process_file_count,
+                "filesystem_checkpoint_written_bytes": filesystem_written_bytes,
+                "filesystem_checkpoint_used_bytes": filesystem_used_bytes,
+                "checkpoint_estimated_io_bytes": estimated_io_bytes,
             },
         ).with_integrity()
         manifest_started = time.perf_counter()
@@ -296,12 +349,44 @@ class DefaultCWorker(CompositeCheckpointWorker):
             "checkpoint.persist_manifest",
             {"component": "checkpoint", "sandbox_id": str(job.sandbox_id), "checkpoint_id": str(checkpoint_id)},
         )
+        write_manifest_operation = start_operation(
+            self._telemetry,
+            "checkpoint.write_manifest",
+            {"component": "checkpoint", "sandbox_id": str(job.sandbox_id), "checkpoint_id": str(checkpoint_id)},
+        )
+        retention_operation = start_operation(
+            self._telemetry,
+            "checkpoint.retention_policy",
+            {"component": "checkpoint", "sandbox_id": str(job.sandbox_id), "checkpoint_id": str(checkpoint_id)},
+        )
+        write_manifest_finished = False
+        retention_finished = False
         try:
+            write_manifest_started = time.perf_counter()
             self._checkpoint_manager.put_manifest(manifest)
+            self._telemetry.emit_metric(
+                "checkpoint.write_manifest_ms",
+                (time.perf_counter() - write_manifest_started) * 1000.0,
+                {"sandbox_id": str(job.sandbox_id), "checkpoint_id": str(checkpoint_id)},
+            )
+            write_manifest_operation.finish(status="succeeded")
+            write_manifest_finished = True
+
+            retention_started = time.perf_counter()
             self._checkpoint_manager.handle_checkpoint_complete(manifest)
+            self._telemetry.emit_metric(
+                "checkpoint.retention_policy_ms",
+                (time.perf_counter() - retention_started) * 1000.0,
+                {"sandbox_id": str(job.sandbox_id), "checkpoint_id": str(checkpoint_id)},
+            )
+            retention_operation.finish(status="succeeded")
+            retention_finished = True
         except Exception as exc:
+            if not retention_finished:
+                retention_operation.finish(status="failed")
+            if not write_manifest_finished:
+                write_manifest_operation.finish(status="failed")
             persist_manifest.finish(status="failed")
-            operation.finish(status="failed", attributes={"failure_code": FailureCode.STORAGE_ERROR.value})
             logger.exception(
                 "Failed to persist manifest for job %s sandbox=%s checkpoint=%s",
                 job.job_id,
@@ -330,18 +415,88 @@ class DefaultCWorker(CompositeCheckpointWorker):
             self._telemetry.emit_metric(
                 "checkpoint.process_ms",
                 process_duration_ms,
-                {"sandbox_id": str(job.sandbox_id), "checkpoint_id": str(checkpoint_id)},
+                {
+                    "sandbox_id": str(job.sandbox_id),
+                    "checkpoint_id": str(checkpoint_id),
+                    "job_id": str(job.job_id),
+                    "checkpoint_scope": checkpoint_scope,
+                },
             )
         if fs_step is not None:
             self._telemetry.emit_metric(
                 "checkpoint.filesystem_ms",
                 filesystem_duration_ms,
-                {"sandbox_id": str(job.sandbox_id), "checkpoint_id": str(checkpoint_id)},
+                {
+                    "sandbox_id": str(job.sandbox_id),
+                    "checkpoint_id": str(checkpoint_id),
+                    "job_id": str(job.job_id),
+                    "checkpoint_scope": checkpoint_scope,
+                },
+            )
+        if process_size_bytes is not None:
+            self._telemetry.emit_metric(
+                "checkpoint.process.size_bytes",
+                process_size_bytes,
+                {
+                    "sandbox_id": str(job.sandbox_id),
+                    "checkpoint_id": str(checkpoint_id),
+                    "job_id": str(job.job_id),
+                    "checkpoint_scope": checkpoint_scope,
+                },
+            )
+        if process_file_count is not None:
+            self._telemetry.emit_metric(
+                "checkpoint.process.file_count",
+                process_file_count,
+                {
+                    "sandbox_id": str(job.sandbox_id),
+                    "checkpoint_id": str(checkpoint_id),
+                    "job_id": str(job.job_id),
+                    "checkpoint_scope": checkpoint_scope,
+                },
+            )
+        if filesystem_written_bytes is not None:
+            self._telemetry.emit_metric(
+                "checkpoint.filesystem.written_bytes",
+                filesystem_written_bytes,
+                {
+                    "sandbox_id": str(job.sandbox_id),
+                    "checkpoint_id": str(checkpoint_id),
+                    "job_id": str(job.job_id),
+                    "checkpoint_scope": checkpoint_scope,
+                },
+            )
+        if filesystem_used_bytes is not None:
+            self._telemetry.emit_metric(
+                "checkpoint.filesystem.used_bytes",
+                filesystem_used_bytes,
+                {
+                    "sandbox_id": str(job.sandbox_id),
+                    "checkpoint_id": str(checkpoint_id),
+                    "job_id": str(job.job_id),
+                    "checkpoint_scope": checkpoint_scope,
+                },
+            )
+        if estimated_io_bytes is not None:
+            self._telemetry.emit_metric(
+                "checkpoint.estimated_io_bytes",
+                estimated_io_bytes,
+                {
+                    "sandbox_id": str(job.sandbox_id),
+                    "checkpoint_id": str(checkpoint_id),
+                    "job_id": str(job.job_id),
+                    "checkpoint_scope": checkpoint_scope,
+                },
             )
         self._telemetry.emit_metric(
             "checkpoint.total_ms",
             (utc_now() - started).total_seconds() * 1000.0,
-            {"sandbox_id": str(job.sandbox_id), "checkpoint_id": str(checkpoint_id)},
+            {
+                "sandbox_id": str(job.sandbox_id),
+                "checkpoint_id": str(checkpoint_id),
+                "job_id": str(job.job_id),
+                "checkpoint_scope": checkpoint_scope,
+            },
         )
 
         logger.info(
@@ -350,7 +505,6 @@ class DefaultCWorker(CompositeCheckpointWorker):
             job.sandbox_id,
             checkpoint_id,
         )
-        operation.finish(status="succeeded")
         return CheckpointResult(
             job_id=job.job_id,
             sandbox_id=job.sandbox_id,
@@ -453,16 +607,6 @@ class DefaultRWorker(CompositeRestoreWorker):
 
     def restore(self, job: RestoreJob) -> RestoreResult:
         started = utc_now()
-        operation = start_operation(
-            self._telemetry,
-            "restore.flow",
-            {
-                "component": "restore",
-                "job_id": str(job.job_id),
-                "sandbox_id": str(job.sandbox_id),
-                "checkpoint_id": str(job.checkpoint_id),
-            },
-        )
         logger.info(
             "Starting composite restore for job %s sandbox=%s checkpoint=%s",
             job.job_id,
@@ -483,7 +627,6 @@ class DefaultRWorker(CompositeRestoreWorker):
             manifest = resolve_restore_manifest(self._checkpoint_manager, manifest)
         except Exception as exc:
             resolve_manifest_operation.finish(status="failed")
-            operation.finish(status="failed")
             logger.exception(
                 "Failed to load manifest for restore job %s sandbox=%s checkpoint=%s",
                 job.job_id,
@@ -506,6 +649,10 @@ class DefaultRWorker(CompositeRestoreWorker):
             {"sandbox_id": str(job.sandbox_id), "checkpoint_id": str(job.checkpoint_id)},
         )
         resolve_manifest_operation.finish(status="succeeded")
+        restore_metric_attributes = _restore_metric_attributes(job, manifest)
+        restore_source_gap_turns = _safe_int(manifest.metadata.get(_RESTORE_SOURCE_GAP_TURNS))
+        restore_source_gap_ms = _safe_float(manifest.metadata.get(_RESTORE_SOURCE_GAP_MS))
+        restore_estimated_io_bytes = _safe_int(manifest.metadata.get(_RESTORE_ESTIMATED_IO_BYTES))
 
         operation_statuses = []
 
@@ -522,7 +669,6 @@ class DefaultRWorker(CompositeRestoreWorker):
             filesystem_duration_ms = (time.perf_counter() - restore_started) * 1000.0
             fs_operation.finish(status="succeeded" if fs_step.success else "failed")
         if fs_step is not None and not fs_step.success:
-            operation.finish(status="failed", attributes={"failure_code": fs_step.failure_code.value})
             logger.warning(
                 "Filesystem restore step failed for job %s sandbox=%s code=%s message=%s",
                 job.job_id,
@@ -546,7 +692,7 @@ class DefaultRWorker(CompositeRestoreWorker):
             self._telemetry.emit_metric(
                 "restore.filesystem_ms",
                 filesystem_duration_ms,
-                {"sandbox_id": str(job.sandbox_id), "checkpoint_id": str(job.checkpoint_id)},
+                restore_metric_attributes,
             )
 
         process_step = None
@@ -562,7 +708,6 @@ class DefaultRWorker(CompositeRestoreWorker):
             process_duration_ms = (time.perf_counter() - restore_started) * 1000.0
             process_operation.finish(status="succeeded" if process_step.success else "failed")
         if process_step is not None and not process_step.success:
-            operation.finish(status="failed", attributes={"failure_code": process_step.failure_code.value})
             logger.warning(
                 "Process restore step failed for job %s sandbox=%s code=%s message=%s",
                 job.job_id,
@@ -586,7 +731,25 @@ class DefaultRWorker(CompositeRestoreWorker):
             self._telemetry.emit_metric(
                 "restore.process_ms",
                 process_duration_ms,
-                {"sandbox_id": str(job.sandbox_id), "checkpoint_id": str(job.checkpoint_id)},
+                restore_metric_attributes,
+            )
+        if restore_source_gap_turns is not None:
+            self._telemetry.emit_metric(
+                "restore.source_gap.turns",
+                restore_source_gap_turns,
+                restore_metric_attributes,
+            )
+        if restore_source_gap_ms is not None:
+            self._telemetry.emit_metric(
+                "restore.source_gap.ms",
+                restore_source_gap_ms,
+                restore_metric_attributes,
+            )
+        if restore_estimated_io_bytes is not None:
+            self._telemetry.emit_metric(
+                "restore.estimated_io_bytes",
+                restore_estimated_io_bytes,
+                restore_metric_attributes,
             )
 
         logger.info(
@@ -598,9 +761,8 @@ class DefaultRWorker(CompositeRestoreWorker):
         self._telemetry.emit_metric(
             "restore.total_ms",
             (utc_now() - started).total_seconds() * 1000.0,
-            {"sandbox_id": str(job.sandbox_id), "checkpoint_id": str(job.checkpoint_id)},
+            restore_metric_attributes,
         )
-        operation.finish(status="succeeded")
         return RestoreResult(
             job_id=job.job_id,
             sandbox_id=job.sandbox_id,
@@ -610,3 +772,54 @@ class DefaultRWorker(CompositeRestoreWorker):
             finished_at=utc_now(),
             operation_statuses=tuple(operation_statuses),
         )
+
+
+def _checkpoint_scope(job: CheckpointJob) -> str:
+    if job.checkpoint_process and job.checkpoint_filesystem:
+        return "full"
+    if job.checkpoint_process:
+        return "process_only"
+    if job.checkpoint_filesystem:
+        return "filesystem_only"
+    return "none"
+
+
+def _safe_int(value: object) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_float(value: object) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _checkpoint_estimated_io_bytes(
+    *,
+    process_size_bytes: int | None,
+    filesystem_written_bytes: int | None,
+) -> int | None:
+    values = [value for value in (process_size_bytes, filesystem_written_bytes) if value is not None]
+    if not values:
+        return None
+    return sum(values)
+
+
+def _restore_metric_attributes(job: RestoreJob, manifest: CheckpointManifest) -> dict[str, object]:
+    attributes: dict[str, object] = {
+        "sandbox_id": str(job.sandbox_id),
+        "checkpoint_id": str(job.checkpoint_id),
+        "job_id": str(job.job_id),
+        "restore.process_source_checkpoint_id": str(manifest.metadata.get(_PROCESS_RESTORE_CHECKPOINT_ID, "")),
+        "restore.filesystem_source_checkpoint_id": str(manifest.metadata.get(_FILESYSTEM_RESTORE_CHECKPOINT_ID, "")),
+        "restore.process_source_created_at": str(manifest.metadata.get(_PROCESS_RESTORE_CREATED_AT, "")),
+        "restore.filesystem_source_created_at": str(manifest.metadata.get(_FILESYSTEM_RESTORE_CREATED_AT, "")),
+        "restore.process_source_trace_cursor": manifest.metadata.get(_PROCESS_RESTORE_TRACE_CURSOR, ""),
+        "restore.filesystem_source_trace_cursor": manifest.metadata.get(_FILESYSTEM_RESTORE_TRACE_CURSOR, ""),
+        "restore.mixed_sources": bool(manifest.metadata.get(_RESTORE_MIXED_SOURCES, False)),
+    }
+    return attributes

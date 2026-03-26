@@ -69,6 +69,11 @@ The default builder creates:
 
 Use direct `AgentCRSystem(...)` construction when you need custom runtime paths, real-host wiring, retention wrappers, or a non-default scheduler policy.
 
+Two core tuning knobs changed recently:
+
+- `SchedulerConfig.inspect_without_pause` now exists and defaults to `False`. The default path still pauses before inspecting, which is the safer option when live inspection of a running sandbox may be stale or unsafe.
+- `ExecutorConfig` now supports separate `checkpoint_workers` and `restore_workers`. When either is omitted, it falls back to the legacy `max_workers` value.
+
 ## Telemetry
 
 Telemetry stays JSONL-based and is designed to be lightweight by default.
@@ -96,10 +101,16 @@ system = build_default_system(
     telemetry_config=TelemetryConfig(
         enabled=True,
         jsonl_path=Path("tmp/agent-cr/telemetry.jsonl"),
-        keep_in_memory_copy=True,
+        keep_in_memory_copy=False,
         detail_level="basic",  # or "detailed"
         capture_command_output=False,
         max_text_attribute_bytes=2048,
+        writer_mode="async",
+        queue_capacity=16384,
+        batch_max_records=256,
+        flush_interval_ms=50,
+        overflow_policy="drop_new",
+        serializer="auto",
     ),
 )
 ```
@@ -109,6 +120,10 @@ Notes:
 - `detail_level="basic"` is the default and is intended for normal benchmark runs.
 - `detail_level="detailed"` preserves the same event/metric model but allows richer attributes for deeper analysis.
 - `capture_command_output=False` avoids storing command stdout/stderr unless you explicitly want it.
+- With `jsonl_path` set, `keep_in_memory_copy` now defaults to `False` unless you explicitly enable it.
+- `writer_mode="async"` is the default JSONL mode and keeps telemetry writes off the request/checkpoint hot path with a bounded queue.
+- `overflow_policy="drop_new"` is the default async backpressure policy. Dropped telemetry is summarized at shutdown.
+- JSONL writes are batched and still file-locked, so the benchmark harness and benchmark LLM router subprocess can safely share one telemetry file.
 
 ## Checkpoint, Restore, And Recovery
 
@@ -138,6 +153,16 @@ Notes:
   - Recovery skips invalid live-request checkpoints and keeps scanning older checkpoints.
 
 This is useful when you want strict coupling between restore eligibility and a still-pending intercepted LLM request. Leave it disabled if you want recovery to prefer availability over that validation.
+
+### Response Gating Guarantees
+
+When response gating is enabled:
+
+- pending interceptor responses are tracked per sandbox and per request generation, not just by sandbox
+- overlapping requests from the same sandbox stay isolated from each other during coordination and recovery
+- a buffered response is released only after that exact request generation has finished coordination and any submitted checkpoint work for it has completed or been skipped
+
+That same request-generation metadata is also stored in live-request checkpoints, so restore-time response release can target the matching buffered response without accidentally releasing a newer one.
 
 ## Runtime Notes
 
@@ -211,21 +236,61 @@ task_dataset: path/to/tasks.jsonl
 sandboxes: 1
 max_workers: 32  # legacy fallback for all phases when phase_workers is omitted
 phase_workers:
-  build: 16
-  prepare: 16
+  setup: 16
   run: 32
   verification: 8
+executor:
+  checkpoint_workers: 32
+  restore_workers: 32
+  coordination_workers: 8
+  composite_step_workers: 16
+  checkpoint_queue_size: 10000
+  max_retries: 0
+  retry_backoff_seconds: 0.05
+scheduler:
+  min_checkpoint_interval_seconds: 0.0
+  force_checkpoint_after_seconds: 0.0
+  require_change_signal: true
+  prefer_checkpoint_during_llm_request: true
+  require_llm_request_for_checkpoint: false
+  inspect_without_pause: false
+llm_server:
+  launch_mode: process
+host_inspector:
+  launch_mode: process
 iterations: 5
 output: logs/tmp/out.csv
 log_file: logs/tmp/out.log
 log_file_mode: append | write
 benchmark_root: logs/tmp/benchmark-runs
+storage_planes:
+  runtime_root: /mnt/agent-cr-runtime
+  storage_root: /mnt/agent-cr-runtime/storage
+  agent_host_root: /mnt/agent-cr-runtime/agents
 telemetry_output: logs/tmp/out.telemetry.jsonl  # legacy top-level form, still supported
 telemetry:
   output: logs/tmp/out.telemetry.jsonl
   detail_level: basic | detailed
   capture_command_output: false
   max_text_attribute_bytes: 2048
+  keep_in_memory_copy: false
+  writer_mode: async | sync
+  queue_capacity: 16384
+  batch_max_records: 256
+  flush_interval_ms: 50
+  overflow_policy: drop_new | block
+  serializer: auto | stdlib | orjson
+  report:
+    enabled: true
+    output_dir: logs/tmp/out.telemetry.report
+    top_k: 25
+    log_scale_charts: false
+    export_svg: true
+monitoring:
+  enabled: true
+  sample_interval_ms: 1000
+  include_host: true
+  include_sandboxes: true
 zpool_size: 10G
 zpool_name: agentcrbench-cache
 zpool_image: logs/tmp/bench.zpool.img
@@ -237,16 +302,20 @@ scenario_options: {}
 llm_service_options: {}  # merged into per-task llm_service_config
 ```
 
-Benchmark runs now use a four-phase pipeline:
+For the fault scenario, `scenario_options` also supports:
 
-- `build`: shared image/materialization work
-- `prepare`: bundle/rootfs/workdir/network setup before `runc` starts
-- `run`: sandbox start plus scenario workload/recovery logic
+- `delete_filesystem_checkpoints: false` by default. Keeping filesystem checkpoints avoids synchronous old-snapshot deletion in the run-phase checkpoint hot path. Set it to `true` only when you explicitly want more aggressive retention cleanup.
+- Latest-only retention cleanup now runs asynchronously in the background. Checkpoint completion only schedules the cleanup work instead of waiting for old-snapshot deletion inline.
+
+Benchmark runs now use a three-phase pipeline:
+
+- `setup`: shared image/materialization work, bundle/rootfs/workdir/network setup, sandbox launch, and any readiness that must complete before the benchmark task starts
+- `run`: scenario workload/recovery logic after all initial sandbox setup has completed
 - `verification`: post-run validation
 
-The runner enforces two barriers:
+The runner enforces hard barriers:
 
-- all sandboxes must finish `build` and `prepare` before any sandbox enters `run`
+- all sandboxes must finish `setup` before any sandbox enters `run`
 - all sandboxes must finish `run` before any sandbox enters `verification`
 
 `phase_workers` lets each phase use a different concurrency limit. When `phase_workers` is omitted, or when a phase key is missing, that phase falls back to `max_workers` and then to `sandboxes`.
@@ -257,13 +326,25 @@ Example:
 sandboxes: 100
 max_workers: 32
 phase_workers:
-  build: 16
-  prepare: 16
+  setup: 16
   run: 32
   verification: 8
 ```
 
-This prepares all 100 sandboxes first, then starts the run phase with at most 32 concurrent run workers, and only starts verification after every run-phase task is complete.
+This fully sets up all 100 sandboxes first, then starts the run phase with at most 32 concurrent run workers, and only starts verification after every run-phase task is complete.
+
+The benchmark YAML also exposes run-phase tuning for the core Agent-CR system:
+
+- `executor.checkpoint_workers` and `executor.restore_workers` split checkpoint and restore concurrency. If omitted, both inherit the benchmark's effective `max_workers`.
+- `executor.coordination_workers` bounds live-request coordination threads, and `executor.composite_step_workers` bounds the shared worker pool used for parallel process/filesystem checkpoint sub-steps.
+- `executor.checkpoint_queue_size`, `executor.max_retries`, and `executor.retry_backoff_seconds` tune checkpoint admission and retry behavior.
+- `scheduler` overrides only `SchedulerConfig` fields. The scenario still chooses the policy class (`default`, `fault-tolerance`, `spot-preemption`, or `tree-search`), and the YAML block merges onto that scenario-owned default field by field.
+- `scheduler.inspect_without_pause` is opt-in and defaults to `false`. Turning it on allows the scheduler to inspect before pausing, but that is intentionally not the default because live inspection of a running sandbox can be risky depending on the inspector.
+- `llm_server.launch_mode` defaults to `process`, which runs the benchmark LLM router in a separate process to reduce thread pressure in the main benchmark process. `thread` remains available for tests and debugging.
+- `host_inspector.launch_mode` also defaults to `process`, which keeps the host inspector and its filesystem-monitor threads out of the main benchmark process.
+- The benchmark request path still goes through HTTP on `localhost`; only the router launch mode changed. Benchmark timings therefore still include interceptor-to-router transport overhead.
+- `storage_planes` lets you move run-phase host writes off the benchmark artifact root. This is especially important when `zpool_image` is a file vdev: keeping CRIU checkpoint images, storage manifests/artifacts, exported rootfs state, and agent host directories on a different filesystem/device avoids sibling host writes contending with the ZFS backing file.
+- `storage_planes` is fully opt-in. If you omit it, the harness preserves the legacy layout under the benchmark run root.
 
 Benchmark artifacts now include both:
 
@@ -281,19 +362,29 @@ This removes the old replay-mode `avg of avg` summary issue for timing metrics l
 Telemetry analysis and visualization:
 
 ```bash
-python3 -m agent_cr.telemetry_analysis.report \
+python3 -m benchmarks.telemetry_analysis.report \
   --input logs/iflow.fault.auto.minimax_hard_14tasks.debug.telemetry.jsonl \
-  --output-dir logs/iflow.fault.auto.minimax_hard_14tasks.telemetry_report
+  --output-dir logs/iflow.fault.auto.minimax_hard_14tasks.telemetry_report \
+  --figure-window-seconds 10
 ```
 
 The analyzer is streaming-oriented and is intended for large JSONL files. It does not load the full telemetry file into memory. The generated output directory contains:
 
-- `report.html`: self-contained visual report with hotspot charts, task latency charts, LLM/checkpoint breakdown views, and lifecycle-gap diagnostics
+- `report.html`: self-contained visual report with hotspot charts, checkpoint analysis, restore analysis, resource-usage views, and lifecycle-gap diagnostics
 - `summary.json`: machine-readable aggregate report
 - `operation_summary.csv`: per-operation counts and latency quantiles
 - `task_summary.csv`: per-task benchmark and recovery metrics
 - `slow_operations.csv`: slowest recorded operations with correlation identifiers
 - `lifecycle_gaps.csv`: operations where `*.start` and `*.finish` counts do not match
+- `checkpoint_analysis.csv`, `checkpoint_per_task.csv`, `checkpoint_load.csv`
+- `restore_analysis.csv`, `restore_per_task.csv`, `restore_load.csv`
+- `resource_summary.csv`, `resource_samples.csv`
+- standalone SVG figure files for hotspot, checkpoint, restore, and resource charts
+
+Report CLI notes:
+
+- `--figure-window-seconds <seconds>` averages checkpoint and restore line charts within fixed-size time windows. This applies to load-over-time and latency-over-time figures and helps smooth dense traces from large runs.
+- Omit `--figure-window-seconds` or pass `0` to keep the raw point-by-point checkpoint/restore figures.
 
 Logging notes:
 
@@ -302,15 +393,25 @@ Logging notes:
 - Default `log_file_mode: append` preserves existing log history.
 - Use `log_file_mode: write` when you want each benchmark run to start with a fresh log file.
 - `benchmark_root` places each run under a timestamped subdirectory rooted at the configured path. If omitted, benchmarks use a temporary directory. `AGENTCR_BENCH_DIR` is still accepted as a fallback for older workflows.
+- `benchmark_root` is still the benchmark artifact root and the default home for runtime bundles, runtime checkpoint images, sandbox metadata, checkpoint storage, exported image rootfs, and agent host state. Use `storage_planes` only when you want to move some of that hot write traffic elsewhere.
 - `benchmark.run` now logs an explicit start marker and end marker for each run, and the final summary/artifact paths are logged as well as printed.
 - Benchmark YAML supports a nested `telemetry:` block for telemetry output and detail controls.
 - `telemetry.output` sets the JSONL artifact path. If omitted, the runner defaults to `<output>.telemetry.jsonl` or `<config>.telemetry.jsonl`.
 - `telemetry.detail_level` accepts `basic` or `detailed`.
 - `telemetry.capture_command_output` is `false` by default to avoid storing command stdout/stderr in normal runs.
 - `telemetry.max_text_attribute_bytes` bounds long text attributes when detailed capture is enabled.
+- `telemetry.keep_in_memory_copy` defaults to `false` for benchmark runs when JSONL output is enabled.
+- `telemetry.writer_mode`, `telemetry.queue_capacity`, `telemetry.batch_max_records`, `telemetry.flush_interval_ms`, `telemetry.overflow_policy`, and `telemetry.serializer` control the async JSONL writer.
+- `telemetry.report.enabled` controls automatic report generation after the benchmark run.
+- `telemetry.report.output_dir` overrides the default `<telemetry_output>.report` directory.
+- `telemetry.report.top_k`, `telemetry.report.log_scale_charts`, and `telemetry.report.export_svg` tune report output.
 - The legacy top-level `telemetry_output` field is still accepted for compatibility, but `telemetry.output` is the preferred YAML form.
+- In `llm_server.launch_mode: process`, the router subprocess writes telemetry with the same `run_id` into the same JSONL file as the harness.
+- `monitoring.enabled` turns host and per-sandbox resource sampling on or off during the run.
+- `monitoring.sample_interval_ms` controls the sampling cadence.
+- `monitoring.include_host` and `monitoring.include_sandboxes` control host and per-sandbox monitoring coverage.
 - `phase_workers` overrides concurrency per benchmark phase. Missing phase keys fall back to `max_workers`.
-- Phase telemetry now emits distinct phase-qualified records such as `benchmark.phase.build.*`, `benchmark.phase.prepare.*`, `benchmark.phase.run.*`, `benchmark.phase.verification.*`, and `benchmark.phase.<phase>.item.*` so JSONL output shows phase timing and configured concurrency.
+- Phase telemetry now emits distinct phase-qualified records such as `benchmark.phase.setup.*`, `benchmark.phase.run.*`, `benchmark.phase.verification.*`, and `benchmark.phase.<phase>.item.*` so JSONL output shows phase timing and configured concurrency.
 - `zpool_size` controls the backing file size for ephemeral benchmark zpools.
 - `reuse_zpool: true` keeps the zpool across runs instead of recreating it every time.
 - When reusing a pool, set both `zpool_name` and `zpool_image` to stable values. Each run still destroys and recreates the `pool/agent-cr` dataset so the benchmark starts clean.

@@ -69,13 +69,18 @@ Flow:
 
 1. The interceptor sees an outbound LLM request from a sandbox.
 2. It records request state in `InMemoryRequestStateStore`.
-3. If response gating is enabled, it arms `SandboxResponseGateRegistry` with the sandbox ID and request ID.
+3. If response gating is enabled, it arms `SandboxResponseGateRegistry` with the sandbox ID, request ID, and a monotonically increasing request generation.
 4. The interceptor notifies `AgentCRSystem.notify_interceptor_state_change(...)`.
-5. The system monitor loop observes the request start and dispatches coordination for that sandbox.
-6. `_execute_checkpoint_flow(...)` asks `CRScheduler` whether a checkpoint should run.
-7. If a checkpoint runs while the request is still in flight and the pending gate matches, `_build_checkpoint_metadata(...)` stores live-request metadata in the checkpoint manifest.
+5. The system monitor loop coordinates pending gated requests for that sandbox generation by generation and keeps looping until no pending request remains.
+6. `_execute_checkpoint_flow(...)` asks `CRScheduler` whether a checkpoint should run for the current pending request generation.
+7. If a checkpoint runs while the request is still in flight and the pending gate matches, `_build_checkpoint_metadata(...)` stores live-request metadata in the checkpoint manifest, including the request generation.
 
 That metadata is what `_validate_restore_checkpoint(...)` inspects when restore validation is enabled.
+
+Two invariants matter here:
+
+- a buffered response is not released until the matching request generation's coordination pass has finished and any submitted checkpoint has completed or been skipped
+- releasing an older pending request does not release a newer pending request from the same sandbox
 
 ## Manual Checkpoint Flow
 
@@ -90,6 +95,15 @@ That metadata is what `_validate_restore_checkpoint(...)` inspects when restore 
 7. The sandbox is resumed when the policy or runtime path expects it.
 
 `checkpoint_if_due(...)` shares the same execution path after the scheduler decision, but does not force a checkpoint if the policy declines.
+
+## Scheduler Inspection Modes
+
+`CRScheduler.query_checkpoint(...)` now has two inspection paths:
+
+- Default: pause the sandbox first, then inspect and evaluate. This is the safe path and is controlled by `SchedulerConfig.inspect_without_pause=False`.
+- Opt-in live inspection: inspect first and only pause later if evaluation decides that a non-`leave_running` checkpoint needs quiescing. This is controlled by `SchedulerConfig.inspect_without_pause=True`.
+
+The benchmark YAML `scheduler:` block can override that flag, but the repository defaults remain on the paused-inspection path.
 
 ## Restore Flow
 
@@ -132,10 +146,10 @@ Manifest resolution is important because restore may depend on artifacts from ea
 
 - Default behavior: validation is disabled, so the newest checkpoint is selected immediately.
 - Strict behavior: when `enforce_restore_checkpoint_validation=True`, each candidate is checked with `_validate_restore_checkpoint(...)`.
-- Live-request checkpoints that no longer match the pending gate are skipped.
+- Live-request checkpoints that no longer match the pending gated request generation are skipped.
 - If no checkpoint satisfies validation, recovery emits telemetry for the failure to find a satisfiable checkpoint.
 
-After a successful restore, `_release_checkpoint_response_gate(...)` checks whether the restored checkpoint captured an in-flight request and whether the current pending gate still matches that request ID. If it does, the buffered interceptor response is released so the restored sandbox can continue the original request path.
+After a successful restore, `_release_checkpoint_response_gate(...)` checks whether the restored checkpoint captured an in-flight request and whether the current pending gate still matches that request ID and generation. If it does, the buffered interceptor response is released so the restored sandbox can continue the original request path without releasing a newer pending request by mistake.
 
 ## Storage And Retention
 
@@ -159,18 +173,32 @@ That harness:
 - Creates a temporary ZFS pool
 - Prepares sandbox bundles and rootfs state before launch
 - Launches `runc` sandboxes through an explicit phased pipeline
-- Runs an interceptor server in front of the simulated LLM service
+- Runs an interceptor server in front of the benchmark LLM router over HTTP on `localhost`
 - Wires `AgentCRSystem` with policy-specific retention and recovery settings
 - Exposes helpers for checkpoint, restore, fault injection, preemption injection, and checkpoint cloning for tree-search fan-out
 
-The benchmark runner now coordinates four phases across the whole run:
+The benchmark LLM router can run in either:
 
-1. `build`
-2. `prepare`
-3. `run`
-4. `verification`
+- `process` mode, which is the default for benchmarks and keeps router threads out of the main benchmark process
+- `thread` mode, which is mainly useful for tests and debugging
 
-`run` does not begin until all sandboxes finish `build` and `prepare`, and `verification` does not begin until all sandboxes finish `run`. Each phase has its own configurable worker limit from benchmark YAML.
+The harness manages router state through `BenchmarkLLMRouterClient` and the router's control endpoints:
+
+- `POST /control/register`
+- `POST /control/unregister`
+- `POST /control/reset`
+- `POST /control/restore`
+- `GET /control/state`
+
+The router process entrypoint is `python -m integrations.llm_services.router`.
+
+The benchmark runner now coordinates three phases across the whole run:
+
+1. `setup`
+2. `run`
+3. `verification`
+
+`run` does not begin until all sandboxes finish `setup`, and `verification` does not begin until all sandboxes finish `run`. Each phase has its own configurable worker limit from benchmark YAML.
 
 The main benchmark entrypoints and configuration surface are:
 

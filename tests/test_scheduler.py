@@ -164,6 +164,75 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(self.sandbox_manager.calls, [("pause", self.sandbox_id)])
         self.assertEqual(self.sandbox_manager.describe(self.sandbox_id).status, "paused")
 
+    def test_query_skips_first_checkpoint_baseline_when_option_disabled(self) -> None:
+        scheduler = CRScheduler(
+            SchedulerConfig(
+                min_checkpoint_interval_seconds=0.0,
+                force_checkpoint_after_seconds=0.0,
+                require_change_signal=True,
+                checkpoint_full_baseline_on_first_checkpoint=False,
+            ),
+            self.inspector,
+            self.sandbox_manager,
+            InMemorySchedulerStateStore(),
+        )
+        self.inspector.upsert_snapshot(
+            SandboxSnapshot(
+                sandbox_id=self.sandbox_id,
+                runtime_name="runc",
+                is_running=True,
+                process_changed=False,
+                filesystem_changed=False,
+                observed_at=utc_now(),
+                last_checkpoint_at=None,
+            )
+        )
+
+        decision = scheduler.query_checkpoint(self.sandbox_id)
+
+        self.assertFalse(decision.should_checkpoint)
+        self.assertEqual(decision.reason, "no_change_signal")
+        self.assertEqual(
+            self.sandbox_manager.calls,
+            [("pause", self.sandbox_id), ("resume", self.sandbox_id)],
+        )
+        self.assertEqual(self.sandbox_manager.describe(self.sandbox_id).status, "running")
+
+    def test_query_allows_normal_first_checkpoint_when_baseline_option_disabled(self) -> None:
+        scheduler = CRScheduler(
+            SchedulerConfig(
+                min_checkpoint_interval_seconds=0.0,
+                force_checkpoint_after_seconds=0.0,
+                require_change_signal=True,
+                checkpoint_full_baseline_on_first_checkpoint=False,
+                prefer_checkpoint_during_llm_request=True,
+            ),
+            self.inspector,
+            self.sandbox_manager,
+            InMemorySchedulerStateStore(),
+        )
+        self.inspector.upsert_snapshot(
+            SandboxSnapshot(
+                sandbox_id=self.sandbox_id,
+                runtime_name="runc",
+                is_running=True,
+                process_changed=True,
+                filesystem_changed=False,
+                observed_at=utc_now(),
+                last_checkpoint_at=None,
+                metadata={"llm_request_in_flight": True},
+            )
+        )
+
+        decision = scheduler.query_checkpoint(self.sandbox_id)
+
+        self.assertTrue(decision.should_checkpoint)
+        self.assertTrue(decision.checkpoint_process)
+        self.assertTrue(decision.checkpoint_filesystem)
+        self.assertEqual(decision.reason, "llm_request_window_available")
+        self.assertEqual(self.sandbox_manager.calls, [("pause", self.sandbox_id)])
+        self.assertEqual(self.sandbox_manager.describe(self.sandbox_id).status, "paused")
+
     def test_query_does_not_resume_after_pause_when_inspector_reports_not_running(self) -> None:
         self.inspector.upsert_snapshot(
             SandboxSnapshot(
@@ -327,7 +396,7 @@ class SchedulerTests(unittest.TestCase):
         self.assertTrue(decision.checkpoint_process)
         self.assertTrue(decision.checkpoint_filesystem)
         self.assertTrue(decision.leave_running)
-        self.assertEqual(decision.reason, "llm_request_window_available")
+        self.assertEqual(decision.reason, "no_previous_checkpoint")
         self.assertEqual(self.sandbox_manager.calls, [("pause", self.sandbox_id)])
 
     def test_query_fault_tolerance_policy_forces_filesystem_checkpoint_for_process_change_in_request_window(self) -> None:
@@ -369,7 +438,7 @@ class SchedulerTests(unittest.TestCase):
         self.assertTrue(decision.checkpoint_process)
         self.assertTrue(decision.checkpoint_filesystem)
         self.assertTrue(decision.leave_running)
-        self.assertEqual(decision.reason, "llm_request_window_available")
+        self.assertEqual(decision.reason, "no_previous_checkpoint")
         self.assertEqual(self.sandbox_manager.calls, [("pause", self.sandbox_id)])
 
     def test_query_handles_pause_failure_when_snapshot_is_not_running(self) -> None:
@@ -390,6 +459,77 @@ class SchedulerTests(unittest.TestCase):
         self.assertFalse(decision.should_checkpoint)
         self.assertEqual(decision.reason, "sandbox_not_running")
         self.assertEqual(self.sandbox_manager.calls, [("pause", self.sandbox_id)])
+
+    def test_query_live_inspection_skip_path_does_not_pause_when_enabled(self) -> None:
+        scheduler = CRScheduler(
+            SchedulerConfig(
+                min_checkpoint_interval_seconds=0.0,
+                force_checkpoint_after_seconds=0.0,
+                require_change_signal=True,
+                inspect_without_pause=True,
+            ),
+            self.inspector,
+            self.sandbox_manager,
+            InMemorySchedulerStateStore(),
+        )
+        observed_at = utc_now()
+        self.inspector.upsert_snapshot(
+            SandboxSnapshot(
+                sandbox_id=self.sandbox_id,
+                runtime_name="runc",
+                is_running=True,
+                process_changed=False,
+                filesystem_changed=False,
+                observed_at=observed_at,
+                last_checkpoint_at=observed_at - timedelta(seconds=31),
+            )
+        )
+
+        decision = scheduler.query_checkpoint(self.sandbox_id)
+
+        self.assertFalse(decision.should_checkpoint)
+        self.assertEqual(self.sandbox_manager.calls, [])
+
+    def test_query_live_inspection_leave_running_checkpoint_does_not_pause(self) -> None:
+        scheduler = CRScheduler(
+            SchedulerConfig(
+                min_checkpoint_interval_seconds=0.0,
+                force_checkpoint_after_seconds=0.0,
+                require_change_signal=True,
+                prefer_checkpoint_during_llm_request=True,
+                inspect_without_pause=True,
+            ),
+            self.inspector,
+            self.sandbox_manager,
+            InMemorySchedulerStateStore(),
+            None,
+            FaultToleranceCheckpointingPolicy(
+                SchedulerConfig(
+                    min_checkpoint_interval_seconds=0.0,
+                    force_checkpoint_after_seconds=0.0,
+                    require_change_signal=True,
+                    prefer_checkpoint_during_llm_request=True,
+                    inspect_without_pause=True,
+                )
+            ),
+        )
+        self.inspector.upsert_snapshot(
+            SandboxSnapshot(
+                sandbox_id=self.sandbox_id,
+                runtime_name="runc",
+                is_running=True,
+                process_changed=True,
+                filesystem_changed=True,
+                observed_at=utc_now(),
+                metadata={"llm_request_in_flight": True},
+            )
+        )
+
+        decision = scheduler.query_checkpoint(self.sandbox_id)
+
+        self.assertTrue(decision.should_checkpoint)
+        self.assertTrue(decision.leave_running)
+        self.assertEqual(self.sandbox_manager.calls, [])
 
 
 if __name__ == "__main__":

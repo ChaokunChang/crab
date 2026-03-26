@@ -11,6 +11,10 @@ It is intended to be the canonical reference for:
 
 The telemetry stream is JSONL-based and is designed to be lightweight by default.
 
+JSONL telemetry now uses an async buffered writer by default. The hot path enqueues records into a bounded queue, and a background writer flushes compact JSONL batches to disk. When the queue overflows in default `overflow_policy="drop_new"` mode, the writer emits a shutdown summary event (`telemetry.writer.dropped`) so analysis can detect lossy runs.
+
+In benchmark `llm_server.launch_mode: process`, both the main benchmark process and the benchmark LLM router subprocess can write to the same JSONL file. Batch writes are still protected by a file lock so records stay intact across processes.
+
 ## Record Format
 
 Each JSONL line is one record with this high-level shape:
@@ -56,6 +60,7 @@ Important implications:
 - `*.duration_ms` is the measured wall-clock latency for that operation instance.
 - `*.duration_ms` is usually the preferred source for latency analysis.
 - `*.start` and `*.finish` are useful for count-matching, failure diagnosis, and chronology.
+- `*.duration_ms` now excludes the helper's own telemetry emit cost. In `detail_level="basic"`, operation `*.start` and `*.finish` events are suppressed while `*.duration_ms` remains.
 
 Some older `*_ms` metrics still exist for compatibility. When both exist, analysis code should prefer the newer `*.duration_ms` form.
 
@@ -69,6 +74,7 @@ Not every record contains every key, but these are the standard correlation fiel
 | `sandbox_id` | Sandbox/container identity. Primary join key for per-sandbox timelines. |
 | `task_id` | Logical benchmark task identity. Often attached by benchmark-level telemetry. |
 | `request_id` | Logical LLM request identity. Used to connect interceptor-side and service-side records. |
+| `request_generation` | Monotonic per-sandbox request generation used to distinguish overlapping gated requests from the same sandbox. |
 | `checkpoint_id` | Checkpoint identity. Used to join checkpoint, restore, and recovery records. |
 | `job_id` | Executor job identity. Used for queue wait and execution analysis. |
 | `event_type` | Benchmark/recovery event type such as `fault` or `preemption`. |
@@ -92,11 +98,11 @@ These metrics describe the request path from the sandbox, through the intercepto
 | `interceptor.request.upstream_response_received` | Upstream response bytes were available to the interceptor. |
 | `interceptor.response_gate.wait.start` | Interceptor began waiting on the response gate. |
 | `interceptor.response_gate.wait.finish` | Response gate wait completed. |
-| `interceptor.response.released` | Response was released back to the sandbox. |
+| `interceptor.response.released` | Response was released back to the sandbox after the matching request generation finished coordination. |
 | `llm.service.request.start` | Benchmark LLM router/service started handling the request. |
 | `llm.service.request.finish` | Benchmark LLM router/service finished handling the request. |
 | `request.start` | Legacy hook-level request-start marker. |
-| `request.end` | Legacy hook-level request-end marker. |
+| `request.finish` | Legacy hook-level request-finish marker. |
 
 ### Metrics
 
@@ -105,9 +111,9 @@ These metrics describe the request path from the sandbox, through the intercepto
 | `interceptor.request.forward.duration_ms` | Total time spent in the interceptor’s upstream transport call. |
 | `llm.upstream_latency_ms` | Time spent in the interceptor server’s HTTP forwarding call to the upstream LLM endpoint. |
 | `llm.service.request.duration_ms` | Time spent executing the benchmark LLM service handler. |
-| `interceptor.response_gate.wait.duration_ms` | Time spent blocked on the response gate. |
-| `llm.gate_wait_ms` | Explicit response-gate wait duration. |
-| `llm.agentcr_delay_ms` | Delay from “upstream response received” to “response released to agent”. |
+| `interceptor.response_gate.wait.duration_ms` | Response-gate wait duration measured by the shared operation helper. This now excludes the helper's own emit overhead. |
+| `llm.gate_wait_ms` | Explicit blocking wait duration inside `wait_for_release(...)`. |
+| `llm.agentcr_delay_ms` | Delay from “upstream response received” to “response released to agent”, sampled before telemetry writes so it no longer absorbs telemetry self-overhead. |
 | `llm.interceptor_total_ms` | Total interceptor-side request latency from request handling start to release back to sandbox. |
 | `llm.request_total_ms` | Legacy alias for interceptor total latency. Prefer `llm.interceptor_total_ms`. |
 
@@ -132,7 +138,10 @@ The main latency relationships are:
 - `interceptor.request.forward.duration_ms` wraps the full forward call seen by the interceptor and therefore is usually greater than or equal to `llm.upstream_latency_ms`.
 - `llm.agentcr_delay_ms` measures the delay introduced after the upstream response arrives but before the sandbox receives it.
 - `llm.gate_wait_ms` is the explicit blocking portion of that delay.
+- `interceptor.response_gate.wait.duration_ms` and `llm.gate_wait_ms` should now be very close; large persistent gaps usually indicate real wrapper work or clocking issues rather than telemetry overhead.
 - `llm.interceptor_total_ms` is the end-to-end interceptor latency and therefore is usually the largest of the LLM path timing metrics.
+
+For overlapping requests from the same sandbox, correlate by both `request_id` and `request_generation` when available. Response-gate release is generation-specific.
 
 In practice, analysis code should treat:
 
@@ -157,9 +166,10 @@ These metrics explain why checkpointing decisions were made and how much schedul
 | Metric | Meaning |
 | --- | --- |
 | `scheduler.evaluate.duration_ms` | Time spent evaluating a scheduler decision. |
-| `executor.job_queue_wait_ms` | Time from job submission to dequeue by the executor worker. |
+| `executor.job_queue_wait_ms` | Time from job submission to start of execution by the executor worker pool. This now reflects real worker contention instead of a forced single-checkpoint-thread bottleneck. |
 | `executor.job.duration_ms` | Total execution time of a checkpoint or restore job. |
 | `executor.job_duration_ms` | Legacy alias for `executor.job.duration_ms`. |
+| `recovery.restore.duration_ms` | Recovery-time wrapper around `restore_once(...)`. This lets reports separate restore execution from checkpoint selection and post-restore release/bookkeeping. |
 
 ### Executor Lifecycle
 
@@ -194,6 +204,8 @@ Because layers are nested, their durations are not additive. They are different 
 | `checkpoint.filesystem.start` / `finish` / `duration_ms` | Filesystem checkpoint worker step. |
 | `checkpoint.persist_artifacts.start` / `finish` / `duration_ms` | Artifact persistence time. |
 | `checkpoint.persist_manifest.start` / `finish` / `duration_ms` | Manifest persistence time. |
+| `checkpoint.write_manifest.start` / `finish` / `duration_ms` | Manifest file write only. |
+| `checkpoint.retention_policy.start` / `finish` / `duration_ms` | Retention scheduling time after the manifest is written. Actual pruning can continue asynchronously in the background. |
 | `checkpoint.captured_live_request` | Checkpoint metadata recorded an in-flight LLM request. |
 
 ### Metrics
@@ -205,10 +217,14 @@ Because layers are nested, their durations are not additive. They are different 
 | `checkpoint.filesystem.duration_ms` | Filesystem checkpoint step duration. |
 | `checkpoint.persist_artifacts.duration_ms` | Artifact persistence duration. |
 | `checkpoint.persist_manifest.duration_ms` | Manifest persistence duration. |
+| `checkpoint.write_manifest.duration_ms` | Manifest file write duration, without retention cleanup. |
+| `checkpoint.retention_policy.duration_ms` | Retention scheduling duration on the checkpoint hot path. It no longer includes background pruning/deletion work. |
 | `checkpoint.total_ms` | Legacy alias for worker checkpoint total duration. Prefer `checkpoint.flow.duration_ms`. |
 | `checkpoint.process_ms` | Legacy alias for `checkpoint.process.duration_ms`. |
 | `checkpoint.filesystem_ms` | Legacy alias for `checkpoint.filesystem.duration_ms`. |
 | `checkpoint.persist_artifacts_ms` | Legacy alias for `checkpoint.persist_artifacts.duration_ms`. |
+| `checkpoint.write_manifest_ms` | Legacy alias for `checkpoint.write_manifest.duration_ms`. |
+| `checkpoint.retention_policy_ms` | Legacy alias for `checkpoint.retention_policy.duration_ms`. |
 | `checkpoint.persist_manifest_ms` | Legacy alias for `checkpoint.persist_manifest.duration_ms`. |
 
 ### Important Relationship
@@ -260,7 +276,7 @@ Prefer the `*.duration_ms` names.
 | `recovery.response_release.start` / `finish` / `duration_ms` | Time spent trying to release a buffered response after restore. |
 | `recovery.response_released` | A buffered response was actually released. |
 | `recovery.event_received` | Fault/preemption event entered the recovery queue. |
-| `recovery.checkpoint_skipped_stale_request` | Candidate checkpoint was rejected because its live request no longer matched the pending request. |
+| `recovery.checkpoint_skipped_stale_request` | Candidate checkpoint was rejected because its live request no longer matched the pending request or request generation. |
 | `recovery.no_satisfiable_checkpoint` | No acceptable recovery checkpoint was found. |
 
 ### Important Relationship
@@ -332,14 +348,15 @@ Important:
 
 Benchmark telemetry is the preferred source for benchmark-level summary metrics when available.
 
+When `llm_server.launch_mode` is `process`, the benchmark LLM router emits its telemetry with the same `run_id` into the same JSONL stream as the harness.
+
 ### Phase Lifecycle
 
-The benchmark harness now runs four explicit phases: `build`, `prepare`, `run`, and `verification`.
+The benchmark harness now runs three explicit phases: `setup`, `run`, and `verification`.
 
 | Name | Meaning |
 | --- | --- |
-| `benchmark.phase.build.start` / `finish` / `duration_ms` | Whole-run timing for the `build` phase. Carries `phase`, `phase_scope="run"`, `sandbox_count`, and `configured_max_workers`. |
-| `benchmark.phase.prepare.start` / `finish` / `duration_ms` | Whole-run timing for the `prepare` phase. Carries `phase`, `phase_scope="run"`, `sandbox_count`, and `configured_max_workers`. |
+| `benchmark.phase.setup.start` / `finish` / `duration_ms` | Whole-run timing for the `setup` phase. Carries `phase`, `phase_scope="run"`, `sandbox_count`, and `configured_max_workers`. |
 | `benchmark.phase.run.start` / `finish` / `duration_ms` | Whole-run timing for the `run` phase. Carries `phase`, `phase_scope="run"`, `sandbox_count`, and `configured_max_workers`. |
 | `benchmark.phase.verification.start` / `finish` / `duration_ms` | Whole-run timing for the `verification` phase. Carries `phase`, `phase_scope="run"`, `sandbox_count`, and `configured_max_workers`. |
 | `benchmark.phase.<phase>.item.start` / `finish` / `duration_ms` | Per-sandbox timing inside a phase. Carries `phase`, `phase_scope="sandbox"`, plus benchmark sandbox/task attributes. |
@@ -489,11 +506,14 @@ These fields appear in the HTML report summary table and in `summary.json`.
 CLI usage:
 
 ```bash
-python3 -m agent_cr.telemetry_analysis.report \
+python3 -m benchmarks.telemetry_analysis.report \
     --input telemetry.jsonl \
     --output-dir report/ \
-    --exclude-failed-tasks
+    --exclude-failed-tasks \
+    --figure-window-seconds 10
 ```
+
+When `--figure-window-seconds` is set, checkpoint and restore line charts in the HTML/SVG report are averaged within each fixed-size time window. This applies to both load-over-time and latency-over-time figures.
 
 ## 7. Lifecycle Count Matching
 

@@ -10,12 +10,11 @@ from benchmarks.core import (
     annotate_row,
     benchmark_phase_item_attributes,
     benchmark_phase_map,
-    build_task_records_phase,
     emit_row_telemetry,
     make_benchmark_sandbox_specs,
     poll_sandbox_status,
-    prepare_task_records_phase,
     resolve_task_records,
+    setup_task_records_phase,
     start_prepared_task_record,
     trace_response_count_for_sandbox,
 )
@@ -41,12 +40,14 @@ def default_task_config() -> TaskConfig:
 
 
 def build_harness_settings(config: BenchmarkConfig) -> HarnessSettings:
-    scheduler_config = SchedulerConfig(
-        min_checkpoint_interval_seconds=0.0,
-        force_checkpoint_after_seconds=0.0,
-        require_change_signal=True,
-        prefer_checkpoint_during_llm_request=True,
-        require_llm_request_for_checkpoint=False,
+    scheduler_config = config.scheduler.apply(
+        SchedulerConfig(
+            min_checkpoint_interval_seconds=0.0,
+            force_checkpoint_after_seconds=0.0,
+            require_change_signal=True,
+            prefer_checkpoint_during_llm_request=True,
+            require_llm_request_for_checkpoint=False,
+        )
     )
     return HarnessSettings(
         scheduler_config=scheduler_config,
@@ -142,15 +143,10 @@ def run_manual(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
         sandbox_name_prefix="sandbox",
         records=records,
     )
-    build_task_records_phase(
+    prepared = setup_task_records_phase(
         harness,
         specs=specs,
-        max_workers=config.effective_phase_workers.build,
-    )
-    prepared = prepare_task_records_phase(
-        harness,
-        specs=specs,
-        max_workers=config.effective_phase_workers.prepare,
+        max_workers=config.effective_phase_workers.setup,
     )
     if records and any(is_replay_llm_service_type(record.llm_service_type) for record in records):
         run_results = benchmark_phase_map(

@@ -15,7 +15,7 @@ def _metadata_artifact(name: str, payload: dict[str, object], *, runtime_name: s
     return ArtifactPayload(
         kind=ArtifactKind.PROCESS,
         name=name,
-        data=json.dumps(payload, sort_keys=True, indent=2).encode("utf-8"),
+        data=json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"),
         metadata={"runtime": runtime_name},
     )
 

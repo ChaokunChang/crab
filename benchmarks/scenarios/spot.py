@@ -14,11 +14,10 @@ from benchmarks.core import (
     annotate_row,
     benchmark_phase_item_attributes,
     benchmark_phase_map,
-    build_task_records_phase,
     emit_row_telemetry,
     make_benchmark_sandbox_specs,
-    prepare_task_records_phase,
     resolve_task_records,
+    setup_task_records_phase,
     start_prepared_task_record,
 )
 from benchmarks.scenarios import HarnessSettings, ScenarioDefinition
@@ -70,10 +69,12 @@ def parse_spot_options(config: BenchmarkConfig) -> SpotOptions:
 
 
 def build_harness_settings(config: BenchmarkConfig) -> HarnessSettings:
-    scheduler_config = SchedulerConfig(
-        min_checkpoint_interval_seconds=0.0,
-        force_checkpoint_after_seconds=0.0,
-        require_change_signal=False,
+    scheduler_config = config.scheduler.apply(
+        SchedulerConfig(
+            min_checkpoint_interval_seconds=0.0,
+            force_checkpoint_after_seconds=0.0,
+            require_change_signal=False,
+        )
     )
     return HarnessSettings(
         scheduler_config=scheduler_config,
@@ -169,8 +170,6 @@ def run_auto_sandbox(
                     "event_injected": 0,
                     "recovery_status": "none",
                     "grace_period_ms": options.grace_period_seconds * 1000.0,
-                    "checkpoint_ms": 0.0,
-                    "restore_ms": 0.0,
                     "recovery_ms": 0.0,
                     "readiness_ms": 0.0,
                     "end_to_end_recovery_ms": 0.0,
@@ -210,8 +209,6 @@ def run_auto_sandbox(
                 "event_injected": 1,
                 "recovery_status": record.status,
                 "grace_period_ms": options.grace_period_seconds * 1000.0,
-                "checkpoint_ms": 0.0,
-                "restore_ms": 0.0,
                 "recovery_ms": (recovery_finished - migration_started) * 1000.0,
                 "readiness_ms": (ready_at - recovery_finished) * 1000.0,
                 "end_to_end_recovery_ms": (ready_at - event_started) * 1000.0,
@@ -468,8 +465,6 @@ def _run_replay_auto_sandbox_run(
             "events_injected": events_injected,
             "recoveries_succeeded": recoveries_succeeded,
             "grace_period_ms": options.grace_period_seconds * 1000.0,
-            "checkpoint_ms_avg": average([]),
-            "restore_ms_avg": average([]),
             "recovery_ms_avg": average(recovery_ms_values),
             "readiness_ms_avg": average(readiness_ms_values),
             "end_to_end_recovery_ms_avg": average(end_to_end_recovery_ms_values),
@@ -574,15 +569,10 @@ def run_manual(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
         sandbox_name_prefix="spot",
         records=records,
     )
-    build_task_records_phase(
+    prepared = setup_task_records_phase(
         harness,
         specs=specs,
-        max_workers=config.effective_phase_workers.build,
-    )
-    prepared = prepare_task_records_phase(
-        harness,
-        specs=specs,
-        max_workers=config.effective_phase_workers.prepare,
+        max_workers=config.effective_phase_workers.setup,
     )
     indexed_prepared = list(enumerate(prepared))
     run_results = benchmark_phase_map(
@@ -633,15 +623,10 @@ def run_auto(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
         sandbox_name_prefix="spot",
         records=records,
     )
-    build_task_records_phase(
+    prepared = setup_task_records_phase(
         harness,
         specs=specs,
-        max_workers=config.effective_phase_workers.build,
-    )
-    prepared = prepare_task_records_phase(
-        harness,
-        specs=specs,
-        max_workers=config.effective_phase_workers.prepare,
+        max_workers=config.effective_phase_workers.setup,
     )
     indexed_prepared = list(enumerate(prepared))
     run_results = benchmark_phase_map(
@@ -686,8 +671,6 @@ def summarize(config: BenchmarkConfig, rows: list[dict[str, object]]) -> dict[st
         return compute_summary_aliases(
             rows,
             {
-                "checkpoint_ms": "checkpoint_ms_avg",
-                "restore_ms": "restore_ms_avg",
                 "recovery_ms": "recovery_ms_avg",
                 "readiness_ms": "readiness_ms_avg",
                 "end_to_end_recovery_ms": "end_to_end_recovery_ms_avg",

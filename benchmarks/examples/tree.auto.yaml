@@ -5,8 +5,7 @@ agent: simulated
 llm_service: simulated
 sandboxes: 3
 phase_workers:
-  build: 3
-  prepare: 3
+  setup: 3
   run: 3
   verification: 3
 iterations: 1

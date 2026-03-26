@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 from pathlib import Path
 import shutil
@@ -9,10 +8,16 @@ import shutil
 from ..config import StorageConfig
 from ..contracts import CheckpointManager
 from ..ids import CheckpointId, SandboxId
+from ..json_codec import get_json_codec
 from ..models import ArtifactPayload, ArtifactReference, CheckpointManifest
 from ..runtime import CommandRunner, SubprocessCommandRunner
 
 logger = logging.getLogger(__name__)
+_STORAGE_JSON_CODEC = get_json_codec("auto")
+
+
+def _stable_json_bytes(payload: object) -> bytes:
+    return _STORAGE_JSON_CODEC.dumps_bytes(payload, sort_keys=True)
 
 
 def _safe_name(value: str) -> str:
@@ -62,7 +67,7 @@ class LocalCheckpointManager(CheckpointManager):
         path = self._manifest_path(manifest.sandbox_id, manifest.checkpoint_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(manifest.to_dict(), sort_keys=True, indent=2))
+        tmp.write_bytes(manifest.to_json_bytes())
         tmp.replace(path)
         logger.debug(
             "Stored manifest for sandbox=%s checkpoint=%s at %s",
@@ -79,7 +84,7 @@ class LocalCheckpointManager(CheckpointManager):
         path = self._manifest_path(sandbox_id, checkpoint_id)
         if not path.exists():
             raise FileNotFoundError(f"manifest not found: {path}")
-        raw = json.loads(path.read_text())
+        raw = _STORAGE_JSON_CODEC.loads(path.read_bytes())
         logger.debug("Loaded manifest for sandbox=%s checkpoint=%s from %s", sandbox_id, checkpoint_id, path)
         return CheckpointManifest.from_dict(raw)
 
@@ -155,9 +160,20 @@ class LocalCheckpointManager(CheckpointManager):
 
         manifests: list[tuple[str, CheckpointId]] = []
         for path in sandbox_dir.glob("*.json"):
-            raw = json.loads(path.read_text())
+            try:
+                raw = _STORAGE_JSON_CODEC.loads(path.read_bytes())
+            except FileNotFoundError:
+                logger.debug("Skipping manifest that disappeared during listing: %s", path)
+                continue
+            except ValueError:
+                logger.warning("Skipping unreadable manifest while listing checkpoints: %s", path)
+                continue
+            checkpoint_id = raw.get("checkpoint_id")
+            if checkpoint_id is None:
+                logger.warning("Skipping manifest missing checkpoint_id while listing checkpoints: %s", path)
+                continue
             created_at = str(raw.get("created_at", ""))
-            ckpt = CheckpointId(str(raw["checkpoint_id"]))
+            ckpt = CheckpointId(str(checkpoint_id))
             manifests.append((created_at, ckpt))
         manifests.sort(key=lambda x: x[0])
         logger.debug("Listed %d checkpoints for sandbox=%s", len(manifests), sandbox_id)
@@ -220,9 +236,10 @@ class LocalCheckpointManager(CheckpointManager):
         except FileNotFoundError:
             return None
         try:
-            return json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            payload = _STORAGE_JSON_CODEC.loads(raw)
+        except ValueError:
             return None
+        return payload if isinstance(payload, dict) else None
 
     def _delete_process_runtime_paths(self, payload: dict[str, object]) -> None:
         checkpoint_location = payload.get("process_checkpoint_location")

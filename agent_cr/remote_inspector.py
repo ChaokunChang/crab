@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-import json
 import logging
-import urllib.error
-import urllib.request
 from dataclasses import dataclass, replace
 from datetime import datetime
 from threading import Lock
 
 from .contracts import SandboxInspector
+from .http_utils import HttpStatusError, ThreadLocalHttpClient
 from .ids import SandboxId
 from .models import SandboxSnapshot, utc_now
 
@@ -26,16 +24,15 @@ class HostInspectorServiceClient:
     base_url: str
     timeout_s: float = 5.0
 
-    def _post(self, path: str, payload: dict[str, object]) -> dict[str, object]:
-        body = json.dumps(payload, sort_keys=True).encode("utf-8")
-        request = urllib.request.Request(
-            f"{self.base_url.rstrip('/')}{path}",
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "_http_client",
+            ThreadLocalHttpClient(self.base_url, timeout_seconds=self.timeout_s),
         )
-        with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
-            return json.loads(response.read().decode("utf-8"))
+
+    def _post(self, path: str, payload: dict[str, object]) -> dict[str, object]:
+        return self._http_client.post_json(path, payload)
 
     def register_sandbox(
         self,
@@ -61,6 +58,9 @@ class HostInspectorServiceClient:
         if at is not None:
             payload["at"] = at.isoformat()
         return self._post("/reset", payload)
+
+    def close(self) -> None:
+        self._http_client.close()
 
 
 class RemoteSandboxInspector(SandboxInspector):
@@ -213,6 +213,6 @@ class RemoteSandboxInspector(SandboxInspector):
     def _is_unknown_sandbox_error(self, exc: Exception) -> bool:
         if isinstance(exc, KeyError):
             return True
-        if isinstance(exc, urllib.error.HTTPError):
-            return exc.code == 404
+        if isinstance(exc, HttpStatusError):
+            return exc.status_code == 404
         return False

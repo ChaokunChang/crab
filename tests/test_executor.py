@@ -4,7 +4,7 @@ import time
 import threading
 import unittest
 
-from agent_cr import CRExecutor, ExecutorConfig
+from agent_cr import CRExecutor, ExecutorConfig, InMemoryTelemetrySink
 from agent_cr.ids import CheckpointId, JobId, SandboxId
 from agent_cr.models import (
     CheckpointJob,
@@ -112,12 +112,14 @@ class PassThroughRestoreWorker:
 
 
 class ExecutorTests(unittest.TestCase):
-    def test_executor_serializes_checkpoint_queue(self) -> None:
+    def test_executor_runs_checkpoints_in_parallel_and_emits_queue_wait(self) -> None:
         worker = SlowCheckpointWorker(sleep_s=0.02)
+        telemetry = InMemoryTelemetrySink()
         executor = CRExecutor(
-            ExecutorConfig(max_workers=3, max_retries=0),
+            ExecutorConfig(max_workers=3, checkpoint_workers=3, max_retries=0),
             checkpoint_worker=worker,
             restore_worker=PassThroughRestoreWorker(),
+            telemetry=telemetry,
         )
         jobs = [
             CheckpointJob(
@@ -135,9 +137,17 @@ class ExecutorTests(unittest.TestCase):
 
         self.assertEqual(len(results), 4)
         self.assertTrue(all(r.status == JobStatus.SUCCEEDED for r in results))
-        self.assertEqual(worker.max_active, 1)
+        self.assertEqual(worker.max_active, 3)
         self.assertEqual(worker.completed_job_ids, [job.job_id.value for job in jobs])
-        self.assertGreater(elapsed, 0.06)
+        self.assertGreater(elapsed, 0.02)
+        self.assertLess(elapsed, 0.08)
+        queue_waits = [
+            value
+            for name, value, attributes in telemetry.metrics
+            if name == "executor.job_queue_wait_ms" and attributes.get("job_type") == "checkpoint"
+        ]
+        self.assertEqual(len(queue_waits), 4)
+        self.assertTrue(any(value > 0.0 for value in queue_waits))
 
     def test_executor_retry_on_failed_checkpoint_result(self) -> None:
         worker = FlakyCheckpointWorker()

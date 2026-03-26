@@ -1,5 +1,6 @@
 from .router import (
     BenchmarkLLMRouter,
+    BenchmarkLLMRouterClient,
     build_llm_service_registry,
     default_llm_service_type_for_agent,
     serve_benchmark_llm_router,
@@ -8,6 +9,7 @@ from .router import (
 
 __all__ = [
     "BenchmarkLLMRouter",
+    "BenchmarkLLMRouterClient",
     "build_llm_service_registry",
     "default_llm_service_type_for_agent",
     "serve_benchmark_llm_router",

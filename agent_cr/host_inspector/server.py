@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import socket
 from dataclasses import replace
 from datetime import datetime
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from threading import Event, Lock, Thread
 from typing import Any
 
+from ..http_utils import PooledHTTPServer
+from ..json_codec import get_json_codec
 from ..models import utc_now
 from .fs_helper import LibbpfFilesystemMonitor
 from .process_filter import parse_process_ignore_rules, pid_matches_ignore_rules
@@ -20,6 +21,7 @@ from .runtime_resolver import ResolvedSandbox, RuntimeResolver
 from .state import SandboxRecord
 
 logger = logging.getLogger(__name__)
+_JSON_CODEC = get_json_codec("auto")
 
 _OPEN_SYSCALLS = {"open", "openat", "openat2", "creat"}
 _WRITE_SYSCALLS = {"write", "pwrite64", "writev", "pwritev", "pwritev2", "truncate", "ftruncate"}
@@ -65,8 +67,18 @@ class HostInspectorDaemon:
         self._resolver = resolver or RuntimeResolver()
         self._fs_monitor = fs_monitor or LibbpfFilesystemMonitor()
         self._process_poll_interval_s = process_poll_interval_s
-        self._lock = Lock()
+        self._records_lock = Lock()
+        self._sandbox_locks_guard = Lock()
+        self._sandbox_locks: dict[str, Lock] = {}
         self._records: dict[str, SandboxRecord] = {}
+
+    def _sandbox_lock(self, sandbox_id: str) -> Lock:
+        with self._sandbox_locks_guard:
+            lock = self._sandbox_locks.get(sandbox_id)
+            if lock is None:
+                lock = Lock()
+                self._sandbox_locks[sandbox_id] = lock
+            return lock
 
     def start(self) -> None:
         self._fs_monitor.start(self._handle_fs_event)
@@ -89,8 +101,10 @@ class HostInspectorDaemon:
         resolved = self._resolver.resolve(runtime, object_id)
         observed_at = utc_now()
         parsed_ignore_rules = parse_process_ignore_rules(ignore_process_rules)
-        with self._lock:
-            previous = self._records.get(sandbox_id)
+        sandbox_lock = self._sandbox_lock(sandbox_id)
+        with sandbox_lock:
+            with self._records_lock:
+                previous = self._records.get(sandbox_id)
         record = SandboxRecord(
             sandbox_id=sandbox_id,
             runtime=runtime,
@@ -105,8 +119,9 @@ class HostInspectorDaemon:
             filesystem_changed=False,
             observed_at=observed_at,
         )
-        with self._lock:
-            self._records[sandbox_id] = record
+        with sandbox_lock:
+            with self._records_lock:
+                self._records[sandbox_id] = record
         if previous is not None and previous.cgroup_id is not None and previous.cgroup_id != resolved.cgroup_id:
             self._fs_monitor.remove_sandbox(sandbox_id)
         if resolved.cgroup_id is not None:
@@ -114,48 +129,52 @@ class HostInspectorDaemon:
         return self.status(sandbox_id)
 
     def unregister(self, sandbox_id: str) -> dict[str, object]:
-        with self._lock:
-            record = self._records.pop(sandbox_id, None)
+        sandbox_lock = self._sandbox_lock(sandbox_id)
+        with sandbox_lock:
+            with self._records_lock:
+                record = self._records.pop(sandbox_id, None)
         if record is None:
             raise KeyError(sandbox_id)
         self._fs_monitor.remove_sandbox(sandbox_id)
         return {"sandbox_id": sandbox_id, "unregistered": True}
 
     def status(self, sandbox_id: str) -> dict[str, object]:
-        with self._lock:
-            record = self._records.get(sandbox_id)
-            if record is None:
-                raise KeyError(sandbox_id)
-        if record.last_reset_at is None:
-            return self._record_to_response(record)
+        sandbox_lock = self._sandbox_lock(sandbox_id)
+        with sandbox_lock:
+            with self._records_lock:
+                record = self._records.get(sandbox_id)
+                if record is None:
+                    raise KeyError(sandbox_id)
+            if record.last_reset_at is None:
+                return self._record_to_response(record)
 
-        resolved = self._resolver.resolve(record.runtime, record.object_id)
-        all_current_pids = list_cgroup_pids(resolved.cgroup_path)
-        tracked_pids, ignored_pids = self._split_pids(all_current_pids, record.ignore_process_rules)
-        dirty = dirty_pids(tracked_pids)
-        live_dirty_entries = self._reconcile_live_dirty_entries(record.live_dirty_entries, resolved.init_pid)
-        filesystem_changed = bool(live_dirty_entries) or any(
-            bool(item.get("counts_as_change")) for item in record.unreconciled_fs_events
-        )
-        updated = replace(
-            record,
-            runtime_name=resolved.runtime_name,
-            is_running=resolved.is_running,
-            init_pid=resolved.init_pid,
-            cgroup_path=resolved.cgroup_path,
-            cgroup_id=resolved.cgroup_id,
-            current_pids=tracked_pids,
-            dirty_pids=dirty,
-            tracked_pids=tracked_pids,
-            ignored_pids=ignored_pids,
-            process_changed=(tracked_pids != record.baseline_pids) or bool(dirty),
-            filesystem_changed=filesystem_changed,
-            live_dirty_entries=live_dirty_entries,
-            observed_at=max(record.observed_at or utc_now(), utc_now()),
-            last_error=None,
-        )
-        with self._lock:
-            self._records[sandbox_id] = updated
+            resolved = self._resolver.resolve(record.runtime, record.object_id)
+            all_current_pids = list_cgroup_pids(resolved.cgroup_path)
+            tracked_pids, ignored_pids = self._split_pids(all_current_pids, record.ignore_process_rules)
+            dirty = dirty_pids(tracked_pids)
+            live_dirty_entries = self._reconcile_live_dirty_entries(record.live_dirty_entries, resolved.init_pid)
+            filesystem_changed = bool(live_dirty_entries) or any(
+                bool(item.get("counts_as_change")) for item in record.unreconciled_fs_events
+            )
+            updated = replace(
+                record,
+                runtime_name=resolved.runtime_name,
+                is_running=resolved.is_running,
+                init_pid=resolved.init_pid,
+                cgroup_path=resolved.cgroup_path,
+                cgroup_id=resolved.cgroup_id,
+                current_pids=tracked_pids,
+                dirty_pids=dirty,
+                tracked_pids=tracked_pids,
+                ignored_pids=ignored_pids,
+                process_changed=(tracked_pids != record.baseline_pids) or bool(dirty),
+                filesystem_changed=filesystem_changed,
+                live_dirty_entries=live_dirty_entries,
+                observed_at=max(record.observed_at or utc_now(), utc_now()),
+                last_error=None,
+            )
+            with self._records_lock:
+                self._records[sandbox_id] = updated
         if resolved.cgroup_id != record.cgroup_id:
             self._fs_monitor.remove_sandbox(sandbox_id)
             if resolved.cgroup_id is not None:
@@ -164,48 +183,52 @@ class HostInspectorDaemon:
 
     def reset(self, sandbox_id: str, at: datetime | None = None) -> dict[str, object]:
         when = at or utc_now()
-        with self._lock:
-            existing = self._records.get(sandbox_id)
-        if existing is None:
-            raise KeyError(sandbox_id)
+        sandbox_lock = self._sandbox_lock(sandbox_id)
+        with sandbox_lock:
+            with self._records_lock:
+                existing = self._records.get(sandbox_id)
+            if existing is None:
+                raise KeyError(sandbox_id)
 
-        resolved = self._resolver.resolve(existing.runtime, existing.object_id)
-        all_current_pids = list_cgroup_pids(resolved.cgroup_path)
-        tracked_pids, ignored_pids = self._split_pids(all_current_pids, existing.ignore_process_rules)
-        baseline_pids = reset_soft_dirty_for_pids(tracked_pids)
+            resolved = self._resolver.resolve(existing.runtime, existing.object_id)
+            all_current_pids = list_cgroup_pids(resolved.cgroup_path)
+            tracked_pids, ignored_pids = self._split_pids(all_current_pids, existing.ignore_process_rules)
+            baseline_pids = reset_soft_dirty_for_pids(tracked_pids)
 
-        updated = replace(
-            existing,
-            runtime_name=resolved.runtime_name,
-            is_running=resolved.is_running,
-            init_pid=resolved.init_pid,
-            cgroup_path=resolved.cgroup_path,
-            cgroup_id=resolved.cgroup_id,
-            baseline_pids=baseline_pids,
-            current_pids=tracked_pids,
-            dirty_pids=set(),
-            tracked_pids=tracked_pids,
-            ignored_pids=ignored_pids,
-            process_changed=False,
-            filesystem_changed=False,
-            last_reset_at=when,
-            observed_at=max(existing.observed_at or when, when),
-            fs_event_count_since_reset=0,
-            recent_fs_events=[],
-            live_dirty_entries={},
-            unreconciled_fs_events=[],
-            last_error=None,
-        )
-        with self._lock:
-            self._records[sandbox_id] = updated
+            updated = replace(
+                existing,
+                runtime_name=resolved.runtime_name,
+                is_running=resolved.is_running,
+                init_pid=resolved.init_pid,
+                cgroup_path=resolved.cgroup_path,
+                cgroup_id=resolved.cgroup_id,
+                baseline_pids=baseline_pids,
+                current_pids=tracked_pids,
+                dirty_pids=set(),
+                tracked_pids=tracked_pids,
+                ignored_pids=ignored_pids,
+                process_changed=False,
+                filesystem_changed=False,
+                last_reset_at=when,
+                observed_at=max(existing.observed_at or when, when),
+                fs_event_count_since_reset=0,
+                recent_fs_events=[],
+                live_dirty_entries={},
+                unreconciled_fs_events=[],
+                last_error=None,
+            )
+            with self._records_lock:
+                self._records[sandbox_id] = updated
         if resolved.cgroup_id is not None:
             self._fs_monitor.upsert_sandbox(sandbox_id, resolved.cgroup_id)
         return self._record_to_response(updated)
 
     def _handle_fs_event(self, event) -> None:
         now = utc_now()
-        with self._lock:
-            record = self._records.get(event.sandbox_id)
+        sandbox_lock = self._sandbox_lock(event.sandbox_id)
+        with sandbox_lock:
+            with self._records_lock:
+                record = self._records.get(event.sandbox_id)
             if record is None:
                 return
             if int(event.pid or 0) > 0 and pid_matches_ignore_rules(int(event.pid or 0), record.ignore_process_rules):
@@ -218,7 +241,7 @@ class HostInspectorDaemon:
             filesystem_changed = bool(live_dirty_entries) or any(
                 bool(item.get("counts_as_change")) for item in unreconciled_fs_events
             )
-            self._records[event.sandbox_id] = replace(
+            updated = replace(
                 record,
                 filesystem_changed=filesystem_changed,
                 observed_at=max(record.observed_at or now, _parse_ts(event.timestamp) or now),
@@ -227,6 +250,8 @@ class HostInspectorDaemon:
                 live_dirty_entries=live_dirty_entries,
                 unreconciled_fs_events=unreconciled_fs_events[-_RECENT_EVENT_LIMIT:],
             )
+            with self._records_lock:
+                self._records[event.sandbox_id] = updated
 
     def _is_countable_fs_event(self, event) -> bool:
         syscall = str(event.syscall)
@@ -573,12 +598,10 @@ class HostInspectorServer:
         host: str = "127.0.0.1",
         port: int = 0,
         daemon: HostInspectorDaemon | None = None,
+        max_workers: int | None = None,
     ) -> None:
         self._daemon = daemon or HostInspectorDaemon()
-        class _ReusableThreadingHTTPServer(ThreadingHTTPServer):
-            allow_reuse_address = True
-
-        self._server = _ReusableThreadingHTTPServer((host, port), self._build_handler())
+        self._server = PooledHTTPServer((host, port), self._build_handler(), max_workers=max_workers)
         self._thread: Thread | None = None
 
     @property
@@ -605,15 +628,25 @@ class HostInspectorServer:
             pass
 
         class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def end_headers(self) -> None:
+                self.send_header("Connection", "close")
+                self.close_connection = True
+                super().end_headers()
+
             def _read_json(self) -> dict[str, Any]:
                 length = int(self.headers.get("Content-Length", "0"))
                 if length <= 0:
                     return {}
                 payload = self.rfile.read(length)
-                return json.loads(payload.decode("utf-8"))
+                result = _JSON_CODEC.loads(payload)
+                if not isinstance(result, dict):
+                    raise ValueError("request body must decode to a JSON object")
+                return dict(result)
 
             def _write_json(self, code: int, payload: dict[str, Any]) -> None:
-                body = json.dumps(payload, sort_keys=True).encode("utf-8")
+                body = _JSON_CODEC.dumps_bytes(payload)
                 try:
                     self.send_response(code)
                     self.send_header("Content-Type", "application/json")
@@ -697,6 +730,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--helper-path", default=None)
     parser.add_argument("--runc-state-root", default=None)
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument("--max-workers", type=int, default=32)
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO))
@@ -705,7 +739,12 @@ def main(argv: list[str] | None = None) -> int:
         fs_monitor=LibbpfFilesystemMonitor(helper_path=args.helper_path),
         process_poll_interval_s=args.process_poll_interval,
     )
-    server = HostInspectorServer(host=args.host, port=args.port, daemon=daemon)
+    server = HostInspectorServer(
+        host=args.host,
+        port=args.port,
+        daemon=daemon,
+        max_workers=args.max_workers,
+    )
     server.start()
     logger.info("host inspector listening on %s:%s", args.host, server.port)
     stop = Event()

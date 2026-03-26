@@ -1,11 +1,36 @@
 from __future__ import annotations
 
 import json
+import socket
+import subprocess
 import tempfile
+import threading
+import time
 import unittest
+import urllib.request
 from pathlib import Path
+import sys
 
-from integrations.llm_services.router import BenchmarkLLMRouter
+from integrations.llm_services.router import BenchmarkLLMRouter, BenchmarkLLMRouterClient, serve_benchmark_llm_router
+
+
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _wait_for_json(url: str, *, timeout_s: float = 10.0) -> dict[str, object]:
+    deadline = time.time() + timeout_s
+    last_exc: Exception | None = None
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=1.0) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(0.05)
+    raise RuntimeError(f"timed out waiting for {url}: {last_exc}")
 
 
 class BenchmarkLLMRouterTests(unittest.TestCase):
@@ -308,6 +333,55 @@ class BenchmarkLLMRouterTests(unittest.TestCase):
         self.assertEqual(original, duplicate)
         self.assertEqual(original_args["command"], original_command)
         self.assertEqual(duplicate_args["command"], original_command)
+
+    def test_router_client_controls_thread_server(self) -> None:
+        server = serve_benchmark_llm_router(host="127.0.0.1", port=0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join, 5.0)
+        base_url = f"http://127.0.0.1:{server.server_address[1]}"
+        _wait_for_json(f"{base_url}/healthz")
+        client = BenchmarkLLMRouterClient(base_url)
+
+        client.register_sandbox(sandbox_id="sbx-client", llm_service_type="simulated")
+        snapshot = client.snapshot()
+        assert snapshot is not None
+        self.assertIn("sbx-client", snapshot)
+        client.reset_sandbox("sbx-client")
+        client.unregister_sandbox("sbx-client")
+        self.assertIsNone(client.snapshot("sbx-client"))
+
+    def test_router_cli_starts_process_and_serves_control_endpoints(self) -> None:
+        port = _find_free_port()
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "integrations.llm_services.router",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        base_url = f"http://127.0.0.1:{port}"
+        try:
+            _wait_for_json(f"{base_url}/healthz")
+            client = BenchmarkLLMRouterClient(base_url)
+            client.register_sandbox(sandbox_id="sbx-process", llm_service_type="simulated")
+            state = client.snapshot("sbx-process")
+            self.assertIsNotNone(state)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=5.0)
+            if process.stderr is not None:
+                process.stderr.close()
 
 
 if __name__ == "__main__":

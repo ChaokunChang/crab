@@ -138,6 +138,22 @@ class BenchmarkHelperTests(unittest.TestCase):
             ],
         )
 
+    def test_resolve_runtime_plane_root_defaults_to_benchmark_run_root(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(),
+            scheduler_policy=None,
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        harness.root = Path("/bench-root/run")
+        resolved = harness._resolve_runtime_plane_root(
+            zpool_image_path=Path("/data/benchpool.zpool.img")
+        )
+
+        self.assertEqual(resolved, harness.root)
+
     def test_build_tree_search_checkpoint_index_collects_steps(self) -> None:
         manifests = [
             self._tree_search_manifest("ckpt-1", step=1),
@@ -2342,6 +2358,43 @@ services:
 
         self.assertFalse(agent._restore_reactivation_pending.is_set())
 
+    def test_iflow_agent_rate_limits_runtime_liveness_checks_while_waiting_on_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            logs_dir = Path(tmp)
+            sandbox = SandboxHandle(
+                sandbox_id=SandboxId("sbx-iflow-rate-limit"),
+                bundle_dir=Path("/tmp/sbx-iflow-rate-limit"),
+                status_port=8123,
+                last_status={},
+                launch_metadata={
+                    "iflow": {
+                        "entrypoint": "/opt/iflow-runtime/global/lib/node_modules/@iflow-ai/iflow-cli/bundle/entry.js",
+                        "logs_dir": str(logs_dir),
+                    }
+                },
+            )
+            agent = IFlowAgent(
+                sandbox,
+                TaskDescription("do work"),
+                TaskConfig(),
+                runtime_state_root=Path("/tmp/runtime"),
+            )
+
+            def _finish_task() -> None:
+                time.sleep(0.25)
+                (logs_dir / "iflow.task.done").write_text("done\n", encoding="utf-8")
+                (logs_dir / "iflow.task.exit").write_text("0\n", encoding="utf-8")
+
+            worker = threading.Thread(target=_finish_task, daemon=True)
+            worker.start()
+
+            with patch.object(IFlowAgent, "SANDBOX_LIVENESS_REFRESH_SECONDS", 10.0), patch.object(
+                agent, "_sandbox_is_live", return_value=True
+            ) as sandbox_is_live:
+                agent.perform_task()
+
+        self.assertEqual(sandbox_is_live.call_count, 1)
+
     def test_iflow_poll_status_is_non_mutating_until_status_helpers_run(self) -> None:
         sandbox = SandboxHandle(
             sandbox_id=SandboxId("sbx-iflow-poll"),
@@ -2771,7 +2824,7 @@ services:
         launch_compose.assert_called_once()
         self.assertEqual(result.launch_metadata["benchmark"]["task_id"], "sbx-compose")
 
-    def test_launch_task_record_uses_staged_harness_methods(self) -> None:
+    def test_launch_task_record_composes_setup_and_run_methods(self) -> None:
         harness = RealHostScenarioHarness(
             provider="openai",
             transfer_delay_ms=0.0,
@@ -2794,18 +2847,16 @@ services:
         prepared = SimpleNamespace(handle=handle)
 
         with (
-            patch.object(harness, "build_task_record") as build_task_record,
-            patch.object(harness, "prepare_task_record", return_value=prepared) as prepare_task_record,
+            patch.object(harness, "setup_task_record", return_value=prepared) as setup_task_record,
             patch.object(harness, "run_prepared_task_record", return_value=handle) as run_prepared_task_record,
             patch.object(harness, "_set_benchmark_launch_metadata") as set_benchmark_launch_metadata,
         ):
             result = harness.launch_task_record("sbx-staged", record)
 
         self.assertIs(result, handle)
-        build_task_record.assert_called_once_with("sbx-staged", record)
-        prepare_task_record.assert_called_once_with("sbx-staged", record)
+        setup_task_record.assert_called_once_with("sbx-staged", record)
         run_prepared_task_record.assert_called_once_with(prepared)
-        set_benchmark_launch_metadata.assert_called_once_with(handle, sandbox_name="sbx-staged", task_record=record)
+        set_benchmark_launch_metadata.assert_not_called()
 
     def test_benchmark_phase_map_emits_phase_telemetry(self) -> None:
         telemetry = InMemoryTelemetrySink()
@@ -2816,51 +2867,54 @@ services:
             results = benchmark_phase_map(
                 [1, 2],
                 lambda value: value * 2,
-                phase="prepare",
+                phase="setup",
                 max_workers=2,
                 harness=harness,
                 item_attributes=lambda value: {
                     "component": "benchmark",
                     "sandbox_id": f"sbx-{value}",
                     "task_id": f"task-{value}",
-                    "phase": "prepare",
+                    "phase": "setup",
                     "phase_scope": "sandbox",
                 },
             )
 
         self.assertEqual(results, [2, 4])
         output = buffer.getvalue()
-        self.assertIn("benchmark.phase.prepare start sandboxes=2 max_workers=2", output)
-        self.assertIn("benchmark.phase.prepare end sandboxes=2 max_workers=2 duration_s=", output)
+        self.assertIn("benchmark.phase.setup start sandboxes=2 max_workers=2", output)
+        self.assertIn("benchmark.phase.setup end sandboxes=2 max_workers=2 duration_s=", output)
         event_names = [name for name, _ in telemetry.events]
         metric_names = [name for name, _, _ in telemetry.metrics]
-        self.assertIn("benchmark.phase.prepare.start", event_names)
-        self.assertIn("benchmark.phase.prepare.finish", event_names)
-        self.assertIn("benchmark.phase.prepare.item.start", event_names)
-        self.assertIn("benchmark.phase.prepare.item.finish", event_names)
-        self.assertIn("benchmark.phase.prepare.duration_ms", metric_names)
-        self.assertIn("benchmark.phase.prepare.item.duration_ms", metric_names)
-        self.assertIn("benchmark.phase.prepare.configured_max_workers", metric_names)
+        self.assertIn("benchmark.phase.setup.start", event_names)
+        self.assertIn("benchmark.phase.setup.finish", event_names)
+        self.assertIn("benchmark.phase.setup.item.start", event_names)
+        self.assertIn("benchmark.phase.setup.item.finish", event_names)
+        self.assertIn("benchmark.phase.setup.duration_ms", metric_names)
+        self.assertIn("benchmark.phase.setup.item.duration_ms", metric_names)
+        self.assertIn("benchmark.phase.setup.configured_max_workers", metric_names)
 
     def test_e2e_benchmark_uses_shared_harness_launch_flow(self) -> None:
         task_run = SimpleNamespace(
             wait_for_progress=Mock(return_value={"total_actions": 6}),
         )
-        harness = SimpleNamespace(
-            launch_task_record=Mock(
-                side_effect=lambda name, record: SandboxHandle(
-                    sandbox_id=SandboxId(name),
-                    bundle_dir=Path("/tmp") / name,
-                    status_port=8123,
-                    last_status={
-                        "total_actions": 6,
-                        "filesystem_actions": 1,
-                        "process_actions": 1,
-                        "network_actions": 1,
-                    },
-                    task_run=task_run,
-                )
+        prepared = SimpleNamespace(
+            sandbox_name="sandbox-0",
+            handle=SandboxHandle(
+                sandbox_id=SandboxId("sandbox-0"),
+                bundle_dir=Path("/tmp") / "sandbox-0",
+                status_port=8123,
+                last_status={
+                    "total_actions": 6,
+                    "filesystem_actions": 1,
+                    "process_actions": 1,
+                    "network_actions": 1,
+                },
+                task_run=task_run,
             ),
+        )
+        harness = SimpleNamespace(
+            setup_task_record=Mock(return_value=prepared),
+            run_prepared_task_record=Mock(return_value=prepared.handle),
             request_state_store=None,
             checkpoint_if_due=Mock(return_value=None),
             restore_once=Mock(),
@@ -2892,7 +2946,8 @@ services:
             harness,
         )
         self.assertEqual(len(rows), 1)
-        harness.launch_task_record.assert_called_once()
+        harness.setup_task_record.assert_called_once()
+        harness.run_prepared_task_record.assert_called_once_with(prepared)
 
 
 if __name__ == "__main__":

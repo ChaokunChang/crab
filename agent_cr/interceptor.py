@@ -1,25 +1,25 @@
 from __future__ import annotations
 
 from collections import deque
-import json
 import threading
 import time
-import urllib.error
-import urllib.request
 import uuid
 from dataclasses import dataclass
 from dataclasses import replace
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from typing import Callable
 import logging
 
 from .contracts import RequestInterceptorHook, SandboxInspector, TelemetrySink
+from .http_utils import PooledHTTPServer, ThreadLocalHttpClient
 from .ids import SandboxId
+from .json_codec import get_json_codec
 from .models import RequestContext, RequestState, RequestStateChange, SandboxSnapshot, utc_now
 from .telemetry import start_operation
 
 
 logger = logging.getLogger(__name__)
+_JSON_CODEC = get_json_codec("auto")
 
 class CompositeRequestInterceptorHook(RequestInterceptorHook):
     def __init__(self, hooks: list[RequestInterceptorHook] | None = None):
@@ -54,7 +54,7 @@ class TelemetryRequestInterceptorHook(RequestInterceptorHook):
 
     def on_request_end(self, context: RequestContext) -> None:
         self._telemetry.emit_event(
-            "request.end",
+            "request.finish",
             {
                 "request_id": context.request_id,
                 "sandbox_id": str(context.sandbox_id),
@@ -70,10 +70,14 @@ class InMemoryRequestStateStore:
         self._condition = threading.Condition(self._lock)
         self._states: dict[SandboxId, RequestState] = {}
         self._changes: deque[RequestStateChange] = deque()
+        self._active_contexts: dict[SandboxId, dict[str, RequestContext]] = {}
 
     def mark_request_start(self, context: RequestContext) -> RequestState:
         with self._lock:
             current = self._states.get(context.sandbox_id, RequestState(sandbox_id=context.sandbox_id))
+            sandbox_contexts = dict(self._active_contexts.get(context.sandbox_id, {}))
+            sandbox_contexts[context.request_id] = replace(context, metadata=dict(context.metadata))
+            self._active_contexts[context.sandbox_id] = sandbox_contexts
             provider = None if context.metadata.get("provider") is None else str(context.metadata["provider"])
             updated = replace(
                 current,
@@ -106,8 +110,15 @@ class InMemoryRequestStateStore:
     def mark_request_end(self, context: RequestContext) -> RequestState:
         with self._lock:
             current = self._states.get(context.sandbox_id, RequestState(sandbox_id=context.sandbox_id))
+            sandbox_contexts = dict(self._active_contexts.get(context.sandbox_id, {}))
+            active_context = sandbox_contexts.pop(context.request_id, None)
+            if sandbox_contexts:
+                self._active_contexts[context.sandbox_id] = sandbox_contexts
+            else:
+                self._active_contexts.pop(context.sandbox_id, None)
             ended_at = utc_now()
-            provider = None if context.metadata.get("provider") is None else str(context.metadata["provider"])
+            metadata = context.metadata if active_context is None else active_context.metadata
+            provider = None if metadata.get("provider") is None else str(metadata["provider"])
             updated = replace(
                 current,
                 active_llm_requests=max(0, current.active_llm_requests - 1),
@@ -140,6 +151,13 @@ class InMemoryRequestStateStore:
         with self._lock:
             return self._states.get(sandbox_id, RequestState(sandbox_id=sandbox_id))
 
+    def get_request_context(self, sandbox_id: SandboxId, request_id: str) -> RequestContext | None:
+        with self._lock:
+            context = self._active_contexts.get(sandbox_id, {}).get(request_id)
+            if context is None:
+                return None
+            return replace(context, metadata=dict(context.metadata))
+
     def wait_for_change(self, timeout: float | None = None) -> RequestStateChange | None:
         with self._condition:
             if not self._changes:
@@ -164,7 +182,7 @@ class SandboxResponseGateRegistry:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._enabled = False
-        self._states: dict[SandboxId, dict[str, int | bool | str | None | threading.Condition]] = {}
+        self._states: dict[SandboxId, dict[str, int | dict[int, str] | threading.Condition]] = {}
 
     def enable(self) -> None:
         with self._lock:
@@ -176,9 +194,9 @@ class SandboxResponseGateRegistry:
             self._enabled = False
             conditions = [state["condition"] for state in self._states.values()]
             for state in self._states.values():
-                state["active"] = False
-                state["released_generation"] = state["generation"]
-                state["request_id"] = None
+                pending = state["pending"]
+                assert isinstance(pending, dict)
+                pending.clear()
             logger.debug("Disabled sandbox response gate registry and released %s sandbox states", len(conditions))
         for condition in conditions:
             assert isinstance(condition, threading.Condition)
@@ -199,15 +217,14 @@ class SandboxResponseGateRegistry:
                 condition = threading.Condition()
                 state = {
                     "generation": 0,
-                    "released_generation": 0,
-                    "active": False,
-                    "request_id": None,
+                    "pending": {},
                     "condition": condition,
                 }
                 self._states[sandbox_id] = state
             state["generation"] = int(state["generation"]) + 1
-            state["active"] = True
-            state["request_id"] = request_id
+            pending = state["pending"]
+            assert isinstance(pending, dict)
+            pending[int(state["generation"])] = request_id
             logger.debug(
                 "Armed response gate: sandbox_id=%s request_id=%s generation=%s",
                 sandbox_id,
@@ -246,21 +263,72 @@ class SandboxResponseGateRegistry:
     def get_pending(self, sandbox_id: SandboxId) -> PendingSandboxResponse | None:
         with self._lock:
             state = self._states.get(sandbox_id)
-            if state is None or not bool(state["active"]):
+            if state is None:
                 return None
-            request_id = state.get("request_id")
-            if not isinstance(request_id, str) or not request_id:
+            pending = state["pending"]
+            assert isinstance(pending, dict)
+            if not pending:
+                return None
+            generation = max(pending)
+            request_id = pending[generation]
+            return PendingSandboxResponse(
+                sandbox_id=sandbox_id,
+                request_id=request_id,
+                generation=generation,
+            )
+
+    def get_oldest_pending(self, sandbox_id: SandboxId) -> PendingSandboxResponse | None:
+        with self._lock:
+            state = self._states.get(sandbox_id)
+            if state is None:
+                return None
+            pending = state["pending"]
+            assert isinstance(pending, dict)
+            if not pending:
+                return None
+            generation = min(pending)
+            return PendingSandboxResponse(
+                sandbox_id=sandbox_id,
+                request_id=pending[generation],
+                generation=generation,
+            )
+
+    def get_pending_generation(self, sandbox_id: SandboxId, generation: int) -> PendingSandboxResponse | None:
+        with self._lock:
+            state = self._states.get(sandbox_id)
+            if state is None:
+                return None
+            pending = state["pending"]
+            assert isinstance(pending, dict)
+            request_id = pending.get(generation)
+            if request_id is None:
                 return None
             return PendingSandboxResponse(
                 sandbox_id=sandbox_id,
                 request_id=request_id,
-                generation=int(state["generation"]),
+                generation=generation,
             )
+
+    def find_pending_request(self, sandbox_id: SandboxId, request_id: str) -> PendingSandboxResponse | None:
+        with self._lock:
+            state = self._states.get(sandbox_id)
+            if state is None:
+                return None
+            pending = state["pending"]
+            assert isinstance(pending, dict)
+            for generation in sorted(pending):
+                if pending[generation] == request_id:
+                    return PendingSandboxResponse(
+                        sandbox_id=sandbox_id,
+                        request_id=request_id,
+                        generation=generation,
+                    )
+            return None
 
     def release_pending(self, sandbox_id: SandboxId, *, request_id: str, generation: int | None = None) -> bool:
         with self._lock:
             state = self._states.get(sandbox_id)
-            if state is None or not bool(state["active"]):
+            if state is None:
                 logger.debug(
                     "No pending response gate to release: sandbox_id=%s request_id=%s generation=%s",
                     sandbox_id,
@@ -268,27 +336,32 @@ class SandboxResponseGateRegistry:
                     generation,
                 )
                 return False
-            current_request_id = state.get("request_id")
-            current_generation = int(state["generation"])
-            if current_request_id != request_id:
+            pending = state["pending"]
+            assert isinstance(pending, dict)
+            target_generation = generation
+            if target_generation is None:
+                for candidate_generation in sorted(pending):
+                    if pending[candidate_generation] == request_id:
+                        target_generation = candidate_generation
+                        break
+            if target_generation is None:
                 logger.debug(
-                    "Skipped releasing response gate due to request_id mismatch: sandbox_id=%s expected=%s actual=%s",
+                    "Skipped releasing response gate due to missing generation: sandbox_id=%s request_id=%s",
                     sandbox_id,
-                    current_request_id,
                     request_id,
                 )
                 return False
-            if generation is not None and current_generation != generation:
+            current_request_id = pending.get(target_generation)
+            if current_request_id != request_id:
                 logger.debug(
-                    "Skipped releasing response gate due to generation mismatch: sandbox_id=%s expected=%s actual=%s",
+                    "Skipped releasing response gate due to request_id mismatch: sandbox_id=%s expected=%s actual=%s generation=%s",
                     sandbox_id,
-                    current_generation,
-                    generation,
+                    current_request_id,
+                    request_id,
+                    target_generation,
                 )
                 return False
-            state["active"] = False
-            state["released_generation"] = current_generation
-            state["request_id"] = None
+            pending.pop(target_generation, None)
             condition = state["condition"]
             assert isinstance(condition, threading.Condition)
         with condition:
@@ -297,24 +370,27 @@ class SandboxResponseGateRegistry:
             "Released pending response gate: sandbox_id=%s request_id=%s generation=%s",
             sandbox_id,
             request_id,
-            current_generation,
+            target_generation,
         )
         return True
 
-    def release(self, sandbox_id: SandboxId) -> None:
+    def release(self, sandbox_id: SandboxId, *, generation: int | None = None) -> None:
         with self._lock:
             state = self._states.get(sandbox_id)
             if state is None:
                 logger.debug("No response gate state found to release: sandbox_id=%s", sandbox_id)
                 return
-            state["active"] = False
-            state["released_generation"] = int(state["generation"])
-            state["request_id"] = None
+            pending = state["pending"]
+            assert isinstance(pending, dict)
+            if generation is None:
+                pending.clear()
+            else:
+                pending.pop(generation, None)
             condition = state["condition"]
             assert isinstance(condition, threading.Condition)
         with condition:
             condition.notify_all()
-        logger.debug("Released response gate: sandbox_id=%s generation=%s", sandbox_id, state["released_generation"])
+        logger.debug("Released response gate: sandbox_id=%s generation=%s", sandbox_id, generation)
 
     def _is_generation_released(self, sandbox_id: SandboxId, generation: int) -> bool:
         with self._lock:
@@ -323,7 +399,9 @@ class SandboxResponseGateRegistry:
                 return True
             if not self._enabled:
                 return True
-            return int(state["released_generation"]) >= generation
+            pending = state["pending"]
+            assert isinstance(pending, dict)
+            return generation not in pending
 
 
 class RequestAwareSandboxInspector(SandboxInspector):
@@ -433,7 +511,7 @@ class AgentCRRequestInterceptor:
         self._request_state_store.mark_request_start(context)
         gate_generation = None
         request_started = time.perf_counter()
-        upstream_response_received_at: float | None = None
+        agentcr_delay_started_at: float | None = None
         if self._response_gate_registry is not None:
             gate_generation = self._response_gate_registry.arm(context.sandbox_id, context.request_id)
         self._notify(context.sandbox_id)
@@ -448,12 +526,12 @@ class AgentCRRequestInterceptor:
             finally:
                 if forward_operation is not None:
                     forward_operation.finish()
-            upstream_response_received_at = time.perf_counter()
             if self._telemetry is not None:
                 self._telemetry.emit_event(
                     "interceptor.request.upstream_response_received",
                     request_attributes,
                 )
+            agentcr_delay_started_at = time.perf_counter()
             logger.debug(
                 "Intercepting request complete: request_id=%s sandbox_id=%s status_code=%s response_bytes=%s",
                 context.request_id,
@@ -465,6 +543,7 @@ class AgentCRRequestInterceptor:
             return response
         finally:
             gate_wait_ms = 0.0
+            released_at = time.perf_counter()
             if self._response_gate_registry is not None:
                 gate_operation = None if self._telemetry is None else start_operation(
                     self._telemetry,
@@ -473,11 +552,19 @@ class AgentCRRequestInterceptor:
                 )
                 wait_started = time.perf_counter()
                 self._response_gate_registry.wait_for_release(context.sandbox_id, gate_generation)
-                gate_wait_ms = (time.perf_counter() - wait_started) * 1000.0
+                released_at = time.perf_counter()
+                gate_wait_ms = (released_at - wait_started) * 1000.0
+                agentcr_delay_ms = None
+                if agentcr_delay_started_at is not None:
+                    agentcr_delay_ms = max(0.0, (released_at - agentcr_delay_started_at) * 1000.0)
+                total_ms = max(0.0, (released_at - request_started) * 1000.0)
                 if gate_operation is not None:
                     gate_operation.finish()
+            else:
+                agentcr_delay_ms = None if agentcr_delay_started_at is None else 0.0
+                total_ms = max(0.0, (released_at - request_started) * 1000.0)
             if self._telemetry is not None:
-                if upstream_response_received_at is not None:
+                if agentcr_delay_started_at is not None:
                     self._telemetry.emit_metric(
                         "llm.gate_wait_ms",
                         gate_wait_ms,
@@ -485,12 +572,11 @@ class AgentCRRequestInterceptor:
                     )
                     self._telemetry.emit_metric(
                         "llm.agentcr_delay_ms",
-                        max(0.0, (time.perf_counter() - upstream_response_received_at) * 1000.0),
+                        0.0 if agentcr_delay_ms is None else agentcr_delay_ms,
                         request_attributes,
                     )
                 self._telemetry.emit_event("interceptor.response.released", request_attributes)
             if self._telemetry is not None:
-                total_ms = (time.perf_counter() - request_started) * 1000.0
                 self._telemetry.emit_metric(
                     "llm.request_total_ms",
                     total_ms,
@@ -528,9 +614,14 @@ class AgentCRRequestInterceptorServer:
         host: str = "127.0.0.1",
         port: int = 0,
         upstream_timeout_seconds: float = 3600.0,
+        max_workers: int | None = None,
     ) -> None:
         self._upstream_url = upstream_url.rstrip("/")
         self._upstream_timeout_seconds = upstream_timeout_seconds
+        self._upstream_client = ThreadLocalHttpClient(
+            self._upstream_url,
+            timeout_seconds=self._upstream_timeout_seconds,
+        )
         self._interceptor = AgentCRRequestInterceptor(
             upstream_transport=self._forward,
             request_state_store=request_state_store,
@@ -541,7 +632,7 @@ class AgentCRRequestInterceptorServer:
             sandbox_id_resolver=sandbox_id_resolver,
         )
         self._telemetry = telemetry
-        self._server = ThreadingHTTPServer((host, port), self._build_handler())
+        self._server = PooledHTTPServer((host, port), self._build_handler(), max_workers=max_workers)
         self._thread: threading.Thread | None = None
 
     @property
@@ -567,6 +658,7 @@ class AgentCRRequestInterceptorServer:
     def stop(self) -> None:
         self._server.shutdown()
         self._server.server_close()
+        self._upstream_client.close()
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             self._thread = None
@@ -576,16 +668,23 @@ class AgentCRRequestInterceptorServer:
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def end_headers(self) -> None:
+                self.send_header("Connection", "close")
+                self.close_connection = True
+                super().end_headers()
+
             def do_GET(self) -> None:
                 if self.path != "/healthz":
                     self.send_error(404)
                     return
-                body = json.dumps(
+                body = _JSON_CODEC.dumps_bytes(
                     {
                         "ok": True,
                         "upstream_url": outer._upstream_url,
                     }
-                ).encode("utf-8")
+                )
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -607,7 +706,7 @@ class AgentCRRequestInterceptorServer:
                     )
                     self.send_response(status_code)
                     for key, value in headers:
-                        if key.lower() == "transfer-encoding":
+                        if key.lower() in {"transfer-encoding", "connection"}:
                             continue
                         self.send_header(key, value)
                     self.end_headers()
@@ -619,25 +718,6 @@ class AgentCRRequestInterceptorServer:
                 except ValueError as exc:
                     logger.debug("Rejecting invalid intercepted request: path=%s error=%s", self.path, exc)
                     self.send_error(400, str(exc))
-                except urllib.error.HTTPError as exc:
-                    body = exc.read()
-                    logger.debug(
-                        "Upstream returned HTTP error: path=%s status_code=%s response_bytes=%s",
-                        self.path,
-                        exc.code,
-                        len(body),
-                    )
-                    self.send_response(exc.code)
-                    for key, value in exc.headers.items():
-                        if key.lower() == "transfer-encoding":
-                            continue
-                        self.send_header(key, value)
-                    self.end_headers()
-                    try:
-                        self.wfile.write(body)
-                    except BrokenPipeError:
-                        logger.debug("Client disconnected while writing upstream error body: path=%s", self.path)
-                        return
 
             def log_message(self, format: str, *args) -> None:
                 _ = (format, args)
@@ -669,25 +749,23 @@ class AgentCRRequestInterceptorServer:
             len(payload),
             self._upstream_url,
         )
-        req = urllib.request.Request(
-            self._upstream_url + path,
-            data=payload,
-            headers=headers,
-            method="POST",
-        )
         started = time.perf_counter()
-        with urllib.request.urlopen(req, timeout=self._upstream_timeout_seconds) as resp:
-            response_body = resp.read()
-            if self._telemetry is not None:
-                self._telemetry.emit_metric(
-                    "llm.upstream_latency_ms",
-                    (time.perf_counter() - started) * 1000.0,
-                    {**request_attributes, "status_code": int(resp.status)},
-                )
-            logger.debug(
-                "Received upstream response: path=%s status_code=%s response_bytes=%s",
-                path,
-                resp.status,
-                len(response_body),
+        status_code, response_headers, response_body = self._upstream_client.request(
+            "POST",
+            path,
+            body=payload,
+            headers=headers,
+        )
+        if self._telemetry is not None:
+            self._telemetry.emit_metric(
+                "llm.upstream_latency_ms",
+                (time.perf_counter() - started) * 1000.0,
+                {**request_attributes, "status_code": int(status_code)},
             )
-            return int(resp.status), list(resp.headers.items()), response_body
+        logger.debug(
+            "Received upstream response: path=%s status_code=%s response_bytes=%s",
+            path,
+            status_code,
+            len(response_body),
+        )
+        return int(status_code), response_headers, response_body

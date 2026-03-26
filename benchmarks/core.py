@@ -29,13 +29,6 @@ class BenchmarkSandboxSpec:
     task_record: BenchmarkTaskRecord
 
 
-@dataclasses.dataclass(frozen=True)
-class LegacyPreparedSandbox:
-    sandbox_name: str
-    task_record: BenchmarkTaskRecord
-    handle: SandboxHandle
-
-
 def _resolve_dataset_service_config(
     dataset_root: Path,
     raw_value: object,
@@ -327,64 +320,24 @@ def benchmark_phase_map(
     return results
 
 
-def build_task_records_phase(
-    harness,
-    *,
-    specs: Sequence[BenchmarkSandboxSpec],
-    max_workers: int,
-) -> None:
-    build_task_record = getattr(harness, "build_task_record", None)
-    if not callable(build_task_record):
-        return
-    benchmark_phase_map(
-        specs,
-        lambda spec: build_task_record(spec.sandbox_name, spec.task_record),
-        phase="build",
-        max_workers=max_workers,
-        harness=harness,
-        item_attributes=lambda spec: benchmark_phase_item_attributes(
-            harness,
-            phase="build",
-            sandbox_name=spec.sandbox_name,
-            task_record=spec.task_record,
-        ),
-    )
-
-
-def prepare_task_records_phase(
+def setup_task_records_phase(
     harness,
     *,
     specs: Sequence[BenchmarkSandboxSpec],
     max_workers: int,
 ):
-    prepare_task_record = getattr(harness, "prepare_task_record", None)
-    if not callable(prepare_task_record):
-        return benchmark_phase_map(
-            specs,
-            lambda spec: LegacyPreparedSandbox(
-                sandbox_name=spec.sandbox_name,
-                task_record=spec.task_record,
-                handle=harness.launch_task_record(spec.sandbox_name, spec.task_record),
-            ),
-            phase="prepare",
-            max_workers=max_workers,
-            harness=harness,
-            item_attributes=lambda spec: benchmark_phase_item_attributes(
-                harness,
-                phase="prepare",
-                sandbox_name=spec.sandbox_name,
-                task_record=spec.task_record,
-            ),
-        )
+    setup_task_record = getattr(harness, "setup_task_record", None)
+    if not callable(setup_task_record):
+        raise AttributeError(f"{type(harness).__name__} must define setup_task_record(...)")
     return benchmark_phase_map(
         specs,
-        lambda spec: prepare_task_record(spec.sandbox_name, spec.task_record),
-        phase="prepare",
+        lambda spec: setup_task_record(spec.sandbox_name, spec.task_record),
+        phase="setup",
         max_workers=max_workers,
         harness=harness,
         item_attributes=lambda spec: benchmark_phase_item_attributes(
             harness,
-            phase="prepare",
+            phase="setup",
             sandbox_name=spec.sandbox_name,
             task_record=spec.task_record,
         ),

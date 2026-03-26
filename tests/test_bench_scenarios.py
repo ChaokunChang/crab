@@ -2,18 +2,20 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import tempfile
 import threading
 import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from agent_cr import CheckpointId, JobStatus, SandboxId
+from agent_cr import CheckpointId, JobStatus, LatestOnlyCheckpointManager, LocalCheckpointManager, SandboxId, StorageConfig
 from integrations.agents import SandboxHandle
 from benchmarks.config import BenchmarkConfig
 from benchmarks.real_host_scenario_base import RealHostScenarioHarness
 from benchmarks.scenarios.common import choose_replay_chunk_targets, wait_for_auto_replay_checkpoint
 from benchmarks.scenarios.fault import (
+    build_harness_settings as build_fault_harness_settings,
     parse_fault_options,
     run_auto as run_fault_auto,
     run_manual as run_fault_manual,
@@ -103,8 +105,7 @@ class _BaseScenarioHarness:
         self.wait_for_progress_calls: list[str] = []
         self.wait_for_action_delta_calls: list[tuple[str, int]] = []
         self.phase_events: list[tuple[str, str]] = []
-        self.build_calls: list[str] = []
-        self.prepare_calls: list[str] = []
+        self.setup_calls: list[str] = []
         self.run_phase_calls: list[str] = []
         self.checkpoint_if_due_calls: list[str] = []
         self.inject_fault_calls: list[str] = []
@@ -112,19 +113,14 @@ class _BaseScenarioHarness:
         self.notify_preemption_calls: list[str] = []
         self.set_snapshot_metadata_calls: list[tuple[str, dict[str, object]]] = []
         self.clear_snapshot_metadata_calls: list[tuple[str, tuple[str, ...]]] = []
-        self.build_delay_s = 0.0
-        self.prepare_delay_s = 0.0
+        self.setup_delay_s = 0.0
         self.progress_delay_s = 0.0
         self._progress_lock = threading.Lock()
         self._active_progress = 0
         self.max_concurrent_progress = 0
-        self.launch_delay_s = 0.0
-        self._launch_lock = threading.Lock()
-        self._active_launches = 0
-        self.max_concurrent_launches = 0
-        self._prepare_lock = threading.Lock()
-        self._active_prepares = 0
-        self.max_concurrent_prepares = 0
+        self._setup_lock = threading.Lock()
+        self._active_setups = 0
+        self.max_concurrent_setups = 0
         self.fail_on_restore_sandbox: str | None = None
         self.fail_recovery_record_sandbox: str | None = None
         self._unreachable_sandboxes: set[str] = set()
@@ -141,25 +137,18 @@ class _BaseScenarioHarness:
             trace_response_count=10 if config.llm_service == "iflow_trace_replay" else None,
         )
 
-    def build_task_record(self, sandbox_name: str, record: BenchmarkTaskRecord) -> None:
-        _ = record
-        self.phase_events.append(("build", sandbox_name))
-        self.build_calls.append(sandbox_name)
-        if self.build_delay_s > 0:
-            time.sleep(self.build_delay_s)
-
-    def prepare_task_record(self, sandbox_name: str, record: BenchmarkTaskRecord):
-        self.phase_events.append(("prepare", sandbox_name))
-        self.prepare_calls.append(sandbox_name)
-        if self.prepare_delay_s > 0:
-            with self._prepare_lock:
-                self._active_prepares += 1
-                self.max_concurrent_prepares = max(self.max_concurrent_prepares, self._active_prepares)
+    def setup_task_record(self, sandbox_name: str, record: BenchmarkTaskRecord):
+        self.phase_events.append(("setup", sandbox_name))
+        self.setup_calls.append(sandbox_name)
+        if self.setup_delay_s > 0:
+            with self._setup_lock:
+                self._active_setups += 1
+                self.max_concurrent_setups = max(self.max_concurrent_setups, self._active_setups)
             try:
-                time.sleep(self.prepare_delay_s)
+                time.sleep(self.setup_delay_s)
             finally:
-                with self._prepare_lock:
-                    self._active_prepares -= 1
+                with self._setup_lock:
+                    self._active_setups -= 1
         sandbox_id = SandboxId(sandbox_name)
         handle = SandboxHandle(
             sandbox_id=sandbox_id,
@@ -174,6 +163,7 @@ class _BaseScenarioHarness:
         self._statuses[str(sandbox_id)] = {"total_actions": 0}
         self._checkpoint_counts[str(sandbox_id)] = 0
         handle.task_run = _FakeTaskRun(self, handle)
+        self.launched.append(sandbox_name)
         return SimpleNamespace(
             sandbox_name=sandbox_name,
             task_record=record,
@@ -182,23 +172,12 @@ class _BaseScenarioHarness:
 
     def run_prepared_task_record(self, prepared) -> SandboxHandle:
         sandbox_name = prepared.sandbox_name
-        if self.launch_delay_s > 0:
-            with self._launch_lock:
-                self._active_launches += 1
-                self.max_concurrent_launches = max(self.max_concurrent_launches, self._active_launches)
-            try:
-                time.sleep(self.launch_delay_s)
-            finally:
-                with self._launch_lock:
-                    self._active_launches -= 1
         self.phase_events.append(("run", sandbox_name))
         self.run_phase_calls.append(sandbox_name)
-        self.launched.append(sandbox_name)
         return prepared.handle
 
     def launch_task_record(self, sandbox_name: str, record: BenchmarkTaskRecord) -> SandboxHandle:
-        self.build_task_record(sandbox_name, record)
-        prepared = self.prepare_task_record(sandbox_name, record)
+        prepared = self.setup_task_record(sandbox_name, record)
         return self.run_prepared_task_record(prepared)
 
     def checkpoint_if_due(self, sandbox: SandboxHandle):
@@ -333,17 +312,17 @@ class FaultScenarioTests(unittest.TestCase):
         )
         self.assertEqual(sorted(harness.inject_fault_calls), ["fault-0", "fault-0", "fault-1", "fault-1"])
 
-    def test_manual_mode_finishes_prepare_for_all_sandboxes_before_run_phase(self) -> None:
+    def test_manual_mode_finishes_setup_for_all_sandboxes_before_run_phase(self) -> None:
         harness = _BaseScenarioHarness()
-        harness.prepare_delay_s = 0.01
-        harness.launch_delay_s = 0.01
+        harness.setup_delay_s = 0.01
 
         run_fault_manual(_config("fault", "manual"), harness)
 
         first_run_index = next(index for index, event in enumerate(harness.phase_events) if event[0] == "run")
-        prepare_events = [event for event in harness.phase_events[:first_run_index] if event[0] == "prepare"]
-        self.assertEqual(sorted(name for _, name in prepare_events), ["fault-0", "fault-1"])
-        self.assertFalse(any(event[0] == "run" for event in harness.phase_events[:first_run_index]))
+        prior_events = harness.phase_events[:first_run_index]
+        setup_events = [event for event in prior_events if event[0] == "setup"]
+        self.assertEqual(sorted(name for _, name in setup_events), ["fault-0", "fault-1"])
+        self.assertFalse(any(event[0] == "run" for event in prior_events))
 
     def test_auto_mode_uses_deterministic_per_sandbox_fault_selection(self) -> None:
         harness = _BaseScenarioHarness()
@@ -362,9 +341,29 @@ class FaultScenarioTests(unittest.TestCase):
         self.assertEqual(injected_rows, [(2, "fault-0"), (2, "fault-1")])
         self.assertEqual(harness.notify_fault_calls, ["fault-0", "fault-1"])
 
-    def test_auto_mode_can_limit_launch_parallelism_below_sandbox_count(self) -> None:
+    def test_fault_options_default_to_retaining_filesystem_checkpoints(self) -> None:
+        options = parse_fault_options(_config("fault", "auto"))
+        self.assertFalse(options.delete_filesystem_checkpoints)
+
+    def test_fault_harness_settings_can_enable_filesystem_checkpoint_deletion(self) -> None:
+        config = _config(
+            "fault",
+            "auto",
+            scenario_options={"delete_filesystem_checkpoints": True},
+        )
+        settings = build_fault_harness_settings(config)
+        factory = settings.checkpoint_manager_factory
+
+        with tempfile.TemporaryDirectory(prefix="agent_cr_fault_policy_") as tmp:
+            base = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
+            manager = factory(base)
+
+        self.assertIsInstance(manager, LatestOnlyCheckpointManager)
+        self.assertTrue(manager.delete_filesystem_checkpoints)
+
+    def test_auto_mode_can_limit_setup_parallelism_below_sandbox_count(self) -> None:
         harness = _BaseScenarioHarness()
-        harness.launch_delay_s = 0.05
+        harness.setup_delay_s = 0.05
 
         rows = run_fault_auto(
             _config(
@@ -380,7 +379,8 @@ class FaultScenarioTests(unittest.TestCase):
 
         self.assertEqual(len(rows), 4)
         self.assertEqual(harness.launched, ["fault-0", "fault-1", "fault-2", "fault-3"])
-        self.assertLessEqual(harness.max_concurrent_launches, 2)
+        self.assertEqual(harness.setup_calls, ["fault-0", "fault-1", "fault-2", "fault-3"])
+        self.assertLessEqual(harness.max_concurrent_setups, 2)
 
     def test_replay_mode_treats_completion_before_later_checkpoint_as_success(self) -> None:
         class _ReplayEarlyFinishTaskRun:
@@ -629,8 +629,6 @@ class FaultScenarioTests(unittest.TestCase):
         rows = [
             {
                 "iterations_planned": 5,
-                "checkpoint_ms_avg": 0.0,
-                "restore_ms_avg": 0.0,
                 "recovery_ms_avg": 12.0,
                 "readiness_ms_avg": 3.0,
                 "end_to_end_recovery_ms_avg": 15.0,

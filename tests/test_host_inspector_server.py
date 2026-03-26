@@ -6,11 +6,12 @@ import subprocess
 import unittest
 from unittest.mock import Mock, patch
 
+from agent_cr import HostInspectorServiceClient, SandboxId
 from agent_cr.host_inspector.fs_helper import LibbpfFilesystemMonitor
 from agent_cr.host_inspector.process_filter import ProcessIdentity
 from agent_cr.host_inspector.protocol import HelperEvent
 from agent_cr.host_inspector.runtime_resolver import ResolvedSandbox
-from agent_cr.host_inspector.server import HostInspectorDaemon
+from agent_cr.host_inspector.server import HostInspectorDaemon, HostInspectorServer
 
 
 class FakeResolver:
@@ -81,6 +82,24 @@ def _event(
     )
 
 class HostInspectorServerTests(unittest.TestCase):
+    def test_server_closes_idle_connections_so_one_client_does_not_pin_only_worker(self) -> None:
+        daemon = HostInspectorDaemon(resolver=FakeResolver(), fs_monitor=FakeFilesystemMonitor(), process_poll_interval_s=60.0)
+        server = HostInspectorServer(host="127.0.0.1", port=0, daemon=daemon, max_workers=1)
+        server.start()
+        base_url = f"http://127.0.0.1:{server.port}"
+        client_a = HostInspectorServiceClient(base_url, timeout_s=0.5)
+        client_b = HostInspectorServiceClient(base_url, timeout_s=0.5)
+        try:
+            first = client_a.register_sandbox(SandboxId("sbx-a"), "docker", "container-1")
+            second = client_b.register_sandbox(SandboxId("sbx-b"), "docker", "container-1")
+        finally:
+            client_a.close()
+            client_b.close()
+            server.stop()
+
+        self.assertTrue(first["ok"])
+        self.assertTrue(second["ok"])
+
     def test_filesystem_monitor_stop_kills_helper_after_terminate_timeout(self) -> None:
         monitor = LibbpfFilesystemMonitor(helper_path="/bin/true")
         stdout = Mock()

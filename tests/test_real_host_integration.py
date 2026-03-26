@@ -339,7 +339,7 @@ class RealHostIntegrationTests(unittest.TestCase):
             self.assertIn("last_llm_provider", inspected_after.metadata)
             request_events = [name for name, _ in telemetry.events if name.startswith("request.")]
             self.assertIn("request.start", request_events)
-            self.assertIn("request.end", request_events)
+            self.assertIn("request.finish", request_events)
 
             system.sandbox_manager.stop(sandbox_id)
             self.assertEqual(system.sandbox_manager.describe(sandbox_id).status, "stopped")

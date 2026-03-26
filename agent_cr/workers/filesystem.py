@@ -37,7 +37,7 @@ class AdapterFileSystemCWorker(FileSystemCWorker):
         artifact = ArtifactPayload(
             kind=ArtifactKind.FILESYSTEM,
             name="filesystem_checkpoint.json",
-            data=json.dumps(payload, sort_keys=True, indent=2).encode("utf-8"),
+            data=json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"),
             metadata={"runtime": self._runtime.name},
         )
         logger.debug(

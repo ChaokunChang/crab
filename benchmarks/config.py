@@ -5,10 +5,17 @@ from pathlib import Path
 
 import yaml
 
+from agent_cr import ExecutorConfig, SchedulerConfig
 from agent_cr.telemetry import (
     DEFAULT_TELEMETRY_CAPTURE_COMMAND_OUTPUT,
+    DEFAULT_TELEMETRY_BATCH_MAX_RECORDS,
     DEFAULT_TELEMETRY_DETAIL_LEVEL,
+    DEFAULT_TELEMETRY_FLUSH_INTERVAL_MS,
     DEFAULT_TELEMETRY_MAX_TEXT_ATTRIBUTE_BYTES,
+    DEFAULT_TELEMETRY_OVERFLOW_POLICY,
+    DEFAULT_TELEMETRY_QUEUE_CAPACITY,
+    DEFAULT_TELEMETRY_SERIALIZER,
+    DEFAULT_TELEMETRY_WRITER_MODE,
 )
 
 
@@ -18,7 +25,12 @@ _PROVIDERS = {"openai", "anthropic"}
 _LOG_LEVELS = {"debug", "info", "warning", "error", "critical"}
 _LOG_FILE_MODES = {"append": "a", "write": "w"}
 _TELEMETRY_DETAIL_LEVELS = {"basic", "detailed"}
-_BENCHMARK_PHASES = ("build", "prepare", "run", "verification")
+_BENCHMARK_PHASES = ("setup", "run", "verification")
+_LLM_SERVER_LAUNCH_MODES = {"process", "thread"}
+_HOST_INSPECTOR_LAUNCH_MODES = {"process", "thread"}
+_TELEMETRY_WRITER_MODES = {"sync", "async"}
+_TELEMETRY_OVERFLOW_POLICIES = {"drop_new", "block"}
+_TELEMETRY_SERIALIZERS = {"auto", "stdlib", "orjson"}
 _SUPPORTED_MODES = {
     "e2e": {"manual"},
     "fault": {"manual", "auto"},
@@ -34,16 +46,31 @@ _DEFAULT_ITERATIONS = {
 
 
 @dataclass(frozen=True)
+class TelemetryReportConfig:
+    enabled: bool = True
+    output_dir: Path | None = None
+    top_k: int = 25
+    log_scale_charts: bool = False
+    export_svg: bool = True
+
+
+@dataclass(frozen=True)
+class MonitoringConfig:
+    enabled: bool = True
+    sample_interval_ms: int = 1000
+    include_host: bool = True
+    include_sandboxes: bool = True
+
+
+@dataclass(frozen=True)
 class BenchmarkPhaseWorkers:
-    build: int | None = None
-    prepare: int | None = None
+    setup: int | None = None
     run: int | None = None
     verification: int | None = None
 
     def resolve(self, *, default: int) -> "ResolvedBenchmarkPhaseWorkers":
         return ResolvedBenchmarkPhaseWorkers(
-            build=default if self.build is None else int(self.build),
-            prepare=default if self.prepare is None else int(self.prepare),
+            setup=default if self.setup is None else int(self.setup),
             run=default if self.run is None else int(self.run),
             verification=default if self.verification is None else int(self.verification),
         )
@@ -51,8 +78,7 @@ class BenchmarkPhaseWorkers:
 
 @dataclass(frozen=True)
 class ResolvedBenchmarkPhaseWorkers:
-    build: int
-    prepare: int
+    setup: int
     run: int
     verification: int
 
@@ -63,6 +89,126 @@ class ResolvedBenchmarkPhaseWorkers:
 
     def as_dict(self) -> dict[str, int]:
         return {phase: self.for_phase(phase) for phase in _BENCHMARK_PHASES}
+
+
+@dataclass(frozen=True)
+class BenchmarkExecutorConfig:
+    checkpoint_workers: int | None = None
+    restore_workers: int | None = None
+    coordination_workers: int | None = None
+    composite_step_workers: int | None = None
+    checkpoint_queue_size: int = 10000
+    max_retries: int = 0
+    retry_backoff_seconds: float = 0.05
+
+    def __post_init__(self) -> None:
+        if self.checkpoint_workers is not None and self.checkpoint_workers <= 0:
+            raise ValueError("executor.checkpoint_workers must be positive when provided")
+        if self.restore_workers is not None and self.restore_workers <= 0:
+            raise ValueError("executor.restore_workers must be positive when provided")
+        if self.coordination_workers is not None and self.coordination_workers <= 0:
+            raise ValueError("executor.coordination_workers must be positive when provided")
+        if self.composite_step_workers is not None and self.composite_step_workers <= 0:
+            raise ValueError("executor.composite_step_workers must be positive when provided")
+        if self.checkpoint_queue_size <= 0:
+            raise ValueError("executor.checkpoint_queue_size must be positive")
+        if self.max_retries < 0:
+            raise ValueError("executor.max_retries must be >= 0")
+        if self.retry_backoff_seconds < 0:
+            raise ValueError("executor.retry_backoff_seconds must be >= 0")
+
+    def resolve(self, *, default_workers: int) -> ExecutorConfig:
+        return ExecutorConfig(
+            max_workers=max(1, int(default_workers)),
+            checkpoint_workers=self.checkpoint_workers,
+            restore_workers=self.restore_workers,
+            coordination_workers=self.coordination_workers,
+            composite_step_workers=self.composite_step_workers,
+            max_checkpoint_queue_size=self.checkpoint_queue_size,
+            max_retries=self.max_retries,
+            retry_backoff_seconds=self.retry_backoff_seconds,
+        )
+
+
+@dataclass(frozen=True)
+class BenchmarkSchedulerConfig:
+    min_checkpoint_interval_seconds: float | None = None
+    force_checkpoint_after_seconds: float | None = None
+    require_change_signal: bool | None = None
+    checkpoint_full_baseline_on_first_checkpoint: bool | None = None
+    prefer_checkpoint_during_llm_request: bool | None = None
+    require_llm_request_for_checkpoint: bool | None = None
+    inspect_without_pause: bool | None = None
+
+    def apply(self, base: SchedulerConfig) -> SchedulerConfig:
+        return SchedulerConfig(
+            min_checkpoint_interval_seconds=(
+                base.min_checkpoint_interval_seconds
+                if self.min_checkpoint_interval_seconds is None
+                else self.min_checkpoint_interval_seconds
+            ),
+            force_checkpoint_after_seconds=(
+                base.force_checkpoint_after_seconds
+                if self.force_checkpoint_after_seconds is None
+                else self.force_checkpoint_after_seconds
+            ),
+            require_change_signal=(
+                base.require_change_signal
+                if self.require_change_signal is None
+                else self.require_change_signal
+            ),
+            checkpoint_full_baseline_on_first_checkpoint=(
+                base.checkpoint_full_baseline_on_first_checkpoint
+                if self.checkpoint_full_baseline_on_first_checkpoint is None
+                else self.checkpoint_full_baseline_on_first_checkpoint
+            ),
+            prefer_checkpoint_during_llm_request=(
+                base.prefer_checkpoint_during_llm_request
+                if self.prefer_checkpoint_during_llm_request is None
+                else self.prefer_checkpoint_during_llm_request
+            ),
+            require_llm_request_for_checkpoint=(
+                base.require_llm_request_for_checkpoint
+                if self.require_llm_request_for_checkpoint is None
+                else self.require_llm_request_for_checkpoint
+            ),
+            inspect_without_pause=(
+                base.inspect_without_pause
+                if self.inspect_without_pause is None
+                else self.inspect_without_pause
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class BenchmarkLLMServerConfig:
+    launch_mode: str = "process"
+
+    def __post_init__(self) -> None:
+        if self.launch_mode not in _LLM_SERVER_LAUNCH_MODES:
+            raise ValueError(
+                f"llm_server.launch_mode must be one of {sorted(_LLM_SERVER_LAUNCH_MODES)}, "
+                f"got {self.launch_mode!r}"
+            )
+
+
+@dataclass(frozen=True)
+class BenchmarkHostInspectorConfig:
+    launch_mode: str = "process"
+
+    def __post_init__(self) -> None:
+        if self.launch_mode not in _HOST_INSPECTOR_LAUNCH_MODES:
+            raise ValueError(
+                f"host_inspector.launch_mode must be one of {sorted(_HOST_INSPECTOR_LAUNCH_MODES)}, "
+                f"got {self.launch_mode!r}"
+            )
+
+
+@dataclass(frozen=True)
+class BenchmarkStoragePlanesConfig:
+    runtime_root: Path | None = None
+    storage_root: Path | None = None
+    agent_host_root: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -83,6 +229,13 @@ class BenchmarkConfig:
     telemetry_detail_level: str = DEFAULT_TELEMETRY_DETAIL_LEVEL
     telemetry_capture_command_output: bool = DEFAULT_TELEMETRY_CAPTURE_COMMAND_OUTPUT
     telemetry_max_text_attribute_bytes: int = DEFAULT_TELEMETRY_MAX_TEXT_ATTRIBUTE_BYTES
+    telemetry_keep_in_memory_copy: bool | None = None
+    telemetry_writer_mode: str = DEFAULT_TELEMETRY_WRITER_MODE
+    telemetry_queue_capacity: int = DEFAULT_TELEMETRY_QUEUE_CAPACITY
+    telemetry_batch_max_records: int = DEFAULT_TELEMETRY_BATCH_MAX_RECORDS
+    telemetry_flush_interval_ms: int = DEFAULT_TELEMETRY_FLUSH_INTERVAL_MS
+    telemetry_overflow_policy: str = DEFAULT_TELEMETRY_OVERFLOW_POLICY
+    telemetry_serializer: str = DEFAULT_TELEMETRY_SERIALIZER
     log_file: Path | None = None
     log_file_mode: str = "append"
     benchmark_root: Path | None = None
@@ -96,6 +249,13 @@ class BenchmarkConfig:
     work_dir_host_root: Path | None = None
     scenario_options: dict[str, object] = field(default_factory=dict)
     llm_service_options: dict[str, object] = field(default_factory=dict)
+    telemetry_report: TelemetryReportConfig = field(default_factory=TelemetryReportConfig)
+    monitoring: MonitoringConfig = field(default_factory=MonitoringConfig)
+    executor: BenchmarkExecutorConfig = field(default_factory=BenchmarkExecutorConfig)
+    scheduler: BenchmarkSchedulerConfig = field(default_factory=BenchmarkSchedulerConfig)
+    llm_server: BenchmarkLLMServerConfig = field(default_factory=BenchmarkLLMServerConfig)
+    host_inspector: BenchmarkHostInspectorConfig = field(default_factory=BenchmarkHostInspectorConfig)
+    storage_planes: BenchmarkStoragePlanesConfig = field(default_factory=BenchmarkStoragePlanesConfig)
 
     @property
     def config_dir(self) -> Path:
@@ -149,6 +309,97 @@ def _load_phase_workers(payload: object) -> BenchmarkPhaseWorkers | None:
             raise ValueError(f"phase_workers.{phase} must be positive, got {value}")
         values[phase] = value
     return BenchmarkPhaseWorkers(**values)
+
+
+def _load_executor_config(payload: object) -> BenchmarkExecutorConfig:
+    if payload is None:
+        return BenchmarkExecutorConfig()
+    data = _require_object(payload, label="executor")
+    return BenchmarkExecutorConfig(
+        checkpoint_workers=(
+            None if data.get("checkpoint_workers") is None else int(data["checkpoint_workers"])
+        ),
+        restore_workers=(
+            None if data.get("restore_workers") is None else int(data["restore_workers"])
+        ),
+        coordination_workers=(
+            None if data.get("coordination_workers") is None else int(data["coordination_workers"])
+        ),
+        composite_step_workers=(
+            None if data.get("composite_step_workers") is None else int(data["composite_step_workers"])
+        ),
+        checkpoint_queue_size=int(data.get("checkpoint_queue_size", 10000)),
+        max_retries=int(data.get("max_retries", 0)),
+        retry_backoff_seconds=float(data.get("retry_backoff_seconds", 0.05)),
+    )
+
+
+def _load_scheduler_config(payload: object) -> BenchmarkSchedulerConfig:
+    if payload is None:
+        return BenchmarkSchedulerConfig()
+    data = _require_object(payload, label="scheduler")
+    return BenchmarkSchedulerConfig(
+        min_checkpoint_interval_seconds=(
+            None
+            if data.get("min_checkpoint_interval_seconds") is None
+            else float(data["min_checkpoint_interval_seconds"])
+        ),
+        force_checkpoint_after_seconds=(
+            None
+            if data.get("force_checkpoint_after_seconds") is None
+            else float(data["force_checkpoint_after_seconds"])
+        ),
+        require_change_signal=(
+            None if data.get("require_change_signal") is None else bool(data["require_change_signal"])
+        ),
+        checkpoint_full_baseline_on_first_checkpoint=(
+            None
+            if data.get("checkpoint_full_baseline_on_first_checkpoint") is None
+            else bool(data["checkpoint_full_baseline_on_first_checkpoint"])
+        ),
+        prefer_checkpoint_during_llm_request=(
+            None
+            if data.get("prefer_checkpoint_during_llm_request") is None
+            else bool(data["prefer_checkpoint_during_llm_request"])
+        ),
+        require_llm_request_for_checkpoint=(
+            None
+            if data.get("require_llm_request_for_checkpoint") is None
+            else bool(data["require_llm_request_for_checkpoint"])
+        ),
+        inspect_without_pause=(
+            None if data.get("inspect_without_pause") is None else bool(data["inspect_without_pause"])
+        ),
+    )
+
+
+def _load_llm_server_config(payload: object) -> BenchmarkLLMServerConfig:
+    if payload is None:
+        return BenchmarkLLMServerConfig()
+    data = _require_object(payload, label="llm_server")
+    return BenchmarkLLMServerConfig(
+        launch_mode=str(data.get("launch_mode", "process")).strip().lower(),
+    )
+
+
+def _load_host_inspector_config(payload: object) -> BenchmarkHostInspectorConfig:
+    if payload is None:
+        return BenchmarkHostInspectorConfig()
+    data = _require_object(payload, label="host_inspector")
+    return BenchmarkHostInspectorConfig(
+        launch_mode=str(data.get("launch_mode", "process")).strip().lower(),
+    )
+
+
+def _load_storage_planes_config(base_dir: Path, payload: object) -> BenchmarkStoragePlanesConfig:
+    if payload is None:
+        return BenchmarkStoragePlanesConfig()
+    data = _require_object(payload, label="storage_planes")
+    return BenchmarkStoragePlanesConfig(
+        runtime_root=_resolve_optional_path(base_dir, data.get("runtime_root")),
+        storage_root=_resolve_optional_path(base_dir, data.get("storage_root")),
+        agent_host_root=_resolve_optional_path(base_dir, data.get("agent_host_root")),
+    )
 
 
 def load_config(path: Path) -> BenchmarkConfig:
@@ -232,6 +483,78 @@ def load_config(path: Path) -> BenchmarkConfig:
     )
     if telemetry_max_text_attribute_bytes <= 0:
         raise ValueError("telemetry.max_text_attribute_bytes must be positive")
+    telemetry_keep_in_memory_copy = (
+        None if telemetry_options.get("keep_in_memory_copy") is None else bool(telemetry_options["keep_in_memory_copy"])
+    )
+    telemetry_writer_mode = str(
+        telemetry_options.get("writer_mode", DEFAULT_TELEMETRY_WRITER_MODE)
+    ).strip().lower()
+    if telemetry_writer_mode not in _TELEMETRY_WRITER_MODES:
+        raise ValueError(
+            f"telemetry.writer_mode must be one of {sorted(_TELEMETRY_WRITER_MODES)}, got {telemetry_writer_mode!r}"
+        )
+    telemetry_queue_capacity = int(
+        telemetry_options.get("queue_capacity", DEFAULT_TELEMETRY_QUEUE_CAPACITY)
+    )
+    if telemetry_queue_capacity <= 0:
+        raise ValueError("telemetry.queue_capacity must be positive")
+    telemetry_batch_max_records = int(
+        telemetry_options.get("batch_max_records", DEFAULT_TELEMETRY_BATCH_MAX_RECORDS)
+    )
+    if telemetry_batch_max_records <= 0:
+        raise ValueError("telemetry.batch_max_records must be positive")
+    telemetry_flush_interval_ms = int(
+        telemetry_options.get("flush_interval_ms", DEFAULT_TELEMETRY_FLUSH_INTERVAL_MS)
+    )
+    if telemetry_flush_interval_ms <= 0:
+        raise ValueError("telemetry.flush_interval_ms must be positive")
+    telemetry_overflow_policy = str(
+        telemetry_options.get("overflow_policy", DEFAULT_TELEMETRY_OVERFLOW_POLICY)
+    ).strip().lower()
+    if telemetry_overflow_policy not in _TELEMETRY_OVERFLOW_POLICIES:
+        raise ValueError(
+            f"telemetry.overflow_policy must be one of {sorted(_TELEMETRY_OVERFLOW_POLICIES)}, got {telemetry_overflow_policy!r}"
+        )
+    telemetry_serializer = str(
+        telemetry_options.get("serializer", DEFAULT_TELEMETRY_SERIALIZER)
+    ).strip().lower()
+    if telemetry_serializer not in _TELEMETRY_SERIALIZERS:
+        raise ValueError(
+            f"telemetry.serializer must be one of {sorted(_TELEMETRY_SERIALIZERS)}, got {telemetry_serializer!r}"
+        )
+    report_options = telemetry_options.get("report", {})
+    if report_options is None:
+        report_options = {}
+    report_options = _require_object(report_options, label="telemetry.report")
+    report_top_k = int(report_options.get("top_k", 25))
+    if report_top_k <= 0:
+        raise ValueError("telemetry.report.top_k must be positive")
+    telemetry_report = TelemetryReportConfig(
+        enabled=bool(report_options.get("enabled", True)),
+        output_dir=_resolve_optional_path(base_dir, report_options.get("output_dir")),
+        top_k=report_top_k,
+        log_scale_charts=bool(report_options.get("log_scale_charts", False)),
+        export_svg=bool(report_options.get("export_svg", True)),
+    )
+
+    monitoring_options = data.get("monitoring", {})
+    if monitoring_options is None:
+        monitoring_options = {}
+    monitoring_options = _require_object(monitoring_options, label="monitoring")
+    monitoring_sample_interval_ms = int(monitoring_options.get("sample_interval_ms", 1000))
+    if monitoring_sample_interval_ms <= 0:
+        raise ValueError("monitoring.sample_interval_ms must be positive")
+    monitoring = MonitoringConfig(
+        enabled=bool(monitoring_options.get("enabled", True)),
+        sample_interval_ms=monitoring_sample_interval_ms,
+        include_host=bool(monitoring_options.get("include_host", True)),
+        include_sandboxes=bool(monitoring_options.get("include_sandboxes", True)),
+    )
+    executor = _load_executor_config(data.get("executor"))
+    scheduler = _load_scheduler_config(data.get("scheduler"))
+    llm_server = _load_llm_server_config(data.get("llm_server"))
+    host_inspector = _load_host_inspector_config(data.get("host_inspector"))
+    storage_planes = _load_storage_planes_config(base_dir, data.get("storage_planes"))
 
     return BenchmarkConfig(
         config_path=config_path,
@@ -250,6 +573,13 @@ def load_config(path: Path) -> BenchmarkConfig:
         telemetry_detail_level=telemetry_detail_level,
         telemetry_capture_command_output=telemetry_capture_command_output,
         telemetry_max_text_attribute_bytes=telemetry_max_text_attribute_bytes,
+        telemetry_keep_in_memory_copy=telemetry_keep_in_memory_copy,
+        telemetry_writer_mode=telemetry_writer_mode,
+        telemetry_queue_capacity=telemetry_queue_capacity,
+        telemetry_batch_max_records=telemetry_batch_max_records,
+        telemetry_flush_interval_ms=telemetry_flush_interval_ms,
+        telemetry_overflow_policy=telemetry_overflow_policy,
+        telemetry_serializer=telemetry_serializer,
         log_file=_resolve_optional_path(base_dir, data.get("log_file")),
         log_file_mode=log_file_mode,
         benchmark_root=_resolve_optional_path(base_dir, data.get("benchmark_root")),
@@ -263,4 +593,11 @@ def load_config(path: Path) -> BenchmarkConfig:
         work_dir_host_root=_resolve_optional_path(base_dir, data.get("work_dir_host_root")),
         scenario_options=scenario_options,
         llm_service_options=llm_service_options,
+        telemetry_report=telemetry_report,
+        monitoring=monitoring,
+        executor=executor,
+        scheduler=scheduler,
+        llm_server=llm_server,
+        host_inspector=host_inspector,
+        storage_planes=storage_planes,
     )

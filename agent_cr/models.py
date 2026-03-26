@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
 from .ids import CheckpointId, JobId, SandboxId
+from .json_codec import get_json_codec
 
 
 MANIFEST_SCHEMA_VERSION = "v1"
+_MANIFEST_JSON_CODEC = get_json_codec("auto")
 
 
 def utc_now() -> datetime:
@@ -193,25 +194,26 @@ class CheckpointManifest:
             raise ValueError("manifest integrity hash mismatch")
 
     def compute_manifest_hash(self) -> str:
-        canonical = json.dumps(
-            {
-                "schema_version": self.schema_version,
-                "checkpoint_id": str(self.checkpoint_id),
-                "sandbox_id": str(self.sandbox_id),
-                "created_at": _isoformat(self.created_at),
-                "runtime_name": self.runtime_name,
-                "runtime_version": self.runtime_version,
-                "process_artifacts": [a.to_dict() for a in self.process_artifacts],
-                "filesystem_artifacts": [a.to_dict() for a in self.filesystem_artifacts],
-                "metadata": self.metadata,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
+        canonical = self.to_canonical_json_bytes()
         return hashlib.sha256(canonical).hexdigest()
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        return self._payload_dict(include_integrity=True)
+
+    def to_canonical_json_bytes(self) -> bytes:
+        return _MANIFEST_JSON_CODEC.dumps_bytes(
+            self._payload_dict(include_integrity=False),
+            sort_keys=True,
+        )
+
+    def to_json_bytes(self) -> bytes:
+        return _MANIFEST_JSON_CODEC.dumps_bytes(
+            self._payload_dict(include_integrity=True),
+            sort_keys=True,
+        )
+
+    def _payload_dict(self, *, include_integrity: bool) -> dict[str, Any]:
+        payload = {
             "schema_version": self.schema_version,
             "checkpoint_id": str(self.checkpoint_id),
             "sandbox_id": str(self.sandbox_id),
@@ -221,8 +223,10 @@ class CheckpointManifest:
             "process_artifacts": [a.to_dict() for a in self.process_artifacts],
             "filesystem_artifacts": [a.to_dict() for a in self.filesystem_artifacts],
             "metadata": self.metadata,
-            "integrity": self.integrity,
         }
+        if include_integrity:
+            payload["integrity"] = self.integrity
+        return payload
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "CheckpointManifest":

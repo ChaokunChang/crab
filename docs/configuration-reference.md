@@ -15,6 +15,7 @@ Defined in `agent_cr/config.py`. Passed to `CRScheduler` (and its policies) via 
 | `require_change_signal` | `bool` | `True` | When `True`, skip checkpoints unless the inspector reports a process or filesystem change. | `CheckpointingPolicy.evaluate()` in `scheduler.py` |
 | `prefer_checkpoint_during_llm_request` | `bool` | `True` | Prefer checkpointing when an LLM request is in flight (to capture the request window). | `CheckpointingPolicy.evaluate()` in `scheduler.py` |
 | `require_llm_request_for_checkpoint` | `bool` | `False` | When `True`, only checkpoint while an LLM request is in flight. | `CheckpointingPolicy.evaluate()` in `scheduler.py` |
+| `inspect_without_pause` | `bool` | `False` | When `True`, `CRScheduler.query_checkpoint()` first inspects the live sandbox and only pauses later if it decides a non-`leave_running` checkpoint needs quiescing. Default `False` keeps the safer pause-before-inspect path. | `CRScheduler.query_checkpoint()` in `scheduler.py` |
 
 **How to specify:** Pass a `SchedulerConfig` dataclass to `build_default_system(scheduler_config=...)` or to `CRScheduler(config=...)`.
 
@@ -26,8 +27,12 @@ Defined in `agent_cr/config.py`. Controls the checkpoint/restore job executor th
 
 | Parameter | Type | Default | Description | Used by |
 |---|---|---|---|---|
-| `max_workers` | `int` | `4` | Number of restore worker threads in the `ThreadPoolExecutor`. Must be ≥ 1. | `CRExecutor.__init__()` in `executor.py` |
-| `max_checkpoint_queue_size` | `int` | `10000` | Maximum number of pending checkpoint jobs in the queue before new submissions are rejected. Must be ≥ 1. | `CRExecutor.__init__()` in `executor.py` |
+| `max_workers` | `int` | `4` | Legacy fallback worker count used when `checkpoint_workers` and/or `restore_workers` are omitted. Must be ≥ 1. | `ExecutorConfig.resolved_checkpoint_workers`, `ExecutorConfig.resolved_restore_workers` in `config.py` |
+| `checkpoint_workers` | `int \| None` | `None` | Dedicated checkpoint worker count. When `None`, falls back to `max_workers`. Must be ≥ 1 when provided. | `CRExecutor.__init__()` in `executor.py` |
+| `restore_workers` | `int \| None` | `None` | Dedicated restore worker count. When `None`, falls back to `max_workers`. Must be ≥ 1 when provided. | `CRExecutor.__init__()` in `executor.py` |
+| `coordination_workers` | `int \| None` | `None` | Worker count for `AgentCRSystem` live-request coordination. When omitted, resolves to `min(8, resolved_checkpoint_workers)`. | `AgentCRSystem.start()` in `system.py` |
+| `composite_step_workers` | `int \| None` | `None` | Shared worker count for parallel process/filesystem checkpoint sub-steps. When omitted, resolves to `max(2, min(2 * resolved_checkpoint_workers, 16))`. | `DefaultCWorker.__init__()` in `workers/composite.py` |
+| `max_checkpoint_queue_size` | `int` | `10000` | Maximum number of pending checkpoint jobs admitted before new submissions are rejected. Must be ≥ 1. | `CRExecutor.__init__()` in `executor.py` |
 | `max_retries` | `int` | `0` | Number of retry attempts for failed checkpoint/restore jobs. Must be ≥ 0. | `CRExecutor._execute_checkpoint()`, `_execute_restore()` in `executor.py` |
 | `retry_backoff_seconds` | `float` | `0.05` | Linear backoff base between retries: sleeps `retry_backoff_seconds * (attempt + 1)`. Must be ≥ 0. | `CRExecutor._execute_checkpoint()`, `_execute_restore()` in `executor.py` |
 
@@ -56,11 +61,17 @@ Defined in `agent_cr/config.py`. Controls the telemetry subsystem.
 | Parameter | Type | Default | Description | Used by |
 |---|---|---|---|---|
 | `enabled` | `bool` | `True` | Whether telemetry is active. When `False`, a `NoopTelemetrySink` is used. | `build_default_system()` in `system.py` |
-| `jsonl_path` | `Path \| None` | `None` | If set, telemetry events/metrics are appended to this JSONL file. | `build_default_system()` in `system.py`; `JsonlTelemetrySink` in `telemetry.py` |
-| `keep_in_memory_copy` | `bool` | `True` | Keep a copy of all telemetry events/metrics in memory (`InMemoryTelemetrySink`). | `build_default_system()` in `system.py` |
+| `jsonl_path` | `Path \| None` | `None` | If set, telemetry events/metrics are appended to this JSONL file. JSONL writes are batched and asynchronous by default, and file locks still keep multi-process appends safe. | `build_default_system()` in `system.py`; `JsonlTelemetrySink` / `AsyncJsonlTelemetrySink` in `telemetry.py` |
+| `keep_in_memory_copy` | `bool \| None` | `None` | Keep a copy of all telemetry in memory (`InMemoryTelemetrySink`). When `None`, in-memory capture stays enabled only when JSONL output is not configured; with `jsonl_path` set, it defaults to `False`. | `build_default_system()` in `system.py` |
 | `detail_level` | `str` | `"basic"` | Telemetry detail level. `"basic"` or `"detailed"`. When `"detailed"`, command stdout/stderr is captured in telemetry. | `ConfiguredTelemetrySink` in `telemetry.py`; `RuncRuntime._command_finish_attributes()` |
 | `capture_command_output` | `bool` | `False` | Capture stdout/stderr of runtime commands in telemetry events regardless of `detail_level`. | `ConfiguredTelemetrySink` in `telemetry.py`; `RuncRuntime._command_finish_attributes()` |
 | `max_text_attribute_bytes` | `int` | `2048` | Maximum byte length for text attributes in telemetry. Longer values are truncated. Minimum enforced: 32. | `ConfiguredTelemetrySink`, `telemetry_truncate_value()` in `telemetry.py` |
+| `writer_mode` | `str` | `"async"` | Telemetry JSONL writer mode. `async` uses a bounded queue and background writer; `sync` writes on the caller thread. | `build_configured_telemetry_sink()` in `telemetry.py` |
+| `queue_capacity` | `int` | `16384` | Maximum queued telemetry records in async mode. Must be ≥ 1. | `AsyncJsonlTelemetrySink` in `telemetry.py` |
+| `batch_max_records` | `int` | `256` | Maximum JSONL records written per async batch. Must be ≥ 1. | `AsyncJsonlTelemetrySink` in `telemetry.py` |
+| `flush_interval_ms` | `int` | `50` | Async telemetry flush interval in milliseconds. Must be ≥ 1. | `AsyncJsonlTelemetrySink` in `telemetry.py` |
+| `overflow_policy` | `str` | `"drop_new"` | Async overflow behavior. `drop_new` keeps the hot path non-blocking and emits a drop summary later; `block` applies backpressure. | `AsyncJsonlTelemetrySink` in `telemetry.py` |
+| `serializer` | `str` | `"auto"` | JSON serializer choice. `auto` prefers `orjson` when installed and falls back to stdlib JSON. | `JsonlTelemetrySink` in `telemetry.py` |
 
 **How to specify:** Pass a `TelemetryConfig` dataclass to `build_default_system(telemetry_config=...)`. For benchmarks, these are also configurable via the YAML `telemetry:` block.
 
@@ -121,6 +132,7 @@ Defined in `agent_cr/interceptor.py` via `AgentCRRequestInterceptorServer.__init
 | `host` | `str` | `"127.0.0.1"` | Host to bind the interceptor HTTP server. |
 | `port` | `int` | `0` | Port to bind. `0` selects an ephemeral port. |
 | `upstream_timeout_seconds` | `float` | `3600.0` | Timeout (seconds) for forwarding requests to the upstream LLM service. |
+| `max_workers` | `int \| None` | `None` | Maximum worker threads for the interceptor HTTP server. The server now uses a bounded pooled HTTP worker model instead of unbounded request threads. |
 
 **How to specify:** Constructor arguments to `AgentCRRequestInterceptorServer(...)`.
 
@@ -142,6 +154,7 @@ Defined in `agent_cr/host_inspector/server.py`.
 |---|---|---|---|
 | `host` | `str` | `"127.0.0.1"` | Host to bind. |
 | `port` | `int` | `0` | Port to bind. `0` selects an ephemeral port. |
+| `max_workers` | `int \| None` | `None` | Maximum worker threads for the host-inspector HTTP server. |
 
 ### 7c. Host Inspector CLI (`agent_cr/host_inspector/__main__.py` and `server.py:main()`)
 
@@ -153,6 +166,7 @@ Defined in `agent_cr/host_inspector/server.py`.
 | `--helper-path` | `None` (auto-detected) | Path to the eBPF filesystem monitor helper binary. |
 | `--runc-state-root` | `None` | Override runc state root for the runtime resolver. |
 | `--log-level` | `"INFO"` | Python logging level. |
+| `--max-workers` | `32` | Maximum worker threads for the host-inspector HTTP server. |
 
 ### 7d. Host Inspector Service Client (`HostInspectorServiceClient`)
 
@@ -236,13 +250,31 @@ Defined in `benchmarks/config.py`. Loaded from YAML via `load_config()`.
 | `task_dataset` | `path \| null` | `null` | Path to a task dataset file (relative to config file). |
 | `sandboxes` | `int` | `1` | Number of concurrent sandboxes. Must be > 0. |
 | `max_workers` | `int \| null` | `null` | Max worker threads. Defaults to `sandboxes` count. |
-| `phase_workers` | `mapping \| null` | `null` | Per-phase worker overrides for `build`, `prepare`, `run`, and `verification`. Missing keys fall back to `max_workers`. |
+| `phase_workers` | `mapping \| null` | `null` | Per-phase worker overrides for `setup`, `run`, and `verification`. Missing keys fall back to `max_workers`. |
 | `iterations` | `int` | scenario-dependent | Number of iterations. Defaults: e2e=5, fault=3, spot=3, tree=1. |
 | `output` | `path \| null` | `null` | Path for CSV output file. |
 | `log_file` | `path \| null` | `null` | Path for log file. |
 | `log_file_mode` | `str` | `"append"` | Log file open mode: `append` or `write`. |
 | `log_level` | `str` | `"info"` | Python log level: `debug`, `info`, `warning`, `error`, `critical`. |
 | `benchmark_root` | `path \| null` | `null` | Root directory for benchmark run data. Falls back to `AGENTCR_BENCH_DIR` env var, then a temp directory. |
+| `storage_planes` | `mapping` | `{}` | Optional benchmark storage-plane overrides for runtime state, checkpoint storage, and agent host directories. |
+
+---
+
+## 12. Telemetry Report CLI (`benchmarks.telemetry_analysis.report`)
+
+Standalone telemetry reports are generated by the report CLI in `benchmarks/telemetry_analysis/report.py`.
+
+| CLI Flag | Default | Description |
+|---|---|---|
+| `--input` | *(required)* | Telemetry JSONL input path. |
+| `--output-dir` | *(required)* | Directory where the HTML, JSON, CSV, and SVG report artifacts are written. |
+| `--run-id` | dominant run in file | Optional `run_id` filter. |
+| `--top-k` | `25` | Top-K operations/outliers to retain in the summaries. |
+| `--exclude-failed-tasks` | `false` | Exclude sandboxes whose `benchmark.task.success_ratio` is `0`. |
+| `--log-scale-charts` | `false` | Use log scaling for bar-chart widths. |
+| `--figure-window-seconds` | `0` | Average checkpoint/restore line charts within fixed-size time windows. Applies to load and latency figures. `0` disables aggregation. |
+| `--no-export-svg` | `false` | Skip standalone SVG export. |
 | `zpool_size` | `str` | `"10G"` | Size of the ZFS pool image file (passed to `truncate -s`). |
 | `zpool_name` | `str \| null` | `null` | Explicit ZFS pool name. Auto-generated if `null`. |
 | `zpool_image` | `path \| null` | `null` | Path to the ZFS pool image file. |
@@ -250,20 +282,77 @@ Defined in `benchmarks/config.py`. Loaded from YAML via `load_config()`.
 | `image_cache_root` | `path \| null` | `null` | Cache directory for Docker images. Default: `.cache/agent-cr/images`. |
 | `transfer_delay_ms` | `float` | `0.0` | Simulated transfer delay (ms) applied as `recovery_delay_seconds` during auto-recovery. |
 | `work_dir_host_root` | `path \| null` | `null` | Host-side working directory root for sandboxes. |
+| `executor` | `mapping` | `{}` | Benchmark-only executor overrides. Resolves to `ExecutorConfig` using the benchmark's effective worker count as the fallback. |
+| `scheduler` | `mapping` | `{}` | Benchmark-only `SchedulerConfig` field overrides. Merged onto the scenario's scheduler defaults; does not choose the scheduler policy class. |
+| `llm_server` | `mapping` | `{ launch_mode: process }` | Benchmark LLM router launch settings. Controls whether the router runs in a subprocess or a thread. |
+| `host_inspector` | `mapping` | `{ launch_mode: process }` | Host-inspector launch settings. Controls whether the host inspector runs in a subprocess or in the benchmark process. |
 
 ### Phase Worker YAML Block (`phase_workers:`)
 
 | YAML Key | Type | Default | Description |
 |---|---|---|---|
-| `phase_workers.build` | `int \| null` | `max_workers` | Worker cap for the build phase. Must be > 0 when provided. |
-| `phase_workers.prepare` | `int \| null` | `max_workers` | Worker cap for the prepare phase. Must be > 0 when provided. |
+| `phase_workers.setup` | `int \| null` | `max_workers` | Worker cap for the setup phase. Must be > 0 when provided. |
 | `phase_workers.run` | `int \| null` | `max_workers` | Worker cap for the run phase. Must be > 0 when provided. |
 | `phase_workers.verification` | `int \| null` | `max_workers` | Worker cap for the verification phase. Must be > 0 when provided. |
 
-The benchmark harness executes all runs in four phases with hard barriers between them:
+The benchmark harness executes all runs in three phases with hard barriers between them:
 
-- all sandboxes finish `build` and `prepare` before `run`
+- all sandboxes finish `setup` before `run`
 - all sandboxes finish `run` before `verification`
+
+### Storage Plane YAML Block (`storage_planes:`)
+
+These paths control the hottest host-side write locations used by the real-host harness. They are especially useful when `zpool_image` is a file-backed vdev and you want checkpoint/process/storage writes to land on a different filesystem or device.
+
+| YAML Key | Type | Default | Description |
+|---|---|---|---|
+| `storage_planes.runtime_root` | `path \| null` | `null` | Root for runtime bundles, CRIU checkpoint images, sandbox metadata, and exported image rootfs. When omitted, the harness preserves the legacy layout and uses the benchmark run root. |
+| `storage_planes.storage_root` | `path \| null` | `null` | Root for checkpoint manifests and artifact storage. When omitted, the harness preserves the legacy layout and uses `<benchmark_run_root>/storage`. |
+| `storage_planes.agent_host_root` | `path \| null` | `null` | Root for agent host-side state and per-sandbox host directories. When omitted, the harness preserves the legacy layout and uses the benchmark run root. |
+
+Notes:
+
+- `benchmark_root` remains the benchmark artifact root for CSV output, logs, and default telemetry/report artifacts.
+- `storage_planes` is opt-in. Omitting it preserves the pre-separation directory layout.
+- To reduce interference with file-backed ZFS pools, point `storage_planes.*` at a different filesystem or block device than `zpool_image`.
+- If you also use `work_dir_host_root`, that path is independent and may need the same treatment for very write-heavy tasks.
+
+### Executor YAML Block (`executor:`)
+
+| YAML Key | Type | Default | Description |
+|---|---|---|---|
+| `executor.checkpoint_workers` | `int \| null` | `null` | Checkpoint worker count. Falls back to the benchmark's effective `max_workers` when omitted. |
+| `executor.restore_workers` | `int \| null` | `null` | Restore worker count. Falls back to the benchmark's effective `max_workers` when omitted. |
+| `executor.coordination_workers` | `int \| null` | `null` | Live-request coordination worker count. When omitted, resolves to `min(8, resolved_checkpoint_workers)`. |
+| `executor.composite_step_workers` | `int \| null` | `null` | Shared worker count for parallel process/filesystem checkpoint sub-steps. When omitted, resolves to `max(2, min(2 * resolved_checkpoint_workers, 16))`. |
+| `executor.checkpoint_queue_size` | `int` | `10000` | Max pending checkpoint jobs before new submissions are rejected. Must be > 0. |
+| `executor.max_retries` | `int` | `0` | Retry attempts for checkpoint/restore jobs. Must be ≥ 0. |
+| `executor.retry_backoff_seconds` | `float` | `0.05` | Linear retry backoff base in seconds. Must be ≥ 0. |
+
+### Scheduler YAML Block (`scheduler:`)
+
+The scenario still owns the scheduler policy class. For example, `fault` auto mode still uses the fault-tolerance policy and `tree` still uses the tree-search policy. The YAML block below only overrides `SchedulerConfig` fields used by that scenario-selected policy.
+
+| YAML Key | Type | Default | Description |
+|---|---|---|---|
+| `scheduler.min_checkpoint_interval_seconds` | `float \| null` | `null` | Override for `SchedulerConfig.min_checkpoint_interval_seconds`. |
+| `scheduler.force_checkpoint_after_seconds` | `float \| null` | `null` | Override for `SchedulerConfig.force_checkpoint_after_seconds`. |
+| `scheduler.require_change_signal` | `bool \| null` | `null` | Override for `SchedulerConfig.require_change_signal`. |
+| `scheduler.prefer_checkpoint_during_llm_request` | `bool \| null` | `null` | Override for `SchedulerConfig.prefer_checkpoint_during_llm_request`. |
+| `scheduler.require_llm_request_for_checkpoint` | `bool \| null` | `null` | Override for `SchedulerConfig.require_llm_request_for_checkpoint`. |
+| `scheduler.inspect_without_pause` | `bool \| null` | `null` | Override for `SchedulerConfig.inspect_without_pause`. The safe default remains `false`. |
+
+### LLM Server YAML Block (`llm_server:`)
+
+| YAML Key | Type | Default | Description |
+|---|---|---|---|
+| `llm_server.launch_mode` | `str` | `"process"` | Launch the benchmark LLM router in a subprocess (`process`) or a thread in the benchmark process (`thread`). The request path still uses HTTP over `localhost` in both modes. |
+
+### Host Inspector YAML Block (`host_inspector:`)
+
+| YAML Key | Type | Default | Description |
+|---|---|---|---|
+| `host_inspector.launch_mode` | `str` | `"process"` | Launch the host inspector in a subprocess (`process`) or in a thread inside the benchmark process (`thread`). `process` is the default to reduce main-process thread pressure. |
 
 ### Telemetry YAML Block (`telemetry:`)
 
@@ -273,6 +362,13 @@ The benchmark harness executes all runs in four phases with hard barriers betwee
 | `telemetry.detail_level` | `str` | `"basic"` | `"basic"` or `"detailed"`. |
 | `telemetry.capture_command_output` | `bool` | `false` | Capture runtime command stdout/stderr in telemetry. |
 | `telemetry.max_text_attribute_bytes` | `int` | `2048` | Maximum byte length per text attribute in telemetry. Must be > 0. |
+| `telemetry.keep_in_memory_copy` | `bool \| null` | `null` | Keep a copy of benchmark telemetry in memory. When omitted and JSONL output is configured, the benchmark defaults this to `false`. |
+| `telemetry.writer_mode` | `str` | `"async"` | Telemetry writer mode: `async` or `sync`. |
+| `telemetry.queue_capacity` | `int` | `16384` | Async telemetry queue capacity. |
+| `telemetry.batch_max_records` | `int` | `256` | Maximum JSONL records per async write batch. |
+| `telemetry.flush_interval_ms` | `int` | `50` | Async telemetry flush interval in milliseconds. |
+| `telemetry.overflow_policy` | `str` | `"drop_new"` | Async telemetry overflow behavior. |
+| `telemetry.serializer` | `str` | `"auto"` | JSON serializer for telemetry output. `auto` prefers `orjson` when available. |
 
 ### Scenario Options (`scenario_options:`)
 
@@ -282,6 +378,7 @@ The benchmark harness executes all runs in four phases with hard barriers betwee
 |---|---|---|---|
 | `injection_rate` | `float` | `0.5` | Probability of injecting a fault per iteration. Range: [0.0, 1.0]. |
 | `first_forced_event_chunk` | `int` | `0` | First chunk/iteration at which fault injection is allowed. Must be ≤ `iterations`. |
+| `delete_filesystem_checkpoints` | `bool` | `false` | Whether the fault-scenario retention policy is allowed to delete older filesystem checkpoints. The default keeps filesystem checkpoints so ZFS snapshot destruction does not run inline on the run-phase hot path. |
 
 #### Spot Preemption Scenario (`benchmarks/scenarios/spot.py`)
 

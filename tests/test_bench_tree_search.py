@@ -133,7 +133,7 @@ class _FakeHarness:
         handle.task_run = _FakeTaskRun(self, handle)
         handle.task_future = Future()
 
-    def launch_task_record(self, sandbox_name: str, record: BenchmarkTaskRecord) -> SandboxHandle:
+    def setup_task_record(self, sandbox_name: str, record: BenchmarkTaskRecord):
         _ = record
         sandbox_id = SandboxId(sandbox_name)
         handle = SandboxHandle(
@@ -153,7 +153,18 @@ class _FakeHarness:
         self._statuses[str(sandbox_id)] = {"total_actions": 0}
         self._snapshot_steps[str(sandbox_id)] = []
         self._install_task(handle)
-        return handle
+        return SimpleNamespace(
+            sandbox_name=sandbox_name,
+            task_record=record,
+            handle=handle,
+        )
+
+    def run_prepared_task_record(self, prepared) -> SandboxHandle:
+        return prepared.handle
+
+    def launch_task_record(self, sandbox_name: str, record: BenchmarkTaskRecord) -> SandboxHandle:
+        prepared = self.setup_task_record(sandbox_name, record)
+        return self.run_prepared_task_record(prepared)
 
     def add_interceptor_hook(self, hook) -> None:
         self.interceptor_hooks.append(hook)

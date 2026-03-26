@@ -1,13 +1,26 @@
 from __future__ import annotations
 
-import json
+import argparse
 import threading
 from dataclasses import dataclass
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from typing import Any, Protocol
-from urllib.parse import parse_qs, urlparse
+from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlparse
 
-from agent_cr.telemetry import start_operation
+from agent_cr import TelemetryConfig
+from agent_cr.http_utils import HttpStatusError, PooledHTTPServer, ThreadLocalHttpClient
+from agent_cr.json_codec import get_json_codec
+from agent_cr.telemetry import (
+    DEFAULT_TELEMETRY_BATCH_MAX_RECORDS,
+    DEFAULT_TELEMETRY_FLUSH_INTERVAL_MS,
+    DEFAULT_TELEMETRY_OVERFLOW_POLICY,
+    DEFAULT_TELEMETRY_QUEUE_CAPACITY,
+    DEFAULT_TELEMETRY_SERIALIZER,
+    DEFAULT_TELEMETRY_WRITER_MODE,
+    build_configured_telemetry_sink,
+    start_operation,
+)
 
 from integrations.llm_services.iflow_trace_replay.service import TraceReplayLLMState
 from integrations.llm_services.manual.service import ManualLLMState, handle_control_request
@@ -18,6 +31,7 @@ from integrations.llm_services.simulated_for_iflow.service import (
 )
 
 _IFLOW_BENCHMARK_MAX_TOOL_CALLS_BEFORE_FINISH = 4096
+_JSON_CODEC = get_json_codec("auto")
 
 
 def _sandbox_id_from_request(headers: dict[str, str], payload: dict[str, Any]) -> str:
@@ -244,26 +258,113 @@ class BenchmarkLLMRouter:
         )
 
 
+@dataclass(frozen=True)
+class BenchmarkLLMRouterClient:
+    base_url: str
+    timeout_seconds: float = 30.0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "_http_client",
+            ThreadLocalHttpClient(self.base_url, timeout_seconds=self.timeout_seconds),
+        )
+
+    def register_sandbox(
+        self,
+        *,
+        sandbox_id: str,
+        llm_service_type: str,
+        llm_service_config: dict[str, object] | None = None,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/control/register",
+            {
+                "sandbox_id": sandbox_id,
+                "llm_service_type": llm_service_type,
+                "llm_service_config": llm_service_config,
+            },
+        )
+
+    def unregister_sandbox(self, sandbox_id: str) -> dict[str, Any]:
+        return self._post("/control/unregister", {"sandbox_id": sandbox_id})
+
+    def snapshot(self, sandbox_id: str | None = None) -> dict[str, Any] | None:
+        query = "" if sandbox_id is None else "?" + urlencode({"sandbox_id": sandbox_id})
+        payload = self._get(f"/control/state{query}")
+        state = payload.get("state")
+        if state is None:
+            return None
+        if isinstance(state, dict):
+            return dict(state)
+        raise ValueError("router state response must be an object")
+
+    def reset_sandbox(self, sandbox_id: str) -> dict[str, Any]:
+        return self._post("/control/reset", {"sandbox_id": sandbox_id})
+
+    def restore_sandbox(self, sandbox_id: str, *, consumed_response_count: int) -> dict[str, Any]:
+        return self._post(
+            "/control/restore",
+            {
+                "sandbox_id": sandbox_id,
+                "consumed_response_count": consumed_response_count,
+            },
+        )
+
+    def close(self) -> None:
+        self._http_client.close()
+
+    def _get(self, path: str) -> dict[str, Any]:
+        return self._request("GET", path)
+
+    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._request("POST", path, payload=payload)
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        try:
+            if method == "GET":
+                return self._http_client.get_json(path)
+            return self._http_client.post_json(path, payload or {})
+        except HttpStatusError as exc:
+            raise RuntimeError(f"router request failed status={exc.status_code} path={path}") from exc
+
+
 def serve_benchmark_llm_router(
     *,
     host: str,
     port: int,
     registry: dict[str, type[LLMServiceState]] | None = None,
     telemetry=None,
-) -> ThreadingHTTPServer:
+    max_workers: int | None = None,
+) -> PooledHTTPServer:
     router = BenchmarkLLMRouter(registry=registry, telemetry=telemetry)
 
     class RouterHandler(BaseHTTPRequestHandler):
         benchmark_llm_router = router
+        protocol_version = "HTTP/1.1"
+
+        def end_headers(self) -> None:
+            self.send_header("Connection", "close")
+            self.close_connection = True
+            super().end_headers()
 
         def _read_json(self) -> dict[str, Any]:
             length = int(self.headers.get("Content-Length", "0"))
             if length <= 0:
                 return {}
-            return json.loads(self.rfile.read(length).decode("utf-8"))
+            result = _JSON_CODEC.loads(self.rfile.read(length))
+            if not isinstance(result, dict):
+                raise ValueError("request body must decode to a JSON object")
+            return dict(result)
 
         def _write_json(self, payload: dict[str, Any], *, code: int = 200) -> None:
-            body = json.dumps(payload, sort_keys=True).encode("utf-8")
+            body = _JSON_CODEC.dumps_bytes(payload)
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -300,6 +401,48 @@ def serve_benchmark_llm_router(
                     response = self.benchmark_llm_router.handle_control_request(path=self.path, payload=payload)
                     self._write_json(response)
                     return
+                if self.path == "/control/register":
+                    sandbox_id = str(payload.get("sandbox_id", "")).strip()
+                    llm_service_type = str(payload.get("llm_service_type", "")).strip()
+                    llm_service_config = payload.get("llm_service_config")
+                    if not sandbox_id:
+                        raise ValueError("sandbox_id is required")
+                    if not llm_service_type:
+                        raise ValueError("llm_service_type is required")
+                    if llm_service_config is not None and not isinstance(llm_service_config, dict):
+                        raise ValueError("llm_service_config must be an object when provided")
+                    self.benchmark_llm_router.register_sandbox(
+                        sandbox_id=sandbox_id,
+                        llm_service_type=llm_service_type,
+                        llm_service_config=None if llm_service_config is None else dict(llm_service_config),
+                    )
+                    self._write_json({"ok": True})
+                    return
+                if self.path == "/control/unregister":
+                    sandbox_id = str(payload.get("sandbox_id", "")).strip()
+                    if not sandbox_id:
+                        raise ValueError("sandbox_id is required")
+                    self.benchmark_llm_router.unregister_sandbox(sandbox_id)
+                    self._write_json({"ok": True})
+                    return
+                if self.path == "/control/reset":
+                    sandbox_id = str(payload.get("sandbox_id", "")).strip()
+                    if not sandbox_id:
+                        raise ValueError("sandbox_id is required")
+                    self.benchmark_llm_router.reset_sandbox(sandbox_id)
+                    self._write_json({"ok": True})
+                    return
+                if self.path == "/control/restore":
+                    sandbox_id = str(payload.get("sandbox_id", "")).strip()
+                    if not sandbox_id:
+                        raise ValueError("sandbox_id is required")
+                    consumed_response_count = int(payload.get("consumed_response_count", 0))
+                    self.benchmark_llm_router.restore_sandbox(
+                        sandbox_id,
+                        consumed_response_count=consumed_response_count,
+                    )
+                    self._write_json({"ok": True})
+                    return
                 self.send_error(404)
             except ValueError as exc:
                 self.send_error(400, str(exc))
@@ -308,6 +451,69 @@ def serve_benchmark_llm_router(
             _ = (format, args)
             return
 
-    server = ThreadingHTTPServer((host, port), RouterHandler)
+    server = PooledHTTPServer((host, port), RouterHandler, max_workers=max_workers)
     server.benchmark_llm_router = router  # type: ignore[attr-defined]
     return server
+
+
+def _router_telemetry_from_args(args: argparse.Namespace):
+    if not args.telemetry_jsonl:
+        return None
+    return build_configured_telemetry_sink(
+        TelemetryConfig(
+            enabled=True,
+            jsonl_path=Path(args.telemetry_jsonl),
+            keep_in_memory_copy=bool(args.telemetry_keep_in_memory_copy),
+            detail_level=args.telemetry_detail_level,
+            capture_command_output=bool(args.telemetry_capture_command_output),
+            max_text_attribute_bytes=int(args.telemetry_max_text_attribute_bytes),
+            writer_mode=str(args.telemetry_writer_mode),
+            queue_capacity=int(args.telemetry_queue_capacity),
+            batch_max_records=int(args.telemetry_batch_max_records),
+            flush_interval_ms=int(args.telemetry_flush_interval_ms),
+            overflow_policy=str(args.telemetry_overflow_policy),
+            serializer=str(args.telemetry_serializer),
+        ),
+        default_attributes={"run_id": args.run_id} if args.run_id else None,
+    )
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Benchmark LLM router")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=0)
+    parser.add_argument("--telemetry-jsonl")
+    parser.add_argument("--run-id")
+    parser.add_argument("--telemetry-detail-level", default="basic")
+    parser.add_argument("--telemetry-capture-command-output", action="store_true")
+    parser.add_argument("--telemetry-max-text-attribute-bytes", type=int, default=2048)
+    parser.add_argument("--telemetry-keep-in-memory-copy", action="store_true")
+    parser.add_argument("--telemetry-writer-mode", default=DEFAULT_TELEMETRY_WRITER_MODE)
+    parser.add_argument("--telemetry-queue-capacity", type=int, default=DEFAULT_TELEMETRY_QUEUE_CAPACITY)
+    parser.add_argument("--telemetry-batch-max-records", type=int, default=DEFAULT_TELEMETRY_BATCH_MAX_RECORDS)
+    parser.add_argument("--telemetry-flush-interval-ms", type=int, default=DEFAULT_TELEMETRY_FLUSH_INTERVAL_MS)
+    parser.add_argument("--telemetry-overflow-policy", default=DEFAULT_TELEMETRY_OVERFLOW_POLICY)
+    parser.add_argument("--telemetry-serializer", default=DEFAULT_TELEMETRY_SERIALIZER)
+    parser.add_argument("--max-workers", type=int, default=32)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    telemetry = _router_telemetry_from_args(args)
+    server = serve_benchmark_llm_router(
+        host=str(args.host),
+        port=int(args.port),
+        telemetry=telemetry,
+        max_workers=int(args.max_workers),
+    )
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+        if telemetry is not None:
+            telemetry.close()
+
+
+if __name__ == "__main__":
+    main()

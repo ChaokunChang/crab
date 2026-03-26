@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 import time
@@ -440,7 +441,7 @@ class RuncRuntime(Runtime):
         ]
         command.extend(self._checkpoint_optional_args())
         command.append(str(sandbox_id))
-        return self._run_status(
+        status = self._run_status(
             command,
             operation="sandbox.checkpoint_process",
             sandbox_id=sandbox_id,
@@ -453,6 +454,16 @@ class RuncRuntime(Runtime):
                 "bundle_path": str(self.bundle_path_for(sandbox_id)),
                 "state_root": str(self._paths.state_root),
                 "leave_running": leave_running,
+            },
+        )
+        size_bytes, file_count = self._summarize_directory(image_path)
+        return replace(
+            status,
+            metadata={
+                **status.metadata,
+                "checkpoint_scope": "process_only",
+                "process_checkpoint_size_bytes": size_bytes,
+                "process_checkpoint_file_count": file_count,
             },
         )
 
@@ -502,12 +513,22 @@ class RuncRuntime(Runtime):
     ) -> RuntimeOperationStatus:
         dataset = self.dataset_name_for(sandbox_id)
         snapshot = f"{dataset}@{checkpoint_id}"
-        return self._run_status(
+        status = self._run_status(
             [self._zfs_bin, "snapshot", snapshot],
             operation="sandbox.checkpoint_filesystem",
             sandbox_id=sandbox_id,
             checkpoint_id=checkpoint_id,
             metadata=self.filesystem_checkpoint_metadata(sandbox_id, checkpoint_id),
+        )
+        written_bytes, used_bytes = self._query_zfs_snapshot_sizes(snapshot, sandbox_id=sandbox_id, checkpoint_id=checkpoint_id)
+        return replace(
+            status,
+            metadata={
+                **status.metadata,
+                "checkpoint_scope": "filesystem_only",
+                "filesystem_checkpoint_written_bytes": written_bytes,
+                "filesystem_checkpoint_used_bytes": used_bytes,
+            },
         )
 
     def restore_filesystem(
@@ -890,3 +911,49 @@ class RuncRuntime(Runtime):
             args.append("--shell-job")
         args.extend(self._restore_options.extra_args)
         return args
+
+    def _summarize_directory(self, path: Path) -> tuple[int, int]:
+        size_bytes = 0
+        file_count = 0
+        try:
+            for root, _, files in os.walk(path):
+                for name in files:
+                    file_path = Path(root) / name
+                    try:
+                        size_bytes += file_path.stat().st_size
+                        file_count += 1
+                    except OSError:
+                        continue
+        except OSError:
+            return 0, 0
+        return size_bytes, file_count
+
+    def _query_zfs_snapshot_sizes(
+        self,
+        snapshot: str,
+        *,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> tuple[int | None, int | None]:
+        result = self._run_command(
+            [self._zfs_bin, "get", "-Hp", "-o", "property,value", "written,used", snapshot],
+            operation="sandbox.zfs_snapshot_stats",
+            sandbox_id=sandbox_id,
+            checkpoint_id=checkpoint_id,
+            check=False,
+            metadata={"snapshot": snapshot},
+        )
+        if result.returncode != 0:
+            return None, None
+        values: dict[str, int] = {}
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            property_name = parts[0].strip()
+            raw_value = parts[1].strip()
+            try:
+                values[property_name] = int(raw_value)
+            except ValueError:
+                continue
+        return values.get("written"), values.get("used")
