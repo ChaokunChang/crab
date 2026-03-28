@@ -170,8 +170,9 @@ The real-host benchmarks share `RealHostScenarioHarness` in [benchmarks/real_hos
 That harness:
 
 - Builds the simulated agent image
-- Creates a temporary ZFS pool
+- Creates or reuses a benchmark ZFS pool
 - Prepares sandbox bundles and rootfs state before launch
+- Reuses shared rootfs base datasets and clones ZFS snapshots into sandbox datasets when benchmark rootfs reuse is enabled
 - Launches `runc` sandboxes through an explicit phased pipeline
 - Runs an interceptor server in front of the benchmark LLM router over HTTP on `localhost`
 - Wires `AgentCRSystem` with policy-specific retention and recovery settings
@@ -198,7 +199,7 @@ The benchmark runner now coordinates three phases across the whole run:
 2. `run`
 3. `verification`
 
-`run` does not begin until all sandboxes finish `setup`, and `verification` does not begin until all sandboxes finish `run`. Each phase has its own configurable worker limit from benchmark YAML.
+By default, `run` does not begin until all sandboxes finish `setup`, and `verification` does not begin until all sandboxes finish `run`. When `phase_merging.setup_and_run` is enabled, eligible per-sandbox flows can pipeline setup directly into run so each sandbox starts run work immediately after its own setup completes. The verification barrier remains unchanged. Each phase has its own configurable worker limit from benchmark YAML.
 
 The main benchmark entrypoints and configuration surface are:
 

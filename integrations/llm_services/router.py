@@ -23,6 +23,7 @@ from agent_cr.telemetry import (
 )
 
 from integrations.llm_services.iflow_trace_replay.service import TraceReplayLLMState
+from integrations.llm_services.mini_swe_trace_replay.service import TraceReplayLLMState as MiniSWETraceReplayLLMState
 from integrations.llm_services.manual.service import ManualLLMState, handle_control_request
 from integrations.llm_services.simulated.service import SimulatedLLMState, handle_request as handle_simulated_request
 from integrations.llm_services.simulated_for_iflow.service import (
@@ -47,12 +48,14 @@ def _sandbox_id_from_request(headers: dict[str, str], payload: dict[str, Any]) -
 def default_llm_service_type_for_agent(agent_type: str) -> str:
     if agent_type == "iflow":
         return "simulated_for_iflow"
+    if agent_type == "mini_swe":
+        return "mini_swe_trace_replay"
     return "simulated"
 
 
 def validate_llm_service_type(*, provider: str, llm_service_type: str) -> None:
-    openai_only = {"manual", "simulated_for_iflow", "iflow_trace_replay"}
-    supported = {"simulated", "manual", "simulated_for_iflow", "iflow_trace_replay"}
+    openai_only = {"manual", "simulated_for_iflow", "iflow_trace_replay", "mini_swe_trace_replay"}
+    supported = {"simulated", "manual", "simulated_for_iflow", "iflow_trace_replay", "mini_swe_trace_replay"}
     if llm_service_type not in supported:
         raise ValueError(f"unsupported llm service type: {llm_service_type}")
     if provider == "anthropic" and llm_service_type in openai_only:
@@ -149,12 +152,30 @@ class IFlowTraceReplayServiceState:
         self._state.restore(consumed_response_count=consumed_response_count)
 
 
+class MiniSWETraceReplayServiceState:
+    def __init__(self, *, llm_service_config: dict[str, object] | None = None) -> None:
+        self._state = MiniSWETraceReplayLLMState(llm_service_config=llm_service_config)
+
+    def handle_request(self, *, path: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
+        return self._state.handle_request(path=path, headers=headers, payload=payload)
+
+    def snapshot(self) -> dict[str, Any]:
+        return self._state.snapshot()
+
+    def reset(self) -> None:
+        self._state.reset()
+
+    def restore(self, *, consumed_response_count: int) -> None:
+        self._state.restore(consumed_response_count=consumed_response_count)
+
+
 def build_llm_service_registry() -> dict[str, type[LLMServiceState]]:
     return {
         "manual": ManualServiceState,
         "simulated": SimulatedServiceState,
         "simulated_for_iflow": SimulatedForIFlowServiceState,
         "iflow_trace_replay": IFlowTraceReplayServiceState,
+        "mini_swe_trace_replay": MiniSWETraceReplayServiceState,
     }
 
 

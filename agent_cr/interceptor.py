@@ -657,8 +657,8 @@ class AgentCRRequestInterceptorServer:
 
     def stop(self) -> None:
         self._server.shutdown()
-        self._server.server_close()
         self._upstream_client.close()
+        self._server.server_close()
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             self._thread = None

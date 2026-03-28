@@ -239,6 +239,10 @@ phase_workers:
   setup: 16
   run: 32
   verification: 8
+rootfs_reuse:
+  enabled: true
+phase_merging:
+  setup_and_run: false
 executor:
   checkpoint_workers: 32
   restore_workers: 32
@@ -262,6 +266,8 @@ iterations: 5
 output: logs/tmp/out.csv
 log_file: logs/tmp/out.log
 log_file_mode: append | write
+verification:
+  enabled: true
 benchmark_root: logs/tmp/benchmark-runs
 storage_planes:
   runtime_root: /mnt/agent-cr-runtime
@@ -270,6 +276,7 @@ storage_planes:
 telemetry_output: logs/tmp/out.telemetry.jsonl  # legacy top-level form, still supported
 telemetry:
   output: logs/tmp/out.telemetry.jsonl
+  file_mode: append | write
   detail_level: basic | detailed
   capture_command_output: false
   max_text_attribute_bytes: 2048
@@ -310,13 +317,17 @@ For the fault scenario, `scenario_options` also supports:
 Benchmark runs now use a three-phase pipeline:
 
 - `setup`: shared image/materialization work, bundle/rootfs/workdir/network setup, sandbox launch, and any readiness that must complete before the benchmark task starts
-- `run`: scenario workload/recovery logic after all initial sandbox setup has completed
-- `verification`: post-run validation
+- `run`: scenario workload/recovery logic after sandbox setup has completed
+- `verification`: post-run validation when `verification.enabled` is `true`
 
-The runner enforces hard barriers:
+By default, the runner enforces hard barriers:
 
 - all sandboxes must finish `setup` before any sandbox enters `run`
 - all sandboxes must finish `run` before any sandbox enters `verification`
+
+`phase_merging.setup_and_run: true` relaxes only the first barrier for per-sandbox scenario flows (`fault`, `spot`, `tree`, and replay-style `e2e`). In that mode, each sandbox can enter `run` as soon as its own `setup` finishes. The verification barrier remains unchanged, and cohort-style non-replay `e2e` still uses the old setup barrier.
+
+If `verification.enabled: false`, the verification phase is skipped entirely.
 
 `phase_workers` lets each phase use a different concurrency limit. When `phase_workers` is omitted, or when a phase key is missing, that phase falls back to `max_workers` and then to `sandboxes`.
 
@@ -332,6 +343,8 @@ phase_workers:
 ```
 
 This fully sets up all 100 sandboxes first, then starts the run phase with at most 32 concurrent run workers, and only starts verification after every run-phase task is complete.
+
+`rootfs_reuse.enabled` defaults to `true`. In real-host ZFS-backed benchmarks, the harness now materializes a shared base rootfs per normalized recipe, snapshots it once, and clones that snapshot for each sandbox instead of copying a full rootfs into every sandbox dataset. For compose-backed tasks, the recipe is anchored by `docker_compose_file`, `service_name`, `agent_type`, and normalized rootfs materialization inputs. When `reuse_zpool: true`, compose-backed shared rootfs bases persist in the reused pool across benchmark runs; otherwise reuse is limited to the current benchmark run.
 
 The benchmark YAML also exposes run-phase tuning for the core Agent-CR system:
 
@@ -392,11 +405,13 @@ Logging notes:
 - `log_file_mode` controls the Python `FileHandler` mode.
 - Default `log_file_mode: append` preserves existing log history.
 - Use `log_file_mode: write` when you want each benchmark run to start with a fresh log file.
+- `verification.enabled` defaults to `true`. Set it to `false` to skip the benchmark verification phase and omit verification fields from output rows.
 - `benchmark_root` places each run under a timestamped subdirectory rooted at the configured path. If omitted, benchmarks use a temporary directory. `AGENTCR_BENCH_DIR` is still accepted as a fallback for older workflows.
 - `benchmark_root` is still the benchmark artifact root and the default home for runtime bundles, runtime checkpoint images, sandbox metadata, checkpoint storage, exported image rootfs, and agent host state. Use `storage_planes` only when you want to move some of that hot write traffic elsewhere.
 - `benchmark.run` now logs an explicit start marker and end marker for each run, and the final summary/artifact paths are logged as well as printed.
 - Benchmark YAML supports a nested `telemetry:` block for telemetry output and detail controls.
 - `telemetry.output` sets the JSONL artifact path. If omitted, the runner defaults to `<output>.telemetry.jsonl` or `<config>.telemetry.jsonl`.
+- `telemetry.file_mode` defaults to `append`. Use `write` to remove any existing telemetry JSONL once at run start before the harness and router append fresh records.
 - `telemetry.detail_level` accepts `basic` or `detailed`.
 - `telemetry.capture_command_output` is `false` by default to avoid storing command stdout/stderr in normal runs.
 - `telemetry.max_text_attribute_bytes` bounds long text attributes when detailed capture is enabled.
@@ -406,15 +421,18 @@ Logging notes:
 - `telemetry.report.output_dir` overrides the default `<telemetry_output>.report` directory.
 - `telemetry.report.top_k`, `telemetry.report.log_scale_charts`, and `telemetry.report.export_svg` tune report output.
 - The legacy top-level `telemetry_output` field is still accepted for compatibility, but `telemetry.output` is the preferred YAML form.
+- The legacy top-level `telemetry_file_mode` field is also accepted for compatibility, but `telemetry.file_mode` is the preferred YAML form.
 - In `llm_server.launch_mode: process`, the router subprocess writes telemetry with the same `run_id` into the same JSONL file as the harness.
 - `monitoring.enabled` turns host and per-sandbox resource sampling on or off during the run.
 - `monitoring.sample_interval_ms` controls the sampling cadence.
 - `monitoring.include_host` and `monitoring.include_sandboxes` control host and per-sandbox monitoring coverage.
 - `phase_workers` overrides concurrency per benchmark phase. Missing phase keys fall back to `max_workers`.
+- `rootfs_reuse.enabled` defaults to `true`. Set it to `false` to restore the older per-sandbox rootfs materialization path.
+- `phase_merging.setup_and_run` defaults to `false`. Set it to `true` to pipeline setup directly into run for eligible per-sandbox scenarios.
 - Phase telemetry now emits distinct phase-qualified records such as `benchmark.phase.setup.*`, `benchmark.phase.run.*`, `benchmark.phase.verification.*`, and `benchmark.phase.<phase>.item.*` so JSONL output shows phase timing and configured concurrency.
 - `zpool_size` controls the backing file size for ephemeral benchmark zpools.
 - `reuse_zpool: true` keeps the zpool across runs instead of recreating it every time.
-- When reusing a pool, set both `zpool_name` and `zpool_image` to stable values. Each run still destroys and recreates the `pool/agent-cr` dataset so the benchmark starts clean.
+- When reusing a pool, set both `zpool_name` and `zpool_image` to stable values. Each run still destroys and recreates the `pool/agent-cr` dataset so the benchmark starts clean, but compose-backed shared rootfs cache datasets created by `rootfs_reuse.enabled: true` are reused until the pool itself is destroyed.
 
 ### LLM Service Options
 

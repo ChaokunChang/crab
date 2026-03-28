@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
+import io
 from pathlib import Path
 import tempfile
 import threading
@@ -11,9 +13,10 @@ from unittest import mock
 
 from agent_cr import CheckpointId, JobStatus, LatestOnlyCheckpointManager, LocalCheckpointManager, SandboxId, StorageConfig
 from integrations.agents import SandboxHandle
-from benchmarks.config import BenchmarkConfig
+from benchmarks.config import BenchmarkConfig, BenchmarkPhaseMergingConfig, BenchmarkPhaseWorkers
 from benchmarks.real_host_scenario_base import RealHostScenarioHarness
 from benchmarks.scenarios.common import choose_replay_chunk_targets, wait_for_auto_replay_checkpoint
+from benchmarks.scenarios.e2e import run_manual as run_e2e_manual, summary_metrics as summarize_e2e
 from benchmarks.scenarios.fault import (
     build_harness_settings as build_fault_harness_settings,
     parse_fault_options,
@@ -73,7 +76,8 @@ class _FakeTaskRun:
             finally:
                 with self._harness._progress_lock:
                     self._harness._active_progress -= 1
-        payload = {"total_actions": max(int(self._harness._statuses[sandbox_id]["total_actions"]), minimum_actions)}
+        total_actions = max(int(self._harness._statuses[sandbox_id]["total_actions"]), minimum_actions)
+        payload = self._harness._action_payload(total_actions)
         self._harness._statuses[sandbox_id] = payload
         self._harness._progress_actions[sandbox_id] = int(payload["total_actions"])
         self._sandbox.last_status = payload
@@ -82,7 +86,7 @@ class _FakeTaskRun:
     def wait_for_action_delta(self, *, delta: int) -> dict[str, object]:
         sandbox_id = str(self._sandbox.sandbox_id)
         self._harness.wait_for_action_delta_calls.append((sandbox_id, delta))
-        payload = {"total_actions": int(self._sandbox.last_status["total_actions"]) + delta}
+        payload = self._harness._action_payload(int(self._sandbox.last_status["total_actions"]) + delta)
         self._harness._statuses[sandbox_id] = payload
         self._sandbox.last_status = payload
         return payload
@@ -99,6 +103,7 @@ class _BaseScenarioHarness:
         self.storage = _FakeStorage()
         self._next_port = 20000
         self._statuses: dict[str, dict[str, object]] = {}
+        self._handles: dict[str, SandboxHandle] = {}
         self._checkpoint_counts: dict[str, int] = {}
         self._progress_actions: dict[str, int] = {}
         self.launched: list[str] = []
@@ -126,6 +131,16 @@ class _BaseScenarioHarness:
         self._unreachable_sandboxes: set[str] = set()
         self.wait_for_task_completion_calls: list[str] = []
         self.verify_task_accuracy_calls: list[str] = []
+        self.deactivate_sandbox_runtime_calls: list[str] = []
+        self.request_state_store = None
+
+    def _action_payload(self, total_actions: int) -> dict[str, object]:
+        return {
+            "total_actions": total_actions,
+            "filesystem_actions": total_actions,
+            "process_actions": total_actions,
+            "network_actions": total_actions,
+        }
 
     def _record_for_config(self, config: BenchmarkConfig, sandbox_index: int) -> BenchmarkTaskRecord:
         return BenchmarkTaskRecord(
@@ -150,20 +165,25 @@ class _BaseScenarioHarness:
                 with self._setup_lock:
                     self._active_setups -= 1
         sandbox_id = SandboxId(sandbox_name)
+        trace_response_count = record.trace_response_count
+        if trace_response_count is None and record.llm_service_type == "iflow_trace_replay":
+            trace_response_count = 10
         handle = SandboxHandle(
             sandbox_id=sandbox_id,
             bundle_dir=Path("/tmp") / sandbox_name,
             status_port=self._next_port,
-            last_status={"total_actions": 0},
+            last_status=self._action_payload(0),
             agent_type=record.agent_type,
             llm_service_type=record.llm_service_type,
-            launch_metadata={"benchmark": {"task_id": record.task_id, "trace_response_count": record.trace_response_count}},
-        )
+            launch_metadata={"benchmark": {"task_id": record.task_id, "trace_response_count": trace_response_count}},
+            )
         self._next_port += 1
-        self._statuses[str(sandbox_id)] = {"total_actions": 0}
+        self._statuses[str(sandbox_id)] = self._action_payload(0)
         self._checkpoint_counts[str(sandbox_id)] = 0
         handle.task_run = _FakeTaskRun(self, handle)
+        self._handles[str(sandbox_id)] = handle
         self.launched.append(sandbox_name)
+        self.phase_events.append(("setup_done", sandbox_name))
         return SimpleNamespace(
             sandbox_name=sandbox_name,
             task_record=record,
@@ -185,6 +205,7 @@ class _BaseScenarioHarness:
         self.checkpoint_if_due_calls.append(sandbox_id)
         self._checkpoint_counts[sandbox_id] = self._checkpoint_counts.get(sandbox_id, 0) + 1
         return SimpleNamespace(
+            sandbox_id=sandbox.sandbox_id,
             checkpoint_id=CheckpointId(f"{sandbox_id}-ckpt-{self._checkpoint_counts[sandbox_id]}"),
             status=JobStatus.SUCCEEDED,
             message="",
@@ -211,7 +232,7 @@ class _BaseScenarioHarness:
         if sandbox_id == self.fail_on_restore_sandbox:
             raise RuntimeError(f"restore failed for {sandbox_id}")
         restored_actions = self._progress_actions.get(sandbox_id, 6)
-        self._statuses[sandbox_id] = {"total_actions": restored_actions}
+        self._statuses[sandbox_id] = self._action_payload(restored_actions)
         now = datetime.now(timezone.utc)
         return SimpleNamespace(
             started_at=now,
@@ -232,7 +253,7 @@ class _BaseScenarioHarness:
             return SimpleNamespace(status="failed")
         if event_type == "fault":
             restored_actions = self._progress_actions.get(sandbox_id, 6)
-            self._statuses[sandbox_id] = {"total_actions": restored_actions}
+            self._statuses[sandbox_id] = self._action_payload(restored_actions)
         return SimpleNamespace(status="restored")
 
     def notify_fault(self, sandbox: SandboxHandle, *, reason: str = "fault") -> None:
@@ -263,15 +284,23 @@ class _BaseScenarioHarness:
         payload = {
             "state": "finished",
             "total_actions": final_actions,
+            "filesystem_actions": final_actions,
+            "process_actions": final_actions,
+            "network_actions": final_actions,
             "replay_trace_cursor": final_actions,
             "replay_is_complete": True,
         }
         self._statuses[sandbox_id] = payload
         sandbox.last_status = dict(payload)
+        self.phase_events.append(("run_done", sandbox_id))
+
+    def get_sandbox_handle(self, sandbox_id: str) -> SandboxHandle:
+        return self._handles[sandbox_id]
 
     def verify_task_accuracy(self, sandbox: SandboxHandle, timeout_s: float | None = None) -> dict[str, object]:
         _ = (sandbox, timeout_s)
         self.verify_task_accuracy_calls.append(str(sandbox.sandbox_id))
+        self.phase_events.append(("verify", str(sandbox.sandbox_id)))
         return {
             "verification_status": "passed",
             "verification_exit_code": 0,
@@ -280,6 +309,11 @@ class _BaseScenarioHarness:
             "verification_stderr": "",
             "verification_command": "bash /tests/run-tests.sh",
         }
+
+    def deactivate_sandbox_runtime(self, sandbox: SandboxHandle) -> None:
+        sandbox_id = str(sandbox.sandbox_id)
+        self.deactivate_sandbox_runtime_calls.append(sandbox_id)
+        self.phase_events.append(("deactivate", sandbox_id))
 
 
 class FaultScenarioTests(unittest.TestCase):
@@ -323,6 +357,27 @@ class FaultScenarioTests(unittest.TestCase):
         setup_events = [event for event in prior_events if event[0] == "setup"]
         self.assertEqual(sorted(name for _, name in setup_events), ["fault-0", "fault-1"])
         self.assertFalse(any(event[0] == "run" for event in prior_events))
+
+    def test_manual_mode_can_merge_setup_and_run_phase(self) -> None:
+        harness = _BaseScenarioHarness()
+        harness.setup_delay_s = 0.01
+
+        run_fault_manual(
+            _config(
+                "fault",
+                "manual",
+                sandboxes=2,
+                max_workers=1,
+                phase_workers=BenchmarkPhaseWorkers(setup=1, run=1, verification=1),
+                phase_merging=BenchmarkPhaseMergingConfig(setup_and_run=True),
+            ),
+            harness,
+        )
+
+        first_run_index = next(index for index, event in enumerate(harness.phase_events) if event[0] == "run")
+        setup_done_before_run = [event for event in harness.phase_events[:first_run_index] if event[0] == "setup_done"]
+        self.assertEqual(len(setup_done_before_run), 1)
+        self.assertEqual(setup_done_before_run[0][1], "fault-0")
 
     def test_auto_mode_uses_deterministic_per_sandbox_fault_selection(self) -> None:
         harness = _BaseScenarioHarness()
@@ -550,6 +605,75 @@ class FaultScenarioTests(unittest.TestCase):
         self.assertEqual(harness.wait_for_task_completion_calls, ["fault-0"])
         self.assertEqual(harness.verify_task_accuracy_calls, ["fault-0"])
 
+    def test_replay_auto_mode_can_skip_final_verification(self) -> None:
+        harness = _BaseScenarioHarness()
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("fault-0"),
+            bundle_dir=Path("/tmp/fault-0"),
+            status_port=20000,
+            last_status={"total_actions": 0},
+            agent_type="iflow",
+            llm_service_type="iflow_trace_replay",
+            launch_metadata={"benchmark": {"task_id": "amuse-install", "trace_response_count": 10}},
+        )
+        sandbox.task_run = _FakeTaskRun(harness, sandbox)
+        harness._statuses[str(sandbox.sandbox_id)] = {"total_actions": 0}
+        harness._progress_actions[str(sandbox.sandbox_id)] = 0
+        config = _config(
+            "fault",
+            "auto",
+            sandboxes=1,
+            iterations=2,
+            agent="iflow",
+            llm_service="iflow_trace_replay",
+            verification_enabled=False,
+            scenario_options={"injection_rate": 0.0, "first_injection_iteration": 2},
+        )
+
+        with mock.patch(
+            "benchmarks.scenarios.fault.wait_for_auto_replay_checkpoint",
+            return_value=(SimpleNamespace(metadata={"benchmark_trace_cursor": 2}), 2),
+        ):
+            row = run_replay_auto_sandbox(
+                config,
+                harness,
+                sandbox_index=0,
+                sandbox=sandbox,
+                options=parse_fault_options(config),
+            )
+
+        self.assertEqual(row["task_error"], "")
+        self.assertEqual(row["success_ratio"], 1.0)
+        self.assertNotIn("verification_status", row)
+        self.assertEqual(harness.wait_for_task_completion_calls, [])
+        self.assertEqual(harness.verify_task_accuracy_calls, [])
+
+    def test_replay_auto_mode_merged_phases_waits_for_completion_and_deactivates_when_verification_is_disabled(self) -> None:
+        harness = _BaseScenarioHarness()
+        config = _config(
+            "fault",
+            "auto",
+            sandboxes=1,
+            iterations=2,
+            agent="iflow",
+            llm_service="iflow_trace_replay",
+            verification_enabled=False,
+            phase_merging=BenchmarkPhaseMergingConfig(setup_and_run=True),
+            scenario_options={"injection_rate": 0.0, "first_injection_iteration": 2},
+        )
+
+        with mock.patch(
+            "benchmarks.scenarios.fault.wait_for_auto_replay_checkpoint",
+            return_value=(SimpleNamespace(metadata={"benchmark_trace_cursor": 2}), 2),
+        ):
+            rows = run_fault_auto(config, harness)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["success_ratio"], 1.0)
+        self.assertEqual(harness.wait_for_task_completion_calls, ["fault-0"])
+        self.assertEqual(harness.deactivate_sandbox_runtime_calls, ["fault-0"])
+        self.assertNotIn("verification_status", rows[0])
+
     def test_replay_auto_mode_uses_chunk_checkpoint_for_forced_fault(self) -> None:
         class _ReplayChunkTaskRun:
             def __init__(self, sandbox: SandboxHandle) -> None:
@@ -682,6 +806,94 @@ class SpotScenarioTests(unittest.TestCase):
         injected_rows = [(int(row["iteration"]), row["sandbox_id"]) for row in rows if int(row["event_injected"]) == 1]
         self.assertEqual(injected_rows, [(2, "spot-0"), (2, "spot-1")])
         self.assertEqual(harness.notify_preemption_calls, ["spot-0", "spot-1"])
+
+
+class E2EScenarioTests(unittest.TestCase):
+    def test_replay_mode_keeps_verification_after_all_run_work_when_setup_and_run_are_merged(self) -> None:
+        harness = _BaseScenarioHarness()
+        config = _config(
+            "e2e",
+            "manual",
+            sandboxes=2,
+            max_workers=1,
+            phase_workers=BenchmarkPhaseWorkers(setup=1, run=1, verification=1),
+            agent="iflow",
+            llm_service="iflow_trace_replay",
+            phase_merging=BenchmarkPhaseMergingConfig(setup_and_run=True),
+        )
+
+        rows = run_e2e_manual(config, harness)
+
+        self.assertEqual(len(rows), 2)
+        first_verify_index = next(index for index, event in enumerate(harness.phase_events) if event[0] == "verify")
+        run_done_before_verify = [event for event in harness.phase_events[:first_verify_index] if event[0] == "run_done"]
+        self.assertEqual(len(run_done_before_verify), 2)
+        self.assertEqual(sorted(name for _, name in run_done_before_verify), ["sandbox-0", "sandbox-1"])
+
+    def test_non_replay_mode_keeps_run_barrier_even_when_phase_merging_is_enabled(self) -> None:
+        harness = _BaseScenarioHarness()
+        harness.setup_delay_s = 0.01
+        config = _config(
+            "e2e",
+            "manual",
+            sandboxes=2,
+            max_workers=1,
+            phase_workers=BenchmarkPhaseWorkers(setup=1, run=1, verification=1),
+            agent="simulated",
+            llm_service="simulated",
+            phase_merging=BenchmarkPhaseMergingConfig(setup_and_run=True),
+        )
+
+        run_e2e_manual(config, harness)
+
+        first_run_index = next(index for index, event in enumerate(harness.phase_events) if event[0] == "run")
+        setup_done_before_run = [event for event in harness.phase_events[:first_run_index] if event[0] == "setup_done"]
+        self.assertEqual(sorted(name for _, name in setup_done_before_run), ["sandbox-0", "sandbox-1"])
+
+    def test_replay_mode_can_skip_verification_phase(self) -> None:
+        harness = _BaseScenarioHarness()
+        config = _config(
+            "e2e",
+            "manual",
+            sandboxes=1,
+            agent="iflow",
+            llm_service="iflow_trace_replay",
+            verification_enabled=False,
+        )
+
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            rows = run_e2e_manual(config, harness)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["success_ratio"], 1.0)
+        self.assertIn("task_completion_ms", rows[0])
+        self.assertNotIn("verification_status", rows[0])
+        self.assertEqual(harness.wait_for_task_completion_calls, ["sandbox-0"])
+        self.assertEqual(harness.verify_task_accuracy_calls, [])
+        self.assertIn("task_completion_ms", summarize_e2e(config, rows))
+        self.assertIn(
+            "benchmark.phase.verification skipped sandboxes=1 max_workers=1",
+            buffer.getvalue(),
+        )
+
+    def test_replay_mode_merged_phases_deactivates_finished_sandbox_when_verification_is_disabled(self) -> None:
+        harness = _BaseScenarioHarness()
+        config = _config(
+            "e2e",
+            "manual",
+            sandboxes=1,
+            agent="iflow",
+            llm_service="iflow_trace_replay",
+            verification_enabled=False,
+            phase_merging=BenchmarkPhaseMergingConfig(setup_and_run=True),
+        )
+
+        rows = run_e2e_manual(config, harness)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(harness.wait_for_task_completion_calls, ["sandbox-0"])
+        self.assertEqual(harness.deactivate_sandbox_runtime_calls, ["sandbox-0"])
 
 
 if __name__ == "__main__":

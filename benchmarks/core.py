@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Callable, Iterable, Sequence, TypeVar
 
@@ -20,6 +20,7 @@ from benchmarks.support import (
 
 
 T = TypeVar("T")
+U = TypeVar("U")
 R = TypeVar("R")
 
 
@@ -222,7 +223,7 @@ def benchmark_phase_item_attributes(
     }
 
 
-def _emit_phase_progress(
+def emit_benchmark_phase_progress(
     *,
     phase: str,
     status: str,
@@ -239,29 +240,37 @@ def _emit_phase_progress(
     print(line, flush=True)
 
 
-def benchmark_phase_map(
-    items: Sequence[T],
-    fn: Callable[[T], R],
+def emit_benchmark_phase_skipped(
     *,
     phase: str,
-    max_workers: int,
-    harness,
-    item_attributes: Callable[[T], dict[str, object]] | None = None,
-) -> list[R]:
-    if not items:
-        return []
-    worker_count = max(1, max_workers)
-    telemetry = getattr(harness, "telemetry", None)
+    sandbox_count: int,
+    configured_max_workers: int,
+) -> None:
+    emit_benchmark_phase_progress(
+        phase=phase,
+        status="skipped",
+        sandbox_count=sandbox_count,
+        configured_max_workers=configured_max_workers,
+    )
+
+
+def _begin_benchmark_phase(
+    *,
+    phase: str,
+    sandbox_count: int,
+    worker_count: int,
+    telemetry,
+):
     run_attributes = benchmark_phase_run_attributes(
         phase=phase,
-        sandbox_count=len(items),
+        sandbox_count=sandbox_count,
         configured_max_workers=worker_count,
     )
     phase_started_at = time.perf_counter()
-    _emit_phase_progress(
+    emit_benchmark_phase_progress(
         phase=phase,
         status="start",
-        sandbox_count=len(items),
+        sandbox_count=sandbox_count,
         configured_max_workers=worker_count,
     )
     phase_operation = None
@@ -276,6 +285,203 @@ def benchmark_phase_map(
             f"benchmark.phase.{phase}",
             run_attributes,
         )
+    return phase_started_at, phase_operation
+
+
+def _finish_benchmark_phase(
+    *,
+    phase: str,
+    sandbox_count: int,
+    worker_count: int,
+    phase_started_at: float,
+    phase_operation,
+    status: str,
+) -> None:
+    if phase_operation is not None:
+        phase_operation.finish(status="succeeded" if status == "end" else "failed")
+    emit_benchmark_phase_progress(
+        phase=phase,
+        status=status,
+        sandbox_count=sandbox_count,
+        configured_max_workers=worker_count,
+        duration_seconds=max(0.0, time.perf_counter() - phase_started_at),
+    )
+
+
+def _finish_phase_item_operation(item_operation, *, success: bool) -> None:
+    if item_operation is not None:
+        item_operation.finish(status="succeeded" if success else "failed")
+
+
+def benchmark_setup_run_pipeline(
+    items: Sequence[T],
+    *,
+    setup_fn: Callable[[T], U],
+    run_fn: Callable[[T, U], R],
+    setup_max_workers: int,
+    run_max_workers: int,
+    harness,
+    setup_item_attributes: Callable[[T], dict[str, object]] | None = None,
+    run_item_attributes: Callable[[T, U], dict[str, object]] | None = None,
+) -> list[R]:
+    if not items:
+        return []
+    setup_worker_count = max(1, setup_max_workers)
+    run_worker_count = max(1, run_max_workers)
+    telemetry = getattr(harness, "telemetry", None)
+    setup_started_at, setup_operation = _begin_benchmark_phase(
+        phase="setup",
+        sandbox_count=len(items),
+        worker_count=setup_worker_count,
+        telemetry=telemetry,
+    )
+    run_started_at: float | None = None
+    run_operation = None
+    run_started = False
+    setup_finished = False
+    results: list[R | None] = [None] * len(items)
+
+    def _invoke_setup(item: T) -> U:
+        item_operation = None
+        if telemetry is not None and setup_item_attributes is not None:
+            item_operation = start_operation(
+                telemetry,
+                "benchmark.phase.setup.item",
+                setup_item_attributes(item),
+            )
+        try:
+            result = setup_fn(item)
+        except Exception:
+            _finish_phase_item_operation(item_operation, success=False)
+            raise
+        _finish_phase_item_operation(item_operation, success=True)
+        return result
+
+    def _invoke_run(item: T, prepared: U) -> R:
+        item_operation = None
+        if telemetry is not None and run_item_attributes is not None:
+            item_operation = start_operation(
+                telemetry,
+                "benchmark.phase.run.item",
+                run_item_attributes(item, prepared),
+            )
+        try:
+            result = run_fn(item, prepared)
+        except Exception:
+            _finish_phase_item_operation(item_operation, success=False)
+            raise
+        _finish_phase_item_operation(item_operation, success=True)
+        return result
+
+    with (
+        ThreadPoolExecutor(max_workers=setup_worker_count) as setup_executor,
+        ThreadPoolExecutor(max_workers=run_worker_count) as run_executor,
+    ):
+        setup_futures: dict[Future[U], tuple[int, T]] = {
+            setup_executor.submit(_invoke_setup, item): (index, item)
+            for index, item in enumerate(items)
+        }
+        run_futures: dict[Future[R], tuple[int, T]] = {}
+        try:
+            while setup_futures or run_futures:
+                done, _ = wait(
+                    set(setup_futures) | set(run_futures),
+                    return_when=FIRST_COMPLETED,
+                )
+                for future in done:
+                    if future in setup_futures:
+                        index, item = setup_futures.pop(future)
+                        prepared = future.result()
+                        if not run_started:
+                            run_started_at, run_operation = _begin_benchmark_phase(
+                                phase="run",
+                                sandbox_count=len(items),
+                                worker_count=run_worker_count,
+                                telemetry=telemetry,
+                            )
+                            run_started = True
+                        run_futures[run_executor.submit(_invoke_run, item, prepared)] = (index, item)
+                        continue
+                    index, _item = run_futures.pop(future)
+                    results[index] = future.result()
+                if not setup_finished and not setup_futures:
+                    _finish_benchmark_phase(
+                        phase="setup",
+                        sandbox_count=len(items),
+                        worker_count=setup_worker_count,
+                        phase_started_at=setup_started_at,
+                        phase_operation=setup_operation,
+                        status="end",
+                    )
+                    setup_finished = True
+        except Exception:
+            for future in (*setup_futures, *run_futures):
+                future.cancel()
+            if not setup_finished:
+                _finish_benchmark_phase(
+                    phase="setup",
+                    sandbox_count=len(items),
+                    worker_count=setup_worker_count,
+                    phase_started_at=setup_started_at,
+                    phase_operation=setup_operation,
+                    status="failed",
+                )
+            if run_started and run_started_at is not None:
+                _finish_benchmark_phase(
+                    phase="run",
+                    sandbox_count=len(items),
+                    worker_count=run_worker_count,
+                    phase_started_at=run_started_at,
+                    phase_operation=run_operation,
+                    status="failed",
+                )
+            raise
+    if not setup_finished:
+        _finish_benchmark_phase(
+            phase="setup",
+            sandbox_count=len(items),
+            worker_count=setup_worker_count,
+            phase_started_at=setup_started_at,
+            phase_operation=setup_operation,
+            status="end",
+        )
+    if not run_started:
+        run_started_at, run_operation = _begin_benchmark_phase(
+            phase="run",
+            sandbox_count=len(items),
+            worker_count=run_worker_count,
+            telemetry=telemetry,
+        )
+    _finish_benchmark_phase(
+        phase="run",
+        sandbox_count=len(items),
+        worker_count=run_worker_count,
+        phase_started_at=run_started_at if run_started_at is not None else time.perf_counter(),
+        phase_operation=run_operation,
+        status="end",
+    )
+    return [result for result in results]
+
+
+def benchmark_phase_map(
+    items: Sequence[T],
+    fn: Callable[[T], R],
+    *,
+    phase: str,
+    max_workers: int,
+    harness,
+    item_attributes: Callable[[T], dict[str, object]] | None = None,
+) -> list[R]:
+    if not items:
+        return []
+    worker_count = max(1, max_workers)
+    telemetry = getattr(harness, "telemetry", None)
+    phase_started_at, phase_operation = _begin_benchmark_phase(
+        phase=phase,
+        sandbox_count=len(items),
+        worker_count=worker_count,
+        telemetry=telemetry,
+    )
 
     def _invoke(item: T) -> R:
         item_operation = None
@@ -288,34 +494,30 @@ def benchmark_phase_map(
         try:
             result = fn(item)
         except Exception:
-            if item_operation is not None:
-                item_operation.finish(status="failed")
+            _finish_phase_item_operation(item_operation, success=False)
             raise
-        if item_operation is not None:
-            item_operation.finish(status="succeeded")
+        _finish_phase_item_operation(item_operation, success=True)
         return result
 
     try:
         results = parallel_map(items, _invoke, max_workers=worker_count)
     except Exception:
-        if phase_operation is not None:
-            phase_operation.finish(status="failed")
-        _emit_phase_progress(
+        _finish_benchmark_phase(
             phase=phase,
-            status="failed",
             sandbox_count=len(items),
-            configured_max_workers=worker_count,
-            duration_seconds=max(0.0, time.perf_counter() - phase_started_at),
+            worker_count=worker_count,
+            phase_started_at=phase_started_at,
+            phase_operation=phase_operation,
+            status="failed",
         )
         raise
-    if phase_operation is not None:
-        phase_operation.finish(status="succeeded")
-    _emit_phase_progress(
+    _finish_benchmark_phase(
         phase=phase,
-        status="end",
         sandbox_count=len(items),
-        configured_max_workers=worker_count,
-        duration_seconds=max(0.0, time.perf_counter() - phase_started_at),
+        worker_count=worker_count,
+        phase_started_at=phase_started_at,
+        phase_operation=phase_operation,
+        status="end",
     )
     return results
 

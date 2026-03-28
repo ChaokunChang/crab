@@ -11,6 +11,7 @@ from typing import Iterable
 from .analyzer import (
     CheckpointAnalysisSummary,
     MetricSummary,
+    OverheadAnalysisSummary,
     PhaseSummary,
     ResourceAnalysisSummary,
     RestoreAnalysisSummary,
@@ -44,6 +45,12 @@ def _format_bytes(value: float) -> str:
 
 def _format_metric_label(metric_name: str) -> str:
     return metric_name.replace(".duration_ms", "").replace("_", " ")
+
+
+_OVERHEAD_METRIC_LABELS = {
+    "llm.gate_wait_ms": "llm.gate_wait",
+    "llm.agentcr_delay_ms": "llm.agentcr_delay",
+}
 
 
 def _format_window_seconds(window_size_seconds: float) -> str:
@@ -303,6 +310,10 @@ def _task_latency_rows(tasks: list[TaskSummary]) -> list[tuple[str, float]]:
     return [(task.sandbox_id, task.metrics.get("benchmark.task.duration_ms", 0.0)) for task in tasks]
 
 
+def _format_overhead_metric_label(metric_name: str) -> str:
+    return _OVERHEAD_METRIC_LABELS.get(metric_name, _format_metric_label(metric_name))
+
+
 def _phase_rows_for_csv(items: list[PhaseSummary]) -> list[dict[str, object]]:
     return [
         {
@@ -353,6 +364,24 @@ def _load_io_series(points, *, window_size_seconds: float | None = None) -> list
                 window_size_seconds=window_size_seconds,
             ),
         )
+    ]
+
+
+def _overhead_series(
+    overhead: OverheadAnalysisSummary,
+    *,
+    window_size_seconds: float | None = None,
+) -> list[tuple[str, list[tuple[float, float]]]]:
+    return [
+        (
+            _format_overhead_metric_label(metric_name),
+            _aggregate_window_series(
+                [(point.offset_seconds, point.value) for point in points],
+                window_size_seconds=window_size_seconds,
+            ),
+        )
+        for metric_name, points in overhead.time_series.items()
+        if points
     ]
 
 
@@ -525,6 +554,12 @@ def build_figure_svgs(
                 formatter=_format_ms,
                 show_points=True,
             )
+    if analysis.overhead_analysis is not None:
+        figures["overhead_latency.svg"] = _svg_line_chart(
+            "LLM Overhead Over Time",
+            _overhead_series(analysis.overhead_analysis, window_size_seconds=window_size_seconds),
+            formatter=_format_ms,
+        )
     if analysis.restore_analysis is not None:
         figures["restore_load_jobs.svg"] = _svg_line_chart(
             "Restore Load Over Time (Jobs)",
@@ -765,6 +800,35 @@ def render_report_html(
             "</section>"
         )
 
+    overhead_section = "<section><h2>Overhead Analysis</h2><p>No overhead data.</p></section>"
+    if analysis.overhead_analysis is not None and analysis.overhead_analysis.metrics:
+        overhead = analysis.overhead_analysis
+        overhead_note = _window_agg_note(window_size_seconds)
+        overhead_summary = _html_table(
+            ["Metric", "Mean (ms)", "Median (ms)", "Min (ms)", "Max (ms)", "P95 (ms)", "P99 (ms)"],
+            [
+                (
+                    _format_overhead_metric_label(item.metric_name),
+                    f"{item.mean_ms:.2f}",
+                    f"{item.p50_ms:.2f}",
+                    f"{item.min_ms:.2f}",
+                    f"{item.max_ms:.2f}",
+                    f"{item.p95_ms:.2f}",
+                    f"{item.p99_ms:.2f}",
+                )
+                for item in overhead.metrics
+            ],
+        )
+        overhead_section = (
+            "<section><h2>Overhead Analysis</h2>"
+            f"{overhead_note}"
+            f"{overhead_summary}"
+            "<section><h3>Window-Aggregated Overhead Over Time</h3>"
+            f"{figures.get('overhead_latency.svg', '<p>No data.</p>')}"
+            "</section>"
+            "</section>"
+        )
+
     restore_section = "<section><h2>Restore Analysis</h2><p>No restore data.</p></section>"
     if analysis.restore_analysis is not None:
         restore = analysis.restore_analysis
@@ -984,6 +1048,7 @@ def render_report_html(
       <section><h2>Average Checkpoint/Restore Breakdown</h2>{figures['checkpoint_breakdown.svg']}</section>
     </div>
     {checkpoint_section}
+    {overhead_section}
     {restore_section}
     {resource_section}
     <section>
@@ -1108,6 +1173,27 @@ def _restore_rows_for_csv(restore: RestoreAnalysisSummary | None) -> tuple[list[
         {"metric": "mean_source_gap_ms", "value": f"{restore.mean_source_gap_ms:.6f}"},
         {"metric": "p95_source_gap_ms", "value": f"{restore.p95_source_gap_ms:.6f}"},
         {"metric": "max_source_gap_ms", "value": f"{restore.max_source_gap_ms:.6f}"},
+    ]
+    return headers, rows
+
+
+def _overhead_rows_for_csv(overhead: OverheadAnalysisSummary | None) -> tuple[list[str], list[dict[str, object]]]:
+    headers = ["metric_name", "source_metric_name", "count", "mean_ms", "p50_ms", "min_ms", "max_ms", "p95_ms", "p99_ms"]
+    if overhead is None:
+        return headers, []
+    rows = [
+        {
+            "metric_name": item.metric_name,
+            "source_metric_name": item.source_metric_name,
+            "count": item.count,
+            "mean_ms": f"{item.mean_ms:.6f}",
+            "p50_ms": f"{item.p50_ms:.6f}",
+            "min_ms": f"{item.min_ms:.6f}",
+            "max_ms": f"{item.max_ms:.6f}",
+            "p95_ms": f"{item.p95_ms:.6f}",
+            "p99_ms": f"{item.p99_ms:.6f}",
+        }
+        for item in overhead.metrics
     ]
     return headers, rows
 
@@ -1287,6 +1373,23 @@ def generate_report_bundle(
                 "active_estimated_io_bytes": f"{item.active_estimated_io_bytes:.6f}",
             }
             for item in ([] if analysis.checkpoint_analysis is None else analysis.checkpoint_analysis.load_over_time)
+        ],
+    )
+
+    headers, rows = _overhead_rows_for_csv(analysis.overhead_analysis)
+    _write_csv(target_dir / "overhead_analysis.csv", headers, rows)
+    _write_csv(
+        target_dir / "overhead_timeseries.csv",
+        ["metric_name", "timestamp", "offset_seconds", "value_ms"],
+        [
+            {
+                "metric_name": metric_name,
+                "timestamp": point.timestamp,
+                "offset_seconds": f"{point.offset_seconds:.6f}",
+                "value_ms": f"{point.value:.6f}",
+            }
+            for metric_name, points in ([] if analysis.overhead_analysis is None else analysis.overhead_analysis.time_series.items())
+            for point in points
         ],
     )
 

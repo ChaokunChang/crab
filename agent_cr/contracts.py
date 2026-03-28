@@ -101,6 +101,20 @@ class Runtime(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def resilient_exec(
+        self,
+        sandbox_id: SandboxId,
+        argv: list[str],
+        *,
+        cwd: str | None = None,
+        env: dict[str, object] | None = None,
+        user: str | None = None,
+        timeout_s: float | None = None,
+        capture_output: bool = True,
+    ) -> SandboxExecResult:
+        raise NotImplementedError
+
+    @abstractmethod
     def checkpoint_process(
         self,
         sandbox_id: SandboxId,

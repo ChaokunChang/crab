@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import redirect_stdout
 import io
 import ipaddress
@@ -32,7 +32,7 @@ from integrations.sandboxes.runtime import image as sandbox_image
 from integrations.sandboxes.runtime import launcher as sandbox_launcher
 from integrations.sandboxes.runtime import network as sandbox_network
 from benchmarks.config import BenchmarkConfig
-from benchmarks.core import benchmark_phase_map
+from benchmarks.core import benchmark_phase_map, emit_benchmark_phase_skipped
 from benchmarks.scenarios.e2e import run_manual as run_e2e_manual
 from agent_cr.models import utc_now
 from benchmarks.scenarios.tree import choose_replay_steps
@@ -153,6 +153,149 @@ class BenchmarkHelperTests(unittest.TestCase):
         )
 
         self.assertEqual(resolved, harness.root)
+
+    def test_shared_rootfs_launch_metadata_reuses_key_for_duplicate_compose_recipe(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(),
+            scheduler_policy=None,
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+            reuse_zpool=True,
+        )
+        compose_file = Path("/tmp/task/docker-compose.yaml")
+        runtime_metadata_a = {
+            "rootfs_init_dirs": ["work", "tests"],
+            "rootfs_copy_paths": [
+                {"source": "/tmp/rootfs", "destination": "/"},
+                {"source": "/tmp/task/tests", "destination": "/tests"},
+            ],
+        }
+        runtime_metadata_b = {
+            "rootfs_init_dirs": ["tests", "work"],
+            "rootfs_copy_paths": [
+                {"source": "/tmp/task/tests", "destination": "/tests"},
+                {"source": "/tmp/rootfs", "destination": "/"},
+            ],
+        }
+
+        harness._attach_shared_rootfs_launch_metadata(
+            runtime_metadata_a,
+            agent_type="iflow",
+            compose_file=compose_file,
+            service_name="client",
+        )
+        harness._attach_shared_rootfs_launch_metadata(
+            runtime_metadata_b,
+            agent_type="iflow",
+            compose_file=compose_file,
+            service_name="client",
+        )
+
+        self.assertEqual(runtime_metadata_a["shared_rootfs_key"], runtime_metadata_b["shared_rootfs_key"])
+        self.assertTrue(runtime_metadata_a["shared_rootfs_persist"])
+        self.assertTrue(runtime_metadata_b["shared_rootfs_persist"])
+
+    def test_shared_rootfs_launch_metadata_logs_reuse_recipe(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(),
+            scheduler_policy=None,
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+            reuse_zpool=True,
+        )
+        runtime_metadata = {
+            "sandbox_id": "sbx-rootfs-log",
+            "rootfs_init_dirs": ["work", "tests"],
+            "rootfs_copy_paths": [
+                {"source": "/tmp/rootfs", "destination": "/"},
+                {"source": "/tmp/task/tests", "destination": "/tests"},
+            ],
+        }
+
+        with self.assertLogs("benchmarks.real_host_scenario_base", level="DEBUG") as captured:
+            harness._attach_shared_rootfs_launch_metadata(
+                runtime_metadata,
+                agent_type="iflow",
+                compose_file=Path("/tmp/task/docker-compose.yaml"),
+                service_name="client",
+            )
+
+        joined = "\n".join(captured.output)
+        self.assertIn("Configured shared rootfs reuse sandbox=sbx-rootfs-log", joined)
+        self.assertIn("Shared rootfs reuse recipe sandbox=sbx-rootfs-log", joined)
+
+    def test_shared_rootfs_launch_metadata_separates_service_name_and_run_scoped_reuse(self) -> None:
+        harness_a = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(),
+            scheduler_policy=None,
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+            reuse_zpool=True,
+            run_id="run-a",
+        )
+        harness_b = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(),
+            scheduler_policy=None,
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+            reuse_zpool=True,
+            run_id="run-b",
+        )
+        compose_primary = {
+            "rootfs_init_dirs": ["work"],
+            "rootfs_copy_paths": [{"source": "/tmp/rootfs", "destination": "/"}],
+        }
+        compose_secondary = {
+            "rootfs_init_dirs": ["work"],
+            "rootfs_copy_paths": [{"source": "/tmp/rootfs", "destination": "/"}],
+        }
+        run_scoped_a = {
+            "rootfs_init_dirs": ["work"],
+            "rootfs_copy_paths": [{"source": "/tmp/rootfs", "destination": "/"}],
+        }
+        run_scoped_b = {
+            "rootfs_init_dirs": ["work"],
+            "rootfs_copy_paths": [{"source": "/tmp/rootfs", "destination": "/"}],
+        }
+
+        harness_a._attach_shared_rootfs_launch_metadata(
+            compose_primary,
+            agent_type="iflow",
+            compose_file=Path("/tmp/task/docker-compose.yaml"),
+            service_name="client",
+        )
+        harness_a._attach_shared_rootfs_launch_metadata(
+            compose_secondary,
+            agent_type="iflow",
+            compose_file=Path("/tmp/task/docker-compose.yaml"),
+            service_name="worker",
+        )
+        harness_a._attach_shared_rootfs_launch_metadata(
+            run_scoped_a,
+            agent_type="simulated",
+            compose_file=None,
+            service_name=None,
+        )
+        harness_b._attach_shared_rootfs_launch_metadata(
+            run_scoped_b,
+            agent_type="simulated",
+            compose_file=None,
+            service_name=None,
+        )
+
+        self.assertNotEqual(compose_primary["shared_rootfs_key"], compose_secondary["shared_rootfs_key"])
+        self.assertTrue(compose_primary["shared_rootfs_persist"])
+        self.assertFalse(run_scoped_a["shared_rootfs_persist"])
+        self.assertFalse(run_scoped_b["shared_rootfs_persist"])
+        self.assertNotEqual(run_scoped_a["shared_rootfs_key"], run_scoped_b["shared_rootfs_key"])
 
     def test_build_tree_search_checkpoint_index_collects_steps(self) -> None:
         manifests = [
@@ -2698,6 +2841,35 @@ services:
         harness._delete_runtime.assert_not_called()
         harness._set_sandbox_running_state.assert_not_called()
 
+    def test_wait_for_fault_injection_window_skips_finished_task(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        completed = Future()
+        completed.set_result(None)
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-finished"),
+            bundle_dir=Path("/tmp/sbx-finished"),
+            status_port=8123,
+            last_status={"state": "finished"},
+            task_future=completed,
+        )
+        harness.request_state_store = SimpleNamespace(
+            get=lambda sandbox_id: SimpleNamespace(llm_request_in_flight=False)
+        )
+        harness.executor = SimpleNamespace(has_active_checkpoint=lambda sandbox_id: False)
+
+        with self.assertLogs("benchmarks.real_host_scenario_base", level="INFO") as captured:
+            result = harness.wait_for_fault_injection_window(sandbox, timeout_s=0.05)
+
+        self.assertFalse(result)
+        self.assertIn("Skipping fault injection for sandbox=sbx-finished because task already finished", "\n".join(captured.output))
+
     def test_load_dataset_normalizes_relative_paths_and_cycles_rows(self) -> None:
         harness = RealHostScenarioHarness(
             provider="openai",
@@ -2858,6 +3030,77 @@ services:
         run_prepared_task_record.assert_called_once_with(prepared)
         set_benchmark_launch_metadata.assert_not_called()
 
+    def test_setup_task_record_prepares_runtime_but_defers_launch_until_run_phase(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        record = BenchmarkTaskRecord(
+            agent_type="simulated",
+            task_description=TaskDescription("task"),
+            task_config=TaskConfig(),
+        )
+        handle = SandboxHandle(
+            sandbox_id=SandboxId("sbx-staged"),
+            bundle_dir=Path("/tmp/sbx-staged"),
+            status_port=8123,
+            last_status={},
+            agent_type=record.agent_type,
+            task_description=record.task_description,
+            task_config=record.task_config,
+        )
+        prepared = SimpleNamespace(
+            handle=handle,
+            sandbox_name="sbx-staged",
+            task_record=record,
+            runtime_prepared=False,
+            wait_for_ready_before_task_start=False,
+            wait_for_ready_after_task_start=False,
+            emit_ready_event=True,
+            runtime_launched=False,
+        )
+
+        with (
+            patch.object(harness, "_ensure_task_record_inputs") as ensure_task_record_inputs,
+            patch.object(harness, "_prepare_runc_task_record", return_value=prepared) as prepare_runc_task_record,
+            patch.object(harness, "_set_benchmark_launch_metadata") as set_benchmark_launch_metadata,
+            patch.object(harness, "_prepare_prepared_runtime") as prepare_prepared_runtime,
+            patch.object(harness, "_launch_prepared_runtime") as launch_prepared_runtime,
+        ):
+            result = harness.setup_task_record("sbx-staged", record)
+
+        self.assertIs(result, prepared)
+        ensure_task_record_inputs.assert_called_once_with("sbx-staged", record)
+        prepare_runc_task_record.assert_called_once_with(sandbox_name="sbx-staged", task_record=record)
+        set_benchmark_launch_metadata.assert_called_once_with(
+            handle,
+            sandbox_name="sbx-staged",
+            task_record=record,
+        )
+        prepare_prepared_runtime.assert_called_once_with(prepared)
+        launch_prepared_runtime.assert_not_called()
+
+        with (
+            patch.object(harness, "_prepare_prepared_runtime") as prepare_prepared_runtime,
+            patch.object(harness, "_launch_prepared_runtime") as launch_prepared_runtime,
+            patch.object(harness, "launch_task", return_value=Mock()) as launch_task,
+        ):
+            launched = harness.run_prepared_task_record(prepared)
+
+        self.assertIs(launched, handle)
+        prepare_prepared_runtime.assert_called_once_with(prepared)
+        launch_prepared_runtime.assert_called_once_with(prepared)
+        launch_task.assert_called_once_with(
+            record.agent_type,
+            record.task_description,
+            record.task_config,
+            "sbx-staged",
+        )
+
     def test_benchmark_phase_map_emits_phase_telemetry(self) -> None:
         telemetry = InMemoryTelemetrySink()
         harness = SimpleNamespace(telemetry=telemetry)
@@ -2892,6 +3135,20 @@ services:
         self.assertIn("benchmark.phase.setup.duration_ms", metric_names)
         self.assertIn("benchmark.phase.setup.item.duration_ms", metric_names)
         self.assertIn("benchmark.phase.setup.configured_max_workers", metric_names)
+
+    def test_emit_benchmark_phase_skipped_prints_progress_line(self) -> None:
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            emit_benchmark_phase_skipped(
+                phase="verification",
+                sandbox_count=3,
+                configured_max_workers=5,
+            )
+
+        self.assertEqual(
+            buffer.getvalue(),
+            "benchmark.phase.verification skipped sandboxes=3 max_workers=5\n",
+        )
 
     def test_e2e_benchmark_uses_shared_harness_launch_flow(self) -> None:
         task_run = SimpleNamespace(

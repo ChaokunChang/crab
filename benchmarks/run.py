@@ -4,8 +4,10 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
+import time
 
 from benchmarks.config import BenchmarkConfig, load_config
+from benchmarks.core import emit_benchmark_phase_progress
 from benchmarks.real_host_scenario_base import RealHostScenarioHarness
 from benchmarks.scenarios.e2e import SCENARIO as E2E_SCENARIO
 from benchmarks.scenarios.fault import SCENARIO as FAULT_SCENARIO
@@ -32,6 +34,13 @@ logger = logging.getLogger(__name__)
 
 def _default_report_output_dir(telemetry_output: Path) -> Path:
     return telemetry_output.with_suffix(".report")
+
+
+def _prepare_telemetry_output_path(path: Path, *, file_mode: str) -> None:
+    if file_mode != "write":
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.unlink(missing_ok=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -105,13 +114,10 @@ def _telemetry_metric_aliases(config: BenchmarkConfig, rows: list[dict[str, obje
             for key in ("recovery_ms", "readiness_ms", "end_to_end_recovery_ms", "migration_ms", "budget_slack_ms"):
                 attribute_filters[key] = {"event_injected": 1}
     elif config.scenario == "e2e":
-        if rows and "verification_status" in rows[0]:
-            aliases.update(
-                {
-                    "task_completion_ms": "benchmark.task.duration_ms",
-                    "verification_ms": "benchmark.task.verify.duration_ms",
-                }
-            )
+        if rows and "task_completion_ms" in rows[0]:
+            aliases["task_completion_ms"] = "benchmark.task.duration_ms"
+            if "verification_status" in rows[0]:
+                aliases["verification_ms"] = "benchmark.task.verify.duration_ms"
         else:
             aliases.update(
                 {
@@ -182,9 +188,11 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
             if config.output is not None
             else config.config_path.with_suffix(".telemetry.jsonl")
         )
+    _prepare_telemetry_output_path(telemetry_output, file_mode=config.telemetry_file_mode)
     executor_default_workers = max(settings.max_workers, config.effective_phase_workers.run)
     executor_config = config.executor.resolve(default_workers=executor_default_workers)
     try:
+        teardown_started_at: float | None = None
         with RealHostScenarioHarness(
             provider=config.provider,
             transfer_delay_ms=config.transfer_delay_ms,
@@ -222,55 +230,89 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
             runtime_root=config.storage_planes.runtime_root,
             storage_root=config.storage_planes.storage_root,
             agent_host_root=config.storage_planes.agent_host_root,
+            rootfs_reuse_enabled=config.rootfs_reuse.enabled,
         ) as harness:
             if scenario.prepare_harness is not None:
                 scenario.prepare_harness(config, harness)
             rows = scenario.runner_for_mode(config.mode)(config, harness)
-        if config.output is not None:
-            config.output.parent.mkdir(parents=True, exist_ok=True)
-            write_rows(str(config.output), rows)
-        summary = scenario.summarize(config, rows)
-        telemetry_aliases, telemetry_filters = _telemetry_metric_aliases(config, rows)
-        if telemetry_aliases:
-            telemetry_summary = compute_telemetry_summary(
-                telemetry_output,
-                telemetry_aliases,
-                run_id=str(run_context["run_id"]),
-                attribute_filters=telemetry_filters,
+            teardown_started_at = time.perf_counter()
+            emit_benchmark_phase_progress(
+                phase="teardown",
+                status="start",
+                sandbox_count=config.sandboxes,
+                configured_max_workers=1,
             )
-            if telemetry_summary:
-                summary = {**summary, **telemetry_summary}
-        report_dir: Path | None = None
-        if config.telemetry_report.enabled and telemetry_output.exists():
-            report_dir = config.telemetry_report.output_dir or _default_report_output_dir(telemetry_output)
-            try:
-                from benchmarks.telemetry_analysis import generate_report_bundle
-
-                generate_report_bundle(
-                    telemetry_output,
-                    output_dir=report_dir,
-                    top_k=max(5, int(config.telemetry_report.top_k)),
-                    log_scale=config.telemetry_report.log_scale_charts,
-                    export_svg=config.telemetry_report.export_svg,
-                )
-            except Exception:
-                logger.exception(
-                    "Telemetry report generation failed for telemetry_output=%s output_dir=%s",
-                    telemetry_output,
-                    report_dir,
-                )
-        _emit_lines(_summary_lines(summary))
-        failed_lines = _failed_sandbox_lines(rows)
-        if failed_lines:
-            _emit_lines(failed_lines)
-        artifact_lines = _artifact_lines(
-            log_file=config.log_file,
-            output=config.output,
-            telemetry_output=telemetry_output,
+        if teardown_started_at is not None:
+            emit_benchmark_phase_progress(
+                phase="teardown",
+                status="end",
+                sandbox_count=config.sandboxes,
+                configured_max_workers=1,
+                duration_seconds=max(0.0, time.perf_counter() - teardown_started_at),
+            )
+        postprocess_started_at = time.perf_counter()
+        emit_benchmark_phase_progress(
+            phase="postprocess",
+            status="start",
+            sandbox_count=config.sandboxes,
+            configured_max_workers=1,
         )
-        if report_dir is not None:
-            artifact_lines.append(f"telemetry_report: {report_dir.resolve()}")
-        _emit_lines(artifact_lines)
+        postprocess_completed = False
+        try:
+            if config.output is not None:
+                config.output.parent.mkdir(parents=True, exist_ok=True)
+                write_rows(str(config.output), rows)
+            summary = scenario.summarize(config, rows)
+            telemetry_aliases, telemetry_filters = _telemetry_metric_aliases(config, rows)
+            if telemetry_aliases:
+                telemetry_summary = compute_telemetry_summary(
+                    telemetry_output,
+                    telemetry_aliases,
+                    run_id=str(run_context["run_id"]),
+                    attribute_filters=telemetry_filters,
+                )
+                if telemetry_summary:
+                    summary = {**summary, **telemetry_summary}
+            report_dir: Path | None = None
+            if config.telemetry_report.enabled and telemetry_output.exists():
+                report_dir = config.telemetry_report.output_dir or _default_report_output_dir(telemetry_output)
+                try:
+                    from benchmarks.telemetry_analysis import generate_report_bundle
+
+                    generate_report_bundle(
+                        telemetry_output,
+                        output_dir=report_dir,
+                        top_k=max(5, int(config.telemetry_report.top_k)),
+                        log_scale=config.telemetry_report.log_scale_charts,
+                        export_svg=config.telemetry_report.export_svg,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Telemetry report generation failed for telemetry_output=%s output_dir=%s",
+                        telemetry_output,
+                        report_dir,
+                    )
+            _emit_lines(_summary_lines(summary))
+            failed_lines = _failed_sandbox_lines(rows)
+            if failed_lines:
+                _emit_lines(failed_lines)
+            artifact_lines = _artifact_lines(
+                log_file=config.log_file,
+                output=config.output,
+                telemetry_output=telemetry_output,
+            )
+            if report_dir is not None:
+                artifact_lines.append(f"telemetry_report: {report_dir.resolve()}")
+            _emit_lines(artifact_lines)
+            postprocess_completed = True
+        finally:
+            emit_benchmark_phase_progress(
+                phase="postprocess",
+                status="end" if postprocess_completed else "failed",
+                sandbox_count=config.sandboxes,
+                configured_max_workers=1,
+                duration_seconds=max(0.0, time.perf_counter() - postprocess_started_at),
+            )
         logger.info(
             "========== benchmark.run end status=completed config=%s duration_s=%.3f ==========",
             config.config_path.resolve(),

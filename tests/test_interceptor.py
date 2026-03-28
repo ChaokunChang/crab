@@ -566,6 +566,36 @@ class InterceptorTests(unittest.TestCase):
         self.assertEqual(payload["ok"], True)
         self.assertEqual(payload["upstream_url"], "http://127.0.0.1:9999")
 
+    def test_interceptor_server_stop_closes_upstream_connections_before_server_close(self) -> None:
+        server = AgentCRRequestInterceptorServer(
+            upstream_url="http://127.0.0.1:9999",
+            request_state_store=InMemoryRequestStateStore(),
+            port=0,
+        )
+        call_order: list[str] = []
+        server._server.server_close()
+
+        class _FakeServer:
+            server_address = ("127.0.0.1", 12345)
+
+            def shutdown(self) -> None:
+                call_order.append("shutdown")
+
+            def server_close(self) -> None:
+                call_order.append("server_close")
+
+        class _FakeUpstreamClient:
+            def close(self) -> None:
+                call_order.append("upstream_close")
+
+        server._server = _FakeServer()  # type: ignore[assignment]
+        server._upstream_client = _FakeUpstreamClient()  # type: ignore[assignment]
+        server._thread = None
+
+        server.stop()
+
+        self.assertEqual(call_order, ["shutdown", "upstream_close", "server_close"])
+
 
 if __name__ == "__main__":
     unittest.main()

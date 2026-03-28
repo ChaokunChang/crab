@@ -115,6 +115,20 @@ class InMemoryRuntime(Runtime):
         _ = (sandbox_id, argv, cwd, env, user, timeout_s, capture_output)
         raise NotImplementedError("sandbox exec is only supported for runc sandboxes")
 
+    def resilient_exec(
+        self,
+        sandbox_id: SandboxId,
+        argv: list[str],
+        *,
+        cwd: str | None = None,
+        env: dict[str, object] | None = None,
+        user: str | None = None,
+        timeout_s: float | None = None,
+        capture_output: bool = True,
+    ) -> SandboxExecResult:
+        _ = (sandbox_id, argv, cwd, env, user, timeout_s, capture_output)
+        raise NotImplementedError("resilient sandbox exec is only supported for runc sandboxes")
+
     def checkpoint_process(
         self,
         sandbox_id: SandboxId,

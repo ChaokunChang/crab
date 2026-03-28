@@ -52,6 +52,11 @@ _LLM_BREAKDOWN_METRICS = (
     "llm.agentcr_delay_ms",
 )
 
+_OVERHEAD_ANALYSIS_METRICS = (
+    "llm.gate_wait_ms",
+    "llm.agentcr_delay_ms",
+)
+
 _CHECKPOINT_BREAKDOWN_METRICS = (
     "checkpoint.flow.duration_ms",
     "checkpoint.process.duration_ms",
@@ -363,6 +368,12 @@ class ResourceAnalysisSummary:
 
 
 @dataclass(frozen=True)
+class OverheadAnalysisSummary:
+    metrics: list[MetricSummary]
+    time_series: dict[str, list[TimeSeriesPoint]]
+
+
+@dataclass(frozen=True)
 class PhaseSummary:
     phase: str
     started_at: str
@@ -407,6 +418,7 @@ class TelemetryAnalysis:
     detail_started_at: str
     detail_finished_at: str
     checkpoint_analysis: CheckpointAnalysisSummary | None = None
+    overhead_analysis: OverheadAnalysisSummary | None = None
     restore_analysis: RestoreAnalysisSummary | None = None
     resource_analysis: ResourceAnalysisSummary | None = None
     exclude_failed_tasks: bool = False
@@ -446,6 +458,7 @@ class TelemetryAnalysis:
             "detail_started_at": self.detail_started_at,
             "detail_finished_at": self.detail_finished_at,
             "checkpoint_analysis": None if self.checkpoint_analysis is None else asdict(self.checkpoint_analysis),
+            "overhead_analysis": None if self.overhead_analysis is None else asdict(self.overhead_analysis),
             "restore_analysis": None if self.restore_analysis is None else asdict(self.restore_analysis),
             "resource_analysis": None if self.resource_analysis is None else asdict(self.resource_analysis),
             "exclude_failed_tasks": self.exclude_failed_tasks,
@@ -1262,6 +1275,7 @@ def analyze_telemetry_file(
     interval_sources: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
     checkpoint_metrics: dict[tuple[str, str, str], dict[str, Any]] = defaultdict(dict)
     restore_metrics: dict[tuple[str, str, str], dict[str, Any]] = defaultdict(dict)
+    overhead_series_raw: dict[str, list[tuple[datetime, float]]] = defaultdict(list)
     host_series_raw: dict[str, list[tuple[datetime, float]]] = defaultdict(list)
     sandbox_series_raw: dict[str, dict[str, list[tuple[datetime, float]]]] = defaultdict(lambda: defaultdict(list))
 
@@ -1372,6 +1386,9 @@ def analyze_telemetry_file(
             continue
         accumulator = metric_accumulators.setdefault(name, _MetricAccumulator(name=name))
         accumulator.add(value, payload=payload, attributes=enriched_attributes, top_k=top_k)
+
+        if timestamp is not None and name in _OVERHEAD_ANALYSIS_METRICS:
+            overhead_series_raw[name].append((timestamp, value))
 
         metric_task_id = task_id
         if sandbox_id and (
@@ -1490,6 +1507,30 @@ def analyze_telemetry_file(
         for metric_name in _CHECKPOINT_BREAKDOWN_METRICS
         if metric_name in summary_by_name
     }
+    overhead_started_at = detail_started_at or started_at
+    overhead_metrics = [
+        summary_by_name[metric_name]
+        for metric_name in _OVERHEAD_ANALYSIS_METRICS
+        if metric_name in summary_by_name
+    ]
+    overhead_time_series = {
+        metric_name: [
+            TimeSeriesPoint(
+                timestamp=timestamp.isoformat(),
+                offset_seconds=_offset_seconds(timestamp, overhead_started_at),
+                value=value,
+            )
+            for timestamp, value in sorted(overhead_series_raw.get(metric_name, []))
+        ]
+        for metric_name in _OVERHEAD_ANALYSIS_METRICS
+        if overhead_series_raw.get(metric_name)
+    }
+    overhead_analysis = None
+    if overhead_metrics or overhead_time_series:
+        overhead_analysis = OverheadAnalysisSummary(
+            metrics=overhead_metrics,
+            time_series=overhead_time_series,
+        )
 
     checkpoint_flow_intervals = _pair_intervals(interval_sources["checkpoint.flow"])
     checkpoint_process_intervals = _pair_intervals(interval_sources["checkpoint.process"])
@@ -1558,6 +1599,7 @@ def analyze_telemetry_file(
         detail_started_at=_format_ts(detail_started_at),
         detail_finished_at=_format_ts(detail_finished_at),
         checkpoint_analysis=checkpoint_analysis,
+        overhead_analysis=overhead_analysis,
         restore_analysis=restore_analysis,
         resource_analysis=resource_analysis,
         exclude_failed_tasks=exclude_failed_tasks,

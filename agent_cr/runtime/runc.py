@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
@@ -20,6 +21,19 @@ from .base import CommandResult, CommandRunner, SubprocessCommandRunner
 logger = logging.getLogger(__name__)
 _HOST_INSPECTOR_REGISTER_ATTEMPTS = 3
 _HOST_INSPECTOR_REGISTER_RETRY_DELAY_S = 0.2
+_RESILIENT_EXEC_RECOVERY_TIMEOUT_S = 300.0
+_LAUNCH_PREPARED_METADATA_KEY = "_agent_cr_runtime_prepared"
+_SHARED_ROOTFS_KEY_METADATA_KEY = "shared_rootfs_key"
+_SHARED_ROOTFS_PERSIST_METADATA_KEY = "shared_rootfs_persist"
+_SHARED_ROOTFS_SNAPSHOT_NAME = "base"
+_RESILIENT_EXEC_RETRYABLE_ERROR_FRAGMENTS = (
+    "container does not exist",
+    "container not running",
+    "container not found",
+    "unable to start container process",
+    "failed to exec in container",
+    "cannot allocate tty",
+)
 
 
 @dataclass(frozen=True)
@@ -103,34 +117,70 @@ class RuncRuntime(Runtime):
             supports_custom_checkpoint_dir=True,
         )
 
-    def launch(self, runtime_name: str, metadata: dict[str, object] | None = None) -> SandboxId:
+    def _resolve_launch_request(
+        self,
+        runtime_name: str,
+        metadata: dict[str, object] | None = None,
+    ) -> tuple[SandboxId, dict[str, object], Path, Path, str]:
         if runtime_name != self.name:
             raise ValueError(f"unsupported runtime for real runtime: {runtime_name}")
-
         sandbox_id = SandboxId(str((metadata or {}).get("sandbox_id", SandboxId.new())))
         md = dict(metadata or {})
         bundle_path = Path(str(md["bundle_path"])) if "bundle_path" in md else self._paths.bundle_root / str(sandbox_id)
         rootfs_path = bundle_path / "rootfs"
         dataset = str(md.get("zfs_dataset", f"{self._paths.zfs_dataset_prefix}/{sandbox_id}"))
+        return sandbox_id, md, bundle_path, rootfs_path, dataset
 
-        bundle_path.mkdir(parents=True, exist_ok=True)
-        rootfs_path.mkdir(parents=True, exist_ok=True)
+    def _shared_rootfs_details(self, key: str, *, persist_across_runs: bool) -> tuple[str, Path]:
+        if persist_across_runs:
+            dataset = f"{self._paths.zfs_dataset_prefix}-cache-{key}"
+        else:
+            dataset = f"{self._paths.zfs_dataset_prefix}/_shared_rootfs_{key}"
+        safe_prefix = "".join(
+            char if char.isalnum() or char in {"-", "_", "."} else "_"
+            for char in self._paths.zfs_dataset_prefix
+        )
+        scope = "persistent" if persist_across_runs else "run"
+        mountpoint = Path("/tmp/agent-cr-rootfs-cache") / safe_prefix / scope / key
+        return dataset, mountpoint
+
+    def _shared_rootfs_lock_path(self, key: str, *, persist_across_runs: bool) -> Path:
+        safe_prefix = "".join(
+            char if char.isalnum() or char in {"-", "_", "."} else "_"
+            for char in self._paths.zfs_dataset_prefix
+        )
+        scope = "persistent" if persist_across_runs else "run"
+        return Path("/tmp/agent-cr-rootfs-cache-locks") / safe_prefix / scope / f"{key}.lock"
+
+    def _zfs_object_exists(self, name: str) -> bool:
+        result = self._run_command(
+            [self._zfs_bin, "list", "-H", "-o", "name", name],
+            operation="sandbox.zfs_list",
+            check=False,
+            metadata={"name": name},
+        )
+        return result.returncode == 0
+
+    def _destroy_dataset_by_name(
+        self,
+        dataset: str,
+        *,
+        operation: str,
+        sandbox_id: SandboxId | None = None,
+    ) -> None:
         self._run_command(
             [self._zfs_bin, "destroy", "-r", dataset],
-            operation="sandbox.zfs_destroy_stale_launch_dataset",
+            operation=operation,
             sandbox_id=sandbox_id,
             check=False,
             metadata={"dataset": dataset},
         )
-        self._run_command(
-            [self._zfs_bin, "create", "-o", f"mountpoint={rootfs_path}", dataset],
-            operation="sandbox.zfs_create",
-            sandbox_id=sandbox_id,
-            metadata={"dataset": dataset, "mountpoint": str(rootfs_path)},
-        )
-        for rel in md.get("rootfs_init_dirs", []):
+
+    def _materialize_rootfs(self, rootfs_path: Path, metadata: dict[str, object]) -> None:
+        rootfs_path.mkdir(parents=True, exist_ok=True)
+        for rel in metadata.get("rootfs_init_dirs", []):
             (rootfs_path / str(rel)).mkdir(parents=True, exist_ok=True)
-        for item in md.get("rootfs_copy_paths", []):
+        for item in metadata.get("rootfs_copy_paths", []):
             source = Path(str(item["source"]))
             destination = rootfs_path / str(item["destination"]).lstrip("/")
             if source.is_dir():
@@ -138,6 +188,146 @@ class RuncRuntime(Runtime):
             else:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, destination, follow_symlinks=True)
+
+    def _sync_clone_view_for_test_runner(self, source_rootfs_path: Path, target_rootfs_path: Path) -> None:
+        if isinstance(self._runner, SubprocessCommandRunner):
+            return
+        if not source_rootfs_path.exists():
+            return
+        target_rootfs_path.mkdir(parents=True, exist_ok=True)
+        for child in list(target_rootfs_path.iterdir()):
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        for child in source_rootfs_path.iterdir():
+            destination = target_rootfs_path / child.name
+            if child.is_dir() and not child.is_symlink():
+                shutil.copytree(child, destination, symlinks=True, dirs_exist_ok=True)
+            elif child.is_symlink():
+                destination.symlink_to(os.readlink(child))
+            else:
+                shutil.copy2(child, destination, follow_symlinks=True)
+
+    def _ensure_shared_rootfs_base(
+        self,
+        key: str,
+        *,
+        persist_across_runs: bool,
+        metadata: dict[str, object],
+    ) -> tuple[str, Path]:
+        dataset, mountpoint = self._shared_rootfs_details(key, persist_across_runs=persist_across_runs)
+        snapshot = f"{dataset}@{_SHARED_ROOTFS_SNAPSHOT_NAME}"
+        lock_path = self._shared_rootfs_lock_path(key, persist_across_runs=persist_across_runs)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("w", encoding="utf-8") as lock_fh:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            dataset_exists = self._zfs_object_exists(dataset)
+            snapshot_exists = self._zfs_object_exists(snapshot)
+            if dataset_exists and snapshot_exists:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+                return dataset, mountpoint
+            if dataset_exists and not snapshot_exists:
+                self._destroy_dataset_by_name(
+                    dataset,
+                    operation="sandbox.zfs_destroy_incomplete_shared_rootfs",
+                )
+            mountpoint.mkdir(parents=True, exist_ok=True)
+            self._run_command(
+                [self._zfs_bin, "create", "-o", f"mountpoint={mountpoint}", dataset],
+                operation="sandbox.zfs_create_shared_rootfs",
+                metadata={"dataset": dataset, "mountpoint": str(mountpoint)},
+            )
+            self._materialize_rootfs(mountpoint, metadata)
+            self._run_command(
+                [self._zfs_bin, "snapshot", snapshot],
+                operation="sandbox.zfs_snapshot_shared_rootfs",
+                metadata={"dataset": dataset, "snapshot": snapshot},
+            )
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+        return dataset, mountpoint
+
+    def prepare_launch(self, runtime_name: str, metadata: dict[str, object] | None = None) -> SandboxId:
+        sandbox_id, md, bundle_path, rootfs_path, dataset = self._resolve_launch_request(runtime_name, metadata)
+        if metadata is not None and bool(metadata.get(_LAUNCH_PREPARED_METADATA_KEY, False)):
+            logger.info(
+                "Skipping runtime launch preparation sandbox=%s bundle_path=%s dataset=%s reason=already_prepared",
+                sandbox_id,
+                bundle_path,
+                dataset,
+            )
+            return sandbox_id
+
+        logger.info(
+            "Preparing runtime launch sandbox=%s bundle_path=%s rootfs_path=%s dataset=%s",
+            sandbox_id,
+            bundle_path,
+            rootfs_path,
+            dataset,
+        )
+        bundle_path.mkdir(parents=True, exist_ok=True)
+        rootfs_path.mkdir(parents=True, exist_ok=True)
+        shared_rootfs_key = str(md.get(_SHARED_ROOTFS_KEY_METADATA_KEY, "")).strip()
+        if shared_rootfs_key:
+            shared_dataset, shared_rootfs_path = self._ensure_shared_rootfs_base(
+                shared_rootfs_key,
+                persist_across_runs=bool(md.get(_SHARED_ROOTFS_PERSIST_METADATA_KEY, False)),
+                metadata=md,
+            )
+            self._destroy_dataset_by_name(
+                dataset,
+                operation="sandbox.zfs_destroy_stale_launch_dataset",
+                sandbox_id=sandbox_id,
+            )
+            shared_snapshot = f"{shared_dataset}@{_SHARED_ROOTFS_SNAPSHOT_NAME}"
+            self._run_command(
+                [self._zfs_bin, "clone", "-o", f"mountpoint={rootfs_path}", shared_snapshot, dataset],
+                operation="sandbox.zfs_clone_launch_rootfs",
+                sandbox_id=sandbox_id,
+                metadata={
+                    "source_dataset": shared_dataset,
+                    "target_dataset": dataset,
+                    "snapshot": shared_snapshot,
+                    "mountpoint": str(rootfs_path),
+                },
+            )
+            self._sync_clone_view_for_test_runner(shared_rootfs_path, rootfs_path)
+        else:
+            self._destroy_dataset_by_name(
+                dataset,
+                operation="sandbox.zfs_destroy_stale_launch_dataset",
+                sandbox_id=sandbox_id,
+            )
+            self._run_command(
+                [self._zfs_bin, "create", "-o", f"mountpoint={rootfs_path}", dataset],
+                operation="sandbox.zfs_create",
+                sandbox_id=sandbox_id,
+                metadata={"dataset": dataset, "mountpoint": str(rootfs_path)},
+            )
+            self._materialize_rootfs(rootfs_path, md)
+        if metadata is not None:
+            metadata["rootfs_path"] = str(rootfs_path)
+            metadata["zfs_dataset"] = dataset
+            metadata[_LAUNCH_PREPARED_METADATA_KEY] = True
+        logger.info(
+            "Prepared runtime launch sandbox=%s bundle_path=%s rootfs_path=%s dataset=%s",
+            sandbox_id,
+            bundle_path,
+            rootfs_path,
+            dataset,
+        )
+        return sandbox_id
+
+    def launch(self, runtime_name: str, metadata: dict[str, object] | None = None) -> SandboxId:
+        self.prepare_launch(runtime_name, metadata)
+        sandbox_id, md, bundle_path, rootfs_path, dataset = self._resolve_launch_request(runtime_name, metadata)
+        description_metadata = {key: value for key, value in md.items() if key != _LAUNCH_PREPARED_METADATA_KEY}
+        logger.info(
+            "Launching prepared runtime sandbox=%s bundle_path=%s dataset=%s",
+            sandbox_id,
+            bundle_path,
+            dataset,
+        )
         self._run_command(
             [self._runtime_bin, "--root", str(self._paths.state_root), "create", "--bundle", str(bundle_path), str(sandbox_id)],
             operation="sandbox.runtime_create",
@@ -162,7 +352,7 @@ class RuncRuntime(Runtime):
             runtime_name=runtime_name,
             status="running",
             metadata={
-                **md,
+                **description_metadata,
                 "bundle_path": str(bundle_path),
                 "rootfs_path": str(rootfs_path),
                 "zfs_dataset": dataset,
@@ -172,6 +362,13 @@ class RuncRuntime(Runtime):
             self._items[sandbox_id] = description
         self._persist(description)
         self._register_with_host_inspector(description)
+        logger.info(
+            "Launched runtime sandbox=%s bundle_path=%s rootfs_path=%s dataset=%s",
+            sandbox_id,
+            bundle_path,
+            rootfs_path,
+            dataset,
+        )
         return sandbox_id
 
     def stop(self, sandbox_id: SandboxId) -> None:
@@ -416,6 +613,70 @@ class RuncRuntime(Runtime):
             ),
         )
         return SandboxExecResult(args=tuple(command), returncode=int(completed.returncode), stdout=stdout, stderr=stderr)
+
+    def resilient_exec(
+        self,
+        sandbox_id: SandboxId,
+        argv: list[str],
+        *,
+        cwd: str | None = None,
+        env: dict[str, object] | None = None,
+        user: str | None = None,
+        timeout_s: float | None = None,
+        capture_output: bool = True,
+    ) -> SandboxExecResult:
+        if not capture_output:
+            raise ValueError("resilient_exec currently only supports attached capture_output=True mode")
+        attempt = 0
+        while True:
+            attempt += 1
+            result = self.exec(
+                sandbox_id,
+                argv,
+                cwd=cwd,
+                env=env,
+                user=user,
+                timeout_s=timeout_s,
+                capture_output=capture_output,
+            )
+            if result.returncode == 0:
+                return result
+            if not self._is_retriable_resilient_exec_failure(sandbox_id, result):
+                return result
+            logger.warning(
+                "Retrying resilient exec after sandbox interruption sandbox=%s attempt=%d command=%s",
+                sandbox_id,
+                attempt,
+                " ".join(argv),
+            )
+            self._wait_for_runtime_running(sandbox_id, timeout_s=_RESILIENT_EXEC_RECOVERY_TIMEOUT_S)
+
+    def _is_retriable_resilient_exec_failure(self, sandbox_id: SandboxId, result: SandboxExecResult) -> bool:
+        stderr = result.stderr.lower()
+        stdout = result.stdout.lower()
+        if any(fragment in stderr or fragment in stdout for fragment in _RESILIENT_EXEC_RETRYABLE_ERROR_FRAGMENTS):
+            return True
+        try:
+            runtime_state = self.inspect_runtime(sandbox_id)
+        except Exception:
+            logger.debug(
+                "Treating exec failure as retriable because runtime inspection failed sandbox=%s",
+                sandbox_id,
+                exc_info=True,
+            )
+            return True
+        return runtime_state.status.lower() in {"missing", "stopped"}
+
+    def _wait_for_runtime_running(self, sandbox_id: SandboxId, *, timeout_s: float) -> None:
+        deadline = time.monotonic() + max(1.0, timeout_s)
+        while time.monotonic() < deadline:
+            runtime_state = self.inspect_runtime(sandbox_id)
+            if runtime_state.status.lower() == "running" and runtime_state.is_running:
+                return
+            time.sleep(0.2)
+        raise RuntimeError(
+            f"timed out waiting for sandbox {sandbox_id} to recover for resilient exec after {timeout_s:.1f}s"
+        )
 
     def checkpoint_process(
         self,
@@ -816,11 +1077,15 @@ class RuncRuntime(Runtime):
             ),
         )
         if not success and check:
-            log_fn = logger.error
-            if any(fragment in stderr for fragment in expected_error_substrings):
-                log_fn = logger.info
+            expected_error = any(fragment in stderr for fragment in expected_error_substrings)
+            log_fn = logger.info if expected_error else logger.error
+            message = (
+                "Runtime command returned expected non-zero rc=%d command=%s stdout=%s stderr=%s"
+                if expected_error
+                else "Runtime command failed rc=%d command=%s stdout=%s stderr=%s"
+            )
             log_fn(
-                "Runtime command failed rc=%d command=%s stdout=%s stderr=%s",
+                message,
                 result.returncode,
                 " ".join(command),
                 stdout,

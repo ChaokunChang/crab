@@ -23,7 +23,7 @@ _SCENARIOS = {"e2e", "fault", "spot", "tree"}
 _MODES = {"manual", "auto"}
 _PROVIDERS = {"openai", "anthropic"}
 _LOG_LEVELS = {"debug", "info", "warning", "error", "critical"}
-_LOG_FILE_MODES = {"append": "a", "write": "w"}
+_FILE_MODES = {"append": "a", "write": "w"}
 _TELEMETRY_DETAIL_LEVELS = {"basic", "detailed"}
 _BENCHMARK_PHASES = ("setup", "run", "verification")
 _LLM_SERVER_LAUNCH_MODES = {"process", "thread"}
@@ -212,6 +212,16 @@ class BenchmarkStoragePlanesConfig:
 
 
 @dataclass(frozen=True)
+class BenchmarkRootfsReuseConfig:
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
+class BenchmarkPhaseMergingConfig:
+    setup_and_run: bool = False
+
+
+@dataclass(frozen=True)
 class BenchmarkConfig:
     config_path: Path
     scenario: str
@@ -236,8 +246,10 @@ class BenchmarkConfig:
     telemetry_flush_interval_ms: int = DEFAULT_TELEMETRY_FLUSH_INTERVAL_MS
     telemetry_overflow_policy: str = DEFAULT_TELEMETRY_OVERFLOW_POLICY
     telemetry_serializer: str = DEFAULT_TELEMETRY_SERIALIZER
+    telemetry_file_mode: str = "append"
     log_file: Path | None = None
     log_file_mode: str = "append"
+    verification_enabled: bool = True
     benchmark_root: Path | None = None
     zpool_size: str = "10G"
     zpool_name: str | None = None
@@ -256,6 +268,8 @@ class BenchmarkConfig:
     llm_server: BenchmarkLLMServerConfig = field(default_factory=BenchmarkLLMServerConfig)
     host_inspector: BenchmarkHostInspectorConfig = field(default_factory=BenchmarkHostInspectorConfig)
     storage_planes: BenchmarkStoragePlanesConfig = field(default_factory=BenchmarkStoragePlanesConfig)
+    rootfs_reuse: BenchmarkRootfsReuseConfig = field(default_factory=BenchmarkRootfsReuseConfig)
+    phase_merging: BenchmarkPhaseMergingConfig = field(default_factory=BenchmarkPhaseMergingConfig)
 
     @property
     def config_dir(self) -> Path:
@@ -402,6 +416,24 @@ def _load_storage_planes_config(base_dir: Path, payload: object) -> BenchmarkSto
     )
 
 
+def _load_rootfs_reuse_config(payload: object) -> BenchmarkRootfsReuseConfig:
+    if payload is None:
+        return BenchmarkRootfsReuseConfig()
+    data = _require_object(payload, label="rootfs_reuse")
+    return BenchmarkRootfsReuseConfig(
+        enabled=bool(data.get("enabled", True)),
+    )
+
+
+def _load_phase_merging_config(payload: object) -> BenchmarkPhaseMergingConfig:
+    if payload is None:
+        return BenchmarkPhaseMergingConfig()
+    data = _require_object(payload, label="phase_merging")
+    return BenchmarkPhaseMergingConfig(
+        setup_and_run=bool(data.get("setup_and_run", False)),
+    )
+
+
 def load_config(path: Path) -> BenchmarkConfig:
     config_path = path.expanduser().resolve()
     payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
@@ -426,8 +458,8 @@ def load_config(path: Path) -> BenchmarkConfig:
         raise ValueError(f"log_level must be one of {sorted(_LOG_LEVELS)}, got {log_level!r}")
 
     log_file_mode = str(data.get("log_file_mode", "append")).strip().lower()
-    if log_file_mode not in _LOG_FILE_MODES:
-        raise ValueError(f"log_file_mode must be one of {sorted(_LOG_FILE_MODES)}, got {log_file_mode!r}")
+    if log_file_mode not in _FILE_MODES:
+        raise ValueError(f"log_file_mode must be one of {sorted(_FILE_MODES)}, got {log_file_mode!r}")
 
     sandboxes = int(data.get("sandboxes", 1))
     if sandboxes <= 0:
@@ -461,6 +493,13 @@ def load_config(path: Path) -> BenchmarkConfig:
         base_dir,
         telemetry_options.get("output", data.get("telemetry_output")),
     )
+    telemetry_file_mode = str(
+        telemetry_options.get("file_mode", data.get("telemetry_file_mode", "append"))
+    ).strip().lower()
+    if telemetry_file_mode not in _FILE_MODES:
+        raise ValueError(
+            f"telemetry.file_mode must be one of {sorted(_FILE_MODES)}, got {telemetry_file_mode!r}"
+        )
     telemetry_detail_level = str(
         telemetry_options.get("detail_level", DEFAULT_TELEMETRY_DETAIL_LEVEL)
     ).strip().lower()
@@ -555,6 +594,18 @@ def load_config(path: Path) -> BenchmarkConfig:
     llm_server = _load_llm_server_config(data.get("llm_server"))
     host_inspector = _load_host_inspector_config(data.get("host_inspector"))
     storage_planes = _load_storage_planes_config(base_dir, data.get("storage_planes"))
+    rootfs_reuse = _load_rootfs_reuse_config(data.get("rootfs_reuse"))
+    phase_merging = _load_phase_merging_config(data.get("phase_merging"))
+    verification_options = data.get("verification", {})
+    if verification_options is None:
+        verification_options = {}
+    verification_options = _require_object(verification_options, label="verification")
+    verification_enabled = bool(
+        verification_options.get(
+            "enabled",
+            data.get("verification_enabled", True),
+        )
+    )
 
     return BenchmarkConfig(
         config_path=config_path,
@@ -580,8 +631,10 @@ def load_config(path: Path) -> BenchmarkConfig:
         telemetry_flush_interval_ms=telemetry_flush_interval_ms,
         telemetry_overflow_policy=telemetry_overflow_policy,
         telemetry_serializer=telemetry_serializer,
+        telemetry_file_mode=telemetry_file_mode,
         log_file=_resolve_optional_path(base_dir, data.get("log_file")),
         log_file_mode=log_file_mode,
+        verification_enabled=verification_enabled,
         benchmark_root=_resolve_optional_path(base_dir, data.get("benchmark_root")),
         zpool_size=str(data.get("zpool_size", "10G")),
         zpool_name=None if data.get("zpool_name") is None else str(data.get("zpool_name")),
@@ -600,4 +653,6 @@ def load_config(path: Path) -> BenchmarkConfig:
         llm_server=llm_server,
         host_inspector=host_inspector,
         storage_planes=storage_planes,
+        rootfs_reuse=rootfs_reuse,
+        phase_merging=phase_merging,
     )

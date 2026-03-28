@@ -56,10 +56,10 @@ def bounded_probability(raw: str) -> float:
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--provider", choices=["openai", "anthropic"], default="openai")
-    parser.add_argument("--agent-type", choices=["simulated", "iflow"], default="simulated")
+    parser.add_argument("--agent-type", choices=["simulated", "iflow", "mini_swe"], default="simulated")
     parser.add_argument(
         "--llm-service-type",
-        choices=["simulated", "manual", "simulated_for_iflow", "iflow_trace_replay"],
+        choices=["simulated", "manual", "simulated_for_iflow", "iflow_trace_replay", "mini_swe_trace_replay"],
         default=None,
     )
     parser.add_argument("--dataset", type=Path, default=None)
@@ -303,7 +303,7 @@ class BenchmarkTaskRecord:
 
 
 def is_replay_llm_service_type(llm_service_type: str | None) -> bool:
-    return llm_service_type == "iflow_trace_replay"
+    return llm_service_type in {"iflow_trace_replay", "mini_swe_trace_replay"}
 
 
 def choose_replay_points(total_responses: int, limit: int) -> list[int]:

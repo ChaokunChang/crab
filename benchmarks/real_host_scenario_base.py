@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -34,6 +35,7 @@ from agent_cr import (
     CRExecutor,
     CRScheduler,
     CheckpointId,
+    CheckpointJob,
     CheckpointManager,
     CheckpointManifest,
     CompositeRequestInterceptorHook,
@@ -59,6 +61,7 @@ from agent_cr import (
     TelemetryConfig,
     TelemetrySink,
     TelemetryRequestInterceptorHook,
+    JobId,
     build_configured_telemetry_sink,
 )
 from agent_cr.models import ArtifactPayload, utc_now
@@ -78,6 +81,7 @@ from integrations.sandboxes.runtime import network as sandbox_network
 from integrations.sandboxes.runtime import bundle as sandbox_bundle
 from integrations.sandboxes.runtime import compose as sandbox_compose
 from integrations.sandboxes.runtime import image as sandbox_image
+from integrations.sandboxes import swebench as swebench_support
 from integrations.sandboxes.iflow import DOCKERFILE_PATH as IFLOW_DOCKERFILE_PATH
 from integrations.sandboxes.simulated import DOCKERFILE_PATH as SIMULATED_DOCKERFILE_PATH
 from benchmarks import core as benchmark_core
@@ -89,6 +93,8 @@ logger = logging.getLogger(__name__)
 _HOST_INSPECTOR_HOST = "127.0.0.1"
 _HOST_INSPECTOR_PORT = 9782
 _DEFAULT_IMAGE_CACHE_ROOT = ROOT / ".cache" / "agent-cr" / "images"
+_SHARED_ROOTFS_KEY_METADATA_KEY = "shared_rootfs_key"
+_SHARED_ROOTFS_PERSIST_METADATA_KEY = "shared_rootfs_persist"
 _TERMNIUS_PROCESS_CAPABILITIES = [
     "CAP_AUDIT_WRITE",
     "CAP_CHOWN",
@@ -180,9 +186,11 @@ class PreparedBenchmarkSandbox:
     task_record: benchmark_support.BenchmarkTaskRecord
     prelaunch_task_run: BaseAgent | None = None
     work_dir_host_path: Path | None = None
+    runtime_prepared: bool = False
     wait_for_ready_before_task_start: bool = False
     wait_for_ready_after_task_start: bool = False
     emit_ready_event: bool = True
+    runtime_launched: bool = False
 
 
 class RealHostScenarioHarness:
@@ -244,6 +252,7 @@ class RealHostScenarioHarness:
         runtime_root: Path | None = None,
         storage_root: Path | None = None,
         agent_host_root: Path | None = None,
+        rootfs_reuse_enabled: bool = True,
     ) -> None:
         self.provider = provider
         self.transfer_delay_ms = transfer_delay_ms
@@ -281,6 +290,7 @@ class RealHostScenarioHarness:
         self.monitoring_include_sandboxes = monitoring_include_sandboxes
         self.llm_server_launch_mode = llm_server_launch_mode
         self.host_inspector_launch_mode = host_inspector_launch_mode
+        self.rootfs_reuse_enabled = bool(rootfs_reuse_enabled)
         self._tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self.root: Path | None = None
         self.runtime_root: Path | None = None
@@ -322,6 +332,7 @@ class RealHostScenarioHarness:
         self._zpool_image_path: Path | None = None
         self._task_attempts: dict[str, int] = {}
         self._resource_monitor: BenchmarkResourceMonitor | None = None
+        self._rootfs_reuse_session_key = self.run_id or uuid.uuid4().hex
 
     @property
     def benchmark_bridge_ip(self) -> str:
@@ -586,47 +597,78 @@ class RealHostScenarioHarness:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         # input("wait for signal to cleanup")
-        if self._resource_monitor is not None:
-            self._resource_monitor.stop()
-            self._resource_monitor = None
-        for sandbox in self.sandboxes:
-            if sandbox.task_run is not None:
+        def _run_teardown_step(step: str, fn) -> None:
+            logger.info("Benchmark teardown step start step=%s", step)
+            started_at = time.perf_counter()
+            try:
+                fn()
+            finally:
+                logger.info(
+                    "Benchmark teardown step end step=%s duration_s=%.3f",
+                    step,
+                    max(0.0, time.perf_counter() - started_at),
+                )
+
+        def _stop_resource_monitor() -> None:
+            if self._resource_monitor is not None:
+                self._resource_monitor.stop()
+                self._resource_monitor = None
+
+        _run_teardown_step("resource_monitor.stop", _stop_resource_monitor)
+        _run_teardown_step(
+            "task_runs.request_stop",
+            lambda: [
                 sandbox.task_run.request_stop()
-        if self.system is not None and self.auto_cr:
-            self.system.stop()
-        if self.interceptor is not None:
-            self.interceptor.stop()
-        if self.runtime is not None:
-            for sandbox in self.sandboxes:
+                for sandbox in self.sandboxes
+                if sandbox.task_run is not None
+            ],
+        )
+        _run_teardown_step(
+            "system.stop",
+            lambda: self.system.stop() if self.system is not None and self.auto_cr else None,
+        )
+        _run_teardown_step(
+            "interceptor.stop",
+            lambda: self.interceptor.stop() if self.interceptor is not None else None,
+        )
+        _run_teardown_step(
+            "runtime.delete_all",
+            lambda: [
                 self.runtime.delete_runtime(sandbox.sandbox_id, force=True, ignore_missing=True)
-        self._task_executor.shutdown(wait=True, cancel_futures=True)
-        if self.executor is not None:
-            self.executor.shutdown()
-        if self.storage is not None:
+                for sandbox in self.sandboxes
+            ]
+            if self.runtime is not None
+            else None,
+        )
+        _run_teardown_step(
+            "task_executor.shutdown",
+            lambda: self._task_executor.shutdown(wait=True, cancel_futures=True),
+        )
+        _run_teardown_step(
+            "executor.shutdown",
+            lambda: self.executor.shutdown() if self.executor is not None else None,
+        )
+
+        def _close_storage() -> None:
+            if self.storage is None:
+                return
             flush_storage = getattr(self.storage, "flush", None)
             if callable(flush_storage):
                 flush_storage()
             close_storage = getattr(self.storage, "close", None)
             if callable(close_storage):
                 close_storage()
-        self.network_manager.cleanup()
-        for sandbox in self.sandboxes:
-            self._unregister_llm_service(sandbox.sandbox_id)
-        # for image in self._sandbox_images.values():
-            # subprocess.run(
-            #     ["docker", "rmi", "-f", image.image_tag],
-            #     check=False,
-            #     stdout=subprocess.DEVNULL,
-            #     stderr=subprocess.DEVNULL,
-            # )
-        # for image_tag in sorted(self._compose_image_tags):
-            # subprocess.run(
-            #     ["docker", "rmi", "-f", image_tag],
-            #     check=False,
-            #     stdout=subprocess.DEVNULL,
-            #     stderr=subprocess.DEVNULL,
-            # )
-        if self.pool_name:
+
+        _run_teardown_step("storage.close", _close_storage)
+        _run_teardown_step("network.cleanup", self.network_manager.cleanup)
+        _run_teardown_step(
+            "llm_service.unregister_all",
+            lambda: [self._unregister_llm_service(sandbox.sandbox_id) for sandbox in self.sandboxes],
+        )
+
+        def _destroy_benchmark_dataset() -> None:
+            if not self.pool_name:
+                return
             dataset = f"{self.pool_name}/agent-cr"
             subprocess.run(
                 ["zfs", "destroy", "-r", dataset],
@@ -641,15 +683,39 @@ class RealHostScenarioHarness:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-        self._stop_llm_server()
-        self._stop_host_inspector_server()
-        if self.host_inspector_client is not None:
-            self.host_inspector_client.close()
-            self.host_inspector_client = None
-        if self.telemetry is not None:
-            self.telemetry.close()
-        if self._tmpdir is not None:
-            self._tmpdir.cleanup()
+
+        _run_teardown_step("zfs.destroy", _destroy_benchmark_dataset)
+        # for image in self._sandbox_images.values():
+            # subprocess.run(
+            #     ["docker", "rmi", "-f", image.image_tag],
+            #     check=False,
+            #     stdout=subprocess.DEVNULL,
+            #     stderr=subprocess.DEVNULL,
+            # )
+        # for image_tag in sorted(self._compose_image_tags):
+            # subprocess.run(
+            #     ["docker", "rmi", "-f", image_tag],
+            #     check=False,
+            #     stdout=subprocess.DEVNULL,
+            #     stderr=subprocess.DEVNULL,
+            # )
+        _run_teardown_step("llm_server.stop", self._stop_llm_server)
+        _run_teardown_step("host_inspector.stop", self._stop_host_inspector_server)
+
+        def _close_host_inspector_client() -> None:
+            if self.host_inspector_client is not None:
+                self.host_inspector_client.close()
+                self.host_inspector_client = None
+
+        _run_teardown_step("host_inspector_client.close", _close_host_inspector_client)
+        _run_teardown_step(
+            "telemetry.close",
+            lambda: self.telemetry.close() if self.telemetry is not None else None,
+        )
+        _run_teardown_step(
+            "tmpdir.cleanup",
+            lambda: self._tmpdir.cleanup() if self._tmpdir is not None else None,
+        )
 
     def _llm_router_subprocess_command(self, *, port: int) -> list[str]:
         command = [
@@ -1067,6 +1133,12 @@ class RealHostScenarioHarness:
             **task_run.extra_launch_metadata(),
             **handle.launch_metadata.get("runtime", {}),
         }
+        self._attach_shared_rootfs_launch_metadata(
+            launch_metadata,
+            agent_type=agent_type,
+            compose_file=None,
+            service_name=None,
+        )
         runtime = self._active_runtime
         if runtime is None:
             raise RuntimeError("runtime is not initialized")
@@ -1241,7 +1313,7 @@ class RealHostScenarioHarness:
                 task_record=task_record,
             )
         self._set_benchmark_launch_metadata(prepared.handle, sandbox_name=sandbox_name, task_record=task_record)
-        self._launch_prepared_runtime(prepared)
+        self._prepare_prepared_runtime(prepared)
         return prepared
 
     def _set_benchmark_launch_metadata(
@@ -1257,6 +1329,79 @@ class RealHostScenarioHarness:
             "trace_malformed_line_count": task_record.trace_malformed_line_count,
             "llm_service_config": None if task_record.llm_service_config is None else dict(task_record.llm_service_config),
         }
+
+    def _normalized_rootfs_reuse_recipe(
+        self,
+        runtime_metadata: dict[str, object],
+        *,
+        agent_type: str,
+        compose_file: Path | None,
+        service_name: str | None,
+        persist_across_runs: bool,
+    ) -> dict[str, object]:
+        init_dirs = sorted({str(item).lstrip("/") for item in runtime_metadata.get("rootfs_init_dirs", [])})
+        copy_paths: list[dict[str, str]] = []
+        for item in runtime_metadata.get("rootfs_copy_paths", []):
+            if not isinstance(item, dict):
+                raise ValueError(f"unsupported rootfs copy item for reuse key: {item!r}")
+            copy_paths.append(
+                {
+                    "source": str(Path(str(item["source"])).expanduser().resolve()),
+                    "destination": f"/{str(item['destination']).lstrip('/')}",
+                }
+            )
+        copy_paths.sort(key=lambda item: (item["destination"], item["source"]))
+        recipe: dict[str, object] = {
+            "version": 1,
+            "agent_type": agent_type,
+            "docker_compose_file": None if compose_file is None else str(compose_file.expanduser().resolve()),
+            "service_name": "" if service_name is None else str(service_name),
+            "rootfs_init_dirs": init_dirs,
+            "rootfs_copy_paths": copy_paths,
+        }
+        if not persist_across_runs:
+            recipe["session_key"] = self._rootfs_reuse_session_key
+        return recipe
+
+    def _attach_shared_rootfs_launch_metadata(
+        self,
+        runtime_metadata: dict[str, object],
+        *,
+        agent_type: str,
+        compose_file: Path | None,
+        service_name: str | None,
+    ) -> None:
+        if not self.rootfs_reuse_enabled:
+            return
+        persist_across_runs = self.reuse_zpool and compose_file is not None
+        recipe = self._normalized_rootfs_reuse_recipe(
+            runtime_metadata,
+            agent_type=agent_type,
+            compose_file=compose_file,
+            service_name=service_name,
+            persist_across_runs=persist_across_runs,
+        )
+        recipe_json = json.dumps(recipe, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        runtime_metadata[_SHARED_ROOTFS_KEY_METADATA_KEY] = hashlib.sha256(
+            recipe_json.encode("utf-8")
+        ).hexdigest()[:32]
+        runtime_metadata[_SHARED_ROOTFS_PERSIST_METADATA_KEY] = persist_across_runs
+        sandbox_id = str(runtime_metadata.get("sandbox_id", ""))
+        logger.info(
+            "Configured shared rootfs reuse sandbox=%s agent=%s key=%s persist=%s compose_file=%s service=%s",
+            sandbox_id,
+            agent_type,
+            runtime_metadata[_SHARED_ROOTFS_KEY_METADATA_KEY],
+            persist_across_runs,
+            "" if compose_file is None else compose_file.expanduser().resolve(),
+            "" if service_name is None else service_name,
+        )
+        logger.debug(
+            "Shared rootfs reuse recipe sandbox=%s init_dirs=%s copy_paths=%s",
+            sandbox_id,
+            recipe["rootfs_init_dirs"],
+            recipe["rootfs_copy_paths"],
+        )
 
     def _prepare_runc_task_record(
         self,
@@ -1306,6 +1451,12 @@ class RealHostScenarioHarness:
             **prelaunch_task_run.extra_launch_metadata(),
             **handle.launch_metadata.get("runtime", {}),
         }
+        self._attach_shared_rootfs_launch_metadata(
+            handle.launch_metadata,
+            agent_type=task_record.agent_type,
+            compose_file=None,
+            service_name=None,
+        )
         return PreparedBenchmarkSandbox(
             handle=handle,
             sandbox_name=sandbox_name,
@@ -1378,6 +1529,12 @@ class RealHostScenarioHarness:
             set(runtime_metadata.get("rootfs_init_dirs", [])) | set(prelaunch_task_run.rootfs_init_dirs())
         )
         runtime_metadata.update(prelaunch_task_run.extra_launch_metadata())
+        self._attach_shared_rootfs_launch_metadata(
+            runtime_metadata,
+            agent_type=task_record.agent_type,
+            compose_file=task_record.docker_compose_file,
+            service_name=service_name,
+        )
         prelaunch_task_run.configure_bundle()
         return PreparedBenchmarkSandbox(
             handle=handle,
@@ -1392,6 +1549,8 @@ class RealHostScenarioHarness:
         self,
         prepared: PreparedBenchmarkSandbox,
     ) -> SandboxHandle:
+        self._prepare_prepared_runtime(prepared)
+        self._launch_prepared_runtime(prepared)
         handle = prepared.handle
         if handle.task_description is not None and handle.task_config is not None:
             self.launch_task(
@@ -1410,15 +1569,39 @@ class RealHostScenarioHarness:
                     self.emit_benchmark_event("benchmark.task.ready", handle)
         return handle
 
+    def _prepare_prepared_runtime(
+        self,
+        prepared: PreparedBenchmarkSandbox,
+    ) -> None:
+        if prepared.runtime_prepared:
+            logger.info("Benchmark runtime already prepared sandbox=%s", prepared.handle.sandbox_id)
+            return
+        runtime = self._active_runtime
+        if runtime is None:
+            raise RuntimeError("runtime is not initialized")
+        prepare_launch = getattr(runtime, "prepare_launch", None)
+        if not callable(prepare_launch):
+            return
+        handle = prepared.handle
+        runtime_metadata = handle.launch_metadata.get("runtime", handle.launch_metadata)
+        logger.info("Benchmark preparing runtime sandbox=%s phase=setup", handle.sandbox_id)
+        prepare_launch("runc", runtime_metadata)
+        prepared.runtime_prepared = True
+        logger.info("Benchmark prepared runtime sandbox=%s phase=setup", handle.sandbox_id)
+
     def _launch_prepared_runtime(
         self,
         prepared: PreparedBenchmarkSandbox,
     ) -> None:
+        if prepared.runtime_launched:
+            logger.info("Benchmark runtime already launched sandbox=%s", prepared.handle.sandbox_id)
+            return
         assert self.base_inspector is not None
         runtime = self._active_runtime
         if runtime is None:
             raise RuntimeError("runtime is not initialized")
         handle = prepared.handle
+        logger.info("Benchmark launching prepared runtime sandbox=%s phase=run", handle.sandbox_id)
         network_lease = self.network_manager.lease_for(handle.sandbox_id)
         if network_lease is not None:
             self.network_manager.register_guest_ip(network_lease.guest_ip, handle.sandbox_id)
@@ -1439,6 +1622,8 @@ class RealHostScenarioHarness:
             prepared.prelaunch_task_run.wait_for_task_ready()
             if prepared.emit_ready_event:
                 self.emit_benchmark_event("benchmark.task.ready", handle)
+        prepared.runtime_launched = True
+        logger.info("Benchmark launched prepared runtime sandbox=%s phase=run", handle.sandbox_id)
 
     def launch_task_record(
         self,
@@ -1538,6 +1723,12 @@ class RealHostScenarioHarness:
             )
             runtime_metadata.update(prelaunch_task_run.extra_launch_metadata())
             prelaunch_task_run.configure_bundle()
+        self._attach_shared_rootfs_launch_metadata(
+            handle.launch_metadata["runtime"],
+            agent_type=agent_type or "simulated",
+            compose_file=compose_file,
+            service_name=service_name,
+        )
         self.network_manager.register_guest_ip(network_lease.guest_ip, handle.sandbox_id)
         self.base_inspector.upsert_snapshot(
             SandboxSnapshot(
@@ -1701,6 +1892,46 @@ class RealHostScenarioHarness:
             raise RuntimeError(f"checkpoint_manual unsupported for launch_source={sandbox.launch_source}")
         logger.debug("Benchmark requesting checkpoint_manual for sandbox=%s", sandbox.sandbox_id)
         return self.system.checkpoint_once(sandbox.sandbox_id, leave_running=leave_running)
+
+    def checkpoint_manual_filesystem_only(self, sandbox: SandboxHandle, leave_running: bool=False):
+        assert self.system is not None
+        if sandbox.launch_source not in {"runc", "compose"}:
+            raise RuntimeError(f"checkpoint_manual_filesystem_only unsupported for launch_source={sandbox.launch_source}")
+        logger.debug("Benchmark requesting filesystem-only checkpoint for sandbox=%s", sandbox.sandbox_id)
+        pending_request = self.system._next_pending_live_request(sandbox.sandbox_id)
+        paused = self.system._pause_for_manual_checkpoint(sandbox.sandbox_id)
+        result = None
+        job = None
+        try:
+            job = CheckpointJob(
+                job_id=JobId.new(),
+                sandbox_id=sandbox.sandbox_id,
+                requested_at=utc_now(),
+                reason="manual_filesystem_only",
+                checkpoint_process=False,
+                checkpoint_filesystem=True,
+                leave_running=leave_running,
+                metadata=self.system._build_checkpoint_metadata(
+                    sandbox.sandbox_id,
+                    pending_request=pending_request,
+                ),
+            )
+            result = self.system.executor.run_checkpoint(job)
+            if result.status.value == "succeeded":
+                self.system.scheduler.mark_checkpoint_complete(sandbox.sandbox_id, result.finished_at)
+                self.system.inspector.mark_checkpoint_complete(
+                    sandbox.sandbox_id,
+                    process=False,
+                    filesystem=True,
+                    at=result.finished_at,
+                )
+        finally:
+            if paused and self.system._should_resume_after_checkpoint(job, result):
+                self.system._resume_sandbox(sandbox.sandbox_id)
+            self.system._release_response_gate(sandbox.sandbox_id, pending_request)
+            self.system._refresh_interceptor_pending_state(sandbox.sandbox_id)
+        assert result is not None
+        return result
 
     def checkpoint_if_due(self, sandbox: SandboxHandle):
         assert self.system is not None
@@ -1898,18 +2129,42 @@ class RealHostScenarioHarness:
         checkpoint_active = False if self.executor is None else self.executor.has_active_checkpoint(sandbox.sandbox_id)
         return not request_in_flight and not checkpoint_active
 
+    @staticmethod
+    def _fault_injection_target_task_finished(sandbox: SandboxHandle) -> bool:
+        if str(sandbox.last_status.get("state", "")).lower() == "finished":
+            return True
+        task_future = sandbox.task_future
+        return isinstance(task_future, Future) and task_future.done()
+
     def wait_for_fault_injection_window(self, sandbox: SandboxHandle, *, timeout_s: float = 60.0) -> bool:
         logger.info(
             "Waiting for fault injection window sandbox=%s timeout_s=%.1f",
             sandbox.sandbox_id,
             timeout_s,
         )
+        if self._fault_injection_target_task_finished(sandbox):
+            logger.info(
+                "Skipping fault injection for sandbox=%s because task already finished state=%s task_future_done=%s",
+                sandbox.sandbox_id,
+                str(sandbox.last_status.get("state", "")),
+                bool(sandbox.task_future is not None and sandbox.task_future.done()),
+            )
+            return False
         ready = benchmark_support.wait_for(
-            lambda: self._fault_injection_ready(sandbox),
+            lambda: self._fault_injection_ready(sandbox) or self._fault_injection_target_task_finished(sandbox),
             timeout_s=timeout_s,
             interval_s=0.01,
             raise_on_timeout=False,
         )
+        if self._fault_injection_target_task_finished(sandbox):
+            logger.info(
+                "Skipping fault injection for sandbox=%s because task finished before the injection window was used "
+                "(state=%s task_future_done=%s)",
+                sandbox.sandbox_id,
+                str(sandbox.last_status.get("state", "")),
+                bool(sandbox.task_future is not None and sandbox.task_future.done()),
+            )
+            return False
         if ready:
             logger.info("Fault injection window ready sandbox=%s", sandbox.sandbox_id)
             return True
@@ -1960,10 +2215,18 @@ class RealHostScenarioHarness:
         description = self.runtime.describe(sandbox.sandbox_id)
         metadata = dict(description.metadata)
         logger.info("Relaunching sandbox=%s after recovery fallback", sandbox.sandbox_id)
+        preserve_task_run = (
+            sandbox.task_run is not None
+            and sandbox.task_future is not None
+            and not sandbox.task_future.done()
+            and sandbox.task_run.survives_fault_relaunch()
+            and not (sandbox.launch_source == "compose" and sandbox.llm_service_type == "iflow_trace_replay")
+        )
         self._delete_runtime(sandbox.sandbox_id)
         self._destroy_filesystem_dataset(sandbox.sandbox_id)
         self.runtime.launch("runc", metadata)
-        self._reset_llm_service_state(sandbox.sandbox_id)
+        if not preserve_task_run:
+            self._reset_llm_service_state(sandbox.sandbox_id)
         self.base_inspector.upsert_snapshot(
             SandboxSnapshot(
                 sandbox_id=sandbox.sandbox_id,
@@ -1976,13 +2239,6 @@ class RealHostScenarioHarness:
             )
         )
         payload = sandbox.last_status
-        preserve_task_run = (
-            sandbox.task_run is not None
-            and sandbox.task_future is not None
-            and not sandbox.task_future.done()
-            and sandbox.task_run.survives_fault_relaunch()
-            and not (sandbox.launch_source == "compose" and sandbox.llm_service_type == "iflow_trace_replay")
-        )
         if sandbox.task_run is not None and not preserve_task_run:
             sandbox.task_run.request_stop()
         if sandbox.task_description is not None and sandbox.task_config is not None:
@@ -2347,15 +2603,23 @@ class RealHostScenarioHarness:
         *,
         timeout_s: float | None = None,
     ) -> dict[str, object]:
+        swebench_instance_id = ""
+        if sandbox.task_config is not None:
+            raw_instance_id = sandbox.task_config.options.get("swebench_instance_id")
+            if isinstance(raw_instance_id, str):
+                swebench_instance_id = raw_instance_id
         command_started = time.perf_counter()
         verify_operation = None if self.telemetry is None else start_operation(
             self.telemetry,
             "benchmark.task.verify",
             self.benchmark_telemetry_attributes(sandbox),
         )
+        verification_command = "bash /tests/run-tests.sh"
+        if swebench_instance_id:
+            verification_command = "bash /tests/run-tests.sh 2>&1"
         result = self.exec_in_sandbox(
             sandbox,
-            ["/bin/bash", "-lc", "bash /tests/run-tests.sh"],
+            ["/bin/bash", "-lc", verification_command],
             cwd=self.sandbox_process_cwd(sandbox),
             env={"TEST_DIR": "/tests"},
             timeout_s=timeout_s,
@@ -2363,6 +2627,20 @@ class RealHostScenarioHarness:
         verification_ms = (time.perf_counter() - command_started) * 1000.0
         stdout = result.stdout.rstrip()
         stderr = result.stderr.rstrip()
+        verification_status = "passed" if result.returncode == 0 else "failed"
+        verification_details: dict[str, object] = {}
+        if swebench_instance_id:
+            instance = swebench_support.load_verified_dataset_row(swebench_instance_id)
+            grading = swebench_support.grade_verification_log(
+                instance=instance,
+                log_text=result.stdout,
+            )
+            verification_status = "passed" if bool(grading["resolved"]) else "failed"
+            verification_details = {
+                "verification_swebench_resolved": bool(grading["resolved"]),
+                "verification_swebench_patch_applied": bool(grading["patch_successfully_applied"]),
+                "verification_swebench_report": json.dumps(grading["tests_status"], sort_keys=True),
+            }
         logger.info(
             "Completed run-tests.sh sandbox=%s exit_code=%s command=%s",
             sandbox.sandbox_id,
@@ -2374,14 +2652,15 @@ class RealHostScenarioHarness:
         if stderr:
             logger.warning("run-tests stderr sandbox=%s\n%s", sandbox.sandbox_id, stderr)
         if verify_operation is not None:
-            verify_operation.finish(status="succeeded" if result.returncode == 0 else "failed")
+            verify_operation.finish(status="succeeded" if verification_status == "passed" else "failed")
         return {
-            "verification_status": "passed" if result.returncode == 0 else "failed",
+            "verification_status": verification_status,
             "verification_exit_code": result.returncode,
             "verification_ms": verification_ms,
             "verification_stdout": result.stdout,
             "verification_stderr": result.stderr,
             "verification_command": " ".join(shlex.quote(part) for part in result.args),
+            **verification_details,
         }
 
     def _prepare_sandbox_handle(
@@ -2439,6 +2718,19 @@ class RealHostScenarioHarness:
         return handle, prepared.work_dir_host_path
 
     def _llm_service_checkpoint_metadata(self, sandbox_id: SandboxId) -> dict[str, object]:
+        sandbox = self._sandbox_by_id.get(sandbox_id)
+        if sandbox is not None and sandbox.task_run is not None:
+            try:
+                status = sandbox.task_run.poll_status()
+            except Exception:
+                logger.debug("Failed to poll task status for llm checkpoint metadata sandbox=%s", sandbox_id, exc_info=True)
+            else:
+                try:
+                    trace_cursor = max(0, int(status.get("replay_trace_cursor", -1)))
+                except (TypeError, ValueError):
+                    trace_cursor = -1
+                if trace_cursor >= 0:
+                    return {"benchmark_trace_cursor": trace_cursor}
         try:
             snapshot = self._snapshot_llm_services()
         except Exception:
@@ -2449,7 +2741,7 @@ class RealHostScenarioHarness:
         sandbox_snapshot = snapshot.get(str(sandbox_id))
         if not isinstance(sandbox_snapshot, dict):
             return {}
-        if sandbox_snapshot.get("llm_service_type") != "iflow_trace_replay":
+        if sandbox_snapshot.get("llm_service_type") not in {"iflow_trace_replay", "mini_swe_trace_replay"}:
             return {}
         state = sandbox_snapshot.get("state")
         if not isinstance(state, dict):
@@ -2471,6 +2763,51 @@ class RealHostScenarioHarness:
             self._reset_llm_router_state(sandbox_id)
         except Exception:
             logger.exception("Failed to reset llm service state for sandbox=%s", sandbox_id)
+
+    @staticmethod
+    def _benchmark_trace_cursor_from_metadata(metadata: dict[str, object]) -> int | None:
+        raw_value = metadata.get("benchmark_trace_cursor")
+        try:
+            return max(0, int(raw_value))
+        except (TypeError, ValueError):
+            return None
+
+    def _restore_task_run_trace_cursor(self, sandbox_id: SandboxId, manifest: CheckpointManifest) -> None:
+        sandbox = self._sandbox_by_id.get(sandbox_id)
+        if sandbox is None or sandbox.task_run is None:
+            return
+        metadata = manifest.metadata if isinstance(manifest.metadata, dict) else {}
+        restore_trace_cursor = None
+        raw_restore_checkpoint_id = metadata.get("filesystem_restore_checkpoint_id")
+        if raw_restore_checkpoint_id is not None and self.storage is not None:
+            try:
+                filesystem_manifest = self.storage.get_manifest(sandbox_id, CheckpointId(str(raw_restore_checkpoint_id)))
+            except Exception:
+                logger.debug(
+                    "Failed to resolve filesystem restore cursor for sandbox=%s checkpoint=%s",
+                    sandbox_id,
+                    raw_restore_checkpoint_id,
+                    exc_info=True,
+                )
+            else:
+                restore_trace_cursor = self._benchmark_trace_cursor_from_metadata(
+                    filesystem_manifest.metadata if isinstance(filesystem_manifest.metadata, dict) else {}
+                )
+        if restore_trace_cursor is None:
+            restore_trace_cursor = self._benchmark_trace_cursor_from_metadata(metadata)
+        if restore_trace_cursor is None:
+            return
+        recorder = getattr(sandbox.task_run, "record_restore_trace_cursor", None)
+        if not callable(recorder):
+            return
+        try:
+            recorder(restore_trace_cursor)
+        except Exception:
+            logger.exception(
+                "Failed to record restore trace cursor for sandbox=%s trace_cursor=%s",
+                sandbox_id,
+                restore_trace_cursor,
+            )
 
     def _restore_llm_service_state(self, sandbox_id: SandboxId, manifest: CheckpointManifest) -> None:
         if self.llm_router_client is None and self.llm_server is None:
@@ -2497,6 +2834,22 @@ class RealHostScenarioHarness:
                 "Failed to restore llm service state for sandbox=%s consumed_response_count=%s",
                 sandbox_id,
                 consumed_response_count,
+            )
+
+        # self._restore_task_run_trace_cursor(sandbox_id, manifest)
+        sandbox = self._sandbox_by_id.get(sandbox_id)
+        if sandbox is None or sandbox.task_run is None:
+            return
+        recorder = getattr(sandbox.task_run, "record_restore_trace_cursor", None)
+        if not callable(recorder):
+            return
+        try:
+            recorder(raw_value)
+        except Exception:
+            logger.exception(
+                "Failed to record restore trace cursor for sandbox=%s trace_cursor=%s",
+                sandbox_id,
+                raw_value,
             )
 
     def _set_sandbox_running_state(self, sandbox_id: SandboxId, *, is_running: bool) -> None:

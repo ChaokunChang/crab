@@ -8,7 +8,14 @@ from agent_cr import CheckpointId
 from integrations.agents import SandboxHandle, TaskConfig
 
 from benchmarks.config import BenchmarkConfig
-from benchmarks.core import annotate_row, emit_row_telemetry, poll_sandbox_status, trace_response_count_for_sandbox, verify_task_accuracy
+from benchmarks.core import (
+    annotate_row,
+    emit_row_telemetry,
+    poll_sandbox_status,
+    task_completion_timeout_seconds,
+    trace_response_count_for_sandbox,
+    verify_task_accuracy,
+)
 from benchmarks.support import average, task_timeout_seconds, total_actions
 
 
@@ -99,6 +106,41 @@ def wait_for_auto_replay_checkpoint(
     raise RuntimeError(f"timed out waiting for auto replay checkpoint at action count {minimum_actions}")
 
 
+def cleanup_finished_replay_sandbox_after_run(
+    config: BenchmarkConfig,
+    harness,
+    sandbox: SandboxHandle,
+    *,
+    task_error: str = "",
+) -> str:
+    if config.verification_enabled or not config.phase_merging.setup_and_run:
+        return task_error
+
+    completed = str(sandbox.last_status.get("state", "")) == "finished"
+    if not completed:
+        try:
+            harness.wait_for_task_completion(
+                sandbox,
+                timeout_s=task_completion_timeout_seconds(sandbox),
+            )
+        except Exception as exc:
+            if not task_error:
+                task_error = str(exc) or exc.__class__.__name__
+            task_future = sandbox.task_future
+            completed = bool(task_future is not None and task_future.done())
+        else:
+            completed = True
+
+    if not completed:
+        return task_error
+
+    poll_sandbox_status(sandbox)
+    deactivate_sandbox_runtime = getattr(harness, "deactivate_sandbox_runtime", None)
+    if callable(deactivate_sandbox_runtime):
+        deactivate_sandbox_runtime(sandbox)
+    return task_error
+
+
 def finalize_replay_row(
     config: BenchmarkConfig,
     harness,
@@ -111,7 +153,8 @@ def finalize_replay_row(
     success_ratio: float | None = None,
 ) -> dict[str, object]:
     trace_response_count = trace_response_count_for_sandbox(sandbox)
-    if verify_task_accuracy_result:
+    should_verify = verify_task_accuracy_result and config.verification_enabled
+    if should_verify:
         verification = {
             "verification_status": "task_failed" if task_error else "verification_skipped",
             "verification_exit_code": -1,
@@ -132,7 +175,7 @@ def finalize_replay_row(
             "replay task finished before reaching the end of the trace "
             f"(replay_final_trace_cursor={raw_replay_final_trace_cursor}, trace_response_count={trace_response_count})"
         )
-        if verify_task_accuracy_result:
+        if should_verify:
             verification = {
                 **verification,
                 "verification_status": "task_failed",
@@ -145,7 +188,7 @@ def finalize_replay_row(
         "replay_is_complete": replay_is_complete,
         **verification,
     }
-    if verify_task_accuracy_result:
+    if should_verify:
         resolved_success_ratio = 1.0 if not task_error and verification["verification_status"] == "passed" else 0.0
     else:
         resolved_success_ratio = 0.0 if task_error else (1.0 if success_ratio is None else float(success_ratio))

@@ -16,14 +16,43 @@ RuncSandboxManagerPaths = RuncRuntimePaths
 class FakeCommandRunner(CommandRunner):
     def __init__(self) -> None:
         self.commands: list[tuple[str, ...]] = []
+        self.datasets: set[str] = set()
+        self.snapshots: set[str] = set()
 
     def run(self, command: list[str], *, cwd: Path | None = None):
         _ = cwd
         self.commands.append(tuple(command))
+        returncode = 0
+        stdout = ""
+        stderr = ""
+        if command[:5] == ["zfs", "list", "-H", "-o", "name"]:
+            name = command[-1]
+            exists = name in self.datasets or name in self.snapshots
+            returncode = 0 if exists else 1
+            stderr = "" if exists else "dataset does not exist"
+        elif command[:2] == ["zfs", "create"]:
+            self.datasets.add(command[-1])
+        elif command[:2] == ["zfs", "snapshot"]:
+            self.snapshots.add(command[-1])
+        elif command[:2] == ["zfs", "clone"]:
+            self.datasets.add(command[-1])
+        elif command[:3] == ["zfs", "destroy", "-r"]:
+            target = command[-1]
+            datasets = {name for name in self.datasets if name == target or name.startswith(f"{target}/")}
+            snapshots = {
+                name
+                for name in self.snapshots
+                if name.startswith(f"{target}@") or name.startswith(f"{target}/")
+            }
+            if not datasets and not snapshots:
+                returncode = 1
+                stderr = "dataset does not exist"
+            self.datasets.difference_update(datasets)
+            self.snapshots.difference_update(snapshots)
         return type(
             "Result",
             (),
-            {"command": tuple(command), "returncode": 0, "stdout": "", "stderr": ""},
+            {"command": tuple(command), "returncode": returncode, "stdout": stdout, "stderr": stderr},
         )()
 
 
@@ -52,6 +81,31 @@ class ResumeRaceCommandRunner(CommandRunner):
                 "Result",
                 (),
                 {"command": tuple(command), "returncode": 0, "stdout": json.dumps(payload), "stderr": ""},
+            )()
+        return type(
+            "Result",
+            (),
+            {"command": tuple(command), "returncode": 0, "stdout": "", "stderr": ""},
+        )()
+
+
+class PauseNotRunningCommandRunner(CommandRunner):
+    def __init__(self) -> None:
+        self.commands: list[tuple[str, ...]] = []
+
+    def run(self, command: list[str], *, cwd: Path | None = None):
+        _ = cwd
+        self.commands.append(tuple(command))
+        if command[-2:] == ["pause", "sbx-test"]:
+            return type(
+                "Result",
+                (),
+                {
+                    "command": tuple(command),
+                    "returncode": 1,
+                    "stdout": "",
+                    "stderr": 'time="2026-03-28T17:17:43+08:00" level=error msg="container not running"',
+                },
             )()
         return type(
             "Result",
@@ -102,6 +156,127 @@ class FlakyHostInspectorClient(FakeHostInspectorClient):
 
 
 class SandboxManagerTests(unittest.TestCase):
+    def test_runc_prepare_launch_moves_rootfs_materialization_out_of_launch(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_sandbox_mgr_") as tmp:
+            root = Path(tmp)
+            runner = FakeCommandRunner()
+            manager = RuncSandboxManager(
+                command_runner=runner,
+                paths=RuncSandboxManagerPaths(
+                    state_root=root / "state",
+                    bundle_root=root / "bundles",
+                    metadata_root=root / "metadata",
+                    zfs_dataset_prefix="pool/agent-cr",
+                ),
+            )
+            rootfs_source = root / "source-file.txt"
+            rootfs_source.write_text("prepared\n", encoding="utf-8")
+            metadata = {
+                "sandbox_id": "sbx-test",
+                "bundle_path": str(root / "bundles" / "sbx-test"),
+                "rootfs_init_dirs": ["work"],
+                "rootfs_copy_paths": [{"source": str(rootfs_source), "destination": "/work/source-file.txt"}],
+            }
+
+            sandbox_id = manager.prepare_launch("runc", metadata)
+
+            self.assertEqual(sandbox_id, SandboxId("sbx-test"))
+            self.assertEqual(
+                runner.commands,
+                [
+                    ("zfs", "destroy", "-r", "pool/agent-cr/sbx-test"),
+                    ("zfs", "create", "-o", f"mountpoint={root / 'bundles' / 'sbx-test' / 'rootfs'}", "pool/agent-cr/sbx-test"),
+                ],
+            )
+            self.assertTrue(bool(metadata.get("_agent_cr_runtime_prepared")))
+            self.assertEqual(metadata["zfs_dataset"], "pool/agent-cr/sbx-test")
+            self.assertEqual(metadata["rootfs_path"], str(root / "bundles" / "sbx-test" / "rootfs"))
+            self.assertTrue((root / "bundles" / "sbx-test" / "rootfs" / "work").is_dir())
+            self.assertEqual(
+                (root / "bundles" / "sbx-test" / "rootfs" / "work" / "source-file.txt").read_text(encoding="utf-8"),
+                "prepared\n",
+            )
+
+            runner.commands.clear()
+            launched_id = manager.launch("runc", metadata)
+
+            self.assertEqual(launched_id, SandboxId("sbx-test"))
+            self.assertEqual(
+                runner.commands,
+                [
+                    ("runc", "--root", str(root / "state"), "create", "--bundle", str(root / "bundles" / "sbx-test"), "sbx-test"),
+                    ("runc", "--root", str(root / "state"), "start", "sbx-test"),
+                ],
+            )
+
+    def test_runc_prepare_launch_clones_shared_rootfs_base_when_key_present(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_sandbox_mgr_") as tmp:
+            root = Path(tmp)
+            runner = FakeCommandRunner()
+            manager = RuncSandboxManager(
+                command_runner=runner,
+                paths=RuncSandboxManagerPaths(
+                    state_root=root / "state",
+                    bundle_root=root / "bundles",
+                    metadata_root=root / "metadata",
+                    zfs_dataset_prefix="pool/agent-cr",
+                ),
+            )
+            rootfs_source = root / "source-file.txt"
+            rootfs_source.write_text("prepared\n", encoding="utf-8")
+            metadata = {
+                "sandbox_id": "sbx-shared-a",
+                "bundle_path": str(root / "bundles" / "sbx-shared-a"),
+                "rootfs_init_dirs": ["work"],
+                "rootfs_copy_paths": [{"source": str(rootfs_source), "destination": "/work/source-file.txt"}],
+                "shared_rootfs_key": "compose-cache-key",
+                "shared_rootfs_persist": True,
+            }
+
+            manager.prepare_launch("runc", metadata)
+
+            self.assertIn(
+                ("zfs", "create", "-o", "mountpoint=/tmp/agent-cr-rootfs-cache/pool_agent-cr/persistent/compose-cache-key", "pool/agent-cr-cache-compose-cache-key"),
+                runner.commands,
+            )
+            self.assertIn(
+                ("zfs", "clone", "-o", f"mountpoint={root / 'bundles' / 'sbx-shared-a' / 'rootfs'}", "pool/agent-cr-cache-compose-cache-key@base", "pool/agent-cr/sbx-shared-a"),
+                runner.commands,
+            )
+            self.assertEqual(
+                (root / "bundles" / "sbx-shared-a" / "rootfs" / "work" / "source-file.txt").read_text(encoding="utf-8"),
+                "prepared\n",
+            )
+
+            runner.commands.clear()
+            metadata_b = {
+                "sandbox_id": "sbx-shared-b",
+                "bundle_path": str(root / "bundles" / "sbx-shared-b"),
+                "rootfs_init_dirs": ["work"],
+                "rootfs_copy_paths": [{"source": str(rootfs_source), "destination": "/work/source-file.txt"}],
+                "shared_rootfs_key": "compose-cache-key",
+                "shared_rootfs_persist": True,
+            }
+
+            manager.prepare_launch("runc", metadata_b)
+
+            self.assertIn(
+                ("zfs", "list", "-H", "-o", "name", "pool/agent-cr-cache-compose-cache-key"),
+                runner.commands,
+            )
+            self.assertIn(
+                ("zfs", "list", "-H", "-o", "name", "pool/agent-cr-cache-compose-cache-key@base"),
+                runner.commands,
+            )
+            self.assertNotIn(
+                ("zfs", "create", "-o", "mountpoint=/tmp/agent-cr-rootfs-cache/pool_agent-cr/persistent/compose-cache-key", "pool/agent-cr-cache-compose-cache-key"),
+                runner.commands,
+            )
+            self.assertEqual(
+                (root / "bundles" / "sbx-shared-b" / "rootfs" / "work" / "source-file.txt").read_text(encoding="utf-8"),
+                "prepared\n",
+            )
+
     def test_runc_sandbox_manager_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_sandbox_mgr_") as tmp:
             root = Path(tmp)
@@ -157,6 +332,37 @@ class SandboxManagerTests(unittest.TestCase):
                     ("zfs", "destroy", "-r", "pool/agent-cr/sbx-test"),
                 ],
             )
+
+    def test_runc_pause_logs_expected_non_running_state_as_benign(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_sandbox_mgr_") as tmp:
+            root = Path(tmp)
+            runner = PauseNotRunningCommandRunner()
+            host_inspector = FakeHostInspectorClient()
+            manager = RuncSandboxManager(
+                command_runner=runner,
+                host_inspector_client=host_inspector,
+                paths=RuncSandboxManagerPaths(
+                    state_root=root / "state",
+                    bundle_root=root / "bundles",
+                    metadata_root=root / "metadata",
+                    zfs_dataset_prefix="pool/agent-cr",
+                ),
+            )
+            sandbox_id = manager.launch(
+                "runc",
+                {
+                    "sandbox_id": "sbx-test",
+                    "bundle_path": str(root / "bundles" / "sbx-test"),
+                },
+            )
+
+            with self.assertLogs("agent_cr.runtime.runc", level="INFO") as captured:
+                with self.assertRaises(RuntimeError):
+                    manager.pause(sandbox_id)
+
+        joined = "\n".join(captured.output)
+        self.assertIn("Runtime command returned expected non-zero", joined)
+        self.assertNotIn("Runtime command failed rc=1", joined)
 
     def test_runc_sandbox_manager_registers_restored_sandbox_with_host_inspector(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_sandbox_mgr_") as tmp:

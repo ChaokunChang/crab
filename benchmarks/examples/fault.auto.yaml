@@ -8,6 +8,10 @@ phase_workers:
   setup: 4
   run: 10
   verification: 4
+rootfs_reuse:
+  enabled: true
+phase_merging:
+  setup_and_run: false
 iterations: 10
 output: ../../logs/tmp/fault.auto.csv
 log_file: ../../logs/tmp/fault.auto.log

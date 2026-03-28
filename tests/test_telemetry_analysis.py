@@ -1038,6 +1038,58 @@ class TelemetryAnalysisTests(unittest.TestCase):
                     },
                 },
                 {
+                    "timestamp": "2026-03-23T01:00:20+08:00",
+                    "kind": "metric",
+                    "name": "llm.gate_wait_ms",
+                    "value": 12.0,
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "sbx-1",
+                        "task_id": "task-1",
+                        "component": "interceptor",
+                        "request_id": "req-1",
+                    },
+                },
+                {
+                    "timestamp": "2026-03-23T01:00:40+08:00",
+                    "kind": "metric",
+                    "name": "llm.gate_wait_ms",
+                    "value": 20.0,
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "sbx-1",
+                        "task_id": "task-1",
+                        "component": "interceptor",
+                        "request_id": "req-2",
+                    },
+                },
+                {
+                    "timestamp": "2026-03-23T01:00:25+08:00",
+                    "kind": "metric",
+                    "name": "llm.agentcr_delay_ms",
+                    "value": 30.0,
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "sbx-1",
+                        "task_id": "task-1",
+                        "component": "interceptor",
+                        "request_id": "req-1",
+                    },
+                },
+                {
+                    "timestamp": "2026-03-23T01:00:55+08:00",
+                    "kind": "metric",
+                    "name": "llm.agentcr_delay_ms",
+                    "value": 50.0,
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "sbx-1",
+                        "task_id": "task-1",
+                        "component": "interceptor",
+                        "request_id": "req-2",
+                    },
+                },
+                {
                     "timestamp": "2026-03-23T01:00:10+08:00",
                     "kind": "metric",
                     "name": "resource.host.cpu.usage_percent",
@@ -1092,6 +1144,15 @@ class TelemetryAnalysisTests(unittest.TestCase):
             self.assertEqual(analysis.restore_analysis.fail_count, 0)
             self.assertEqual(analysis.restore_analysis.mixed_source_count, 1)
             self.assertAlmostEqual(analysis.restore_analysis.mean_source_gap_turns, 2.0)
+            self.assertIsNotNone(analysis.overhead_analysis)
+            assert analysis.overhead_analysis is not None
+            overhead_by_name = {item.metric_name: item for item in analysis.overhead_analysis.metrics}
+            self.assertAlmostEqual(overhead_by_name["llm.gate_wait_ms"].mean_ms, 16.0)
+            self.assertAlmostEqual(overhead_by_name["llm.gate_wait_ms"].p50_ms, 16.0)
+            self.assertAlmostEqual(overhead_by_name["llm.agentcr_delay_ms"].mean_ms, 40.0)
+            self.assertAlmostEqual(overhead_by_name["llm.agentcr_delay_ms"].p50_ms, 40.0)
+            self.assertEqual(len(analysis.overhead_analysis.time_series["llm.gate_wait_ms"]), 2)
+            self.assertEqual(len(analysis.overhead_analysis.time_series["llm.agentcr_delay_ms"]), 2)
             self.assertEqual(
                 max(point.active_estimated_io_bytes for point in analysis.checkpoint_analysis.load_over_time),
                 1792.0,
@@ -1111,15 +1172,23 @@ class TelemetryAnalysisTests(unittest.TestCase):
 
             html = (root / "report" / "report.html").read_text(encoding="utf-8")
             self.assertIn("Checkpoint Analysis", html)
+            self.assertIn("Overhead Analysis", html)
             self.assertIn("Restore Analysis", html)
+            self.assertLess(html.index("Checkpoint Analysis"), html.index("Overhead Analysis"))
+            self.assertLess(html.index("Overhead Analysis"), html.index("Restore Analysis"))
             self.assertIn("15s windows", html)
             self.assertIn("Resource Usage", html)
             self.assertIn("Min (ms)", html)
+            self.assertIn("Median (ms)", html)
             self.assertIn("P25 (ms)", html)
             self.assertIn("P50 (ms)", html)
+            self.assertIn("llm.gate_wait", html)
+            self.assertIn("llm.agentcr_delay", html)
+            self.assertIn("Window-Aggregated Overhead Over Time", html)
             self.assertIn("Process Checkpoint Latency Over Time", html)
             self.assertIn("Filesystem Restore Latency Over Time", html)
             self.assertTrue((root / "report" / "checkpoint_load_jobs.svg").exists())
+            self.assertTrue((root / "report" / "overhead_latency.svg").exists())
             self.assertTrue((root / "report" / "restore_load_jobs.svg").exists())
             self.assertTrue((root / "report" / "checkpoint_flow_latency.svg").exists())
             self.assertTrue((root / "report" / "checkpoint_process_latency.svg").exists())
@@ -1129,11 +1198,16 @@ class TelemetryAnalysisTests(unittest.TestCase):
             self.assertTrue((root / "report" / "restore_filesystem_latency.svg").exists())
             self.assertTrue((root / "report" / "resource_host_cpu.svg").exists())
             self.assertTrue((root / "report" / "resource_summary.csv").exists())
+            self.assertTrue((root / "report" / "overhead_analysis.csv").exists())
+            self.assertTrue((root / "report" / "overhead_timeseries.csv").exists())
             operation_csv = (root / "report" / "operation_summary.csv").read_text(encoding="utf-8")
             self.assertIn("p25_ms", operation_csv.splitlines()[0])
             checkpoint_load_svg = (root / "report" / "checkpoint_load_jobs.svg").read_text(encoding="utf-8")
             self.assertIn("legend-bg", checkpoint_load_svg)
             self.assertIn("active filesystem jobs", checkpoint_load_svg)
+            overhead_svg = (root / "report" / "overhead_latency.svg").read_text(encoding="utf-8")
+            self.assertIn("llm.gate_wait", overhead_svg)
+            self.assertIn("llm.agentcr_delay", overhead_svg)
             restore_load_svg = (root / "report" / "restore_load_jobs.svg").read_text(encoding="utf-8")
             self.assertIn("active process jobs", restore_load_svg)
 
