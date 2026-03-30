@@ -701,6 +701,7 @@ class SystemIntegrationTests(unittest.TestCase):
                         ).encode("utf-8"),
                     ),
                     request_state_store=request_store,
+                    on_response_ready=system.notify_live_response_ready,
                     response_gate_registry=system.response_gate_registry,
                 )
                 _, _, body = interceptor.intercept(

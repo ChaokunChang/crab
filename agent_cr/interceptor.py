@@ -451,6 +451,7 @@ class AgentCRRequestInterceptor:
         hook: RequestInterceptorHook | None = None,
         telemetry: TelemetrySink | None = None,
         on_state_change: Callable[[SandboxId], None] | None = None,
+        on_response_ready: Callable[[SandboxId, str, int | None], None] | None = None,
         response_gate_registry: SandboxResponseGateRegistry | None = None,
         sandbox_id_resolver: Callable[[str | None, dict[str, str], bytes], str | None] | None = None,
     ) -> None:
@@ -459,6 +460,7 @@ class AgentCRRequestInterceptor:
         self._hook = hook or CompositeRequestInterceptorHook()
         self._telemetry = telemetry
         self._on_state_change = on_state_change
+        self._on_response_ready = on_response_ready
         self._response_gate_registry = response_gate_registry
         self._sandbox_id_resolver = sandbox_id_resolver
 
@@ -532,6 +534,16 @@ class AgentCRRequestInterceptor:
                     request_attributes,
                 )
             agentcr_delay_started_at = time.perf_counter()
+            if self._on_response_ready is not None:
+                try:
+                    self._on_response_ready(context.sandbox_id, context.request_id, gate_generation)
+                except Exception:
+                    logger.exception(
+                        "Response-ready callback failed: sandbox_id=%s request_id=%s generation=%s",
+                        context.sandbox_id,
+                        context.request_id,
+                        gate_generation,
+                    )
             logger.debug(
                 "Intercepting request complete: request_id=%s sandbox_id=%s status_code=%s response_bytes=%s",
                 context.request_id,
@@ -609,6 +621,7 @@ class AgentCRRequestInterceptorServer:
         hook: RequestInterceptorHook | None = None,
         telemetry: TelemetrySink | None = None,
         on_state_change: Callable[[SandboxId], None] | None = None,
+        on_response_ready: Callable[[SandboxId, str, int | None], None] | None = None,
         response_gate_registry: SandboxResponseGateRegistry | None = None,
         sandbox_id_resolver: Callable[[str | None, dict[str, str], bytes], str | None] | None = None,
         host: str = "127.0.0.1",
@@ -628,6 +641,7 @@ class AgentCRRequestInterceptorServer:
             hook=hook,
             telemetry=telemetry,
             on_state_change=on_state_change,
+            on_response_ready=on_response_ready,
             response_gate_registry=response_gate_registry,
             sandbox_id_resolver=sandbox_id_resolver,
         )

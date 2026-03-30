@@ -22,3 +22,5 @@ logs/
 integrations/sandboxes/3rdparty/
 data/
 .cache/
+integrations/sandboxes/iflow/cache/
+.codex

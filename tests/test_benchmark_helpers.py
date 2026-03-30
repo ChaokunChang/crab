@@ -53,7 +53,11 @@ from benchmarks.support import (
 from benchmarks.real_host_scenario_base import (
     RealHostScenarioHarness,
 )
-from integrations.sandboxes.runtime.network import parse_ipv4_route_networks, select_benchmark_network
+from integrations.sandboxes.runtime.network import (
+    benchmark_network_guest_capacity,
+    parse_ipv4_route_networks,
+    select_benchmark_network,
+)
 
 ImageRuntimeDefaults = sandbox_image.ImageRuntimeDefaults
 
@@ -435,6 +439,14 @@ class BenchmarkHelperTests(unittest.TestCase):
         )
         self.assertEqual((bridge_ip, network_cidr), ("10.250.2.1", "10.250.2.0/24"))
 
+    def test_select_benchmark_network_expands_cidr_for_large_runs(self) -> None:
+        bridge_ip, network_cidr = select_benchmark_network(
+            existing_routes="10.250.0.0/24 dev acb0 proto kernel scope link src 10.250.0.1",
+            required_guest_capacity=640,
+        )
+
+        self.assertEqual((bridge_ip, network_cidr), ("10.250.4.1", "10.250.4.0/22"))
+
     def test_total_actions_reads_payload(self) -> None:
         self.assertEqual(total_actions({"total_actions": 7}), 7)
 
@@ -767,6 +779,37 @@ class BenchmarkHelperTests(unittest.TestCase):
         self.assertEqual(second.namespace_path.name, second.namespace_name)
         self.assertTrue(run.called)
 
+    def test_allocate_benchmark_network_lease_respects_configured_network_capacity(self) -> None:
+        manager = sandbox_network.BenchmarkNetworkManager()
+        manager._network_cidr = "10.250.0.0/30"
+        manager._bridge_ip = "10.250.0.1"
+
+        with patch("integrations.sandboxes.runtime.network.subprocess.run"):
+            lease = manager.allocate_lease(SandboxId("sbx-a"))
+            self.assertEqual(lease.guest_ip, "10.250.0.2")
+            with self.assertRaisesRegex(RuntimeError, "max_guests=1"):
+                manager.allocate_lease(SandboxId("sbx-b"))
+
+    def test_benchmark_network_manager_configure_accepts_large_env_override(self) -> None:
+        manager = sandbox_network.BenchmarkNetworkManager()
+
+        with patch.dict("os.environ", {"AGENT_CR_BENCHMARK_NETWORK_CIDR": "10.250.8.0/22"}, clear=False):
+            manager.configure(expected_sandboxes=640)
+
+        self.assertEqual(manager.network_cidr, "10.250.8.0/22")
+        self.assertEqual(manager.bridge_ip, "10.250.8.1")
+        self.assertGreaterEqual(
+            benchmark_network_guest_capacity(ipaddress.ip_network(manager.network_cidr)),
+            640,
+        )
+
+    def test_benchmark_network_manager_configure_rejects_small_env_override(self) -> None:
+        manager = sandbox_network.BenchmarkNetworkManager()
+
+        with patch.dict("os.environ", {"AGENT_CR_BENCHMARK_NETWORK_CIDR": "10.250.8.0/24"}, clear=False):
+            with self.assertRaisesRegex(ValueError, "supports at most 253 guest sandboxes, need 640"):
+                manager.configure(expected_sandboxes=640)
+
     def test_release_benchmark_network_lease_cleans_up_ip_mapping(self) -> None:
         manager = sandbox_network.BenchmarkNetworkManager()
 
@@ -935,6 +978,7 @@ class BenchmarkHelperTests(unittest.TestCase):
         )
         harness.root = Path("/tmp/harness-root")
         harness.runtime_state_root = Path("/tmp/runtime-root")
+        harness.telemetry = InMemoryTelemetrySink()
         sandbox = SandboxHandle(
             sandbox_id=SandboxId("sbx-explicit"),
             bundle_dir=Path("/tmp/sbx-explicit"),
@@ -949,6 +993,7 @@ class BenchmarkHelperTests(unittest.TestCase):
         self.assertEqual(agent.runtime_state_root, Path("/tmp/runtime-root"))
         self.assertEqual(agent.agent_host_dir, Path("/tmp/harness-root/recording/sbx-explicit"))
         self.assertEqual(agent.llm_base_url, "http://127.0.0.1:43123/v1")
+        self.assertIs(agent.telemetry, harness.telemetry)
 
     def test_base_agent_post_task_finish_deactivates_sandbox_runtime(self) -> None:
         class _RecordingAgent(BaseAgent):

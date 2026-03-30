@@ -9,6 +9,7 @@ from pathlib import Path
 from threading import Event
 
 from agent_cr import EBPFEvent, EBPFEventKind, InMemoryEBPFEventCollector, Runtime, SandboxId
+from agent_cr.contracts import TelemetrySink
 from agent_cr.models import utc_now
 
 from .contracts import SandboxHandle
@@ -73,6 +74,7 @@ class BaseAgent(ABC):
         sandbox_manager: Runtime | None = None,
         agent_host_dir: Path | None = None,
         llm_base_url: str | None = None,
+        telemetry: TelemetrySink | None = None,
     ) -> None:
         if runtime is not None and sandbox_manager is not None and runtime is not sandbox_manager:
             raise ValueError("runtime and sandbox_manager refer to the same runtime and cannot differ")
@@ -83,6 +85,7 @@ class BaseAgent(ABC):
         self.runtime = runtime if runtime is not None else sandbox_manager
         self.agent_host_dir = agent_host_dir
         self.llm_base_url = llm_base_url
+        self.telemetry = telemetry
         self._activity_collector = InMemoryEBPFEventCollector()
         self._stop_requested = Event()
 

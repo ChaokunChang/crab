@@ -206,6 +206,28 @@ class IFlowTraceReplayTests(unittest.TestCase):
         self.assertEqual(snapshot["consumed_response_count"], 1)
         self.assertEqual(snapshot["trace_cursor"], 1)
 
+    def test_trace_replay_state_snapshot_can_omit_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.log"
+            trace_path.write_text(
+                "\n".join(self._request_response_lines("first", "second")),
+                encoding="utf-8",
+            )
+            state = TraceReplayLLMState(llm_service_config={"trace_path": str(trace_path)})
+
+            first_index, first = state.next_response(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx"},
+                payload={"model": "trace-model", "messages": [{"role": "user", "content": "first"}], "tools": []},
+            )
+            snapshot = state.snapshot(include_events=False)
+
+        self.assertEqual(first_index, 1)
+        self.assertEqual(first["choices"][0]["message"]["content"], "first")
+        self.assertEqual(snapshot["consumed_response_count"], 1)
+        self.assertEqual(snapshot["trace_cursor"], 1)
+        self.assertNotIn("events", snapshot)
+
     def test_trace_replay_state_matches_escape_only_formatting_differences(self) -> None:
         trace_content = 'If potentially_problematic_new_string is console.log("Hello\nWorld"), fix it.'
         live_content = 'If potentially_problematic_new_string is console.log(\\"Hello\\\\nWorld\\"), fix it.'

@@ -105,7 +105,8 @@ class TraceReplayLLMState:
         _ = consumed_response_count
         return
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self, *, include_events: bool = True) -> dict[str, Any]:
+        _ = include_events
         with self._lock:
             trace_cursor = self._trace_cursor
         return {

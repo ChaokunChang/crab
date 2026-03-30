@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+from collections import defaultdict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 import logging
-from threading import BoundedSemaphore, Lock
+from threading import BoundedSemaphore, Condition, Lock, Thread
 import time
 
 from .config import ExecutorConfig
 from .contracts import CompositeCheckpointWorker, CompositeRestoreWorker, TelemetrySink
-from .ids import CheckpointId, JobId
+from .ids import CheckpointId, JobId, SandboxId
 from .models import (
     CheckpointJob,
     CheckpointResult,
@@ -23,6 +25,16 @@ from .telemetry import NoopTelemetrySink, start_operation
 
 logger = logging.getLogger(__name__)
 
+_CAPTURED_REQUEST_ID = "captured_request_id"
+
+
+@dataclass
+class _CheckpointQueueItem:
+    job: CheckpointJob
+    future: Future[CheckpointResult]
+    queue_class: str
+    request_key: tuple[SandboxId, str] | None = None
+
 
 class CRExecutor:
     def __init__(
@@ -37,12 +49,30 @@ class CRExecutor:
         self._restore_worker = restore_worker
         self._telemetry = telemetry or NoopTelemetrySink()
         self._restore_pool = ThreadPoolExecutor(max_workers=config.resolved_restore_workers)
-        self._checkpoint_pool = ThreadPoolExecutor(max_workers=config.resolved_checkpoint_workers)
         self._checkpoint_slots = BoundedSemaphore(
             config.resolved_checkpoint_workers + config.max_checkpoint_queue_size
         )
         self._lock = Lock()
         self._records: dict[JobId, JobRecord] = {}
+
+        self._checkpoint_condition = Condition()
+        self._checkpoint_shutdown = False
+        self._checkpoint_queue: deque[_CheckpointQueueItem] = deque()
+        self._checkpoint_urgent_queue: deque[_CheckpointQueueItem] = deque()
+        self._checkpoint_items: dict[JobId, _CheckpointQueueItem] = {}
+        self._checkpoint_request_items: dict[tuple[SandboxId, str], list[JobId]] = defaultdict(list)
+        self._exposed_live_requests: set[tuple[SandboxId, str]] = set()
+        self._urgent_dequeue_streak = 0
+        self._checkpoint_threads = [
+            Thread(
+                target=self._checkpoint_worker_loop,
+                name=f"agent-cr-ckpt-{index}",
+                daemon=True,
+            )
+            for index in range(config.resolved_checkpoint_workers)
+        ]
+        for thread in self._checkpoint_threads:
+            thread.start()
 
     @property
     def config(self) -> ExecutorConfig:
@@ -50,7 +80,11 @@ class CRExecutor:
 
     def shutdown(self) -> None:
         logger.info("Shutting down executor worker pool")
-        self._checkpoint_pool.shutdown(wait=True)
+        with self._checkpoint_condition:
+            self._checkpoint_shutdown = True
+            self._checkpoint_condition.notify_all()
+        for thread in self._checkpoint_threads:
+            thread.join()
         self._restore_pool.shutdown(wait=True)
         for worker in (self._checkpoint_worker, self._restore_worker):
             close = getattr(worker, "close", None)
@@ -87,6 +121,10 @@ class CRExecutor:
             )
 
     def submit_checkpoint(self, job: CheckpointJob) -> Future[CheckpointResult]:
+        with self._checkpoint_condition:
+            if self._checkpoint_shutdown:
+                raise RuntimeError("cannot schedule new checkpoint jobs after shutdown")
+
         self._set_record(
             JobRecord(
                 job_id=job.job_id,
@@ -103,6 +141,7 @@ class CRExecutor:
                 "job_id": str(job.job_id),
                 "job_type": JobType.CHECKPOINT.value,
                 "sandbox_id": str(job.sandbox_id),
+                "checkpoint_scheduling_policy": self._config.checkpoint_scheduling_policy,
             },
         )
         logger.info("Queued checkpoint job %s for sandbox %s", job.job_id, job.sandbox_id)
@@ -126,13 +165,98 @@ class CRExecutor:
                 )
             )
             raise RuntimeError("checkpoint queue is full")
+
+        future: Future[CheckpointResult] = Future()
+        future.add_done_callback(lambda _: self._checkpoint_slots.release())
+        item = _CheckpointQueueItem(
+            job=job,
+            future=future,
+            queue_class="fifo"
+            if self._config.checkpoint_scheduling_policy == "fifo"
+            else "normal",
+            request_key=self._checkpoint_request_key(job),
+        )
         try:
-            future = self._checkpoint_pool.submit(self._execute_checkpoint, job)
+            with self._checkpoint_condition:
+                if self._checkpoint_shutdown:
+                    raise RuntimeError("cannot schedule new checkpoint jobs after shutdown")
+                self._checkpoint_items[job.job_id] = item
+                self._register_checkpoint_request_locked(item)
+                if (
+                    self._config.checkpoint_scheduling_policy == "reactive"
+                    and item.request_key is not None
+                    and item.request_key in self._exposed_live_requests
+                ):
+                    item.queue_class = "urgent"
+                    self._checkpoint_urgent_queue.append(item)
+                    self._exposed_live_requests.discard(item.request_key)
+                else:
+                    self._checkpoint_queue.append(item)
+                self._checkpoint_condition.notify()
         except Exception:
+            self._finish_checkpoint_item(item)
             self._checkpoint_slots.release()
             raise
-        future.add_done_callback(lambda _: self._checkpoint_slots.release())
         return future
+
+    def notify_live_response_ready(
+        self,
+        sandbox_id: SandboxId,
+        request_id: str,
+        *,
+        generation: int | None = None,
+    ) -> bool:
+        if self._config.checkpoint_scheduling_policy != "reactive":
+            return False
+        request_id = request_id.strip()
+        if not request_id:
+            return False
+        request_key = (sandbox_id, request_id)
+        promoted_item: _CheckpointQueueItem | None = None
+        was_promoted = False
+        with self._checkpoint_condition:
+            promoted_item, was_promoted = self._promote_checkpoint_request_locked(request_key)
+            if promoted_item is None:
+                self._exposed_live_requests.add(request_key)
+            self._checkpoint_condition.notify_all()
+        if promoted_item is None:
+            logger.debug(
+                "Marked live request as exposed for reactive scheduling sandbox=%s request_id=%s generation=%s",
+                sandbox_id,
+                request_id,
+                generation,
+            )
+            return False
+        if was_promoted:
+            logger.info(
+                "Promoted checkpoint job %s to urgent queue sandbox=%s request_id=%s generation=%s",
+                promoted_item.job.job_id,
+                sandbox_id,
+                request_id,
+                generation,
+            )
+            self._telemetry.emit_event(
+                "executor.job_promoted",
+                {
+                    "job_id": str(promoted_item.job.job_id),
+                    "job_type": JobType.CHECKPOINT.value,
+                    "sandbox_id": str(sandbox_id),
+                    "request_id": request_id,
+                    "request_generation": generation,
+                },
+            )
+        return True
+
+    def clear_live_response_ready(self, sandbox_id: SandboxId, request_id: str | None = None) -> None:
+        if self._config.checkpoint_scheduling_policy != "reactive":
+            return
+        with self._checkpoint_condition:
+            if request_id is None:
+                to_clear = [key for key in self._exposed_live_requests if key[0] == sandbox_id]
+                for key in to_clear:
+                    self._exposed_live_requests.discard(key)
+                return
+            self._exposed_live_requests.discard((sandbox_id, request_id))
 
     def _submit_restore(self, job: RestoreJob) -> Future[RestoreResult]:
         self._set_record(
@@ -162,7 +286,109 @@ class CRExecutor:
         )
         return self._restore_pool.submit(self._execute_restore, job)
 
-    def _execute_checkpoint(self, job: CheckpointJob) -> CheckpointResult:
+    def _checkpoint_worker_loop(self) -> None:
+        while True:
+            item = self._dequeue_checkpoint_item()
+            if item is None:
+                return
+            if not item.future.set_running_or_notify_cancel():
+                self._finish_checkpoint_item(item)
+                continue
+            try:
+                result = self._execute_checkpoint(item.job, queue_class=item.queue_class)
+            except Exception as exc:
+                self._finish_checkpoint_item(item)
+                item.future.set_exception(exc)
+            else:
+                self._finish_checkpoint_item(item)
+                item.future.set_result(result)
+
+    def _dequeue_checkpoint_item(self) -> _CheckpointQueueItem | None:
+        with self._checkpoint_condition:
+            while True:
+                item = self._take_next_checkpoint_item_locked()
+                if item is not None:
+                    self._unregister_checkpoint_request_locked(item)
+                    return item
+                if self._checkpoint_shutdown:
+                    return None
+                self._checkpoint_condition.wait()
+
+    def _take_next_checkpoint_item_locked(self) -> _CheckpointQueueItem | None:
+        if self._config.checkpoint_scheduling_policy == "fifo":
+            if not self._checkpoint_queue:
+                return None
+            return self._checkpoint_queue.popleft()
+        if self._checkpoint_urgent_queue:
+            if (
+                self._checkpoint_queue
+                and self._urgent_dequeue_streak >= self._config.reactive_checkpoint_urgent_quota
+            ):
+                self._urgent_dequeue_streak = 0
+                return self._checkpoint_queue.popleft()
+            self._urgent_dequeue_streak += 1
+            return self._checkpoint_urgent_queue.popleft()
+        if not self._checkpoint_queue:
+            return None
+        self._urgent_dequeue_streak = 0
+        return self._checkpoint_queue.popleft()
+
+    def _checkpoint_request_key(self, job: CheckpointJob) -> tuple[SandboxId, str] | None:
+        raw_request_id = job.metadata.get(_CAPTURED_REQUEST_ID)
+        if raw_request_id is None:
+            return None
+        request_id = str(raw_request_id).strip()
+        if not request_id:
+            return None
+        return (job.sandbox_id, request_id)
+
+    def _register_checkpoint_request_locked(self, item: _CheckpointQueueItem) -> None:
+        if item.request_key is None:
+            return
+        request_jobs = self._checkpoint_request_items[item.request_key]
+        if item.job.job_id not in request_jobs:
+            request_jobs.append(item.job.job_id)
+
+    def _unregister_checkpoint_request_locked(self, item: _CheckpointQueueItem) -> None:
+        if item.request_key is None:
+            return
+        request_jobs = self._checkpoint_request_items.get(item.request_key)
+        if request_jobs is None:
+            return
+        self._checkpoint_request_items[item.request_key] = [
+            job_id for job_id in request_jobs if job_id != item.job.job_id
+        ]
+        if not self._checkpoint_request_items[item.request_key]:
+            self._checkpoint_request_items.pop(item.request_key, None)
+
+    def _promote_checkpoint_request_locked(
+        self,
+        request_key: tuple[SandboxId, str],
+    ) -> tuple[_CheckpointQueueItem | None, bool]:
+        request_jobs = list(self._checkpoint_request_items.get(request_key, ()))
+        for job_id in request_jobs:
+            item = self._checkpoint_items.get(job_id)
+            if item is None or item.future.done():
+                continue
+            if item.queue_class == "urgent":
+                self._exposed_live_requests.discard(request_key)
+                return item, False
+            try:
+                self._checkpoint_queue.remove(item)
+            except ValueError:
+                continue
+            item.queue_class = "urgent"
+            self._checkpoint_urgent_queue.append(item)
+            self._exposed_live_requests.discard(request_key)
+            return item, True
+        return None, False
+
+    def _finish_checkpoint_item(self, item: _CheckpointQueueItem) -> None:
+        with self._checkpoint_condition:
+            self._checkpoint_items.pop(item.job.job_id, None)
+            self._unregister_checkpoint_request_locked(item)
+
+    def _execute_checkpoint(self, job: CheckpointJob, *, queue_class: str) -> CheckpointResult:
         started = utc_now()
         queue_wait_ms = max(0.0, (started - job.requested_at).total_seconds() * 1000.0)
         self._telemetry.emit_event(
@@ -172,6 +398,8 @@ class CRExecutor:
                 "job_type": JobType.CHECKPOINT.value,
                 "sandbox_id": str(job.sandbox_id),
                 "queue_wait_ms": queue_wait_ms,
+                "queue_class": queue_class,
+                "checkpoint_scheduling_policy": self._config.checkpoint_scheduling_policy,
             },
         )
         self._telemetry.emit_metric(
@@ -181,6 +409,7 @@ class CRExecutor:
                 "job_id": str(job.job_id),
                 "job_type": JobType.CHECKPOINT.value,
                 "sandbox_id": str(job.sandbox_id),
+                "queue_class": queue_class,
             },
         )
         self._set_record(
@@ -203,9 +432,15 @@ class CRExecutor:
                 "job_id": str(job.job_id),
                 "job_type": JobType.CHECKPOINT.value,
                 "sandbox_id": str(job.sandbox_id),
+                "queue_class": queue_class,
             },
         )
-        logger.info("Starting checkpoint job %s for sandbox %s", job.job_id, job.sandbox_id)
+        logger.info(
+            "Starting checkpoint job %s for sandbox %s queue_class=%s",
+            job.job_id,
+            job.sandbox_id,
+            queue_class,
+        )
 
         last_result: CheckpointResult | None = None
         for attempt in range(self._config.max_retries + 1):
@@ -288,7 +523,11 @@ class CRExecutor:
             status=last_result.status.value,
             attributes={
                 "checkpoint_id": str(last_result.checkpoint_id),
-                "attempt_count": self._config.max_retries + 1 if last_result.status != JobStatus.SUCCEEDED else attempt + 1,
+                "attempt_count": (
+                    self._config.max_retries + 1
+                    if last_result.status != JobStatus.SUCCEEDED
+                    else attempt + 1
+                ),
             },
         )
         log_fn = logger.info if (
@@ -431,7 +670,13 @@ class CRExecutor:
         )
         operation.finish(
             status=last_result.status.value,
-            attributes={"attempt_count": self._config.max_retries + 1 if last_result.status != JobStatus.SUCCEEDED else attempt + 1},
+            attributes={
+                "attempt_count": (
+                    self._config.max_retries + 1
+                    if last_result.status != JobStatus.SUCCEEDED
+                    else attempt + 1
+                )
+            },
         )
         log_fn = logger.info if last_result.status == JobStatus.SUCCEEDED else logger.error
         log_fn(

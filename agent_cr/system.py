@@ -440,6 +440,18 @@ class AgentCRSystem:
             },
         )
 
+    def notify_live_response_ready(
+        self,
+        sandbox_id: SandboxId,
+        request_id: str,
+        generation: int | None = None,
+    ) -> None:
+        self.executor.notify_live_response_ready(
+            sandbox_id,
+            request_id,
+            generation=generation,
+        )
+
     def has_pending_interceptor_signal(self, sandbox_id: SandboxId) -> bool:
         with self._interceptor_lock:
             return sandbox_id in self._interceptor_pending
@@ -1024,6 +1036,7 @@ class AgentCRSystem:
         if not captured_request_id:
             release_operation.finish(status="skipped")
             return False
+        self.executor.clear_live_response_ready(sandbox_id, captured_request_id)
         pending = self._find_captured_pending_request(sandbox_id, manifest)
         if pending is None:
             release_operation.finish(status="skipped")
@@ -1173,6 +1186,10 @@ class AgentCRSystem:
         sandbox_id: SandboxId,
         pending_request: PendingSandboxResponse | None = None,
     ) -> None:
+        self.executor.clear_live_response_ready(
+            sandbox_id,
+            None if pending_request is None else pending_request.request_id,
+        )
         if self.response_gate_registry is None:
             return
         if pending_request is None:

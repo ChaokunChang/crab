@@ -149,6 +149,69 @@ class InterceptorTests(unittest.TestCase):
         self.assertEqual(event_names.count("request.start"), 1)
         self.assertEqual(event_names.count("request.finish"), 1)
 
+    def test_interceptor_calls_response_ready_callback_before_gate_release(self) -> None:
+        request_state_store = InMemoryRequestStateStore()
+        response_gate_registry = SandboxResponseGateRegistry()
+        response_gate_registry.enable()
+        callback_event = threading.Event()
+        callback_calls: list[tuple[SandboxId, str, int | None]] = []
+        interceptor = AgentCRRequestInterceptor(
+            upstream_transport=lambda path, headers, body: (
+                200,
+                [("Content-Type", "application/json")],
+                json.dumps(
+                    handle_request(
+                        path=path,
+                        headers=headers,
+                        payload=json.loads(body.decode("utf-8")),
+                        state=SimulatedLLMState(),
+                    ),
+                    sort_keys=True,
+                ).encode("utf-8"),
+            ),
+            request_state_store=request_state_store,
+            on_response_ready=lambda sandbox_id, request_id, generation: (
+                callback_calls.append((sandbox_id, request_id, generation)),
+                callback_event.set(),
+            ),
+            response_gate_registry=response_gate_registry,
+        )
+        response_holder: dict[str, object] = {}
+
+        def _run_request() -> None:
+            response_holder["response"] = interceptor.intercept(
+                path="/v1/chat/completions",
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Agent-Sandbox-Id": "sbx-callback",
+                    "X-Request-Id": "req-callback",
+                },
+                body=json.dumps(
+                    {
+                        "model": "simulated-openai",
+                        "messages": [{"role": "user", "content": "continue"}],
+                    }
+                ).encode("utf-8"),
+            )
+
+        thread = threading.Thread(target=_run_request)
+        thread.start()
+        self.assertTrue(callback_event.wait(timeout=2.0))
+        pending = response_gate_registry.find_pending_request(SandboxId("sbx-callback"), "req-callback")
+        self.assertIsNotNone(pending)
+        assert pending is not None
+        self.assertEqual(callback_calls, [(SandboxId("sbx-callback"), "req-callback", pending.generation)])
+        self.assertTrue(
+            response_gate_registry.release_pending(
+                SandboxId("sbx-callback"),
+                request_id="req-callback",
+                generation=pending.generation,
+            )
+        )
+        thread.join(timeout=2.0)
+        self.assertFalse(thread.is_alive())
+        self.assertIn("response", response_holder)
+
     def test_interceptor_resolves_sandbox_id_from_client_host_and_overrides_forwarded_header(self) -> None:
         request_state_store = InMemoryRequestStateStore()
         forwarded_headers: dict[str, str] = {}

@@ -249,6 +249,8 @@ executor:
   coordination_workers: 8
   composite_step_workers: 16
   checkpoint_queue_size: 10000
+  checkpoint_scheduling_policy: fifo
+  reactive_checkpoint_urgent_quota: 4
   max_retries: 0
   retry_backoff_seconds: 0.05
 scheduler:

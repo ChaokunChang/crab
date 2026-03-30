@@ -667,10 +667,10 @@ class TraceReplayLLMState:
             return float(self._response_delay_ms)
         return float(self._response_delay_ms)
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self, *, include_events: bool = True) -> dict[str, Any]:
         with self._lock:
             consumed_response_count = self._consumed_response_count
-            return {
+            payload = {
                 "trace_path": str(self._trace.trace_path),
                 "response_delay_policy": self._response_delay_policy,
                 "response_delay_ms": self._response_delay_ms,
@@ -682,8 +682,10 @@ class TraceReplayLLMState:
                 "is_complete": consumed_response_count >= self._total_progress_responses,
                 "malformed_line_count": len(self._trace.malformed_lines),
                 "malformed_lines": list(self._trace.malformed_lines),
-                "events": list(self._events),
             }
+            if include_events:
+                payload["events"] = list(self._events)
+            return payload
 
 
 def handle_request(

@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_cr import RuncRuntime, RuncRuntimePaths, SandboxId
+from agent_cr import InMemoryTelemetrySink, RuncRuntime, RuncRuntimePaths, SandboxId
 from agent_cr.runtime import CommandRunner
 
 RuncSandboxManager = RuncRuntime
@@ -276,6 +276,41 @@ class SandboxManagerTests(unittest.TestCase):
                 (root / "bundles" / "sbx-shared-b" / "rootfs" / "work" / "source-file.txt").read_text(encoding="utf-8"),
                 "prepared\n",
             )
+
+    def test_runc_prepare_launch_emits_prepare_phase_telemetry(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_sandbox_mgr_") as tmp:
+            root = Path(tmp)
+            runner = FakeCommandRunner()
+            telemetry = InMemoryTelemetrySink()
+            manager = RuncSandboxManager(
+                command_runner=runner,
+                telemetry=telemetry,
+                paths=RuncSandboxManagerPaths(
+                    state_root=root / "state",
+                    bundle_root=root / "bundles",
+                    metadata_root=root / "metadata",
+                    zfs_dataset_prefix="pool/agent-cr",
+                ),
+            )
+            rootfs_source = root / "source-file.txt"
+            rootfs_source.write_text("prepared\n", encoding="utf-8")
+            metadata = {
+                "sandbox_id": "sbx-telemetry",
+                "bundle_path": str(root / "bundles" / "sbx-telemetry"),
+                "rootfs_init_dirs": ["work"],
+                "rootfs_copy_paths": [{"source": str(rootfs_source), "destination": "/work/source-file.txt"}],
+            }
+
+            manager.prepare_launch("runc", metadata)
+
+        event_names = [name for name, _ in telemetry.events]
+        metric_names = [name for name, _, _ in telemetry.metrics]
+        self.assertIn("sandbox.runtime_prepare_launch.start", event_names)
+        self.assertIn("sandbox.runtime_prepare_launch.finish", event_names)
+        self.assertIn("sandbox.rootfs_materialize.start", event_names)
+        self.assertIn("sandbox.rootfs_materialize.finish", event_names)
+        self.assertIn("sandbox.runtime_prepare_launch.duration_ms", metric_names)
+        self.assertIn("sandbox.rootfs_materialize.duration_ms", metric_names)
 
     def test_runc_sandbox_manager_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_sandbox_mgr_") as tmp:

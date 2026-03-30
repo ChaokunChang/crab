@@ -33,6 +33,8 @@ Defined in `agent_cr/config.py`. Controls the checkpoint/restore job executor th
 | `coordination_workers` | `int \| None` | `None` | Worker count for `AgentCRSystem` live-request coordination. When omitted, resolves to `min(8, resolved_checkpoint_workers)`. | `AgentCRSystem.start()` in `system.py` |
 | `composite_step_workers` | `int \| None` | `None` | Shared worker count for parallel process/filesystem checkpoint sub-steps. When omitted, resolves to `max(2, min(2 * resolved_checkpoint_workers, 16))`. | `DefaultCWorker.__init__()` in `workers/composite.py` |
 | `max_checkpoint_queue_size` | `int` | `10000` | Maximum number of pending checkpoint jobs admitted before new submissions are rejected. Must be ≥ 1. | `CRExecutor.__init__()` in `executor.py` |
+| `checkpoint_scheduling_policy` | `"fifo" \| "reactive"` | `"fifo"` | Queue discipline for checkpoint jobs. `fifo` preserves the historical submission order. `reactive` uses normal/urgent queues and promotes live-request checkpoints once their response has already returned. | `CRExecutor.submit_checkpoint()`, `CRExecutor.notify_live_response_ready()` in `executor.py` |
+| `reactive_checkpoint_urgent_quota` | `int` | `4` | When `checkpoint_scheduling_policy="reactive"` and both queues are non-empty, the executor serves at most this many urgent jobs before forcing one normal job to avoid starvation. Must be ≥ 1. | `CRExecutor._take_next_checkpoint_item_locked()` in `executor.py` |
 | `max_retries` | `int` | `0` | Number of retry attempts for failed checkpoint/restore jobs. Must be ≥ 0. | `CRExecutor._execute_checkpoint()`, `_execute_restore()` in `executor.py` |
 | `retry_backoff_seconds` | `float` | `0.05` | Linear backoff base between retries: sleeps `retry_backoff_seconds * (attempt + 1)`. Must be ≥ 0. | `CRExecutor._execute_checkpoint()`, `_execute_restore()` in `executor.py` |
 
@@ -353,6 +355,8 @@ Notes:
 | `executor.coordination_workers` | `int \| null` | `null` | Live-request coordination worker count. When omitted, resolves to `min(8, resolved_checkpoint_workers)`. |
 | `executor.composite_step_workers` | `int \| null` | `null` | Shared worker count for parallel process/filesystem checkpoint sub-steps. When omitted, resolves to `max(2, min(2 * resolved_checkpoint_workers, 16))`. |
 | `executor.checkpoint_queue_size` | `int` | `10000` | Max pending checkpoint jobs before new submissions are rejected. Must be > 0. |
+| `executor.checkpoint_scheduling_policy` | `"fifo" \| "reactive"` | `"fifo"` | Checkpoint queue discipline. `fifo` preserves the historical behavior; `reactive` promotes checkpoints whose overlapping LLM response has already returned. |
+| `executor.reactive_checkpoint_urgent_quota` | `int` | `4` | When `executor.checkpoint_scheduling_policy: reactive`, serve at most this many urgent jobs in a row before forcing one normal job if both queues are non-empty. |
 | `executor.max_retries` | `int` | `0` | Retry attempts for checkpoint/restore jobs. Must be ≥ 0. |
 | `executor.retry_backoff_seconds` | `float` | `0.05` | Linear retry backoff base in seconds. Must be ≥ 0. |
 

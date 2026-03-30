@@ -13,6 +13,11 @@ from agent_cr import SandboxId
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_BENCHMARK_NETWORK_CIDR = "10.250.0.0/24"
+_DEFAULT_BENCHMARK_NETWORK_PREFIXLEN = 24
+_SMALLEST_SUPPORTED_BENCHMARK_NETWORK_PREFIXLEN = 30
+_DEFAULT_BENCHMARK_GUEST_CAPACITY = 253
+
 
 def parse_ipv4_route_networks(raw_routes: str) -> list[ipaddress.IPv4Network]:
     networks: list[ipaddress.IPv4Network] = []
@@ -32,19 +37,62 @@ def parse_ipv4_route_networks(raw_routes: str) -> list[ipaddress.IPv4Network]:
     return networks
 
 
-def select_benchmark_network(*, existing_routes: str, candidate_pool: str = "10.250.0.0/16") -> tuple[str, str]:
+def benchmark_network_guest_capacity(network: ipaddress.IPv4Network) -> int:
+    if network.prefixlen > _SMALLEST_SUPPORTED_BENCHMARK_NETWORK_PREFIXLEN:
+        return 0
+    return max(0, network.num_addresses - 3)
+
+
+def benchmark_network_prefixlen_for_guest_capacity(required_guest_capacity: int) -> int:
+    if required_guest_capacity <= 0:
+        raise ValueError(
+            f"required_guest_capacity must be positive, got {required_guest_capacity}"
+        )
+    for prefixlen in range(_SMALLEST_SUPPORTED_BENCHMARK_NETWORK_PREFIXLEN, -1, -1):
+        network = ipaddress.ip_network(f"10.0.0.0/{prefixlen}", strict=False)
+        if benchmark_network_guest_capacity(network) >= required_guest_capacity:
+            return prefixlen
+    raise RuntimeError(
+        f"unable to determine benchmark network prefix for guest capacity {required_guest_capacity}"
+    )
+
+
+def select_benchmark_network(
+    *,
+    existing_routes: str,
+    candidate_pool: str = "10.250.0.0/16",
+    required_guest_capacity: int = _DEFAULT_BENCHMARK_GUEST_CAPACITY,
+) -> tuple[str, str]:
     pool = ipaddress.ip_network(candidate_pool, strict=False)
     if not isinstance(pool, ipaddress.IPv4Network):
         raise ValueError(f"candidate pool must be IPv4, got {candidate_pool}")
-    if pool.prefixlen > 24:
-        raise ValueError(f"candidate pool must be at most /24, got {candidate_pool}")
+    if pool.prefixlen > _SMALLEST_SUPPORTED_BENCHMARK_NETWORK_PREFIXLEN:
+        raise ValueError(
+            "candidate pool must be at most "
+            f"/{_SMALLEST_SUPPORTED_BENCHMARK_NETWORK_PREFIXLEN}, got {candidate_pool}"
+        )
+    preferred_prefixlen = min(
+        _DEFAULT_BENCHMARK_NETWORK_PREFIXLEN,
+        benchmark_network_prefixlen_for_guest_capacity(required_guest_capacity),
+    )
+    target_prefixlen = max(pool.prefixlen, preferred_prefixlen)
+    target_capacity = benchmark_network_guest_capacity(
+        ipaddress.ip_network(f"10.0.0.0/{target_prefixlen}", strict=False)
+    )
+    if target_capacity < required_guest_capacity:
+        raise ValueError(
+            f"candidate pool {candidate_pool} supports at most "
+            f"{benchmark_network_guest_capacity(pool)} guest sandboxes, need {required_guest_capacity}"
+        )
     existing_networks = parse_ipv4_route_networks(existing_routes)
-    candidates = [pool] if pool.prefixlen == 24 else list(pool.subnets(new_prefix=24))
+    candidates = [pool] if pool.prefixlen == target_prefixlen else list(pool.subnets(new_prefix=target_prefixlen))
     for network in candidates:
         if any(network.overlaps(existing) for existing in existing_networks):
             continue
         return str(next(network.hosts())), str(network)
-    raise RuntimeError(f"unable to find an available benchmark /24 inside {candidate_pool}")
+    raise RuntimeError(
+        f"unable to find an available benchmark /{target_prefixlen} inside {candidate_pool}"
+    )
 
 
 @dataclass(frozen=True)
@@ -61,7 +109,7 @@ class BenchmarkNetworkManager:
     def __init__(self) -> None:
         self._bridge_name: str | None = None
         self._bridge_ip = "10.250.0.1"
-        self._network_cidr = "10.250.0.0/24"
+        self._network_cidr = _DEFAULT_BENCHMARK_NETWORK_CIDR
         self._ip_cursor = 2
         self._leases: dict[SandboxId, BenchmarkNetworkLease] = {}
         self._ip_to_sandbox: dict[str, SandboxId] = {}
@@ -76,14 +124,28 @@ class BenchmarkNetworkManager:
     def network_cidr(self) -> str:
         return self._network_cidr
 
-    def configure(self) -> None:
+    def configure(self, *, expected_sandboxes: int | None = None) -> None:
+        required_guest_capacity = (
+            _DEFAULT_BENCHMARK_GUEST_CAPACITY
+            if expected_sandboxes is None
+            else max(1, int(expected_sandboxes))
+        )
         configured_cidr = os.environ.get("AGENT_CR_BENCHMARK_NETWORK_CIDR", "").strip()
         if configured_cidr:
             network = ipaddress.ip_network(configured_cidr, strict=False)
             if not isinstance(network, ipaddress.IPv4Network):
                 raise ValueError(f"benchmark network must be IPv4, got {configured_cidr}")
-            if network.prefixlen != 24:
-                raise ValueError(f"benchmark network must be a /24, got {configured_cidr}")
+            supported_capacity = benchmark_network_guest_capacity(network)
+            if supported_capacity <= 0:
+                raise ValueError(
+                    "benchmark network must be between /0 and "
+                    f"/{_SMALLEST_SUPPORTED_BENCHMARK_NETWORK_PREFIXLEN}, got {configured_cidr}"
+                )
+            if supported_capacity < required_guest_capacity:
+                raise ValueError(
+                    f"benchmark network {configured_cidr} supports at most {supported_capacity} "
+                    f"guest sandboxes, need {required_guest_capacity}"
+                )
             self._network_cidr = str(network)
             self._bridge_ip = str(next(network.hosts()))
             return
@@ -93,15 +155,22 @@ class BenchmarkNetworkManager:
             capture_output=True,
             text=True,
         )
-        self._bridge_ip, self._network_cidr = select_benchmark_network(existing_routes=route_result.stdout)
+        self._bridge_ip, self._network_cidr = select_benchmark_network(
+            existing_routes=route_result.stdout,
+            required_guest_capacity=required_guest_capacity,
+        )
 
     def ensure_bridge(self) -> None:
         with self._lock:
             if self._bridge_name is not None:
                 return
+            network = ipaddress.ip_network(self._network_cidr, strict=False)
             bridge_name = f"acb{uuid.uuid4().hex[:8]}"
             subprocess.run(["ip", "link", "add", bridge_name, "type", "bridge"], check=True)
-            subprocess.run(["ip", "addr", "add", f"{self._bridge_ip}/24", "dev", bridge_name], check=True)
+            subprocess.run(
+                ["ip", "addr", "add", f"{self._bridge_ip}/{network.prefixlen}", "dev", bridge_name],
+                check=True,
+            )
             subprocess.run(["ip", "link", "set", bridge_name, "up"], check=True)
             self._bridge_name = bridge_name
             self._ensure_outbound_connectivity_rules(bridge_name)
@@ -154,9 +223,12 @@ class BenchmarkNetworkManager:
         self.ensure_bridge()
         with self._lock:
             assert self._bridge_name is not None
-            network = ipaddress.ip_network(self._network_cidr)
+            network = ipaddress.ip_network(self._network_cidr, strict=False)
             if self._ip_cursor >= network.num_addresses - 1:
-                raise RuntimeError("benchmark network exhausted guest IP capacity")
+                raise RuntimeError(
+                    f"benchmark network exhausted guest IP capacity "
+                    f"cidr={self._network_cidr} max_guests={benchmark_network_guest_capacity(network)}"
+                )
             guest_ip = str(network[self._ip_cursor])
             self._ip_cursor += 1
             suffix = uuid.uuid4().hex[:8]
@@ -177,7 +249,18 @@ class BenchmarkNetworkManager:
                 check=True,
             )
             subprocess.run(
-                ["ip", "netns", "exec", namespace_name, "ip", "addr", "add", f"{guest_ip}/24", "dev", "eth0"],
+                [
+                    "ip",
+                    "netns",
+                    "exec",
+                    namespace_name,
+                    "ip",
+                    "addr",
+                    "add",
+                    f"{guest_ip}/{network.prefixlen}",
+                    "dev",
+                    "eth0",
+                ],
                 check=True,
             )
             subprocess.run(["ip", "netns", "exec", namespace_name, "ip", "link", "set", "eth0", "up"], check=True)

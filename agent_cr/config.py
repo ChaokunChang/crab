@@ -6,6 +6,7 @@ from pathlib import Path
 _TELEMETRY_WRITER_MODES = {"sync", "async"}
 _TELEMETRY_OVERFLOW_POLICIES = {"drop_new", "block"}
 _TELEMETRY_SERIALIZERS = {"auto", "stdlib", "orjson"}
+_CHECKPOINT_SCHEDULING_POLICIES = {"fifo", "reactive"}
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,8 @@ class ExecutorConfig:
     coordination_workers: int | None = None
     composite_step_workers: int | None = None
     max_checkpoint_queue_size: int = 10000
+    checkpoint_scheduling_policy: str = "fifo"
+    reactive_checkpoint_urgent_quota: int = 4
     max_retries: int = 0
     retry_backoff_seconds: float = 0.05
 
@@ -49,6 +52,13 @@ class ExecutorConfig:
             raise ValueError("composite_step_workers must be >= 1 when provided")
         if self.max_checkpoint_queue_size < 1:
             raise ValueError("max_checkpoint_queue_size must be >= 1")
+        if self.checkpoint_scheduling_policy not in _CHECKPOINT_SCHEDULING_POLICIES:
+            raise ValueError(
+                "checkpoint_scheduling_policy must be one of "
+                f"{sorted(_CHECKPOINT_SCHEDULING_POLICIES)}, got {self.checkpoint_scheduling_policy!r}"
+            )
+        if self.reactive_checkpoint_urgent_quota < 1:
+            raise ValueError("reactive_checkpoint_urgent_quota must be >= 1")
         if self.max_retries < 0:
             raise ValueError("max_retries must be >= 0")
         if self.retry_backoff_seconds < 0:

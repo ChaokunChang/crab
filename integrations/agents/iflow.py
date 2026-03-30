@@ -107,6 +107,7 @@ class IFlowAgent(BaseAgent):
         runtime=None,
         agent_host_dir=None,
         llm_base_url=None,
+        telemetry=None,
     ) -> None:
         super().__init__(
             sandbox,
@@ -116,6 +117,7 @@ class IFlowAgent(BaseAgent):
             runtime=runtime,
             agent_host_dir=agent_host_dir,
             llm_base_url=llm_base_url,
+            telemetry=telemetry,
         )
         self._tick_seconds = max(
             0.001,
@@ -142,7 +144,11 @@ class IFlowAgent(BaseAgent):
         assert self.llm_base_url is not None
         logger.debug(f"preparing sandbox in {self.agent_host_dir=}")
         sandbox_root = self.agent_host_dir
-        prepared_runtime = prepare_iflow_runtime(work_root=sandbox_root)
+        prepared_runtime = prepare_iflow_runtime(
+            work_root=sandbox_root,
+            telemetry=self.telemetry,
+            sandbox_id=str(self.sandbox.sandbox_id),
+        )
         prepared_state = prepare_iflow_state(
             work_root=sandbox_root,
             base_url=self.llm_base_url,
@@ -150,8 +156,10 @@ class IFlowAgent(BaseAgent):
             max_session_turns=int(
                 os.environ.get("AGENT_CR_IFLOW_BENCHMARK_MAX_SESSION_TURNS", str(self.DEFAULT_MAX_SESSION_TURNS))
             ),
+            telemetry=self.telemetry,
+            sandbox_id=str(self.sandbox.sandbox_id),
         )
-        self.sandbox.launch_metadata["iflow"] = {
+        metadata = {
             "runtime_root": str(prepared_runtime.root),
             "iflow_home": str(prepared_state.iflow_home),
             "npm_home": str(prepared_state.npm_home),
@@ -159,6 +167,13 @@ class IFlowAgent(BaseAgent):
             "entrypoint": prepared_runtime.mounted_entrypoint,
             "ignore_process_rules": prepared_runtime.ignore_process_rules,
         }
+        runtime_strategy = getattr(prepared_runtime, "runtime_strategy", None)
+        if isinstance(runtime_strategy, str) and runtime_strategy:
+            metadata["runtime_strategy"] = runtime_strategy
+        node_source = getattr(prepared_runtime, "node_source", None)
+        if isinstance(node_source, Path):
+            metadata["node_source"] = str(node_source)
+        self.sandbox.launch_metadata["iflow"] = metadata
 
     def configure_bundle(self) -> None:
         metadata = self.sandbox.launch_metadata.get("iflow", {})

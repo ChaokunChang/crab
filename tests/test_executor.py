@@ -98,6 +98,55 @@ class FlakyCheckpointWorker:
         )
 
 
+class BlockingCheckpointWorker:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._release_events: dict[str, threading.Event] = {}
+        self._started_events: dict[str, threading.Event] = {}
+        self.started_job_ids: list[str] = []
+
+    def checkpoint(self, job: CheckpointJob) -> CheckpointResult:
+        with self._lock:
+            started_event = self._started_events.setdefault(job.job_id.value, threading.Event())
+            release_event = self._release_events.setdefault(job.job_id.value, threading.Event())
+            self.started_job_ids.append(job.job_id.value)
+            started_event.set()
+        if not release_event.wait(timeout=5.0):
+            raise TimeoutError(f"timed out waiting to release checkpoint job {job.job_id.value}")
+        now = utc_now()
+        ckpt_id = CheckpointId(f"ckpt-{job.job_id.value}")
+        manifest = CheckpointManifest(
+            schema_version="v1",
+            checkpoint_id=ckpt_id,
+            sandbox_id=job.sandbox_id,
+            created_at=now,
+            runtime_name="test",
+            runtime_version="1",
+            process_artifacts=[],
+            filesystem_artifacts=[],
+            metadata={},
+        ).with_integrity()
+        return CheckpointResult(
+            job_id=job.job_id,
+            sandbox_id=job.sandbox_id,
+            checkpoint_id=ckpt_id,
+            status=JobStatus.SUCCEEDED,
+            started_at=now,
+            finished_at=utc_now(),
+            manifest=manifest,
+        )
+
+    def wait_started(self, job_id: str, timeout: float = 2.0) -> bool:
+        with self._lock:
+            started_event = self._started_events.setdefault(job_id, threading.Event())
+        return started_event.wait(timeout=timeout)
+
+    def release(self, job_id: str) -> None:
+        with self._lock:
+            release_event = self._release_events.setdefault(job_id, threading.Event())
+        release_event.set()
+
+
 class PassThroughRestoreWorker:
     def restore(self, job: RestoreJob) -> RestoreResult:
         now = utc_now()
@@ -112,6 +161,17 @@ class PassThroughRestoreWorker:
 
 
 class ExecutorTests(unittest.TestCase):
+    def _live_checkpoint_job(self, job_id: str, *, request_id: str) -> CheckpointJob:
+        return CheckpointJob(
+            job_id=JobId(job_id),
+            sandbox_id=SandboxId("sbx-live"),
+            requested_at=utc_now(),
+            metadata={
+                "captures_inflight_llm": True,
+                "captured_request_id": request_id,
+            },
+        )
+
     def test_executor_runs_checkpoints_in_parallel_and_emits_queue_wait(self) -> None:
         worker = SlowCheckpointWorker(sleep_s=0.02)
         telemetry = InMemoryTelemetrySink()
@@ -171,6 +231,116 @@ class ExecutorTests(unittest.TestCase):
         self.assertIsNotNone(record)
         assert record is not None
         self.assertEqual(record.status, JobStatus.SUCCEEDED)
+
+    def test_reactive_checkpoint_scheduler_promotes_exposed_job(self) -> None:
+        worker = BlockingCheckpointWorker()
+        executor = CRExecutor(
+            ExecutorConfig(
+                max_workers=1,
+                checkpoint_workers=1,
+                checkpoint_scheduling_policy="reactive",
+            ),
+            checkpoint_worker=worker,
+            restore_worker=PassThroughRestoreWorker(),
+        )
+        job_a = self._live_checkpoint_job("job-a", request_id="req-a")
+        job_b = self._live_checkpoint_job("job-b", request_id="req-b")
+        job_c = self._live_checkpoint_job("job-c", request_id="req-c")
+
+        future_a = executor.submit_checkpoint(job_a)
+        future_b = executor.submit_checkpoint(job_b)
+        future_c = executor.submit_checkpoint(job_c)
+
+        self.assertTrue(worker.wait_started("job-a"))
+        self.assertTrue(
+            executor.notify_live_response_ready(job_c.sandbox_id, "req-c"),
+        )
+
+        worker.release("job-a")
+        future_a.result(timeout=2.0)
+        self.assertTrue(worker.wait_started("job-c"))
+        worker.release("job-c")
+        future_c.result(timeout=2.0)
+        self.assertTrue(worker.wait_started("job-b"))
+        worker.release("job-b")
+        future_b.result(timeout=2.0)
+        executor.shutdown()
+
+        self.assertEqual(worker.started_job_ids, ["job-a", "job-c", "job-b"])
+
+    def test_reactive_checkpoint_scheduler_serves_normal_job_after_urgent_quota(self) -> None:
+        worker = BlockingCheckpointWorker()
+        executor = CRExecutor(
+            ExecutorConfig(
+                max_workers=1,
+                checkpoint_workers=1,
+                checkpoint_scheduling_policy="reactive",
+                reactive_checkpoint_urgent_quota=1,
+            ),
+            checkpoint_worker=worker,
+            restore_worker=PassThroughRestoreWorker(),
+        )
+        job_a = self._live_checkpoint_job("job-a", request_id="req-a")
+        job_b = self._live_checkpoint_job("job-b", request_id="req-b")
+        job_c = self._live_checkpoint_job("job-c", request_id="req-c")
+        job_d = self._live_checkpoint_job("job-d", request_id="req-d")
+
+        futures = [
+            executor.submit_checkpoint(job)
+            for job in (job_a, job_b, job_c, job_d)
+        ]
+
+        self.assertTrue(worker.wait_started("job-a"))
+        self.assertTrue(executor.notify_live_response_ready(job_c.sandbox_id, "req-c"))
+        self.assertTrue(executor.notify_live_response_ready(job_d.sandbox_id, "req-d"))
+
+        worker.release("job-a")
+        futures[0].result(timeout=2.0)
+        self.assertTrue(worker.wait_started("job-c"))
+        worker.release("job-c")
+        futures[2].result(timeout=2.0)
+        self.assertTrue(worker.wait_started("job-b"))
+        worker.release("job-b")
+        futures[1].result(timeout=2.0)
+        self.assertTrue(worker.wait_started("job-d"))
+        worker.release("job-d")
+        futures[3].result(timeout=2.0)
+        executor.shutdown()
+
+        self.assertEqual(worker.started_job_ids, ["job-a", "job-c", "job-b", "job-d"])
+
+    def test_reactive_checkpoint_scheduler_handles_response_ready_before_job_submission(self) -> None:
+        worker = BlockingCheckpointWorker()
+        executor = CRExecutor(
+            ExecutorConfig(
+                max_workers=1,
+                checkpoint_workers=1,
+                checkpoint_scheduling_policy="reactive",
+            ),
+            checkpoint_worker=worker,
+            restore_worker=PassThroughRestoreWorker(),
+        )
+        job_a = self._live_checkpoint_job("job-a", request_id="req-a")
+        job_b = self._live_checkpoint_job("job-b", request_id="req-b")
+        job_c = self._live_checkpoint_job("job-c", request_id="req-c")
+
+        future_a = executor.submit_checkpoint(job_a)
+        self.assertTrue(worker.wait_started("job-a"))
+        self.assertFalse(executor.notify_live_response_ready(job_b.sandbox_id, "req-b"))
+        future_b = executor.submit_checkpoint(job_b)
+        future_c = executor.submit_checkpoint(job_c)
+
+        worker.release("job-a")
+        future_a.result(timeout=2.0)
+        self.assertTrue(worker.wait_started("job-b"))
+        worker.release("job-b")
+        future_b.result(timeout=2.0)
+        self.assertTrue(worker.wait_started("job-c"))
+        worker.release("job-c")
+        future_c.result(timeout=2.0)
+        executor.shutdown()
+
+        self.assertEqual(worker.started_job_ids, ["job-a", "job-b", "job-c"])
 
 
 if __name__ == "__main__":

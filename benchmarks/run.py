@@ -230,6 +230,7 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
             runtime_root=config.storage_planes.runtime_root,
             storage_root=config.storage_planes.storage_root,
             agent_host_root=config.storage_planes.agent_host_root,
+            expected_sandboxes=config.sandboxes,
             rootfs_reuse_enabled=config.rootfs_reuse.enabled,
         ) as harness:
             if scenario.prepare_harness is not None:

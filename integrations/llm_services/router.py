@@ -65,7 +65,7 @@ def validate_llm_service_type(*, provider: str, llm_service_type: str) -> None:
 class LLMServiceState(Protocol):
     def handle_request(self, *, path: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]: ...
 
-    def snapshot(self) -> dict[str, Any]: ...
+    def snapshot(self, *, include_events: bool = True) -> dict[str, Any]: ...
 
     def reset(self) -> None: ...
 
@@ -80,7 +80,8 @@ class SimulatedServiceState:
     def handle_request(self, *, path: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
         return handle_simulated_request(path=path, headers=headers, payload=payload, state=self._state, response_delay_ms=250)
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self, *, include_events: bool = True) -> dict[str, Any]:
+        _ = include_events
         return {"turns": self._state.snapshot()}
 
     def reset(self) -> None:
@@ -102,7 +103,8 @@ class ManualServiceState:
     def handle_control(self, *, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         return handle_control_request(path=path, payload=payload, state=self._state)
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self, *, include_events: bool = True) -> dict[str, Any]:
+        _ = include_events
         return self._state.snapshot()
 
     def reset(self) -> None:
@@ -124,7 +126,8 @@ class SimulatedForIFlowServiceState:
     def handle_request(self, *, path: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
         return handle_iflow_simulated_request(path=path, headers=headers, payload=payload, state=self._state)
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self, *, include_events: bool = True) -> dict[str, Any]:
+        _ = include_events
         return self._state.snapshot()
 
     def reset(self) -> None:
@@ -142,8 +145,8 @@ class IFlowTraceReplayServiceState:
     def handle_request(self, *, path: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
         return self._state.handle_request(path=path, headers=headers, payload=payload)
 
-    def snapshot(self) -> dict[str, Any]:
-        return self._state.snapshot()
+    def snapshot(self, *, include_events: bool = True) -> dict[str, Any]:
+        return self._state.snapshot(include_events=include_events)
 
     def reset(self) -> None:
         self._state.reset()
@@ -159,8 +162,8 @@ class MiniSWETraceReplayServiceState:
     def handle_request(self, *, path: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
         return self._state.handle_request(path=path, headers=headers, payload=payload)
 
-    def snapshot(self) -> dict[str, Any]:
-        return self._state.snapshot()
+    def snapshot(self, *, include_events: bool = True) -> dict[str, Any]:
+        return self._state.snapshot(include_events=include_events)
 
     def reset(self) -> None:
         self._state.reset()
@@ -259,16 +262,41 @@ class BenchmarkLLMRouter:
         assert isinstance(manual_service, ManualServiceState)
         return manual_service.handle_control(path=path, payload=payload)
 
-    def snapshot(self) -> dict[str, Any]:
+    def _snapshot_registered_service(
+        self,
+        item: RegisteredSandboxService,
+        *,
+        include_events: bool,
+    ) -> dict[str, Any]:
+        return {
+            "llm_service_type": item.llm_service_type,
+            "llm_service_config": item.llm_service_config,
+            "state": item.service_state.snapshot(include_events=include_events),
+        }
+
+    def snapshot(
+        self,
+        sandbox_id: str | None = None,
+        *,
+        include_events: bool = True,
+    ) -> dict[str, Any] | None:
+        if sandbox_id is not None:
+            with self._lock:
+                item = self._services.get(sandbox_id)
+            if item is None:
+                return None
+            return self._snapshot_registered_service(item, include_events=include_events)
+
         with self._lock:
-            return {
-                sandbox_id: {
-                    "llm_service_type": item.llm_service_type,
-                    "llm_service_config": item.llm_service_config,
-                    "state": item.service_state.snapshot(),
-                }
-                for sandbox_id, item in self._services.items()
-            }
+            services = list(self._services.items())
+        return {
+            registered_sandbox_id: self._snapshot_registered_service(item, include_events=include_events)
+            for registered_sandbox_id, item in services
+        }
+
+    def registered_sandbox_count(self) -> int:
+        with self._lock:
+            return len(self._services)
 
     def reset_sandbox(self, sandbox_id: str) -> None:
         self.resolve_service(sandbox_id).service_state.reset()
@@ -394,15 +422,21 @@ def serve_benchmark_llm_router(
 
         def do_GET(self) -> None:  # noqa: N802
             if self.path == "/healthz":
-                self._write_json({"ok": True, "registered_sandboxes": len(self.benchmark_llm_router.snapshot())})
+                self._write_json(
+                    {
+                        "ok": True,
+                        "registered_sandboxes": self.benchmark_llm_router.registered_sandbox_count(),
+                    }
+                )
                 return
             if self.path.startswith("/control/state"):
                 query = parse_qs(urlparse(self.path).query)
                 sandbox_id = next(iter(query.get("sandbox_id", [])), "")
-                snapshot = self.benchmark_llm_router.snapshot()
                 if sandbox_id:
-                    self._write_json({"ok": True, "state": snapshot.get(sandbox_id)})
+                    snapshot = self.benchmark_llm_router.snapshot(sandbox_id=sandbox_id, include_events=False)
+                    self._write_json({"ok": True, "state": snapshot})
                     return
+                snapshot = self.benchmark_llm_router.snapshot(include_events=False)
                 self._write_json({"ok": True, "state": snapshot})
                 return
             self.send_error(404)

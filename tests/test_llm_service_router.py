@@ -33,6 +33,50 @@ def _wait_for_json(url: str, *, timeout_s: float = 10.0) -> dict[str, object]:
     raise RuntimeError(f"timed out waiting for {url}: {last_exc}")
 
 
+class _SnapshotProbeState:
+    instances: dict[str, "_SnapshotProbeState"] = {}
+
+    def __init__(self, *, llm_service_config: dict[str, object] | None = None) -> None:
+        config = llm_service_config or {}
+        self.name = str(config.get("name", "probe"))
+        self.snapshot_calls: list[bool] = []
+        type(self).instances[self.name] = self
+
+    def handle_request(self, *, path: str, headers: dict[str, str], payload: dict[str, object]) -> dict[str, object]:
+        _ = (path, headers, payload)
+        return {}
+
+    def snapshot(self, *, include_events: bool = True) -> dict[str, object]:
+        self.snapshot_calls.append(include_events)
+        return {"name": self.name, "events": ["included"] if include_events else []}
+
+    def reset(self) -> None:
+        return
+
+    def restore(self, *, consumed_response_count: int) -> None:
+        _ = consumed_response_count
+        return
+
+
+class _ExplodingSnapshotState:
+    def __init__(self, *, llm_service_config: dict[str, object] | None = None) -> None:
+        _ = llm_service_config
+
+    def handle_request(self, *, path: str, headers: dict[str, str], payload: dict[str, object]) -> dict[str, object]:
+        _ = (path, headers, payload)
+        return {}
+
+    def snapshot(self, *, include_events: bool = True) -> dict[str, object]:
+        raise AssertionError(f"unexpected snapshot(include_events={include_events}) on unrelated sandbox")
+
+    def reset(self) -> None:
+        return
+
+    def restore(self, *, consumed_response_count: int) -> None:
+        _ = consumed_response_count
+        return
+
+
 class BenchmarkLLMRouterTests(unittest.TestCase):
     def test_router_dispatches_to_simulated_service_for_registered_sandbox(self) -> None:
         router = BenchmarkLLMRouter()
@@ -333,6 +377,94 @@ class BenchmarkLLMRouterTests(unittest.TestCase):
         self.assertEqual(original, duplicate)
         self.assertEqual(original_args["command"], original_command)
         self.assertEqual(duplicate_args["command"], original_command)
+
+    def test_router_single_sandbox_snapshot_does_not_touch_other_registered_services(self) -> None:
+        _SnapshotProbeState.instances.clear()
+        router = BenchmarkLLMRouter(
+            registry={
+                "probe": _SnapshotProbeState,
+                "explode": _ExplodingSnapshotState,
+            }
+        )
+        router.register_sandbox(
+            sandbox_id="sbx-keep",
+            llm_service_type="probe",
+            llm_service_config={"name": "keep"},
+        )
+        router.register_sandbox(
+            sandbox_id="sbx-ignore",
+            llm_service_type="explode",
+        )
+
+        snapshot = router.snapshot("sbx-keep", include_events=False)
+
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual(snapshot["llm_service_type"], "probe")
+        self.assertEqual(snapshot["state"]["name"], "keep")
+        self.assertEqual(_SnapshotProbeState.instances["keep"].snapshot_calls, [False])
+
+    def test_router_client_single_sandbox_snapshot_omits_replay_events_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.log"
+            trace_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "request",
+                                "data": {
+                                    "model": "trace-model",
+                                    "messages": [{"role": "user", "content": "first"}],
+                                    "tools": [],
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "response",
+                                "data": {"choices": [{"message": {"content": "first"}}]},
+                            }
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            server = serve_benchmark_llm_router(host="127.0.0.1", port=0)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            self.addCleanup(server.shutdown)
+            self.addCleanup(server.server_close)
+            self.addCleanup(thread.join, 5.0)
+            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            _wait_for_json(f"{base_url}/healthz")
+
+            server.benchmark_llm_router.register_sandbox(
+                sandbox_id="sbx-replay",
+                llm_service_type="iflow_trace_replay",
+                llm_service_config={"trace_path": str(trace_path), "response_delay_ms": 0},
+            )
+            server.benchmark_llm_router.handle_request(
+                path="/v1/chat/completions",
+                headers={"X-Agent-Sandbox-Id": "sbx-replay"},
+                payload={
+                    "model": "trace-model",
+                    "messages": [{"role": "user", "content": "first"}],
+                    "tools": [],
+                },
+            )
+
+            direct_snapshot = server.benchmark_llm_router.snapshot("sbx-replay")
+            client = BenchmarkLLMRouterClient(base_url)
+            state = client.snapshot("sbx-replay")
+
+        assert direct_snapshot is not None
+        assert state is not None
+        self.assertIn("events", direct_snapshot["state"])
+        self.assertNotIn("events", state["state"])
+        self.assertEqual(state["state"]["consumed_response_count"], 1)
+        self.assertEqual(state["state"]["trace_cursor"], 1)
 
     def test_router_client_controls_thread_server(self) -> None:
         server = serve_benchmark_llm_router(host="127.0.0.1", port=0)

@@ -138,6 +138,7 @@ class MiniSweAgent(BaseAgent):
         sandbox_manager=None,
         agent_host_dir: Path | None = None,
         llm_base_url: str | None = None,
+        telemetry=None,
     ) -> None:
         super().__init__(
             sandbox,
@@ -148,6 +149,7 @@ class MiniSweAgent(BaseAgent):
             sandbox_manager=sandbox_manager,
             agent_host_dir=agent_host_dir,
             llm_base_url=llm_base_url,
+            telemetry=telemetry,
         )
         self._lock = threading.Lock()
         self._state = "idle"

@@ -31,6 +31,7 @@ _HOST_INSPECTOR_LAUNCH_MODES = {"process", "thread"}
 _TELEMETRY_WRITER_MODES = {"sync", "async"}
 _TELEMETRY_OVERFLOW_POLICIES = {"drop_new", "block"}
 _TELEMETRY_SERIALIZERS = {"auto", "stdlib", "orjson"}
+_CHECKPOINT_SCHEDULING_POLICIES = {"fifo", "reactive"}
 _SUPPORTED_MODES = {
     "e2e": {"manual"},
     "fault": {"manual", "auto"},
@@ -98,6 +99,8 @@ class BenchmarkExecutorConfig:
     coordination_workers: int | None = None
     composite_step_workers: int | None = None
     checkpoint_queue_size: int = 10000
+    checkpoint_scheduling_policy: str = "fifo"
+    reactive_checkpoint_urgent_quota: int = 4
     max_retries: int = 0
     retry_backoff_seconds: float = 0.05
 
@@ -112,6 +115,13 @@ class BenchmarkExecutorConfig:
             raise ValueError("executor.composite_step_workers must be positive when provided")
         if self.checkpoint_queue_size <= 0:
             raise ValueError("executor.checkpoint_queue_size must be positive")
+        if self.checkpoint_scheduling_policy not in _CHECKPOINT_SCHEDULING_POLICIES:
+            raise ValueError(
+                "executor.checkpoint_scheduling_policy must be one of "
+                f"{sorted(_CHECKPOINT_SCHEDULING_POLICIES)}, got {self.checkpoint_scheduling_policy!r}"
+            )
+        if self.reactive_checkpoint_urgent_quota <= 0:
+            raise ValueError("executor.reactive_checkpoint_urgent_quota must be positive")
         if self.max_retries < 0:
             raise ValueError("executor.max_retries must be >= 0")
         if self.retry_backoff_seconds < 0:
@@ -125,6 +135,8 @@ class BenchmarkExecutorConfig:
             coordination_workers=self.coordination_workers,
             composite_step_workers=self.composite_step_workers,
             max_checkpoint_queue_size=self.checkpoint_queue_size,
+            checkpoint_scheduling_policy=self.checkpoint_scheduling_policy,
+            reactive_checkpoint_urgent_quota=self.reactive_checkpoint_urgent_quota,
             max_retries=self.max_retries,
             retry_backoff_seconds=self.retry_backoff_seconds,
         )
@@ -343,6 +355,8 @@ def _load_executor_config(payload: object) -> BenchmarkExecutorConfig:
             None if data.get("composite_step_workers") is None else int(data["composite_step_workers"])
         ),
         checkpoint_queue_size=int(data.get("checkpoint_queue_size", 10000)),
+        checkpoint_scheduling_policy=str(data.get("checkpoint_scheduling_policy", "fifo")),
+        reactive_checkpoint_urgent_quota=int(data.get("reactive_checkpoint_urgent_quota", 4)),
         max_retries=int(data.get("max_retries", 0)),
         retry_backoff_seconds=float(data.get("retry_backoff_seconds", 0.05)),
     )

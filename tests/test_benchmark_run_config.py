@@ -270,6 +270,8 @@ class BenchmarkConfigTests(unittest.TestCase):
                         "  coordination_workers: 5",
                         "  composite_step_workers: 11",
                         "  checkpoint_queue_size: 123",
+                        "  checkpoint_scheduling_policy: reactive",
+                        "  reactive_checkpoint_urgent_quota: 6",
                         "  max_retries: 2",
                         "  retry_backoff_seconds: 0.25",
                         "scheduler:",
@@ -297,6 +299,8 @@ class BenchmarkConfigTests(unittest.TestCase):
             self.assertEqual(config.executor.coordination_workers, 5)
             self.assertEqual(config.executor.composite_step_workers, 11)
             self.assertEqual(config.executor.checkpoint_queue_size, 123)
+            self.assertEqual(config.executor.checkpoint_scheduling_policy, "reactive")
+            self.assertEqual(config.executor.reactive_checkpoint_urgent_quota, 6)
             self.assertEqual(config.executor.max_retries, 2)
             self.assertEqual(config.executor.retry_backoff_seconds, 0.25)
             self.assertEqual(resolved_executor.resolved_checkpoint_workers, 7)
@@ -304,6 +308,8 @@ class BenchmarkConfigTests(unittest.TestCase):
             self.assertEqual(resolved_executor.resolved_coordination_workers, 5)
             self.assertEqual(resolved_executor.resolved_composite_step_workers, 11)
             self.assertEqual(resolved_executor.max_checkpoint_queue_size, 123)
+            self.assertEqual(resolved_executor.checkpoint_scheduling_policy, "reactive")
+            self.assertEqual(resolved_executor.reactive_checkpoint_urgent_quota, 6)
             self.assertEqual(config.scheduler.min_checkpoint_interval_seconds, 1.5)
             self.assertEqual(config.scheduler.force_checkpoint_after_seconds, 9.0)
             self.assertFalse(config.scheduler.require_change_signal)
@@ -690,6 +696,51 @@ class BenchmarkRunDispatchTests(unittest.TestCase):
         self.assertEqual(calls[0]["telemetry_detail_level"], "detailed")
         self.assertTrue(calls[0]["telemetry_capture_command_output"])
         self.assertEqual(calls[0]["telemetry_max_text_attribute_bytes"], 512)
+
+    def test_run_benchmark_config_passes_expected_sandboxes_to_harness(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        class _HarnessContext:
+            def __init__(self, **kwargs) -> None:
+                calls.append(kwargs)
+
+            def __enter__(self):
+                return {"kind": "fake-harness"}
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                _ = (exc_type, exc, tb)
+
+        scenario = ScenarioDefinition(
+            name="fake",
+            supported_modes=frozenset({"manual"}),
+            build_harness_settings=lambda config: HarnessSettings(
+                scheduler_config={"mode": config.mode},
+                scheduler_policy=None,
+                checkpoint_manager_factory=lambda base: base,
+                max_workers=1,
+            ),
+            run_manual=lambda config, harness: [],
+            run_auto=None,
+            summarize=lambda config, rows: {},
+        )
+        config = BenchmarkConfig(
+            config_path=Path("/tmp/bench.yaml"),
+            scenario="fake",
+            mode="manual",
+            provider="openai",
+            agent="simulated",
+            llm_service="simulated",
+            sandboxes=640,
+        )
+
+        with patch("benchmarks.run.RealHostScenarioHarness", _HarnessContext), patch.dict(
+            "benchmarks.run.SCENARIOS",
+            {"fake": scenario},
+            clear=True,
+        ):
+            run_benchmark_config(config)
+
+        self.assertEqual(calls[0]["expected_sandboxes"], 640)
 
     def test_run_benchmark_config_passes_rootfs_reuse_setting_to_harness(self) -> None:
         calls: list[dict[str, object]] = []

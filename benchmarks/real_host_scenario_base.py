@@ -252,6 +252,7 @@ class RealHostScenarioHarness:
         runtime_root: Path | None = None,
         storage_root: Path | None = None,
         agent_host_root: Path | None = None,
+        expected_sandboxes: int | None = None,
         rootfs_reuse_enabled: bool = True,
     ) -> None:
         self.provider = provider
@@ -290,6 +291,7 @@ class RealHostScenarioHarness:
         self.monitoring_include_sandboxes = monitoring_include_sandboxes
         self.llm_server_launch_mode = llm_server_launch_mode
         self.host_inspector_launch_mode = host_inspector_launch_mode
+        self.expected_sandboxes = expected_sandboxes
         self.rootfs_reuse_enabled = bool(rootfs_reuse_enabled)
         self._tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self.root: Path | None = None
@@ -459,7 +461,7 @@ class RealHostScenarioHarness:
 
     def __enter__(self) -> "RealHostScenarioHarness":
         require_binaries()
-        self.network_manager.configure()
+        self.network_manager.configure(expected_sandboxes=self.expected_sandboxes)
         logger.info(
             "Selected benchmark network cidr=%s bridge_ip=%s",
             self.network_manager.network_cidr,
@@ -583,6 +585,7 @@ class RealHostScenarioHarness:
             hook=self.interceptor_hook,
             telemetry=self.telemetry,
             on_state_change=self.system.notify_interceptor_state_change,
+            on_response_ready=self.system.notify_live_response_ready,
             response_gate_registry=self.system.response_gate_registry,
             sandbox_id_resolver=self.resolve_interceptor_sandbox_id,
             host="0.0.0.0",
@@ -869,11 +872,15 @@ class RealHostScenarioHarness:
             return f"http://127.0.0.1:{self.llm_server.server_address[1]}"
         return ""
 
-    def _snapshot_llm_services(self) -> dict[str, object] | None:
+    def _snapshot_llm_services(self, sandbox_id: SandboxId | None = None) -> dict[str, object] | None:
+        resolved_sandbox_id = None if sandbox_id is None else str(sandbox_id)
         if self.llm_router_client is not None:
-            return self.llm_router_client.snapshot()
+            return self.llm_router_client.snapshot(resolved_sandbox_id)
         if self.llm_server is not None:
-            snapshot = self.llm_server.benchmark_llm_router.snapshot()  # type: ignore[attr-defined]
+            snapshot = self.llm_server.benchmark_llm_router.snapshot(  # type: ignore[attr-defined]
+                sandbox_id=resolved_sandbox_id,
+                include_events=False,
+            )
             return None if snapshot is None else dict(snapshot)
         return None
 
@@ -961,6 +968,7 @@ class RealHostScenarioHarness:
             runtime=self.runtime,
             agent_host_dir=self._effective_agent_host_root() / agent_type / str(sandbox.sandbox_id),
             llm_base_url=sandbox.llm_base_url,
+            telemetry=self.telemetry,
         )
 
     def _agent_requires_benchmark_network(self, agent_type: str) -> bool:
@@ -1253,6 +1261,39 @@ class RealHostScenarioHarness:
 
         task_future.add_done_callback(_finalize)
 
+    def _run_benchmark_setup_step(
+        self,
+        sandbox: SandboxHandle,
+        *,
+        name: str,
+        setup_step: str,
+        fn,
+        extra: dict[str, object] | None = None,
+    ):
+        operation = None
+        if self.telemetry is not None:
+            attributes = {
+                "phase": "setup",
+                "phase_scope": "sandbox",
+                "setup_step": setup_step,
+            }
+            if extra:
+                attributes.update(extra)
+            operation = start_operation(
+                self.telemetry,
+                name,
+                self.benchmark_telemetry_attributes(sandbox, extra=attributes),
+            )
+        try:
+            result = fn()
+        except Exception:
+            if operation is not None:
+                operation.finish(status="failed")
+            raise
+        if operation is not None:
+            operation.finish(status="succeeded")
+        return result
+
     def launch_task(
         self,
         agent_type: str,
@@ -1440,8 +1481,18 @@ class RealHostScenarioHarness:
             task_record.task_description,
             task_record.task_config,
         )
-        prelaunch_task_run.prepare_sandbox()
-        prelaunch_task_run.configure_bundle()
+        self._run_benchmark_setup_step(
+            handle,
+            name="benchmark.setup.prepare_sandbox",
+            setup_step="prepare_sandbox",
+            fn=prelaunch_task_run.prepare_sandbox,
+        )
+        self._run_benchmark_setup_step(
+            handle,
+            name="benchmark.setup.configure_bundle",
+            setup_step="configure_bundle",
+            fn=prelaunch_task_run.configure_bundle,
+        )
         handle.launch_metadata = {
             "sandbox_id": sandbox_name,
             "bundle_path": str(handle.bundle_dir),
@@ -1504,17 +1555,31 @@ class RealHostScenarioHarness:
             task_record.task_description,
             task_record.task_config,
         )
-        prelaunch_task_run.prepare_sandbox()
-        translation = sandbox_compose.translate_compose_service(
-            compose_file=task_record.docker_compose_file,
-            service_name=service_name,
-            service=service,
-            bundle_dir=handle.bundle_dir,
-            sandbox_id=str(handle.sandbox_id),
-            work_dir_host_path=work_dir_host_path,
-            compose_image_root=self.image_cache_root,
-            compose_image_tags=self._compose_image_tags,
-            telemetry=self.telemetry,
+        self._run_benchmark_setup_step(
+            handle,
+            name="benchmark.setup.prepare_sandbox",
+            setup_step="prepare_sandbox",
+            fn=prelaunch_task_run.prepare_sandbox,
+        )
+        translation = self._run_benchmark_setup_step(
+            handle,
+            name="benchmark.setup.compose_translate",
+            setup_step="compose_translate",
+            fn=lambda: sandbox_compose.translate_compose_service(
+                compose_file=task_record.docker_compose_file,
+                service_name=service_name,
+                service=service,
+                bundle_dir=handle.bundle_dir,
+                sandbox_id=str(handle.sandbox_id),
+                work_dir_host_path=work_dir_host_path,
+                compose_image_root=self.image_cache_root,
+                compose_image_tags=self._compose_image_tags,
+                telemetry=self.telemetry,
+            ),
+            extra={
+                "compose_file": str(task_record.docker_compose_file),
+                "compose_service": service_name,
+            },
         )
         handle.launch_source = "compose"
         handle.launch_metadata["runtime"] = dict(translation.runtime_launch_metadata)
@@ -1535,7 +1600,12 @@ class RealHostScenarioHarness:
             compose_file=task_record.docker_compose_file,
             service_name=service_name,
         )
-        prelaunch_task_run.configure_bundle()
+        self._run_benchmark_setup_step(
+            handle,
+            name="benchmark.setup.configure_bundle",
+            setup_step="configure_bundle",
+            fn=prelaunch_task_run.configure_bundle,
+        )
         return PreparedBenchmarkSandbox(
             handle=handle,
             sandbox_name=sandbox_name,
@@ -1585,7 +1655,13 @@ class RealHostScenarioHarness:
         handle = prepared.handle
         runtime_metadata = handle.launch_metadata.get("runtime", handle.launch_metadata)
         logger.info("Benchmark preparing runtime sandbox=%s phase=setup", handle.sandbox_id)
-        prepare_launch("runc", runtime_metadata)
+        self._run_benchmark_setup_step(
+            handle,
+            name="benchmark.setup.runtime_prepare",
+            setup_step="runtime_prepare",
+            fn=lambda: prepare_launch("runc", runtime_metadata),
+            extra={"launch_source": handle.launch_source},
+        )
         prepared.runtime_prepared = True
         logger.info("Benchmark prepared runtime sandbox=%s phase=setup", handle.sandbox_id)
 
@@ -2732,13 +2808,13 @@ class RealHostScenarioHarness:
                 if trace_cursor >= 0:
                     return {"benchmark_trace_cursor": trace_cursor}
         try:
-            snapshot = self._snapshot_llm_services()
+            snapshot = self._snapshot_llm_services(sandbox_id)
         except Exception:
             logger.exception("Failed to capture llm service checkpoint metadata for sandbox=%s", sandbox_id)
             return {}
         if snapshot is None:
             return {}
-        sandbox_snapshot = snapshot.get(str(sandbox_id))
+        sandbox_snapshot = snapshot if isinstance(snapshot, dict) and "state" in snapshot else snapshot.get(str(sandbox_id))
         if not isinstance(sandbox_snapshot, dict):
             return {}
         if sandbox_snapshot.get("llm_service_type") not in {"iflow_trace_replay", "mini_swe_trace_replay"}:
