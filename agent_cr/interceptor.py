@@ -706,14 +706,15 @@ class AgentCRRequestInterceptorServer:
                 self.wfile.write(body)
 
             def do_POST(self) -> None:
-                if self.path not in {"/v1/chat/completions", "/v1/messages"}:
+                request_path = self.path.split("?")[0]
+                if request_path not in {"/v1/chat/completions", "/v1/messages", "/v1/messages/count_tokens"}:
                     self.send_error(404)
                     return
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
                     body = self.rfile.read(length) if length else b"{}"
                     status_code, headers, body = outer._interceptor.intercept(
-                        path=self.path,
+                        path=request_path,
                         headers=dict(self.headers.items()),
                         body=body,
                         client_host=str(self.client_address[0]),

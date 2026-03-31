@@ -1700,6 +1700,8 @@ class ResponseDelayPolicyTests(unittest.TestCase):
         self.assertEqual(snapshot["response_delay_policy"], "fixed")
         self.assertEqual(snapshot["response_delay_ms"], 0)
         self.assertAlmostEqual(snapshot["response_delay_scaling_factor"], 1.0)
+        self.assertEqual(snapshot["minimal_delay"], 0.0)
+        self.assertEqual(snapshot["maximal_delay"], 1_000_000_000.0)
 
     def test_trace_replay_policy_uses_trace_timestamps(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1812,6 +1814,75 @@ class ResponseDelayPolicyTests(unittest.TestCase):
             delay = state._compute_delay_ms(exchange)
 
         self.assertAlmostEqual(delay, 100.0)
+
+    def test_trace_replay_policy_clamps_delay_to_minimum_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.log"
+            trace_path.write_text(
+                "\n".join(
+                    self._timestamped_request_response_lines(
+                        ("hello", 1000.0, 1002.0),
+                    )
+                ),
+                encoding="utf-8",
+            )
+            state = TraceReplayLLMState(
+                llm_service_config={
+                    "trace_path": str(trace_path),
+                    "response_delay_policy": "trace_replay",
+                    "response_delay_scaling_factor": 0.25,
+                    "minimal_delay": 1500,
+                    "maximal_delay": 5000,
+                }
+            )
+            exchange = state._trace.exchanges[0]
+            delay = state._compute_delay_ms(exchange)
+
+        self.assertAlmostEqual(delay, 1500.0)
+
+    def test_fixed_policy_clamps_delay_to_maximum_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.log"
+            trace_path.write_text(
+                "\n".join(
+                    self._timestamped_request_response_lines(
+                        ("hello", 1000.0, 1002.0),
+                    )
+                ),
+                encoding="utf-8",
+            )
+            state = TraceReplayLLMState(
+                llm_service_config={
+                    "trace_path": str(trace_path),
+                    "response_delay_policy": "fixed",
+                    "response_delay_ms": 4000,
+                    "maximal_delay": 2500,
+                }
+            )
+            exchange = state._trace.exchanges[0]
+            delay = state._compute_delay_ms(exchange)
+
+        self.assertAlmostEqual(delay, 2500.0)
+
+    def test_invalid_delay_bounds_raise_value_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.log"
+            trace_path.write_text(
+                "\n".join(
+                    self._timestamped_request_response_lines(
+                        ("hello", 1000.0, 1002.0),
+                    )
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "maximal_delay"):
+                TraceReplayLLMState(
+                    llm_service_config={
+                        "trace_path": str(trace_path),
+                        "minimal_delay": 10,
+                        "maximal_delay": 5,
+                    }
+                )
 
     def test_invalid_policy_raises_value_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -27,6 +27,7 @@ from benchmarks.scenarios.common import (
     choose_replay_chunk_targets,
     cleanup_finished_replay_sandbox_after_run,
     finalize_replay_row,
+    resolve_scheduler_policy_override,
     should_inject_event,
     wait_for_iteration_progress,
 )
@@ -81,7 +82,10 @@ def build_harness_settings(config: BenchmarkConfig) -> HarnessSettings:
     )
     return HarnessSettings(
         scheduler_config=scheduler_config,
-        scheduler_policy=SpotPreemptionCheckpointingPolicy(scheduler_config),
+        scheduler_policy=resolve_scheduler_policy_override(
+            config,
+            scenario_default_policy=SpotPreemptionCheckpointingPolicy(scheduler_config),
+        ),
         checkpoint_manager_factory=lambda base: DeleteAfterRestoreCheckpointManager(base),
         max_workers=config.effective_max_workers,
     )
@@ -612,6 +616,7 @@ def run_manual(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
                 phase="run",
                 prepared=prepared,
             ),
+            executor_pool=config.phase_merging.setup_and_run_executor_pool,
         )
     else:
         prepared = setup_task_records_phase(
@@ -702,6 +707,7 @@ def run_auto(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
                 phase="run",
                 prepared=prepared,
             ),
+            executor_pool=config.phase_merging.setup_and_run_executor_pool,
         )
     else:
         prepared = setup_task_records_phase(

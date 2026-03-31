@@ -22,6 +22,7 @@ from agent_cr import (
 )
 from agent_cr.models import utc_now
 from agent_cr.runtime import CommandRunner
+from agent_cr.workers.composite import resolve_restore_manifest
 
 
 class FakeCommandRunner(CommandRunner):
@@ -575,6 +576,51 @@ class StorageTests(unittest.TestCase):
             mgr.handle_checkpoint_complete(m3)
             self._flush_manager(mgr)
             self.assertEqual(mgr.list_checkpoints(sid), [CheckpointId("ckpt-3")])
+
+    def test_resolve_restore_manifest_can_reuse_preloaded_candidates(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+            sid = SandboxId("sbx-1")
+            base = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
+            manifests = [
+                CheckpointManifest(
+                    schema_version="v1",
+                    checkpoint_id=CheckpointId("ckpt-1"),
+                    sandbox_id=sid,
+                    created_at=utc_now(),
+                    runtime_name="runc",
+                    runtime_version=None,
+                    process_artifacts=[self._reference(ArtifactKind.PROCESS, "p1")],
+                    filesystem_artifacts=[self._reference(ArtifactKind.FILESYSTEM, "f1")],
+                    metadata={"benchmark_trace_cursor": 1, "benchmark_latest_mutating_response_count": 1},
+                ).with_integrity(),
+                CheckpointManifest(
+                    schema_version="v1",
+                    checkpoint_id=CheckpointId("ckpt-2"),
+                    sandbox_id=sid,
+                    created_at=utc_now() + timedelta(seconds=1),
+                    runtime_name="runc",
+                    runtime_version=None,
+                    process_artifacts=[],
+                    filesystem_artifacts=[self._reference(ArtifactKind.FILESYSTEM, "f2")],
+                    metadata={"benchmark_trace_cursor": 2, "benchmark_latest_mutating_response_count": 1},
+                ).with_integrity(),
+            ]
+            for manifest in manifests:
+                base.put_manifest(manifest)
+
+            with mock.patch.object(base, "list_checkpoints", side_effect=AssertionError("unexpected list")):
+                with mock.patch.object(base, "get_manifest", side_effect=AssertionError("unexpected load")):
+                    resolved = resolve_restore_manifest(base, manifests[-1], candidates=manifests)
+
+            self.assertEqual(resolved.checkpoint_id, CheckpointId("ckpt-2"))
+            self.assertEqual(
+                resolved.metadata["process_restore_checkpoint_id"],
+                "ckpt-1",
+            )
+            self.assertEqual(
+                resolved.metadata["filesystem_restore_checkpoint_id"],
+                "ckpt-2",
+            )
 
     def test_delete_after_restore_manager_removes_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:

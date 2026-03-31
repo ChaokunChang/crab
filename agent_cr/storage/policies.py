@@ -120,19 +120,38 @@ class DelegatingCheckpointManager(CheckpointManager):
         self._delegate.handle_restore_complete(sandbox_id, checkpoint_id)
 
     def _manifests(self, sandbox_id: SandboxId) -> list[CheckpointManifest]:
-        manifests: list[CheckpointManifest] = []
-        for checkpoint_id in self.list_checkpoints(sandbox_id):
-            try:
-                manifests.append(self.get_manifest(sandbox_id, checkpoint_id))
-            except FileNotFoundError:
-                continue
+        _, manifests, _ = self._manifest_snapshot(sandbox_id)
         return manifests
 
-    def _protected_checkpoint_ids(self, sandbox_id: SandboxId) -> set[CheckpointId]:
+    def _manifest_snapshot(
+        self,
+        sandbox_id: SandboxId,
+    ) -> tuple[list[CheckpointId], list[CheckpointManifest], dict[CheckpointId, CheckpointManifest]]:
+        checkpoint_ids = self.list_checkpoints(sandbox_id)
+        manifests: list[CheckpointManifest] = []
+        manifest_by_id: dict[CheckpointId, CheckpointManifest] = {}
+        for checkpoint_id in checkpoint_ids:
+            try:
+                manifest = self.get_manifest(sandbox_id, checkpoint_id)
+            except FileNotFoundError:
+                continue
+            manifests.append(manifest)
+            manifest_by_id[checkpoint_id] = manifest
+        return checkpoint_ids, manifests, manifest_by_id
+
+    def _protected_checkpoint_ids(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        manifests: list[CheckpointManifest] | None = None,
+        manifest_by_id: dict[CheckpointId, CheckpointManifest] | None = None,
+    ) -> set[CheckpointId]:
+        if manifests is None or manifest_by_id is None:
+            _, manifests, manifest_by_id = self._manifest_snapshot(sandbox_id)
         latest_checkpoint: CheckpointId | None = None
         latest_process: CheckpointId | None = None
         latest_filesystem: CheckpointId | None = None
-        for manifest in self._manifests(sandbox_id):
+        for manifest in manifests:
             latest_checkpoint = manifest.checkpoint_id
             if manifest.process_artifacts:
                 latest_process = manifest.checkpoint_id
@@ -146,16 +165,36 @@ class DelegatingCheckpointManager(CheckpointManager):
         if latest_filesystem is not None:
             protected.add(latest_filesystem)
         if latest_checkpoint is not None:
-            protected.update(self._restore_dependency_checkpoint_ids(sandbox_id, latest_checkpoint))
+            protected.update(
+                self._restore_dependency_checkpoint_ids(
+                    sandbox_id,
+                    latest_checkpoint,
+                    manifests=manifests,
+                    manifest_by_id=manifest_by_id,
+                )
+            )
         with self._pin_lock_for(sandbox_id):
             protected.update(self._pinned_checkpoint_counts.get(sandbox_id, {}).keys())
         return protected
 
-    def _restore_dependency_checkpoint_ids(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> set[CheckpointId]:
+    def _restore_dependency_checkpoint_ids(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+        *,
+        manifests: list[CheckpointManifest] | None = None,
+        manifest_by_id: dict[CheckpointId, CheckpointManifest] | None = None,
+    ) -> set[CheckpointId]:
         try:
             from ..workers.composite import resolve_restore_manifest
 
-            resolved = resolve_restore_manifest(self, self.get_manifest(sandbox_id, checkpoint_id))
+            if manifest_by_id is not None:
+                manifest = manifest_by_id.get(checkpoint_id)
+            else:
+                manifest = None
+            if manifest is None:
+                manifest = self.get_manifest(sandbox_id, checkpoint_id)
+            resolved = resolve_restore_manifest(self, manifest, candidates=manifests)
         except Exception:
             return set()
         protected = {checkpoint_id}
@@ -166,8 +205,13 @@ class DelegatingCheckpointManager(CheckpointManager):
         return protected
 
     def _prune_unprotected(self, sandbox_id: SandboxId) -> None:
-        protected = self._protected_checkpoint_ids(sandbox_id)
-        for checkpoint_id in self.list_checkpoints(sandbox_id):
+        checkpoint_ids, manifests, manifest_by_id = self._manifest_snapshot(sandbox_id)
+        protected = self._protected_checkpoint_ids(
+            sandbox_id,
+            manifests=manifests,
+            manifest_by_id=manifest_by_id,
+        )
+        for checkpoint_id in checkpoint_ids:
             if checkpoint_id not in protected:
                 self.delete_checkpoint(sandbox_id, checkpoint_id)
 
@@ -215,11 +259,23 @@ class LatestOnlyCheckpointManager(DelegatingCheckpointManager):
     def delete_filesystem_checkpoints(self) -> bool:
         return self._delete_filesystem_checkpoints
 
-    def _protected_checkpoint_ids(self, sandbox_id: SandboxId) -> set[CheckpointId]:
-        protected = super()._protected_checkpoint_ids(sandbox_id)
+    def _protected_checkpoint_ids(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        manifests: list[CheckpointManifest] | None = None,
+        manifest_by_id: dict[CheckpointId, CheckpointManifest] | None = None,
+    ) -> set[CheckpointId]:
+        if manifests is None or manifest_by_id is None:
+            _, manifests, manifest_by_id = self._manifest_snapshot(sandbox_id)
+        protected = super()._protected_checkpoint_ids(
+            sandbox_id,
+            manifests=manifests,
+            manifest_by_id=manifest_by_id,
+        )
         if self._delete_filesystem_checkpoints:
             return protected
-        for manifest in self._manifests(sandbox_id):
+        for manifest in manifests:
             if manifest.filesystem_artifacts:
                 protected.add(manifest.checkpoint_id)
         return protected

@@ -299,6 +299,43 @@ class BenchmarkNetworkManager:
         with self._lock:
             return self._leases.get(sandbox_id)
 
+    def repair_lease(self, sandbox_id: SandboxId) -> bool:
+        with self._lock:
+            lease = self._leases.get(sandbox_id)
+            bridge_name = self._bridge_name
+        if lease is None or bridge_name is None:
+            return False
+        try:
+            self._ensure_outbound_connectivity_rules(bridge_name)
+            subprocess.run(["ip", "link", "set", lease.host_veth_name, "up"], check=True)
+            subprocess.run(["ip", "link", "set", lease.host_veth_name, "master", bridge_name], check=True)
+            subprocess.run(["ip", "netns", "exec", lease.namespace_name, "ip", "link", "set", "lo", "up"], check=True)
+            subprocess.run(["ip", "netns", "exec", lease.namespace_name, "ip", "link", "set", "eth0", "up"], check=True)
+            subprocess.run(
+                ["ip", "netns", "exec", lease.namespace_name, "ip", "addr", "replace", f"{lease.guest_ip}/24", "dev", "eth0"],
+                check=True,
+            )
+            subprocess.run(
+                ["ip", "netns", "exec", lease.namespace_name, "ip", "route", "replace", "default", "via", self._bridge_ip],
+                check=True,
+            )
+        except subprocess.CalledProcessError:
+            logger.warning(
+                "Failed to repair benchmark network lease sandbox=%s guest_ip=%s namespace=%s",
+                sandbox_id,
+                lease.guest_ip,
+                lease.namespace_name,
+                exc_info=True,
+            )
+            return False
+        logger.info(
+            "Repaired benchmark network lease sandbox=%s guest_ip=%s namespace=%s",
+            sandbox_id,
+            lease.guest_ip,
+            lease.namespace_name,
+        )
+        return True
+
     def release_lease(self, sandbox_id: SandboxId) -> None:
         with self._lock:
             lease = self._leases.pop(sandbox_id, None)

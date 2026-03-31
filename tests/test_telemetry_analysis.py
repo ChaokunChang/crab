@@ -75,8 +75,23 @@ class TelemetryAnalysisTests(unittest.TestCase):
                 {
                     "timestamp": "2026-03-23T01:00:03+08:00",
                     "kind": "metric",
-                    "name": "benchmark.task.duration_ms",
-                    "value": 120.0,
+                    "name": "benchmark.task.queue_wait_ms",
+                    "value": 15.0,
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "sbx-1",
+                        "task_id": "task-1",
+                        "component": "benchmark",
+                        "agent_type": "iflow",
+                        "llm_service_type": "iflow_trace_replay",
+                        "status": "succeeded",
+                    },
+                },
+                {
+                    "timestamp": "2026-03-23T01:00:03.500000+08:00",
+                    "kind": "metric",
+                    "name": "benchmark.task.run.duration_ms",
+                    "value": 105.0,
                     "attributes": {
                         "run_id": "run-a",
                         "sandbox_id": "sbx-1",
@@ -90,6 +105,21 @@ class TelemetryAnalysisTests(unittest.TestCase):
                 {
                     "timestamp": "2026-03-23T01:00:04+08:00",
                     "kind": "metric",
+                    "name": "benchmark.task.duration_ms",
+                    "value": 120.0,
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "sbx-1",
+                        "task_id": "task-1",
+                        "component": "benchmark",
+                        "agent_type": "iflow",
+                        "llm_service_type": "iflow_trace_replay",
+                        "status": "succeeded",
+                    },
+                },
+                {
+                    "timestamp": "2026-03-23T01:00:05+08:00",
+                    "kind": "metric",
                     "name": "llm.agentcr_delay_ms",
                     "value": 30.0,
                     "attributes": {
@@ -101,7 +131,7 @@ class TelemetryAnalysisTests(unittest.TestCase):
                     },
                 },
                 {
-                    "timestamp": "2026-03-23T01:00:05+08:00",
+                    "timestamp": "2026-03-23T01:00:06+08:00",
                     "kind": "metric",
                     "name": "benchmark.task.duration_ms",
                     "value": 999.0,
@@ -125,6 +155,8 @@ class TelemetryAnalysisTests(unittest.TestCase):
             self.assertEqual(len(analysis.task_summaries), 1)
             self.assertEqual(analysis.task_summaries[0].sandbox_id, "sbx-1")
             self.assertEqual(analysis.task_summaries[0].task_id, "task-1")
+            self.assertAlmostEqual(analysis.task_summaries[0].metrics["benchmark.task.queue_wait_ms"], 15.0)
+            self.assertAlmostEqual(analysis.task_summaries[0].metrics["benchmark.task.run.duration_ms"], 105.0)
             self.assertAlmostEqual(analysis.task_summaries[0].metrics["benchmark.task.duration_ms"], 120.0)
             self.assertEqual(analysis.distinct_requests, 1)
 
@@ -138,6 +170,38 @@ class TelemetryAnalysisTests(unittest.TestCase):
                         json.dumps(
                             {
                                 "timestamp": "2026-03-23T01:00:00+08:00",
+                                "kind": "metric",
+                                "name": "benchmark.task.queue_wait_ms",
+                                "value": 7.0,
+                                "attributes": {
+                                    "run_id": "run-a",
+                                    "sandbox_id": "sbx-1",
+                                    "task_id": "task-1",
+                                    "component": "benchmark",
+                                    "agent_type": "iflow",
+                                    "llm_service_type": "iflow_trace_replay",
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-03-23T01:00:00.500000+08:00",
+                                "kind": "metric",
+                                "name": "benchmark.task.run.duration_ms",
+                                "value": 43.0,
+                                "attributes": {
+                                    "run_id": "run-a",
+                                    "sandbox_id": "sbx-1",
+                                    "task_id": "task-1",
+                                    "component": "benchmark",
+                                    "agent_type": "iflow",
+                                    "llm_service_type": "iflow_trace_replay",
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-03-23T01:00:01+08:00",
                                 "kind": "metric",
                                 "name": "benchmark.task.duration_ms",
                                 "value": 50.0,
@@ -153,7 +217,7 @@ class TelemetryAnalysisTests(unittest.TestCase):
                         ),
                         json.dumps(
                             {
-                                "timestamp": "2026-03-23T01:00:01+08:00",
+                                "timestamp": "2026-03-23T01:00:02+08:00",
                                 "kind": "metric",
                                 "name": "llm.interceptor_total_ms",
                                 "value": 10.0,
@@ -183,6 +247,137 @@ class TelemetryAnalysisTests(unittest.TestCase):
             self.assertTrue((root / "report" / "checkpoint_analysis.csv").exists())
             self.assertTrue((root / "report" / "restore_analysis.csv").exists())
             self.assertTrue((root / "report" / "resource_summary.csv").exists())
+            self.assertTrue((root / "report" / "turn_analysis.csv").exists())
+            self.assertTrue((root / "report" / "turn_timeseries.csv").exists())
+            self.assertTrue((root / "report" / "turn_cdf.csv").exists())
+            self.assertTrue((root / "report" / "task_run_latency.svg").exists())
+            self.assertTrue((root / "report" / "task_queue_wait.svg").exists())
+
+            html = (root / "report" / "report.html").read_text(encoding="utf-8")
+            self.assertIn("Task Timing Analysis", html)
+            self.assertIn("Sandbox Pure Task Run Time", html)
+            self.assertIn("Sandbox Task Queue Wait", html)
+
+    def test_turn_analysis_reconstructs_request_response_and_action_timings(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_telemetry_turn_analysis_") as tmp:
+            root = Path(tmp)
+            path = root / "telemetry.jsonl"
+            records = [
+                {
+                    "timestamp": "2026-03-23T01:00:00.100000+08:00",
+                    "kind": "metric",
+                    "name": "llm.interceptor_total_ms",
+                    "value": 100.0,
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "sbx-1",
+                        "task_id": "task-1",
+                        "component": "interceptor",
+                        "request_id": "req-1",
+                    },
+                },
+                {
+                    "timestamp": "2026-03-23T01:00:00.050000+08:00",
+                    "kind": "metric",
+                    "name": "llm.service.request.duration_ms",
+                    "value": 50.0,
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "sbx-1",
+                        "task_id": "task-1",
+                        "component": "llm_service",
+                        "request_id": "req-1",
+                    },
+                },
+                {
+                    "timestamp": "2026-03-23T01:00:00.280000+08:00",
+                    "kind": "metric",
+                    "name": "llm.interceptor_total_ms",
+                    "value": 80.0,
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "sbx-1",
+                        "task_id": "task-1",
+                        "component": "interceptor",
+                        "request_id": "req-2",
+                    },
+                },
+                {
+                    "timestamp": "2026-03-23T01:00:00.240000+08:00",
+                    "kind": "metric",
+                    "name": "llm.service.request.duration_ms",
+                    "value": 40.0,
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "sbx-1",
+                        "task_id": "task-1",
+                        "component": "llm_service",
+                        "request_id": "req-2",
+                    },
+                },
+                {
+                    "timestamp": "2026-03-23T01:00:00.650000+08:00",
+                    "kind": "metric",
+                    "name": "llm.request_total_ms",
+                    "value": 150.0,
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "sbx-2",
+                        "task_id": "task-2",
+                        "component": "interceptor",
+                        "request_id": "req-3",
+                    },
+                },
+                {
+                    "timestamp": "2026-03-23T01:00:00.560000+08:00",
+                    "kind": "metric",
+                    "name": "llm.service.request.duration_ms",
+                    "value": 60.0,
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "sbx-2",
+                        "task_id": "task-2",
+                        "component": "llm_service",
+                        "request_id": "req-3",
+                    },
+                },
+            ]
+            path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+            analysis = generate_report_bundle(path, output_dir=root / "report", window_size_seconds=15.0)
+
+            self.assertIsNotNone(analysis.turn_analysis)
+            assert analysis.turn_analysis is not None
+            by_name = {item.metric_name: item for item in analysis.turn_analysis.metrics}
+            self.assertEqual(by_name["llm_response_time"].count, 3)
+            self.assertAlmostEqual(by_name["llm_response_time"].mean_ms, 110.0)
+            self.assertEqual(by_name["pure_llm_time"].count, 3)
+            self.assertAlmostEqual(by_name["pure_llm_time"].mean_ms, 50.0)
+            self.assertEqual(by_name["action_time"].count, 1)
+            self.assertAlmostEqual(by_name["action_time"].mean_ms, 100.0)
+            self.assertEqual(by_name["turn_time"].count, 1)
+            self.assertAlmostEqual(by_name["turn_time"].mean_ms, 200.0)
+            self.assertEqual(len(analysis.turn_analysis.time_series["llm_response_time"]), 3)
+            self.assertEqual(len(analysis.turn_analysis.time_series["pure_llm_time"]), 3)
+            self.assertEqual(len(analysis.turn_analysis.time_series["action_time"]), 1)
+            self.assertEqual(len(analysis.turn_analysis.time_series["turn_time"]), 1)
+            self.assertEqual(
+                analysis.turn_analysis.cdf_series["llm_response_time"][-1].cumulative_probability,
+                1.0,
+            )
+
+            html = (root / "report" / "report.html").read_text(encoding="utf-8")
+            self.assertIn("Turn Analysis", html)
+            self.assertIn("pure_llm_time", html)
+            self.assertIn("Window-Aggregated Turn Timing Over Time", html)
+            summary = json.loads((root / "report" / "summary.json").read_text(encoding="utf-8"))
+            self.assertIn("turn_analysis", summary)
+            self.assertTrue((root / "report" / "turn_analysis.csv").exists())
+            self.assertTrue((root / "report" / "turn_timeseries.csv").exists())
+            self.assertTrue((root / "report" / "turn_cdf.csv").exists())
+            self.assertTrue((root / "report" / "turn_timing.svg").exists())
+            self.assertTrue((root / "report" / "turn_llm_response_time_cdf.svg").exists())
+            self.assertTrue((root / "report" / "turn_pure_llm_time_cdf.svg").exists())
 
     def test_detailed_analysis_is_limited_to_run_phase_when_phase_markers_exist(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_telemetry_run_scope_") as tmp:

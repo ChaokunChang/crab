@@ -93,7 +93,7 @@ class AgentCRSystem:
     telemetry: TelemetrySink
     request_state_store: InMemoryRequestStateStore | None = None
     response_gate_registry: SandboxResponseGateRegistry | None = None
-    relaunch_handler: Callable[[SandboxId, str], None] | None = None
+    relaunch_handler: Callable[[SandboxId, str, bool], None] | None = None
     extra_checkpoint_metadata_provider: Callable[[SandboxId], dict[str, object]] | None = None
     restore_metadata_handler: Callable[[SandboxId, CheckpointManifest], None] | None = None
     recovery_delay_seconds: float = 0.0
@@ -316,6 +316,15 @@ class AgentCRSystem:
                 },
             )
             return failed_result
+        restore_manifest = None
+        if self.restore_metadata_handler is not None:
+            restore_manifest = self._resolve_restore_manifest(sandbox_id, restore_checkpoint_id)
+            if restore_manifest is not None:
+                # Preload replay/router state before the restored process can
+                # resume making requests. This avoids a narrow race where the
+                # process issues its first post-restore request before the
+                # replay service cursor is rewound to the checkpoint position.
+                self.restore_metadata_handler(sandbox_id, restore_manifest)
         self.runtime.prepare_for_restore(sandbox_id)
         job = RestoreJob(
             job_id=JobId.new(),
@@ -343,14 +352,9 @@ class AgentCRSystem:
                     message=message,
                 )
             else:
-                restore_manifest = None
-                if self.restore_metadata_handler is not None:
-                    restore_manifest = self._resolve_restore_manifest(sandbox_id, restore_checkpoint_id)
                 self.runtime.mark_restored(sandbox_id)
                 self._mark_sandbox_running(sandbox_id)
                 self.storage.handle_restore_complete(sandbox_id, result.checkpoint_id)
-                if self.restore_metadata_handler is not None and restore_manifest is not None:
-                    self.restore_metadata_handler(sandbox_id, restore_manifest)
         logger.info(
             "Manual restore for sandbox %s checkpoint=%s finished with status=%s",
             sandbox_id,
@@ -709,7 +713,20 @@ class AgentCRSystem:
                         checkpoint_id,
                         restore_result.message,
                     )
-                    self.relaunch_handler(event.sandbox_id, event.event_type)
+                    if self.restore_metadata_handler is not None and restore_manifest is not None:
+                        try:
+                            self.restore_metadata_handler(event.sandbox_id, restore_manifest)
+                        except Exception:
+                            logger.exception(
+                                "Failed to restore replay metadata before relaunch sandbox=%s checkpoint=%s",
+                                event.sandbox_id,
+                                checkpoint_id,
+                            )
+                    self.relaunch_handler(
+                        event.sandbox_id,
+                        event.event_type,
+                        True,
+                    )
                     status = "relaunched"
                     message = "restore_failed_relaunch_handler_invoked"
                 else:
@@ -723,7 +740,11 @@ class AgentCRSystem:
                     )
             elif self.relaunch_handler is not None:
                 logger.info("No checkpoint available; invoking relaunch handler for sandbox=%s", event.sandbox_id)
-                self.relaunch_handler(event.sandbox_id, event.event_type)
+                self.relaunch_handler(
+                    event.sandbox_id,
+                    event.event_type,
+                    False,
+                )
                 status = "relaunched"
                 message = "relaunch_handler_invoked"
             else:
@@ -1281,7 +1302,7 @@ def build_default_system(
     host_inspector_url: str | None = None,
     scheduler_policy: SchedulerPolicy | None = None,
     checkpoint_manager: CheckpointManager | None = None,
-    relaunch_handler: Callable[[SandboxId, str], None] | None = None,
+    relaunch_handler: Callable[[SandboxId, str, bool], None] | None = None,
     enforce_restore_checkpoint_validation: bool = False,
 ) -> AgentCRSystem:
     logger.info("Building default agent-cr system with runtime=%s storage_root=%s", runtime, storage_root)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler
@@ -23,6 +24,7 @@ from agent_cr.telemetry import (
 )
 
 from integrations.llm_services.iflow_trace_replay.service import TraceReplayLLMState
+from integrations.llm_services.claude_code_trace_replay.service import TraceReplayLLMState as ClaudeCodeTraceReplayLLMState
 from integrations.llm_services.mini_swe_trace_replay.service import TraceReplayLLMState as MiniSWETraceReplayLLMState
 from integrations.llm_services.manual.service import ManualLLMState, handle_control_request
 from integrations.llm_services.simulated.service import SimulatedLLMState, handle_request as handle_simulated_request
@@ -30,6 +32,8 @@ from integrations.llm_services.simulated_for_iflow.service import (
     SimulatedLLMState as SimulatedIFlowLLMState,
     handle_request as handle_iflow_simulated_request,
 )
+
+logger = logging.getLogger(__name__)
 
 _IFLOW_BENCHMARK_MAX_TOOL_CALLS_BEFORE_FINISH = 4096
 _JSON_CODEC = get_json_codec("auto")
@@ -50,12 +54,14 @@ def default_llm_service_type_for_agent(agent_type: str) -> str:
         return "simulated_for_iflow"
     if agent_type == "mini_swe":
         return "mini_swe_trace_replay"
+    if agent_type == "claude_code":
+        return "claude_code_trace_replay"
     return "simulated"
 
 
 def validate_llm_service_type(*, provider: str, llm_service_type: str) -> None:
     openai_only = {"manual", "simulated_for_iflow", "iflow_trace_replay", "mini_swe_trace_replay"}
-    supported = {"simulated", "manual", "simulated_for_iflow", "iflow_trace_replay", "mini_swe_trace_replay"}
+    supported = {"simulated", "manual", "simulated_for_iflow", "iflow_trace_replay", "mini_swe_trace_replay", "claude_code_trace_replay"}
     if llm_service_type not in supported:
         raise ValueError(f"unsupported llm service type: {llm_service_type}")
     if provider == "anthropic" and llm_service_type in openai_only:
@@ -172,6 +178,23 @@ class MiniSWETraceReplayServiceState:
         self._state.restore(consumed_response_count=consumed_response_count)
 
 
+class ClaudeCodeTraceReplayServiceState:
+    def __init__(self, *, llm_service_config: dict[str, object] | None = None) -> None:
+        self._state = ClaudeCodeTraceReplayLLMState(llm_service_config=llm_service_config)
+
+    def handle_request(self, *, path: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
+        return self._state.handle_request(path=path, headers=headers, payload=payload)
+
+    def snapshot(self, *, include_events: bool = True) -> dict[str, Any]:
+        return self._state.snapshot(include_events=include_events)
+
+    def reset(self) -> None:
+        self._state.reset()
+
+    def restore(self, *, consumed_response_count: int) -> None:
+        self._state.restore(consumed_response_count=consumed_response_count)
+
+
 def build_llm_service_registry() -> dict[str, type[LLMServiceState]]:
     return {
         "manual": ManualServiceState,
@@ -179,6 +202,7 @@ def build_llm_service_registry() -> dict[str, type[LLMServiceState]]:
         "simulated_for_iflow": SimulatedForIFlowServiceState,
         "iflow_trace_replay": IFlowTraceReplayServiceState,
         "mini_swe_trace_replay": MiniSWETraceReplayServiceState,
+        "claude_code_trace_replay": ClaudeCodeTraceReplayServiceState,
     }
 
 
@@ -413,12 +437,76 @@ def serve_benchmark_llm_router(
             return dict(result)
 
         def _write_json(self, payload: dict[str, Any], *, code: int = 200) -> None:
+            # Check if the response should be streamed as SSE (Anthropic Messages API streaming)
+            if payload.pop("_streaming", False):
+                self._write_anthropic_sse(payload)
+                return
             body = _JSON_CODEC.dumps_bytes(payload)
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def _write_anthropic_sse(self, response: dict[str, Any]) -> None:
+            """Convert an Anthropic Messages API response to SSE events."""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+
+            def _sse(event: str, data: dict[str, Any]) -> None:
+                line = f"event: {event}\ndata: {_JSON_CODEC.dumps(data)}\n\n"
+                self.wfile.write(line.encode("utf-8"))
+                self.wfile.flush()
+
+            content_blocks = response.get("content", [])
+            msg_start = dict(response)
+            msg_start["content"] = []
+            msg_start.pop("_streaming", None)
+            _sse("message_start", {"type": "message_start", "message": msg_start})
+
+            for idx, block in enumerate(content_blocks):
+                block_type = block.get("type", "text")
+                if block_type == "text":
+                    _sse("content_block_start", {
+                        "type": "content_block_start",
+                        "index": idx,
+                        "content_block": {"type": "text", "text": ""},
+                    })
+                    _sse("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": idx,
+                        "delta": {"type": "text_delta", "text": block.get("text", "")},
+                    })
+                elif block_type == "tool_use":
+                    _sse("content_block_start", {
+                        "type": "content_block_start",
+                        "index": idx,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": block.get("id", ""),
+                            "name": block.get("name", ""),
+                            "input": {},
+                        },
+                    })
+                    input_json = _JSON_CODEC.dumps(block.get("input", {}))
+                    _sse("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": idx,
+                        "delta": {"type": "input_json_delta", "partial_json": input_json},
+                    })
+                _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
+
+            _sse("message_delta", {
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": response.get("stop_reason", "end_turn"),
+                    "stop_sequence": response.get("stop_sequence"),
+                },
+                "usage": {"output_tokens": response.get("usage", {}).get("output_tokens", 0)},
+            })
+            _sse("message_stop", {"type": "message_stop"})
 
         def do_GET(self) -> None:  # noqa: N802
             if self.path == "/healthz":
@@ -428,6 +516,12 @@ def serve_benchmark_llm_router(
                         "registered_sandboxes": self.benchmark_llm_router.registered_sandbox_count(),
                     }
                 )
+                return
+            if self.path == "/v1/models":
+                self._write_json({
+                    "data": [{"id": "claude-opus-4-6-20250318", "object": "model"}, {"id": "claude-opus-4-6", "object": "model"}, {"id": "claude-sonnet-4-6-20250514", "object": "model"}],
+                    "object": "list",
+                })
                 return
             if self.path.startswith("/control/state"):
                 query = parse_qs(urlparse(self.path).query)
@@ -442,11 +536,12 @@ def serve_benchmark_llm_router(
             self.send_error(404)
 
         def do_POST(self) -> None:  # noqa: N802
+            request_path = self.path.split("?")[0]
             payload = self._read_json()
             try:
-                if self.path in {"/v1/chat/completions", "/v1/messages"}:
+                if request_path in {"/v1/chat/completions", "/v1/messages", "/v1/messages/count_tokens"}:
                     response = self.benchmark_llm_router.handle_request(
-                        path=self.path,
+                        path=request_path,
                         headers=dict(self.headers.items()),
                         payload=payload,
                     )

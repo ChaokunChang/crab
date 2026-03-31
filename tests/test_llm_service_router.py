@@ -485,6 +485,99 @@ class BenchmarkLLMRouterTests(unittest.TestCase):
         client.unregister_sandbox("sbx-client")
         self.assertIsNone(client.snapshot("sbx-client"))
 
+    def test_router_server_handles_anthropic_count_tokens_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.json"
+            trace_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "ATIF-v1.2",
+                        "session_id": "session-1",
+                        "agent": {"name": "claude-code", "version": "2.1.34", "model_name": "claude-opus-4-6"},
+                        "steps": [
+                            {"source": "user", "message": "task", "timestamp": "2026-02-07T00:00:00Z", "extra": {}},
+                            {
+                                "source": "agent",
+                                "message": "Read file",
+                                "timestamp": "2026-02-07T00:00:01Z",
+                                "model_name": "claude-opus-4-6",
+                                "extra": {},
+                            },
+                            {
+                                "source": "agent",
+                                "message": "Executed Read toolu_1",
+                                "timestamp": "2026-02-07T00:00:02Z",
+                                "model_name": "claude-opus-4-6",
+                                "tool_calls": [
+                                    {
+                                        "tool_call_id": "toolu_1",
+                                        "function_name": "Read",
+                                        "arguments": {"file_path": "/app/file.txt"},
+                                    }
+                                ],
+                                "observation": {"results": [{"source_call_id": "toolu_1", "content": "hello"}]},
+                                "extra": {
+                                    "tool_result_metadata": {
+                                        "tool_use_result": {
+                                            "type": "text",
+                                            "file": {
+                                                "filePath": "/app/file.txt",
+                                                "content": "hello",
+                                                "startLine": 1,
+                                                "numLines": 1,
+                                            },
+                                        }
+                                    }
+                                },
+                            },
+                        ],
+                        "final_metrics": {"total_steps": 2, "extra": {}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            server = serve_benchmark_llm_router(host="127.0.0.1", port=0)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            self.addCleanup(server.shutdown)
+            self.addCleanup(server.server_close)
+            self.addCleanup(thread.join, 5.0)
+            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            _wait_for_json(f"{base_url}/healthz")
+            client = BenchmarkLLMRouterClient(base_url)
+            client.register_sandbox(
+                sandbox_id="sbx-claude",
+                llm_service_type="claude_code_trace_replay",
+                llm_service_config={"trace_path": str(trace_path)},
+            )
+
+            count_request = urllib.request.Request(
+                f"{base_url}/v1/messages/count_tokens",
+                data=json.dumps(
+                    {
+                        "messages": [{"role": "user", "content": "task"}],
+                        "tools": [{"name": "Read", "input_schema": {"type": "object"}}],
+                    }
+                ).encode("utf-8"),
+                headers={"Content-Type": "application/json", "X-Agent-Sandbox-Id": "sbx-claude"},
+                method="POST",
+            )
+            with urllib.request.urlopen(count_request, timeout=2.0) as response:
+                count_payload = json.loads(response.read().decode("utf-8"))
+
+            replay_request = urllib.request.Request(
+                f"{base_url}/v1/messages",
+                data=json.dumps({"messages": [{"role": "user", "content": "task"}], "stream": False}).encode("utf-8"),
+                headers={"Content-Type": "application/json", "X-Agent-Sandbox-Id": "sbx-claude"},
+                method="POST",
+            )
+            with urllib.request.urlopen(replay_request, timeout=2.0) as response:
+                replay_response = json.loads(response.read().decode("utf-8"))
+
+        self.assertGreaterEqual(count_payload["input_tokens"], 1)
+        self.assertEqual(replay_response["content"][0]["type"], "text")
+        self.assertEqual(replay_response["content"][0]["text"], "Read file")
+
     def test_router_cli_starts_process_and_serves_control_endpoints(self) -> None:
         port = _find_free_port()
         process = subprocess.Popen(

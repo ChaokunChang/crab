@@ -230,8 +230,8 @@ Each benchmark run is now driven by a YAML config. The top-level fields are:
 scenario: fault | spot | tree | e2e
 mode: manual | auto
 provider: openai | anthropic
-agent: simulated | iflow
-llm_service: simulated | manual | simulated_for_iflow | iflow_trace_replay
+agent: simulated | iflow | mini_swe | claude_code
+llm_service: simulated | manual | simulated_for_iflow | iflow_trace_replay | mini_swe_trace_replay | claude_code_trace_replay
 task_dataset: path/to/tasks.jsonl
 sandboxes: 1
 max_workers: 32  # legacy fallback for all phases when phase_workers is omitted
@@ -243,20 +243,23 @@ rootfs_reuse:
   enabled: true
 phase_merging:
   setup_and_run: false
+  setup_and_run_executor_pool: separate | shared
 executor:
   checkpoint_workers: 32
   restore_workers: 32
   coordination_workers: 8
   composite_step_workers: 16
   checkpoint_queue_size: 10000
-  checkpoint_scheduling_policy: fifo
+  checkpoint_scheduling_policy: fifo | reactive
   reactive_checkpoint_urgent_quota: 4
   max_retries: 0
   retry_backoff_seconds: 0.05
 scheduler:
+  policy: scenario_default | no_checkpointing
   min_checkpoint_interval_seconds: 0.0
   force_checkpoint_after_seconds: 0.0
   require_change_signal: true
+  checkpoint_full_baseline_on_first_checkpoint: false
   prefer_checkpoint_during_llm_request: true
   require_llm_request_for_checkpoint: false
   inspect_without_pause: false
@@ -271,10 +274,13 @@ log_file_mode: append | write
 verification:
   enabled: true
 benchmark_root: logs/tmp/benchmark-runs
+clear_benchmark_root_after_run: false
 storage_planes:
   runtime_root: /mnt/agent-cr-runtime
   storage_root: /mnt/agent-cr-runtime/storage
   agent_host_root: /mnt/agent-cr-runtime/agents
+runtime_command_timeout_seconds: 60.0
+runtime_zfs_prepare_timeout_seconds: 300.0
 telemetry_output: logs/tmp/out.telemetry.jsonl  # legacy top-level form, still supported
 telemetry:
   output: logs/tmp/out.telemetry.jsonl
@@ -304,9 +310,12 @@ zpool_size: 10G
 zpool_name: agentcrbench-cache
 zpool_image: logs/tmp/bench.zpool.img
 reuse_zpool: false
+image_cache_root: logs/tmp/image-cache
 log_level: info
 transfer_delay_ms: 0.0
 work_dir_host_root: logs/tmp
+max_agent_timeout_scale: 1.0
+max_test_timeout_scale: 1.0
 scenario_options: {}
 llm_service_options: {}  # merged into per-task llm_service_config
 ```
@@ -328,6 +337,8 @@ By default, the runner enforces hard barriers:
 - all sandboxes must finish `run` before any sandbox enters `verification`
 
 `phase_merging.setup_and_run: true` relaxes only the first barrier for per-sandbox scenario flows (`fault`, `spot`, `tree`, and replay-style `e2e`). In that mode, each sandbox can enter `run` as soon as its own `setup` finishes. The verification barrier remains unchanged, and cohort-style non-replay `e2e` still uses the old setup barrier.
+
+`phase_merging.setup_and_run_executor_pool` controls how merged setup/run work is scheduled. `separate` keeps today's behavior with independent setup and run executor pools. `shared` submits one combined `setup+run` task per sandbox to a single executor pool sized by `min(phase_workers.setup, phase_workers.run)`.
 
 If `verification.enabled: false`, the verification phase is skipped entirely.
 
@@ -354,12 +365,16 @@ The benchmark YAML also exposes run-phase tuning for the core Agent-CR system:
 - `executor.coordination_workers` bounds live-request coordination threads, and `executor.composite_step_workers` bounds the shared worker pool used for parallel process/filesystem checkpoint sub-steps.
 - `executor.checkpoint_queue_size`, `executor.max_retries`, and `executor.retry_backoff_seconds` tune checkpoint admission and retry behavior.
 - `scheduler` overrides only `SchedulerConfig` fields. The scenario still chooses the policy class (`default`, `fault-tolerance`, `spot-preemption`, or `tree-search`), and the YAML block merges onto that scenario-owned default field by field.
+- `scheduler.policy` defaults to `scenario_default`. Set it to `no_checkpointing` only when you explicitly want a scenario to run without checkpoint capture.
+- `scheduler.checkpoint_full_baseline_on_first_checkpoint` forces the first checkpoint for a sandbox to include both process and filesystem state even when the scheduler would otherwise choose a narrower scope.
 - `scheduler.inspect_without_pause` is opt-in and defaults to `false`. Turning it on allows the scheduler to inspect before pausing, but that is intentionally not the default because live inspection of a running sandbox can be risky depending on the inspector.
 - `llm_server.launch_mode` defaults to `process`, which runs the benchmark LLM router in a separate process to reduce thread pressure in the main benchmark process. `thread` remains available for tests and debugging.
 - `host_inspector.launch_mode` also defaults to `process`, which keeps the host inspector and its filesystem-monitor threads out of the main benchmark process.
 - The benchmark request path still goes through HTTP on `localhost`; only the router launch mode changed. Benchmark timings therefore still include interceptor-to-router transport overhead.
 - `storage_planes` lets you move run-phase host writes off the benchmark artifact root. This is especially important when `zpool_image` is a file vdev: keeping CRIU checkpoint images, storage manifests/artifacts, exported rootfs state, and agent host directories on a different filesystem/device avoids sibling host writes contending with the ZFS backing file.
 - `storage_planes` is fully opt-in. If you omit it, the harness preserves the legacy layout under the benchmark run root.
+- `runtime_command_timeout_seconds` and `runtime_zfs_prepare_timeout_seconds` tune the runtime command and ZFS materialization timeouts used by the real-host harness.
+- `image_cache_root` overrides the host directory used for cached benchmark images.
 
 Benchmark artifacts now include both:
 
@@ -409,6 +424,7 @@ Logging notes:
 - Use `log_file_mode: write` when you want each benchmark run to start with a fresh log file.
 - `verification.enabled` defaults to `true`. Set it to `false` to skip the benchmark verification phase and omit verification fields from output rows.
 - `benchmark_root` places each run under a timestamped subdirectory rooted at the configured path. If omitted, benchmarks use a temporary directory. `AGENTCR_BENCH_DIR` is still accepted as a fallback for older workflows.
+- `clear_benchmark_root_after_run` defaults to `false`. When enabled, the runner deletes the resolved per-run benchmark directory after postprocessing completes. Tempdir-backed runs keep their existing automatic cleanup behavior.
 - `benchmark_root` is still the benchmark artifact root and the default home for runtime bundles, runtime checkpoint images, sandbox metadata, checkpoint storage, exported image rootfs, and agent host state. Use `storage_planes` only when you want to move some of that hot write traffic elsewhere.
 - `benchmark.run` now logs an explicit start marker and end marker for each run, and the final summary/artifact paths are logged as well as printed.
 - Benchmark YAML supports a nested `telemetry:` block for telemetry output and detail controls.
@@ -429,9 +445,13 @@ Logging notes:
 - `monitoring.sample_interval_ms` controls the sampling cadence.
 - `monitoring.include_host` and `monitoring.include_sandboxes` control host and per-sandbox monitoring coverage.
 - `phase_workers` overrides concurrency per benchmark phase. Missing phase keys fall back to `max_workers`.
+- `max_agent_timeout_scale` and `max_test_timeout_scale` scale per-task `task_config.options.max_agent_timeout_sec` and `task_config.options.max_test_timeout_sec` when those values are present in the dataset. Both default to `1.0`.
 - `rootfs_reuse.enabled` defaults to `true`. Set it to `false` to restore the older per-sandbox rootfs materialization path.
 - `phase_merging.setup_and_run` defaults to `false`. Set it to `true` to pipeline setup directly into run for eligible per-sandbox scenarios.
+- `phase_merging.setup_and_run_executor_pool` defaults to `separate`. Set it to `shared` to use one executor pool for merged `setup+run` work.
 - Phase telemetry now emits distinct phase-qualified records such as `benchmark.phase.setup.*`, `benchmark.phase.run.*`, `benchmark.phase.verification.*`, and `benchmark.phase.<phase>.item.*` so JSONL output shows phase timing and configured concurrency.
+- The telemetry HTML report now includes a `Turn Analysis` section with stats, CDFs, and over-time charts for `llm_response_time`, `pure_llm_time`, `action_time`, and `turn_time`.
+- `llm_response_time` is the observed interceptor-side latency for a request, while `pure_llm_time` is the underlying `llm.service.request` duration from the LLM service itself.
 - `zpool_size` controls the backing file size for ephemeral benchmark zpools.
 - `reuse_zpool: true` keeps the zpool across runs instead of recreating it every time.
 - When reusing a pool, set both `zpool_name` and `zpool_image` to stable values. Each run still destroys and recreates the `pool/agent-cr` dataset so the benchmark starts clean, but compose-backed shared rootfs cache datasets created by `rootfs_reuse.enabled: true` are reused until the pool itself is destroyed.
@@ -440,20 +460,28 @@ Logging notes:
 
 `llm_service_options` is a top-level YAML block whose keys are merged into each task's `llm_service_config` (dataset-level values take precedence). This is useful for controlling replay behavior globally without editing the dataset JSONL.
 
-For `iflow_trace_replay`, the following options control how response delays are simulated:
+For replay-backed services such as `iflow_trace_replay`, `mini_swe_trace_replay`, and `claude_code_trace_replay`, the following options control how response delays are simulated:
 
 - `response_delay_policy`: selects how the replay service simulates LLM response latency.
-  - `fixed` (default): uses a constant delay of `response_delay_ms` milliseconds (default 250ms).
+  - `fixed` (default): uses a constant delay of `response_delay_ms` milliseconds.
   - `trace_replay`: uses the actual request-to-response timestamps recorded in the trajectory, scaled by `response_delay_scaling_factor`.
-- `response_delay_ms`: constant delay in milliseconds, used by the `fixed` policy and as a fallback when `trace_replay` timestamps are unavailable (default 250).
+- `response_delay_ms`: constant delay in milliseconds, used by the `fixed` policy and as a fallback when `trace_replay` timestamps are unavailable. The default is service-specific: `250` for `iflow_trace_replay`, `0` for `mini_swe_trace_replay`, and `0` for `claude_code_trace_replay`.
 - `response_delay_scaling_factor`: multiplier applied to trace-derived delays when `response_delay_policy` is `trace_replay` (default 1.0). A value of 0.5 replays at 2× speed; 2.0 replays at half speed.
+- `minimal_delay`: lower clamp in milliseconds applied after the policy-specific delay and `response_delay_scaling_factor` are resolved (default `0`).
+- `maximal_delay`: upper clamp in milliseconds applied after the policy-specific delay and `response_delay_scaling_factor` are resolved (default `1e9`).
 
 Example YAML:
 
 ```yaml
+max_agent_timeout_scale: 1.0
+max_test_timeout_scale: 1.0
+
 llm_service_options:
   response_delay_policy: trace_replay
+  response_delay_ms: 250
   response_delay_scaling_factor: 1.0
+  minimal_delay: 0
+  maximal_delay: 1000000000
 ```
 
 The per-scenario knobs live under `scenario_options`:

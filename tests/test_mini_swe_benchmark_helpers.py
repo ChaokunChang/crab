@@ -43,6 +43,33 @@ class MiniSWEBenchmarkHelperTests(unittest.TestCase):
         self.assertEqual(metadata, {"benchmark_trace_cursor": 7})
         harness._snapshot_llm_services.assert_not_called()
 
+    def test_llm_service_checkpoint_metadata_accepts_claude_snapshot_cursor(self) -> None:
+        sandbox_id = SandboxId("sbx-claude-meta")
+        sandbox = SandboxHandle(
+            sandbox_id=sandbox_id,
+            bundle_dir=Path("/tmp/bundle"),
+            status_port=8123,
+            last_status={},
+            llm_service_type="claude_code_trace_replay",
+        )
+        sandbox.task_run = Mock()
+        sandbox.task_run.poll_status.side_effect = RuntimeError("timed out")
+
+        harness = RealHostScenarioHarness.__new__(RealHostScenarioHarness)
+        harness._sandbox_by_id = {sandbox_id: sandbox}
+        harness._snapshot_llm_services = Mock(
+            return_value={
+                str(sandbox_id): {
+                    "llm_service_type": "claude_code_trace_replay",
+                    "state": {"trace_cursor": 9, "total_responses": 23, "is_complete": False},
+                }
+            }
+        )
+
+        metadata = RealHostScenarioHarness._llm_service_checkpoint_metadata(harness, sandbox_id)
+
+        self.assertEqual(metadata, {"benchmark_trace_cursor": 9})
+
     def test_restore_llm_service_state_records_restore_trace_cursor_for_task_run(self) -> None:
         sandbox_id = SandboxId("sbx-mini-restore-cursor")
         sandbox = SandboxHandle(
@@ -56,7 +83,7 @@ class MiniSWEBenchmarkHelperTests(unittest.TestCase):
 
         harness = RealHostScenarioHarness.__new__(RealHostScenarioHarness)
         harness._sandbox_by_id = {sandbox_id: sandbox}
-        harness.llm_router_client = None
+        harness.llm_router_client = Mock()
         harness.llm_server = None
         harness.storage = Mock()
         harness.storage.get_manifest.return_value = CheckpointManifest(
@@ -80,7 +107,11 @@ class MiniSWEBenchmarkHelperTests(unittest.TestCase):
             runtime_version=None,
             process_artifacts=[],
             filesystem_artifacts=[],
-            metadata={"filesystem_restore_checkpoint_id": "ckpt-fs"},
+            metadata={
+                "filesystem_restore_checkpoint_id": "ckpt-fs",
+                "process_restore_trace_cursor": 7,
+                "filesystem_restore_trace_cursor": 7,
+            },
             integrity={},
         )
 

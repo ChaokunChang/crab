@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .analyzer import (
+    CDFPoint,
     CheckpointAnalysisSummary,
     MetricSummary,
     OverheadAnalysisSummary,
@@ -17,6 +18,7 @@ from .analyzer import (
     RestoreAnalysisSummary,
     TaskSummary,
     TelemetryAnalysis,
+    TurnAnalysisSummary,
     analyze_telemetry_file,
 )
 
@@ -29,6 +31,10 @@ def _format_ms(value: float) -> str:
 
 def _format_number(value: float) -> str:
     return f"{value:.2f}"
+
+
+def _format_percent(value: float) -> str:
+    return f"{value * 100.0:.0f}%"
 
 
 def _format_bytes(value: float) -> str:
@@ -52,6 +58,24 @@ _OVERHEAD_METRIC_LABELS = {
     "llm.agentcr_delay_ms": "llm.agentcr_delay",
 }
 
+_TURN_METRIC_LABELS = {
+    "llm_response_time": "llm_response_time",
+    "pure_llm_time": "pure_llm_time",
+    "action_time": "action_time",
+    "turn_time": "turn_time",
+}
+
+_TASK_TIMING_METRICS = (
+    "benchmark.task.duration_ms",
+    "benchmark.task.run.duration_ms",
+    "benchmark.task.queue_wait_ms",
+)
+
+_TASK_TIMING_LABELS = {
+    "benchmark.task.duration_ms": "end_to_end",
+    "benchmark.task.run.duration_ms": "pure_run",
+    "benchmark.task.queue_wait_ms": "queue_wait",
+}
 
 def _format_window_seconds(window_size_seconds: float) -> str:
     rounded = round(window_size_seconds)
@@ -234,6 +258,53 @@ def _svg_line_chart(
     return "".join(pieces)
 
 
+def _svg_cdf_chart(
+    title: str,
+    points: list[CDFPoint],
+    *,
+    width: int = 900,
+    height: int = 320,
+    formatter=_format_ms,
+) -> str:
+    if not points:
+        return f"<section><h3>{escape(title)}</h3><p>No data.</p></section>"
+    left_pad = 72
+    right_pad = 24
+    top_pad = 20
+    bottom_pad = 36
+    chart_width = width - left_pad - right_pad
+    chart_height = height - top_pad - bottom_pad
+    max_x = max((point.value for point in points), default=1.0)
+    max_x = max(1.0, max_x)
+    pieces = [
+        f"<svg style='width:100%;max-width:{width}px;height:auto' viewBox='0 0 {width} {height}' preserveAspectRatio='xMinYMin meet' role='img' aria-label='{escape(title)}'>",
+        "<style>"
+        ".axis{stroke:#94a3b8;stroke-width:1}"
+        ".grid{stroke:#e2e8f0;stroke-width:1}"
+        ".cdf{fill:none;stroke:#2563eb;stroke-width:2.5}"
+        ".tick{font:15px sans-serif;fill:#475569}"
+        "</style>",
+    ]
+    for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
+        y = top_pad + chart_height - chart_height * fraction
+        pieces.append(f"<line class='grid' x1='{left_pad}' y1='{y:.2f}' x2='{width - right_pad}' y2='{y:.2f}'></line>")
+        pieces.append(f"<text class='tick' x='4' y='{y + 4:.2f}'>{escape(_format_percent(fraction))}</text>")
+    pieces.append(f"<line class='axis' x1='{left_pad}' y1='{top_pad}' x2='{left_pad}' y2='{top_pad + chart_height}'></line>")
+    pieces.append(f"<line class='axis' x1='{left_pad}' y1='{top_pad + chart_height}' x2='{width - right_pad}' y2='{top_pad + chart_height}'></line>")
+    path_parts = []
+    for index, point in enumerate(points):
+        x = left_pad + (point.value / max_x) * chart_width if max_x > 0 else left_pad
+        y = top_pad + chart_height - point.cumulative_probability * chart_height
+        path_parts.append(f"{'M' if index == 0 else 'L'}{x:.2f},{y:.2f}")
+    pieces.append(f"<path class='cdf' d='{' '.join(path_parts)}'></path>")
+    pieces.append(f"<text class='tick' x='{left_pad}' y='{height - 8}'>0</text>")
+    pieces.append(
+        f"<text class='tick' x='{width - right_pad - 72}' y='{height - 8}'>{escape(formatter(max_x))}</text>"
+    )
+    pieces.append("</svg>")
+    return "".join(pieces)
+
+
 def _counter_window_series(
     points: list[tuple[float, float]],
 ) -> list[tuple[float, float]]:
@@ -306,14 +377,26 @@ def _operation_tail_rows(items: list[MetricSummary]) -> list[tuple[str, float]]:
     return [(_format_metric_label(item.metric_name), item.p95_ms) for item in items]
 
 
-def _task_latency_rows(tasks: list[TaskSummary]) -> list[tuple[str, float]]:
-    return [(task.sandbox_id, task.metrics.get("benchmark.task.duration_ms", 0.0)) for task in tasks]
+def _task_metric_rows(tasks: list[TaskSummary], metric_name: str) -> list[tuple[str, float]]:
+    rows = [
+        (task.sandbox_id, task.metrics.get(metric_name, 0.0))
+        for task in tasks
+        if metric_name in task.metrics
+    ]
+    rows.sort(key=lambda item: item[1], reverse=True)
+    return rows
 
 
 def _format_overhead_metric_label(metric_name: str) -> str:
     return _OVERHEAD_METRIC_LABELS.get(metric_name, _format_metric_label(metric_name))
 
 
+def _format_turn_metric_label(metric_name: str) -> str:
+    return _TURN_METRIC_LABELS.get(metric_name, metric_name)
+
+
+def _format_task_timing_metric_label(metric_name: str) -> str:
+    return _TASK_TIMING_LABELS.get(metric_name, _format_metric_label(metric_name))
 def _phase_rows_for_csv(items: list[PhaseSummary]) -> list[dict[str, object]]:
     return [
         {
@@ -385,6 +468,22 @@ def _overhead_series(
     ]
 
 
+def _turn_series(
+    turn_analysis: TurnAnalysisSummary,
+    *,
+    window_size_seconds: float | None = None,
+) -> list[tuple[str, list[tuple[float, float]]]]:
+    return [
+        (
+            _format_turn_metric_label(metric_name),
+            _aggregate_window_series(
+                [(point.offset_seconds, point.value) for point in points],
+                window_size_seconds=window_size_seconds,
+            ),
+        )
+        for metric_name, points in turn_analysis.time_series.items()
+        if points
+    ]
 _CHECKPOINT_LATENCY_FIGURES = (
     ("checkpoint_flow_latency.svg", "Checkpoint Latency Over Time", "checkpoint.flow.duration_ms", "checkpoint"),
     (
@@ -517,7 +616,19 @@ def build_figure_svgs(
         ),
         "task_latency.svg": _svg_bar_chart(
             "Sandbox End-To-End Latency (ms)",
-            _task_latency_rows(analysis.task_summaries[:20]),
+            _task_metric_rows(analysis.task_summaries, "benchmark.task.duration_ms")[:20],
+            width=980,
+            log_scale=log_scale,
+        ),
+        "task_run_latency.svg": _svg_bar_chart(
+            "Sandbox Pure Task Run Time (ms)",
+            _task_metric_rows(analysis.task_summaries, "benchmark.task.run.duration_ms")[:20],
+            width=980,
+            log_scale=log_scale,
+        ),
+        "task_queue_wait.svg": _svg_bar_chart(
+            "Sandbox Task Queue Wait (ms)",
+            _task_metric_rows(analysis.task_summaries, "benchmark.task.queue_wait_ms")[:20],
             width=980,
             log_scale=log_scale,
         ),
@@ -560,6 +671,18 @@ def build_figure_svgs(
             _overhead_series(analysis.overhead_analysis, window_size_seconds=window_size_seconds),
             formatter=_format_ms,
         )
+    if analysis.turn_analysis is not None:
+        figures["turn_timing.svg"] = _svg_line_chart(
+            "Turn Timing Over Time",
+            _turn_series(analysis.turn_analysis, window_size_seconds=window_size_seconds),
+            formatter=_format_ms,
+        )
+        for metric_name, points in analysis.turn_analysis.cdf_series.items():
+            figures[f"turn_{metric_name}_cdf.svg"] = _svg_cdf_chart(
+                f"{_format_turn_metric_label(metric_name)} CDF",
+                points,
+                formatter=_format_ms,
+            )
     if analysis.restore_analysis is not None:
         figures["restore_load_jobs.svg"] = _svg_line_chart(
             "Restore Load Over Time (Jobs)",
@@ -697,6 +820,27 @@ def render_report_html(
         ],
     )
 
+    summary_by_name = {item.metric_name: item for item in analysis.operation_summaries}
+    task_timing_items = [
+        summary_by_name[metric_name]
+        for metric_name in _TASK_TIMING_METRICS
+        if metric_name in summary_by_name
+    ]
+    task_timing_table = _html_table(
+        ["Metric", "Count", "Mean (ms)", "Median (ms)", "P95 (ms)", "Max (ms)"],
+        [
+            (
+                _format_task_timing_metric_label(item.metric_name),
+                item.count,
+                f"{item.mean_ms:.2f}",
+                f"{item.p50_ms:.2f}",
+                f"{item.p95_ms:.2f}",
+                f"{item.max_ms:.2f}",
+            )
+            for item in task_timing_items
+        ] if task_timing_items else [("None", 0, "0.00", "0.00", "0.00", "0.00")],
+    )
+
     task_metric_names = sorted({metric_name for task in analysis.task_summaries for metric_name in task.metrics})
     task_table = _html_table(
         ["Sandbox", "Task", "Agent", "LLM Service"] + task_metric_names,
@@ -829,6 +973,44 @@ def render_report_html(
             "</section>"
         )
 
+    turn_section = "<section><h2>Turn Analysis</h2><p>No turn timing data.</p></section>"
+    if analysis.turn_analysis is not None and analysis.turn_analysis.metrics:
+        turn = analysis.turn_analysis
+        turn_note = _window_agg_note(window_size_seconds)
+        turn_summary = _html_table(
+            ["Metric", "Count", "Mean (ms)", "Median (ms)", "P95 (ms)", "P99 (ms)", "Min (ms)", "Max (ms)"],
+            [
+                (
+                    _format_turn_metric_label(item.metric_name),
+                    item.count,
+                    f"{item.mean_ms:.2f}",
+                    f"{item.p50_ms:.2f}",
+                    f"{item.p95_ms:.2f}",
+                    f"{item.p99_ms:.2f}",
+                    f"{item.min_ms:.2f}",
+                    f"{item.max_ms:.2f}",
+                )
+                for item in turn.metrics
+            ],
+        )
+        cdf_blocks = "".join(
+            f"<section><h3>{escape(_format_turn_metric_label(item.metric_name))} CDF</h3>"
+            f"{figures.get(f'turn_{item.metric_name}_cdf.svg', '<p>No data.</p>')}"
+            "</section>"
+            for item in turn.metrics
+        )
+        turn_section = (
+            "<section><h2>Turn Analysis</h2>"
+            f"{turn_note}"
+            f"{turn_summary}"
+            "<section><h3>Window-Aggregated Turn Timing Over Time</h3>"
+            f"{figures.get('turn_timing.svg', '<p>No data.</p>')}"
+            "</section>"
+            "<div class='grid'>"
+            f"{cdf_blocks}"
+            "</div>"
+            "</section>"
+        )
     restore_section = "<section><h2>Restore Analysis</h2><p>No restore data.</p></section>"
     if analysis.restore_analysis is not None:
         restore = analysis.restore_analysis
@@ -1043,12 +1225,21 @@ def render_report_html(
       <section><h2>Top Operations By P95 Latency</h2>{figures['top_tail_latency.svg']}</section>
       <section><h2>Sandbox End-To-End Latency</h2>{figures['task_latency.svg']}</section>
     </div>
+    <section>
+      <h2>Task Timing Analysis</h2>
+      {task_timing_table}
+    </section>
+    <div class="grid">
+      <section><h2>Sandbox Pure Task Run Time</h2>{figures['task_run_latency.svg']}</section>
+      <section><h2>Sandbox Task Queue Wait</h2>{figures['task_queue_wait.svg']}</section>
+    </div>
     <div class="grid">
       <section><h2>Average LLM Path Breakdown</h2>{figures['llm_breakdown.svg']}</section>
       <section><h2>Average Checkpoint/Restore Breakdown</h2>{figures['checkpoint_breakdown.svg']}</section>
     </div>
     {checkpoint_section}
     {overhead_section}
+    {turn_section}
     {restore_section}
     {resource_section}
     <section>
@@ -1198,6 +1389,24 @@ def _overhead_rows_for_csv(overhead: OverheadAnalysisSummary | None) -> tuple[li
     return headers, rows
 
 
+def _turn_rows_for_csv(turn: TurnAnalysisSummary | None) -> tuple[list[str], list[dict[str, object]]]:
+    headers = ["metric_name", "count", "mean_ms", "p50_ms", "min_ms", "max_ms", "p95_ms", "p99_ms"]
+    if turn is None:
+        return headers, []
+    rows = [
+        {
+            "metric_name": item.metric_name,
+            "count": item.count,
+            "mean_ms": f"{item.mean_ms:.6f}",
+            "p50_ms": f"{item.p50_ms:.6f}",
+            "min_ms": f"{item.min_ms:.6f}",
+            "max_ms": f"{item.max_ms:.6f}",
+            "p95_ms": f"{item.p95_ms:.6f}",
+            "p99_ms": f"{item.p99_ms:.6f}",
+        }
+        for item in turn.metrics
+    ]
+    return headers, rows
 def _resource_rows_for_csv(resource: ResourceAnalysisSummary | None) -> tuple[list[str], list[dict[str, object]]]:
     headers = ["metric_name", "sandbox_id", "sample_count", "mean_value", "max_value"]
     if resource is None:
@@ -1393,6 +1602,35 @@ def generate_report_bundle(
         ],
     )
 
+    headers, rows = _turn_rows_for_csv(analysis.turn_analysis)
+    _write_csv(target_dir / "turn_analysis.csv", headers, rows)
+    _write_csv(
+        target_dir / "turn_timeseries.csv",
+        ["metric_name", "timestamp", "offset_seconds", "value_ms"],
+        [
+            {
+                "metric_name": metric_name,
+                "timestamp": point.timestamp,
+                "offset_seconds": f"{point.offset_seconds:.6f}",
+                "value_ms": f"{point.value:.6f}",
+            }
+            for metric_name, points in ([] if analysis.turn_analysis is None else analysis.turn_analysis.time_series.items())
+            for point in points
+        ],
+    )
+    _write_csv(
+        target_dir / "turn_cdf.csv",
+        ["metric_name", "value_ms", "cumulative_probability"],
+        [
+            {
+                "metric_name": metric_name,
+                "value_ms": f"{point.value:.6f}",
+                "cumulative_probability": f"{point.cumulative_probability:.6f}",
+            }
+            for metric_name, points in ([] if analysis.turn_analysis is None else analysis.turn_analysis.cdf_series.items())
+            for point in points
+        ],
+    )
     headers, rows = _restore_rows_for_csv(analysis.restore_analysis)
     _write_csv(target_dir / "restore_analysis.csv", headers, rows)
     _write_csv(

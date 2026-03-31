@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 _DEFAULT_RESPONSE_DELAY_MS = 250
+_DEFAULT_MINIMAL_DELAY_MS = 0.0
+_DEFAULT_MAXIMAL_DELAY_MS = 1_000_000_000.0
 _IFLOW_SYSTEM_PROMPT_SENTINEL = "<iflow-system-prompt>"
 _IFLOW_CONTEXT_SENTINEL = "<iflow-context-bootstrap>"
 _IFLOW_CONTEXT_ACK_SENTINEL = "<iflow-context-ack>"
@@ -55,6 +57,19 @@ _SYSTEM_SETUP_SHELL_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _config_with_legacy_alias(
+    config: dict[str, object],
+    key: str,
+    legacy_key: str,
+    default: object,
+) -> object:
+    if key in config:
+        return config[key]
+    if legacy_key in config:
+        return config[legacy_key]
+    return default
 
 _IFLOW_CONTEXT_ACK_MESSAGES = {
     "Got it. Thanks for the context!",
@@ -508,6 +523,28 @@ class TraceReplayLLMState:
             scaling_factor = float(config.get("response_delay_scaling_factor", 1.0))
         except (TypeError, ValueError):
             scaling_factor = 1.0
+        try:
+            minimal_delay_ms = float(
+                _config_with_legacy_alias(
+                    config,
+                    "minimal_delay",
+                    "minimal-delay",
+                    _DEFAULT_MINIMAL_DELAY_MS,
+                )
+            )
+        except (TypeError, ValueError):
+            minimal_delay_ms = _DEFAULT_MINIMAL_DELAY_MS
+        try:
+            maximal_delay_ms = float(
+                _config_with_legacy_alias(
+                    config,
+                    "maximal_delay",
+                    "maximal-delay",
+                    _DEFAULT_MAXIMAL_DELAY_MS,
+                )
+            )
+        except (TypeError, ValueError):
+            maximal_delay_ms = _DEFAULT_MAXIMAL_DELAY_MS
         parsed = parse_replay_trace(Path(trace_path_value))
         if not parsed.exchanges:
             raise ValueError(
@@ -517,6 +554,13 @@ class TraceReplayLLMState:
         self._response_delay_policy = raw_policy
         self._response_delay_ms = max(0, response_delay_ms)
         self._response_delay_scaling_factor = max(0.0, scaling_factor)
+        self._minimal_delay_ms = max(0.0, minimal_delay_ms)
+        self._maximal_delay_ms = max(0.0, maximal_delay_ms)
+        if self._maximal_delay_ms < self._minimal_delay_ms:
+            raise ValueError(
+                "maximal_delay must be greater than or equal to minimal_delay, "
+                f"got {self._maximal_delay_ms!r} < {self._minimal_delay_ms!r}"
+            )
         self._events: list[dict[str, Any]] = []
         self._consumed_response_count = 0
         self._duplicate_response_count = 0
@@ -663,9 +707,12 @@ class TraceReplayLLMState:
         if self._response_delay_policy == "trace_replay":
             trace_delay = exchange.trace_delay_ms
             if trace_delay is not None:
-                return trace_delay * self._response_delay_scaling_factor
-            return float(self._response_delay_ms)
-        return float(self._response_delay_ms)
+                delay_ms = trace_delay * self._response_delay_scaling_factor
+            else:
+                delay_ms = float(self._response_delay_ms)
+        else:
+            delay_ms = float(self._response_delay_ms)
+        return min(self._maximal_delay_ms, max(self._minimal_delay_ms, delay_ms))
 
     def snapshot(self, *, include_events: bool = True) -> dict[str, Any]:
         with self._lock:
@@ -675,6 +722,8 @@ class TraceReplayLLMState:
                 "response_delay_policy": self._response_delay_policy,
                 "response_delay_ms": self._response_delay_ms,
                 "response_delay_scaling_factor": self._response_delay_scaling_factor,
+                "minimal_delay": self._minimal_delay_ms,
+                "maximal_delay": self._maximal_delay_ms,
                 "total_responses": self._total_progress_responses,
                 "consumed_response_count": consumed_response_count,
                 "duplicate_response_count": self._duplicate_response_count,

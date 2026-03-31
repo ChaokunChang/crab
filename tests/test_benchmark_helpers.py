@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import ipaddress
 import json
+import os
 import subprocess
 import tempfile
 import threading
@@ -32,7 +33,8 @@ from integrations.sandboxes.runtime import image as sandbox_image
 from integrations.sandboxes.runtime import launcher as sandbox_launcher
 from integrations.sandboxes.runtime import network as sandbox_network
 from benchmarks.config import BenchmarkConfig
-from benchmarks.core import benchmark_phase_map, emit_benchmark_phase_skipped
+from benchmarks.core import benchmark_phase_map, benchmark_setup_run_pipeline, emit_benchmark_phase_skipped
+from benchmarks.scenarios.common import finalize_replay_row
 from benchmarks.scenarios.e2e import run_manual as run_e2e_manual
 from agent_cr.models import utc_now
 from benchmarks.scenarios.tree import choose_replay_steps
@@ -52,6 +54,7 @@ from benchmarks.support import (
 )
 from benchmarks.real_host_scenario_base import (
     RealHostScenarioHarness,
+    _merge_runtime_launch_metadata,
 )
 from integrations.sandboxes.runtime.network import (
     benchmark_network_guest_capacity,
@@ -63,6 +66,11 @@ ImageRuntimeDefaults = sandbox_image.ImageRuntimeDefaults
 
 
 class BenchmarkHelperTests(unittest.TestCase):
+    def _load_verification_uv_shim_namespace(self) -> dict[str, object]:
+        namespace: dict[str, object] = {}
+        exec(RealHostScenarioHarness._verification_uv_python_shim_script(), namespace)
+        return namespace
+
     def _tree_search_manifest(
         self,
         checkpoint_id: str,
@@ -104,7 +112,6 @@ class BenchmarkHelperTests(unittest.TestCase):
                     },
                 ],
             )
-
             self.assertEqual(
                 output_path.read_text(encoding="utf-8").splitlines(),
                 [
@@ -113,6 +120,545 @@ class BenchmarkHelperTests(unittest.TestCase):
                     "fault-1,0.0,failed,boom",
                 ],
             )
+
+    def test_wait_for_task_completion_short_circuits_when_replay_is_complete(self) -> None:
+        harness = RealHostScenarioHarness.__new__(RealHostScenarioHarness)
+        harness.system = None
+        harness.runtime = None
+        future: Future[None] = Future()
+        future.set_result(None)
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-replay-complete"),
+            bundle_dir=Path("/tmp/sbx-replay-complete"),
+            status_port=8123,
+            last_status={
+                "state": "finished",
+                "total_actions": 12,
+                "replay_trace_cursor": 12,
+                "replay_is_complete": True,
+            },
+            agent_type="claude_code",
+            llm_service_type="claude_code_trace_replay",
+            launch_metadata={"benchmark": {"task_id": "hf-model-inference", "trace_response_count": 12}},
+            task_future=future,
+        )
+        sandbox.task_run = SimpleNamespace(poll_status=lambda: dict(sandbox.last_status))
+
+        RealHostScenarioHarness.wait_for_task_completion(harness, sandbox, timeout_s=0.01)
+
+    def test_wait_for_task_completion_waits_for_pending_interceptor_signal_before_short_circuit(self) -> None:
+        harness = RealHostScenarioHarness.__new__(RealHostScenarioHarness)
+        harness.system = SimpleNamespace(has_pending_interceptor_signal=Mock(side_effect=[True, False]))
+        harness.runtime = SimpleNamespace(resume=Mock())
+        future: Future[None] = Future()
+        future.set_result(None)
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-replay-pending"),
+            bundle_dir=Path("/tmp/sbx-replay-pending"),
+            status_port=8123,
+            last_status={
+                "state": "running",
+                "total_actions": 12,
+                "replay_trace_cursor": 12,
+                "replay_is_complete": True,
+            },
+            agent_type="claude_code",
+            llm_service_type="claude_code_trace_replay",
+            launch_metadata={"benchmark": {"task_id": "mailman", "trace_response_count": 12}},
+            task_future=future,
+        )
+        sandbox.task_run = SimpleNamespace(poll_status=lambda: dict(sandbox.last_status))
+
+        RealHostScenarioHarness.wait_for_task_completion(harness, sandbox, timeout_s=0.2)
+
+        self.assertEqual(harness.system.has_pending_interceptor_signal.call_count, 2)
+        harness.runtime.resume.assert_called_once_with(sandbox.sandbox_id)
+
+    def test_wait_for_task_completion_waits_for_replay_future_before_short_circuit(self) -> None:
+        harness = RealHostScenarioHarness.__new__(RealHostScenarioHarness)
+        harness.system = None
+        harness.runtime = SimpleNamespace(resume=Mock())
+        future: Future[None] = Future()
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-replay-future"),
+            bundle_dir=Path("/tmp/sbx-replay-future"),
+            status_port=8123,
+            last_status={
+                "state": "running",
+                "total_actions": 12,
+                "replay_trace_cursor": 12,
+                "replay_is_complete": True,
+            },
+            agent_type="claude_code",
+            llm_service_type="claude_code_trace_replay",
+            launch_metadata={"benchmark": {"task_id": "build-pov-ray", "trace_response_count": 12}},
+            task_future=future,
+        )
+        sandbox.task_run = SimpleNamespace(poll_status=lambda: dict(sandbox.last_status))
+
+        def _finish_later() -> None:
+            time.sleep(0.05)
+            future.set_result(None)
+
+        thread = threading.Thread(target=_finish_later)
+        thread.start()
+        started = time.monotonic()
+        try:
+            RealHostScenarioHarness.wait_for_task_completion(harness, sandbox, timeout_s=0.5)
+        finally:
+            thread.join(timeout=1.0)
+
+        self.assertGreaterEqual(time.monotonic() - started, 0.05)
+        harness.runtime.resume.assert_called_once_with(sandbox.sandbox_id)
+
+    def test_wait_for_task_completion_requests_stop_for_stale_replay_future_after_grace(self) -> None:
+        harness = RealHostScenarioHarness.__new__(RealHostScenarioHarness)
+        harness.system = SimpleNamespace(has_pending_interceptor_signal=Mock(return_value=False))
+        harness.runtime = SimpleNamespace(resume=Mock())
+        harness.REPLAY_COMPLETION_TASK_FUTURE_GRACE_SECONDS = 0.0
+        future: Future[None] = Future()
+        stop_requests: list[str] = []
+
+        def _request_stop() -> None:
+            stop_requests.append("stop")
+            future.set_result(None)
+
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-replay-stale-future"),
+            bundle_dir=Path("/tmp/sbx-replay-stale-future"),
+            status_port=8123,
+            last_status={
+                "state": "running",
+                "total_actions": 15,
+                "replay_trace_cursor": 15,
+                "replay_is_complete": True,
+            },
+            agent_type="claude_code",
+            llm_service_type="claude_code_trace_replay",
+            launch_metadata={"benchmark": {"task_id": "bn-fit-modify", "trace_response_count": 15}},
+            task_future=future,
+        )
+        sandbox.task_run = SimpleNamespace(
+            poll_status=lambda: dict(sandbox.last_status),
+            request_stop=_request_stop,
+        )
+
+        RealHostScenarioHarness.wait_for_task_completion(harness, sandbox, timeout_s=0.5)
+
+        self.assertEqual(stop_requests, ["stop"])
+        harness.runtime.resume.assert_called_once_with(sandbox.sandbox_id)
+
+    def test_wait_for_task_completion_ignores_replay_exception_after_completion(self) -> None:
+        harness = RealHostScenarioHarness.__new__(RealHostScenarioHarness)
+        harness.system = None
+        harness.runtime = None
+        future: Future[None] = Future()
+        future.set_exception(RuntimeError("timed out waiting for claude_code replay action count 1"))
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-replay-complete-exc"),
+            bundle_dir=Path("/tmp/sbx-replay-complete-exc"),
+            status_port=8123,
+            last_status={
+                "state": "finished",
+                "total_actions": 8,
+                "replay_trace_cursor": 8,
+                "replay_is_complete": True,
+            },
+            agent_type="claude_code",
+            llm_service_type="claude_code_trace_replay",
+            launch_metadata={"benchmark": {"task_id": "kv-store-grpc", "trace_response_count": 8}},
+            task_future=future,
+        )
+        sandbox.task_run = SimpleNamespace(poll_status=lambda: dict(sandbox.last_status))
+
+        RealHostScenarioHarness.wait_for_task_completion(harness, sandbox, timeout_s=0.01)
+
+    def test_finalize_replay_row_preserves_pre_verification_replay_completion(self) -> None:
+        config = BenchmarkConfig(
+            config_path=Path("/tmp/bench.yaml"),
+            scenario="fault",
+            mode="auto",
+        )
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-finalize-replay"),
+            bundle_dir=Path("/tmp/sbx-finalize-replay"),
+            status_port=8123,
+            last_status={},
+            agent_type="claude_code",
+            llm_service_type="claude_code_trace_replay",
+            task_config=TaskConfig(options={"task_id": "bn-fit-modify"}),
+            launch_metadata={"benchmark": {"trace_response_count": 15}},
+        )
+        statuses = iter(
+            [
+                {
+                    "state": "running",
+                    "replay_trace_cursor": 15,
+                    "replay_is_complete": True,
+                },
+                {
+                    "state": "finished",
+                    "replay_trace_cursor": 0,
+                    "replay_is_complete": False,
+                },
+            ]
+        )
+        sandbox.task_run = SimpleNamespace(poll_status=lambda: dict(next(statuses)))
+        harness = SimpleNamespace()
+
+        with patch(
+            "benchmarks.scenarios.common.verify_task_accuracy",
+            return_value=(
+                "",
+                {
+                    "verification_status": "passed",
+                    "verification_exit_code": 0,
+                    "verification_ms": 12.0,
+                },
+            ),
+        ):
+            row = finalize_replay_row(
+                config,
+                harness,
+                sandbox,
+                row={"task_id": "bn-fit-modify"},
+                verify_task_accuracy_result=True,
+            )
+
+        self.assertEqual(row["verification_status"], "passed")
+        self.assertEqual(row["success_ratio"], 1.0)
+        self.assertEqual(row["replay_final_trace_cursor"], 15)
+        self.assertTrue(row["replay_is_complete"])
+        self.assertEqual(row["task_error"], "")
+
+    def test_verification_uv_bootstrap_script_installs_working_uv_shim(self) -> None:
+        script = RealHostScenarioHarness._verification_uv_bootstrap_script()
+        self.assertIn('export PATH="$shim_bin:$PATH"', script)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            work = Path(tmpdir) / "work"
+            home.mkdir()
+            work.mkdir()
+            env = {**os.environ, "HOME": str(home)}
+
+            bootstrap = subprocess.run(
+                ["bash", "-lc", script],
+                cwd=work,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(bootstrap.returncode, 0, bootstrap.stderr)
+
+            verify = subprocess.run(
+                [
+                    "bash",
+                    "-lc",
+                    (
+                        'source "$HOME/.local/bin/env" && '
+                        "uv venv .tbench-testing && "
+                        "source .tbench-testing/bin/activate && "
+                        "uv pip install --system --help >/dev/null && "
+                        'test "$(uv run python -c \'print(123)\')" = "123" && '
+                        "uv python pin 3.11"
+                    ),
+                ],
+                cwd=work,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(verify.returncode, 0, verify.stderr)
+
+    def test_verify_task_accuracy_bootstraps_uv_before_running_tests(self) -> None:
+        harness = RealHostScenarioHarness.__new__(RealHostScenarioHarness)
+        harness.telemetry = None
+        harness.sandbox_process_cwd = lambda sandbox: "/app"
+        harness.benchmark_telemetry_attributes = lambda sandbox: {}
+        harness._agent_requires_benchmark_network = lambda agent_type: False
+        calls: list[tuple[list[str], dict[str, object]]] = []
+
+        def fake_exec_in_sandbox(sandbox, command, **kwargs):
+            calls.append((list(command), dict(kwargs)))
+            return SimpleNamespace(
+                returncode=0,
+                stdout="verification ok\n",
+                stderr="",
+                args=list(command),
+            )
+
+        harness.exec_in_sandbox = fake_exec_in_sandbox
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-verify"),
+            bundle_dir=Path("/tmp/sbx-verify"),
+            status_port=8123,
+            last_status={},
+            agent_type="claude_code",
+            llm_service_type="claude_code_trace_replay",
+            task_config=TaskConfig(),
+        )
+
+        verification = RealHostScenarioHarness.verify_task_accuracy(harness, sandbox, timeout_s=120.0)
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][0][:2], ["/bin/bash", "-lc"])
+        self.assertIn("$HOME/.local/bin/uv", calls[0][0][2])
+        self.assertIn("$HOME/.local/agent-cr-verification/bin", calls[0][0][2])
+        self.assertAlmostEqual(float(calls[0][1]["timeout_s"]), 120.0, places=2)
+        self.assertEqual(calls[1][0], ["/bin/bash", "-lc", "bash /tests/run-tests.sh"])
+        self.assertEqual(calls[1][1]["env"]["TEST_DIR"], "/tests")
+        self.assertIn("/root/.local/agent-cr-verification/bin", calls[1][1]["env"]["PATH"])
+        self.assertEqual(calls[1][1]["timeout_s"], 120.0)
+        self.assertEqual(verification["verification_status"], "passed")
+
+    def test_ensure_verification_uv_retries_transient_bootstrap_failures(self) -> None:
+        harness = RealHostScenarioHarness.__new__(RealHostScenarioHarness)
+        harness.sandbox_process_cwd = lambda sandbox: "/app"
+        responses = [
+            SimpleNamespace(
+                returncode=100,
+                stdout="",
+                stderr="Temporary failure resolving 'archive.ubuntu.com'\n",
+                args=["/bin/bash", "-lc", "bootstrap"],
+            ),
+            SimpleNamespace(
+                returncode=0,
+                stdout="",
+                stderr="",
+                args=["/bin/bash", "-lc", "bootstrap"],
+            ),
+        ]
+        calls: list[dict[str, object]] = []
+
+        def fake_exec_in_sandbox(sandbox, command, **kwargs):
+            calls.append({"command": list(command), **kwargs})
+            return responses.pop(0)
+
+        harness.exec_in_sandbox = fake_exec_in_sandbox
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-verify-retry"),
+            bundle_dir=Path("/tmp/sbx-verify-retry"),
+            status_port=8123,
+            last_status={},
+            agent_type="claude_code",
+            llm_service_type="claude_code_trace_replay",
+        )
+
+        with patch("benchmarks.real_host_scenario_base.time.sleep") as sleep:
+            RealHostScenarioHarness._ensure_verification_uv(harness, sandbox, timeout_s=120.0)
+
+        self.assertEqual(len(calls), 2)
+        self.assertGreaterEqual(float(calls[0]["timeout_s"]), 1.0)
+        sleep.assert_called_once()
+
+    def test_verification_uv_shim_installs_pytest_inside_fake_venv(self) -> None:
+        namespace = self._load_verification_uv_shim_namespace()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            venv_root = Path(tmpdir) / "venv"
+            site_packages = venv_root / "lib" / "python3.11" / "site-packages"
+            calls: list[list[str]] = []
+
+            with patch.dict(os.environ, {"VIRTUAL_ENV": str(venv_root)}, clear=False):
+                with patch.dict(namespace, {"_resolve_python": lambda _requested: "python3"}):
+                    with patch.object(namespace["subprocess"], "call") as call_mock:
+                        call_mock.side_effect = lambda cmd: calls.append(list(cmd)) or 0
+                        with patch.dict(namespace, {"_python_version_tag": lambda _python: "3.11"}):
+                            result = namespace["_run_pip"](["install", "pytest==8.4.1"])
+
+            self.assertEqual(result, 0)
+            self.assertEqual(
+                calls,
+                [
+                    [
+                        "python3",
+                        "-m",
+                        "pip",
+                        "install",
+                        "--target",
+                        str(site_packages),
+                        "pytest==8.4.1",
+                    ]
+                ],
+            )
+
+    def test_verification_uv_pytest_fallback_emits_pytest_style_summary_banner(self) -> None:
+        namespace = self._load_verification_uv_shim_namespace()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_path = Path(tmpdir) / "test_sample.py"
+            test_path.write_text(
+                "def test_passes():\n"
+                "    return None\n",
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                result = namespace["_run_pytest_fallback"]([str(test_path), "-rA"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertIn(
+            "=========================== short test summary info ============================",
+            stdout.getvalue(),
+        )
+        self.assertIn(f"PASSED {test_path.resolve()}::test_passes", stdout.getvalue())
+
+    def test_verification_uv_shim_uses_real_pytest_when_available_in_fake_venv(self) -> None:
+        namespace = self._load_verification_uv_shim_namespace()
+        calls: list[list[str]] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            venv_root = Path(tmpdir) / "venv"
+            (venv_root / ".agent_cr_fake_venv").parent.mkdir(parents=True, exist_ok=True)
+            (venv_root / ".agent_cr_fake_venv").write_text("", encoding="utf-8")
+            with patch.dict(os.environ, {"VIRTUAL_ENV": str(venv_root)}, clear=False):
+                with patch.object(namespace["shutil"], "which", return_value="/tmp/pytest"):
+                    with patch.object(namespace["subprocess"], "call") as call_mock:
+                        call_mock.side_effect = lambda cmd: calls.append(list(cmd)) or 0
+                        result = namespace["_run_command"](
+                            ["pytest", "/tests/test_outputs.py", "-rA"]
+                        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, [["pytest", "/tests/test_outputs.py", "-rA"]])
+
+    def test_verification_uv_shim_runs_python_module_pytest_inside_venv_without_script(self) -> None:
+        namespace = self._load_verification_uv_shim_namespace()
+        calls: list[list[str]] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            venv_root = Path(tmpdir) / "venv"
+            venv_root.mkdir(parents=True, exist_ok=True)
+            with patch.dict(os.environ, {"VIRTUAL_ENV": str(venv_root)}, clear=False):
+                with patch.object(namespace["shutil"], "which", return_value=None):
+                    with patch.dict(namespace, {"_resolve_python": lambda _requested: "python3"}):
+                        with patch.object(namespace["subprocess"], "call") as call_mock:
+                            call_mock.side_effect = lambda cmd: calls.append(list(cmd)) or 0
+                            result = namespace["_run_command"](
+                                ["pytest", "/tests/test_outputs.py", "-rA"]
+                            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, [["python3", "-m", "pytest", "/tests/test_outputs.py", "-rA"]])
+
+    def test_verification_uv_failure_classifies_apt_lock_as_transient(self) -> None:
+        harness = RealHostScenarioHarness.__new__(RealHostScenarioHarness)
+
+        self.assertTrue(
+            RealHostScenarioHarness._verification_uv_failure_is_transient(
+                harness,
+                "E: Could not get lock /var/lib/apt/lists/lock. It is held by process 10 (apt-get)\n"
+                "E: Unable to lock directory /var/lib/apt/lists/\n",
+            )
+        )
+
+    def test_wait_for_verification_network_retries_until_dns_recovers(self) -> None:
+        harness = RealHostScenarioHarness.__new__(RealHostScenarioHarness)
+        harness.sandbox_process_cwd = lambda sandbox: "/app"
+        harness._agent_requires_benchmark_network = lambda agent_type: True
+        harness._refresh_sandbox_resolv_conf = Mock(return_value=False)
+        responses = [
+            SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="archive.ubuntu.com:80 [Errno -3] Temporary failure in name resolution\n",
+                args=["/bin/bash", "-lc", "probe"],
+            ),
+            SimpleNamespace(
+                returncode=0,
+                stdout="",
+                stderr="",
+                args=["/bin/bash", "-lc", "probe"],
+            ),
+        ]
+        calls: list[dict[str, object]] = []
+
+        def fake_exec_in_sandbox(sandbox, command, **kwargs):
+            calls.append({"command": list(command), **kwargs})
+            return responses.pop(0)
+
+        harness.exec_in_sandbox = fake_exec_in_sandbox
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-network-ready"),
+            bundle_dir=Path("/tmp/sbx-network-ready"),
+            status_port=8123,
+            last_status={},
+            agent_type="claude_code",
+            llm_service_type="claude_code_trace_replay",
+        )
+
+        with patch("benchmarks.real_host_scenario_base.time.sleep") as sleep:
+            RealHostScenarioHarness._wait_for_verification_network(harness, sandbox, timeout_s=120.0)
+
+        self.assertEqual(len(calls), 2)
+        sleep.assert_called_once()
+
+    def test_wait_for_verification_network_refreshes_resolv_conf_after_dns_failure(self) -> None:
+        harness = RealHostScenarioHarness.__new__(RealHostScenarioHarness)
+        harness.sandbox_process_cwd = lambda sandbox: "/app"
+        harness._agent_requires_benchmark_network = lambda agent_type: True
+        harness._refresh_sandbox_resolv_conf = Mock(return_value=True)
+        responses = [
+            SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="archive.ubuntu.com:80 [Errno -3] Temporary failure in name resolution\n",
+                args=["/bin/bash", "-lc", "probe"],
+            ),
+            SimpleNamespace(
+                returncode=0,
+                stdout="",
+                stderr="",
+                args=["/bin/bash", "-lc", "probe"],
+            ),
+        ]
+        harness.exec_in_sandbox = lambda sandbox, command, **kwargs: responses.pop(0)
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-network-resolv"),
+            bundle_dir=Path("/tmp/sbx-network-resolv"),
+            status_port=8123,
+            last_status={},
+            agent_type="claude_code",
+            llm_service_type="claude_code_trace_replay",
+        )
+
+        with patch("benchmarks.real_host_scenario_base.time.sleep"):
+            RealHostScenarioHarness._wait_for_verification_network(harness, sandbox, timeout_s=120.0)
+
+        harness._refresh_sandbox_resolv_conf.assert_called_once_with(sandbox)
+
+    def test_merge_runtime_launch_metadata_appends_copy_paths_and_ignores_rules(self) -> None:
+        merged = _merge_runtime_launch_metadata(
+            {
+                "rootfs_init_dirs": ["work", "root/.claude"],
+                "rootfs_copy_paths": [{"source": "/base", "destination": "/"}],
+                "host_inspector_ignore_process_rules": [{"cmdline_contains": ["base"]}],
+                "zfs_dataset": "pool/a",
+            },
+            {
+                "rootfs_init_dirs": ["root/.claude", "opt/claude-code-logs"],
+                "rootfs_copy_paths": [{"source": "/seed", "destination": "/root/.claude"}],
+                "host_inspector_ignore_process_rules": [{"cmdline_contains": ["wrapper"]}],
+            },
+        )
+
+        self.assertEqual(
+            merged["rootfs_init_dirs"],
+            ["work", "root/.claude", "opt/claude-code-logs"],
+        )
+        self.assertEqual(
+            merged["rootfs_copy_paths"],
+            [
+                {"source": "/base", "destination": "/"},
+                {"source": "/seed", "destination": "/root/.claude"},
+            ],
+        )
+        self.assertEqual(
+            merged["host_inspector_ignore_process_rules"],
+            [
+                {"cmdline_contains": ["base"]},
+                {"cmdline_contains": ["wrapper"]},
+            ],
+        )
+        self.assertEqual(merged["zfs_dataset"], "pool/a")
 
     def test_ensure_zpool_reuses_existing_dataset_when_destroy_does_not_remove_it(self) -> None:
         harness = RealHostScenarioHarness.__new__(RealHostScenarioHarness)
@@ -141,7 +687,6 @@ class BenchmarkHelperTests(unittest.TestCase):
                 )
             ],
         )
-
     def test_resolve_runtime_plane_root_defaults_to_benchmark_run_root(self) -> None:
         harness = RealHostScenarioHarness(
             provider="openai",
@@ -959,7 +1504,63 @@ class BenchmarkHelperTests(unittest.TestCase):
         self.assertIs(handle.task_run, mock_task_run)
         self.assertIs(handle.task_future, mock_future)
         build_task_run.assert_called_once_with("simulated", handle, task_description, task_config)
-        submit.assert_called_once_with(mock_task_run.perform_task)
+        submit.assert_called_once()
+        submitted_callable = submit.call_args.args[0]
+        self.assertTrue(callable(submitted_callable))
+        self.assertIsNot(submitted_callable, mock_task_run.perform_task)
+
+    def test_launch_task_emits_queue_wait_and_run_duration_metrics(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        harness.telemetry = InMemoryTelemetrySink()
+        handle = SandboxHandle(
+            sandbox_id=SandboxId("sbx-agent-telemetry"),
+            bundle_dir=Path("/tmp/sbx-agent-telemetry"),
+            status_port=8123,
+            last_status={},
+        )
+        harness._sandbox_by_id[handle.sandbox_id] = handle
+
+        class _TaskRun:
+            def __init__(self) -> None:
+                self.perform_task = Mock(side_effect=lambda: time.sleep(0.01))
+
+        task_run = _TaskRun()
+
+        def _submit(fn):
+            future: Future[None] = Future()
+            try:
+                fn()
+            except Exception as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(None)
+            return future
+
+        with patch.object(harness, "build_task_run", return_value=task_run), patch.object(
+            harness._task_executor,
+            "submit",
+            side_effect=_submit,
+        ):
+            returned = harness.launch_task("simulated", TaskDescription("progress"), TaskConfig(), "sbx-agent-telemetry")
+
+        self.assertIs(returned, task_run)
+        metric_values = {name: value for name, value, _attributes in harness.telemetry.metrics}
+        self.assertIn("benchmark.task.queue_wait_ms", metric_values)
+        self.assertIn("benchmark.task.run.duration_ms", metric_values)
+        self.assertIn("benchmark.task.duration_ms", metric_values)
+        self.assertGreaterEqual(metric_values["benchmark.task.queue_wait_ms"], 0.0)
+        self.assertGreater(metric_values["benchmark.task.run.duration_ms"], 0.0)
+        self.assertGreaterEqual(
+            metric_values["benchmark.task.duration_ms"],
+            metric_values["benchmark.task.run.duration_ms"],
+        )
 
     def test_build_task_run_passes_explicit_runtime_inputs(self) -> None:
         class _RecordingAgent(BaseAgent):
@@ -1168,6 +1769,60 @@ class BenchmarkHelperTests(unittest.TestCase):
         fake_task_run.wait_for_task_ready.assert_called_once()
         fake_task_run.on_restore_complete.assert_called_once()
         fake_task_run.poll_status.assert_called_once()
+
+    def test_relaunch_sandbox_preserves_restored_filesystem_when_requested(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+        )
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("sbx-relaunch-preserve-fs"),
+            bundle_dir=Path("/tmp/sbx-relaunch-preserve-fs"),
+            status_port=8123,
+            last_status={},
+            agent_type="claude_code",
+            llm_service_type="claude_code_trace_replay",
+            llm_base_url="http://10.250.0.1:43123/v1",
+            task_description=TaskDescription("resume"),
+            task_config=TaskConfig(),
+        )
+        runtime_launch = Mock()
+        harness.sandbox_manager = SimpleNamespace(
+            describe=lambda sandbox_id: SimpleNamespace(
+                metadata={
+                    "sandbox_id": str(sandbox.sandbox_id),
+                    "zfs_dataset": "pool/agent-cr/sbx-relaunch-preserve-fs",
+                    "bundle_path": "/tmp/bundle",
+                }
+            ),
+            delete_runtime=Mock(),
+            destroy_filesystem_dataset=Mock(),
+            launch=runtime_launch,
+        )
+        harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())
+        harness.runtime_state_root = Path("/tmp/runtime")
+
+        fake_task_run = SimpleNamespace(
+            survives_fault_relaunch=Mock(return_value=True),
+            wait_for_task_ready=Mock(),
+            on_restore_complete=Mock(),
+            poll_status=Mock(return_value={"total_actions": 3}),
+        )
+        sandbox.task_run = fake_task_run
+        sandbox.task_future = SimpleNamespace(done=Mock(return_value=False))
+
+        with patch.object(harness, "_destroy_filesystem_dataset") as destroy_dataset:
+            harness.relaunch_sandbox(sandbox, preserve_filesystem_state=True)
+
+        destroy_dataset.assert_not_called()
+        runtime_launch.assert_called_once()
+        launch_metadata = runtime_launch.call_args.args[1]
+        self.assertTrue(launch_metadata["_agent_cr_runtime_reuse_existing_rootfs"])
+        self.assertEqual(launch_metadata["zfs_dataset"], "pool/agent-cr/sbx-relaunch-preserve-fs")
 
     def test_harness_exit_requests_stop_for_running_tasks(self) -> None:
         harness = RealHostScenarioHarness(
@@ -1839,6 +2494,87 @@ services:
                     sandbox_name="sbx-compose",
                     service_name="app",
                 )
+
+    def test_prepare_compose_task_record_preserves_translated_rootfs_copy_paths_when_agent_metadata_is_empty(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+            reuse_zpool=True,
+        )
+        harness.root = Path(tempfile.mkdtemp(prefix="agent_cr_prepare_compose_test_"))
+        harness.image_cache_root = harness.root / "images"
+        harness.image_cache_root.mkdir(parents=True, exist_ok=True)
+        harness._compose_image_tags = set()
+        lease = SimpleNamespace(guest_ip="10.250.0.2", namespace_path=Path("/var/run/netns/test-claude"))
+        harness.network_manager = SimpleNamespace(
+            allocate_lease=Mock(return_value=lease),
+            bridge_ip="10.250.0.1",
+        )
+
+        compose_file = harness.root / "compose.yaml"
+        compose_file.write_text("services:\n  client:\n    image: ignored\n", encoding="utf-8")
+        handle = SandboxHandle(
+            sandbox_id=SandboxId("sbx-claude-compose"),
+            bundle_dir=harness.root / "bundle-claude-compose",
+            status_port=8123,
+            status_host=lease.guest_ip,
+            last_status={},
+            agent_type="claude_code",
+            llm_service_type="claude_code_trace_replay",
+        )
+        work_dir_host_path = harness.root / "workdir"
+        translated_rootfs = harness.root / "compose-rootfs"
+        translated_rootfs.mkdir(parents=True, exist_ok=True)
+        translation = sandbox_compose.ComposeSandboxTranslation(
+            runtime_launch_metadata={
+                "sandbox_id": str(handle.sandbox_id),
+                "bundle_path": str(handle.bundle_dir),
+                "work_dir_host_path": str(work_dir_host_path),
+                "rootfs_init_dirs": ["work", "tmp"],
+                "rootfs_copy_paths": [{"source": str(translated_rootfs), "destination": "/"}],
+            },
+            compose_launch_metadata={"service_name": "client", "image_ref": "example/client:latest", "ports": []},
+        )
+        prelaunch_task_run = SimpleNamespace(
+            prepare_sandbox=Mock(),
+            configure_bundle=Mock(),
+            rootfs_init_dirs=Mock(return_value=["opt/claude-code-home"]),
+            extra_launch_metadata=Mock(return_value={"rootfs_copy_paths": []}),
+        )
+        task_record = BenchmarkTaskRecord(
+            agent_type="claude_code",
+            task_description=TaskDescription("solve the task"),
+            task_config=TaskConfig(),
+            task_id="task-claude-compose",
+            llm_service_type="claude_code_trace_replay",
+            docker_compose_file=compose_file,
+            service_name="client",
+            llm_service_config={"trace_path": "/tmp/trace.json"},
+        )
+
+        with (
+            patch.object(harness, "_build_termnius_compose_env", return_value={}),
+            patch("benchmarks.real_host_scenario_base.sandbox_compose.load_compose_service", return_value=("client", {})),
+            patch("benchmarks.real_host_scenario_base.sandbox_compose.translate_compose_service", return_value=translation),
+            patch.object(harness, "_prepare_sandbox_handle", return_value=(handle, work_dir_host_path)),
+            patch.object(harness, "build_task_run", return_value=prelaunch_task_run),
+            patch.object(harness, "_configure_termnius_bundle_privileges"),
+        ):
+            prepared = harness._prepare_compose_task_record(
+                sandbox_name="sbx-claude-compose",
+                task_record=task_record,
+            )
+
+        runtime_metadata = prepared.handle.launch_metadata["runtime"]
+        self.assertIn(
+            {"source": str(translated_rootfs), "destination": "/"},
+            runtime_metadata["rootfs_copy_paths"],
+        )
+        self.assertTrue(runtime_metadata["shared_rootfs_key"])
 
     def test_resolve_compose_image_ref_uses_explicit_image_name_for_build_service(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3180,6 +3916,81 @@ services:
         self.assertIn("benchmark.phase.setup.duration_ms", metric_names)
         self.assertIn("benchmark.phase.setup.item.duration_ms", metric_names)
         self.assertIn("benchmark.phase.setup.configured_max_workers", metric_names)
+
+    def test_benchmark_setup_run_pipeline_keeps_separate_executor_pools_by_default(self) -> None:
+        run_started = threading.Event()
+        second_setup_started = threading.Event()
+        release_first_run = threading.Event()
+        errors: list[BaseException] = []
+
+        def setup_fn(item: int) -> int:
+            if item == 1:
+                second_setup_started.set()
+            return item
+
+        def run_fn(item: int, prepared: int) -> int:
+            _ = prepared
+            if item == 0:
+                run_started.set()
+                self.assertTrue(second_setup_started.wait(timeout=1.0))
+                release_first_run.wait(timeout=1.0)
+            return item
+
+        def _run_pipeline() -> None:
+            try:
+                benchmark_setup_run_pipeline(
+                    [0, 1],
+                    setup_fn=setup_fn,
+                    run_fn=run_fn,
+                    setup_max_workers=1,
+                    run_max_workers=1,
+                    harness=SimpleNamespace(telemetry=None),
+                )
+            except BaseException as exc:  # pragma: no cover - surfaced via assertion below
+                errors.append(exc)
+
+        thread = threading.Thread(
+            target=_run_pipeline,
+        )
+        thread.start()
+        try:
+            self.assertTrue(run_started.wait(timeout=1.0))
+        finally:
+            release_first_run.set()
+            thread.join(timeout=1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_benchmark_setup_run_pipeline_can_use_shared_executor_pool(self) -> None:
+        second_setup_started = threading.Event()
+        order: list[str] = []
+
+        def setup_fn(item: int) -> int:
+            order.append(f"setup-{item}")
+            if item == 1:
+                second_setup_started.set()
+            return item
+
+        def run_fn(item: int, prepared: int) -> int:
+            _ = prepared
+            order.append(f"run-{item}")
+            if item == 0:
+                self.assertFalse(second_setup_started.wait(timeout=0.1))
+            return item
+
+        results = benchmark_setup_run_pipeline(
+            [0, 1],
+            setup_fn=setup_fn,
+            run_fn=run_fn,
+            setup_max_workers=1,
+            run_max_workers=1,
+            harness=SimpleNamespace(telemetry=None),
+            executor_pool="shared",
+        )
+
+        self.assertEqual(results, [0, 1])
+        self.assertEqual(order, ["setup-0", "run-0", "setup-1", "run-1"])
 
     def test_emit_benchmark_phase_skipped_prints_progress_line(self) -> None:
         buffer = io.StringIO()

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
+import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
@@ -22,6 +24,8 @@ from benchmarks.support import (
 T = TypeVar("T")
 U = TypeVar("U")
 R = TypeVar("R")
+
+logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -121,6 +125,30 @@ def _apply_llm_service_options(
     return dataclasses.replace(record, llm_service_config=merged)
 
 
+def _apply_task_timeout_scales(
+    record: BenchmarkTaskRecord,
+    *,
+    max_agent_timeout_scale: float,
+    max_test_timeout_scale: float,
+) -> BenchmarkTaskRecord:
+    options = dict(record.task_config.options)
+    changed = False
+    for key, scale in (
+        ("max_agent_timeout_sec", max_agent_timeout_scale),
+        ("max_test_timeout_sec", max_test_timeout_scale),
+    ):
+        if key not in options:
+            continue
+        try:
+            options[key] = float(options[key]) * scale
+        except (TypeError, ValueError):
+            continue
+        changed = True
+    if not changed:
+        return record
+    return dataclasses.replace(record, task_config=TaskConfig(options=options))
+
+
 def resolve_task_records(
     config: BenchmarkConfig,
     *,
@@ -141,6 +169,15 @@ def resolve_task_records(
     ]
     if config.llm_service_options:
         records = [_apply_llm_service_options(r, config.llm_service_options) for r in records]
+    if config.max_agent_timeout_scale != 1.0 or config.max_test_timeout_scale != 1.0:
+        records = [
+            _apply_task_timeout_scales(
+                r,
+                max_agent_timeout_scale=config.max_agent_timeout_scale,
+                max_test_timeout_scale=config.max_test_timeout_scale,
+            )
+            for r in records
+        ]
     return records
 
 
@@ -313,7 +350,7 @@ def _finish_phase_item_operation(item_operation, *, success: bool) -> None:
         item_operation.finish(status="succeeded" if success else "failed")
 
 
-def benchmark_setup_run_pipeline(
+def _benchmark_setup_run_pipeline_with_separate_pools(
     items: Sequence[T],
     *,
     setup_fn: Callable[[T], U],
@@ -463,6 +500,190 @@ def benchmark_setup_run_pipeline(
     return [result for result in results]
 
 
+def _benchmark_setup_run_pipeline_with_shared_pool(
+    items: Sequence[T],
+    *,
+    setup_fn: Callable[[T], U],
+    run_fn: Callable[[T, U], R],
+    setup_max_workers: int,
+    run_max_workers: int,
+    harness,
+    setup_item_attributes: Callable[[T], dict[str, object]] | None = None,
+    run_item_attributes: Callable[[T, U], dict[str, object]] | None = None,
+) -> list[R]:
+    if not items:
+        return []
+    shared_worker_count = max(1, min(setup_max_workers, run_max_workers))
+    telemetry = getattr(harness, "telemetry", None)
+    setup_started_at, setup_operation = _begin_benchmark_phase(
+        phase="setup",
+        sandbox_count=len(items),
+        worker_count=shared_worker_count,
+        telemetry=telemetry,
+    )
+    run_started_at: float | None = None
+    run_operation = None
+    run_started = False
+    setup_finished = False
+    completed_setups = 0
+    phase_state_lock = threading.Lock()
+    results: list[R | None] = [None] * len(items)
+
+    def _invoke_setup(item: T) -> U:
+        item_operation = None
+        if telemetry is not None and setup_item_attributes is not None:
+            item_operation = start_operation(
+                telemetry,
+                "benchmark.phase.setup.item",
+                setup_item_attributes(item),
+            )
+        try:
+            result = setup_fn(item)
+        except Exception:
+            _finish_phase_item_operation(item_operation, success=False)
+            raise
+        _finish_phase_item_operation(item_operation, success=True)
+        return result
+
+    def _invoke_run(item: T, prepared: U) -> R:
+        item_operation = None
+        if telemetry is not None and run_item_attributes is not None:
+            item_operation = start_operation(
+                telemetry,
+                "benchmark.phase.run.item",
+                run_item_attributes(item, prepared),
+            )
+        try:
+            result = run_fn(item, prepared)
+        except Exception:
+            _finish_phase_item_operation(item_operation, success=False)
+            raise
+        _finish_phase_item_operation(item_operation, success=True)
+        return result
+
+    def _invoke_setup_and_run(item: T) -> R:
+        nonlocal run_started_at, run_operation, run_started, setup_finished, completed_setups
+
+        prepared = _invoke_setup(item)
+        with phase_state_lock:
+            completed_setups += 1
+            if not run_started:
+                run_started_at, run_operation = _begin_benchmark_phase(
+                    phase="run",
+                    sandbox_count=len(items),
+                    worker_count=shared_worker_count,
+                    telemetry=telemetry,
+                )
+                run_started = True
+            if not setup_finished and completed_setups == len(items):
+                _finish_benchmark_phase(
+                    phase="setup",
+                    sandbox_count=len(items),
+                    worker_count=shared_worker_count,
+                    phase_started_at=setup_started_at,
+                    phase_operation=setup_operation,
+                    status="end",
+                )
+                setup_finished = True
+        return _invoke_run(item, prepared)
+
+    with ThreadPoolExecutor(max_workers=shared_worker_count) as executor:
+        futures: dict[Future[R], int] = {
+            executor.submit(_invoke_setup_and_run, item): index
+            for index, item in enumerate(items)
+        }
+        try:
+            while futures:
+                done, _ = wait(set(futures), return_when=FIRST_COMPLETED)
+                for future in done:
+                    index = futures.pop(future)
+                    results[index] = future.result()
+        except Exception:
+            for future in futures:
+                future.cancel()
+            if not setup_finished:
+                _finish_benchmark_phase(
+                    phase="setup",
+                    sandbox_count=len(items),
+                    worker_count=shared_worker_count,
+                    phase_started_at=setup_started_at,
+                    phase_operation=setup_operation,
+                    status="failed",
+                )
+            if run_started and run_started_at is not None:
+                _finish_benchmark_phase(
+                    phase="run",
+                    sandbox_count=len(items),
+                    worker_count=shared_worker_count,
+                    phase_started_at=run_started_at,
+                    phase_operation=run_operation,
+                    status="failed",
+                )
+            raise
+    if not setup_finished:
+        _finish_benchmark_phase(
+            phase="setup",
+            sandbox_count=len(items),
+            worker_count=shared_worker_count,
+            phase_started_at=setup_started_at,
+            phase_operation=setup_operation,
+            status="end",
+        )
+    if not run_started:
+        run_started_at, run_operation = _begin_benchmark_phase(
+            phase="run",
+            sandbox_count=len(items),
+            worker_count=shared_worker_count,
+            telemetry=telemetry,
+        )
+    _finish_benchmark_phase(
+        phase="run",
+        sandbox_count=len(items),
+        worker_count=shared_worker_count,
+        phase_started_at=run_started_at if run_started_at is not None else time.perf_counter(),
+        phase_operation=run_operation,
+        status="end",
+    )
+    return [result for result in results]
+
+
+def benchmark_setup_run_pipeline(
+    items: Sequence[T],
+    *,
+    setup_fn: Callable[[T], U],
+    run_fn: Callable[[T, U], R],
+    setup_max_workers: int,
+    run_max_workers: int,
+    harness,
+    setup_item_attributes: Callable[[T], dict[str, object]] | None = None,
+    run_item_attributes: Callable[[T, U], dict[str, object]] | None = None,
+    executor_pool: str = "separate",
+) -> list[R]:
+    if executor_pool == "shared":
+        return _benchmark_setup_run_pipeline_with_shared_pool(
+            items,
+            setup_fn=setup_fn,
+            run_fn=run_fn,
+            setup_max_workers=setup_max_workers,
+            run_max_workers=run_max_workers,
+            harness=harness,
+            setup_item_attributes=setup_item_attributes,
+            run_item_attributes=run_item_attributes,
+        )
+    if executor_pool != "separate":
+        raise ValueError(f"unsupported merged setup/run executor pool {executor_pool!r}")
+    return _benchmark_setup_run_pipeline_with_separate_pools(
+        items,
+        setup_fn=setup_fn,
+        run_fn=run_fn,
+        setup_max_workers=setup_max_workers,
+        run_max_workers=run_max_workers,
+        harness=harness,
+        setup_item_attributes=setup_item_attributes,
+        run_item_attributes=run_item_attributes,
+    )
+
+
 def benchmark_phase_map(
     items: Sequence[T],
     fn: Callable[[T], R],
@@ -594,6 +815,29 @@ def trace_response_count_for_sandbox(sandbox: SandboxHandle) -> int:
         return 0
 
 
+def replay_trace_cursor(status: dict[str, object]) -> int:
+    raw_value = status.get("replay_trace_cursor", status.get("total_actions", 0))
+    try:
+        return max(0, int(raw_value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def replay_status_is_complete(status: dict[str, object], *, trace_response_count: int) -> bool:
+    if bool(status.get("replay_is_complete", False)):
+        return True
+    if trace_response_count <= 0:
+        return False
+    return replay_trace_cursor(status) >= trace_response_count
+
+
+def replay_action_count_wait_error(task_error: str) -> bool:
+    lowered = str(task_error).strip().lower()
+    if not lowered or "replay action count" not in lowered:
+        return False
+    return "timed out waiting" in lowered or "finished before reaching" in lowered
+
+
 def task_completion_timeout_seconds(sandbox: SandboxHandle) -> float:
     timeout_s = task_timeout_seconds(sandbox.task_config or TaskConfig())
     if not is_replay_llm_service_type(sandbox.llm_service_type):
@@ -624,20 +868,59 @@ def verify_task_accuracy(harness, sandbox: SandboxHandle) -> tuple[str, dict[str
         "verification_exit_code": -1,
         "verification_ms": 0.0,
     }
+    completion_timeout = task_completion_timeout_seconds(sandbox)
+    wait_error = ""
     try:
+        logger.info(
+            "Benchmark verification waiting for task completion sandbox=%s timeout_s=%.3f",
+            sandbox.sandbox_id,
+            completion_timeout,
+        )
         harness.wait_for_task_completion(
             sandbox,
-            timeout_s=task_completion_timeout_seconds(sandbox),
+            timeout_s=completion_timeout,
         )
     except Exception as exc:
-        task_error = str(exc) or exc.__class__.__name__
-    else:
+        wait_error = str(exc) or exc.__class__.__name__
+        status = poll_sandbox_status(sandbox)
+        trace_response_count = trace_response_count_for_sandbox(sandbox)
+        if is_replay_llm_service_type(sandbox.llm_service_type) and replay_status_is_complete(
+            status,
+            trace_response_count=trace_response_count,
+        ):
+            logger.info(
+                "Benchmark verification continuing after task completion wait failed because replay is complete "
+                "sandbox=%s error=%s replay_final_trace_cursor=%d trace_response_count=%d",
+                sandbox.sandbox_id,
+                wait_error,
+                replay_trace_cursor(status),
+                trace_response_count,
+            )
+        else:
+            task_error = wait_error
+            logger.warning(
+                "Benchmark verification skipped after task completion wait failed sandbox=%s error=%s",
+                sandbox.sandbox_id,
+                task_error,
+            )
+    if not task_error:
+        verification_timeout = verification_timeout_seconds(sandbox.task_config or TaskConfig())
         try:
+            logger.info(
+                "Benchmark verification starting sandbox=%s timeout_s=%.3f",
+                sandbox.sandbox_id,
+                verification_timeout,
+            )
             verification = harness.verify_task_accuracy(
                 sandbox,
-                timeout_s=verification_timeout_seconds(sandbox.task_config or TaskConfig()),
+                timeout_s=verification_timeout,
             )
         except Exception as exc:
+            logger.warning(
+                "Benchmark verification raised an exception sandbox=%s error=%s",
+                sandbox.sandbox_id,
+                exc,
+            )
             verification = {
                 "verification_status": "verification_error",
                 "verification_exit_code": -1,

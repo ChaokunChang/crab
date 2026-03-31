@@ -955,7 +955,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(process_worker.manifests[0].metadata["filesystem_restore_checkpoint_id"], "ckpt-2")
         self.assertEqual(process_worker.manifests[0].metadata["filesystem_restore_trace_cursor"], 6)
 
-    def test_default_restore_worker_uses_committed_replay_count_for_inflight_filesystem_checkpoint(self) -> None:
+    def test_default_restore_worker_preserves_replay_count_for_inflight_filesystem_checkpoint(self) -> None:
         sid = SandboxId("sbx-1")
         manager = LocalCheckpointManager(StorageConfig(root_dir=Path(tempfile.mkdtemp())))
         fs_ref = manager.put_artifact(
@@ -998,7 +998,7 @@ class ContractTests(unittest.TestCase):
 
         self.assertEqual(result.status.value, "succeeded")
         self.assertEqual(fs_worker.manifests[0].metadata["filesystem_restore_checkpoint_id"], "ckpt-1")
-        self.assertEqual(fs_worker.manifests[0].metadata["filesystem_restore_trace_cursor"], 2)
+        self.assertEqual(fs_worker.manifests[0].metadata["filesystem_restore_trace_cursor"], 3)
 
     def test_default_restore_worker_rewinds_process_when_filesystem_lacks_latest_mutation(self) -> None:
         sid = SandboxId("sbx-1")

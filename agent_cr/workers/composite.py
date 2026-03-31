@@ -52,15 +52,28 @@ _CAPTURED_REQUEST_STARTED_AT = "captured_request_started_at"
 def resolve_restore_manifest(
     checkpoint_manager: CheckpointManager,
     manifest: CheckpointManifest,
+    *,
+    candidates: list[CheckpointManifest] | None = None,
 ) -> CheckpointManifest:
-    checkpoints = checkpoint_manager.list_checkpoints(manifest.sandbox_id)
-    try:
-        current_index = checkpoints.index(manifest.checkpoint_id)
-        candidate_ids = checkpoints[: current_index + 1]
-    except ValueError:
-        candidate_ids = checkpoints
+    if candidates is None:
+        checkpoints = checkpoint_manager.list_checkpoints(manifest.sandbox_id)
+        try:
+            current_index = checkpoints.index(manifest.checkpoint_id)
+            candidate_ids = checkpoints[: current_index + 1]
+        except ValueError:
+            candidate_ids = checkpoints
 
-    candidates = [checkpoint_manager.get_manifest(manifest.sandbox_id, checkpoint_id) for checkpoint_id in candidate_ids]
+        candidates = [checkpoint_manager.get_manifest(manifest.sandbox_id, checkpoint_id) for checkpoint_id in candidate_ids]
+    else:
+        try:
+            current_index = next(
+                index for index, candidate in enumerate(candidates) if candidate.checkpoint_id == manifest.checkpoint_id
+            )
+        except StopIteration:
+            candidates = list(candidates)
+        else:
+            candidates = candidates[: current_index + 1]
+
     current_candidate = candidates[-1] if candidates else manifest
 
     filesystem_manifest = _latest_manifest_with_artifacts(
@@ -153,10 +166,10 @@ def _trace_cursor_from_metadata(metadata: dict[str, object]) -> int:
 
 
 def _committed_trace_cursor(metadata: dict[str, object]) -> int:
-    trace_cursor = _trace_cursor_from_metadata(metadata)
-    if bool(metadata.get(_CAPTURES_INFLIGHT_LLM, False)):
-        return max(0, trace_cursor - 1)
-    return trace_cursor
+    # benchmark_trace_cursor already records the last replay turn that has been
+    # served. Capturing the next in-flight LLM request should not rewind that
+    # committed replay position during restore selection.
+    return _trace_cursor_from_metadata(metadata)
 
 
 def _copy_process_restore_metadata(target: dict[str, object], source: dict[str, object]) -> None:

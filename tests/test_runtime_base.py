@@ -67,6 +67,21 @@ class RuntimeBaseTests(unittest.TestCase):
         self.assertIs(kwargs["stdout"], subprocess.PIPE)
         self.assertIs(kwargs["stderr"], subprocess.PIPE)
 
+    def test_run_accepts_timeout_override(self) -> None:
+        runner = SubprocessCommandRunner(timeout_seconds=1.0)
+
+        with patch("agent_cr.runtime.base.subprocess.run") as run_mock:
+            run_mock.return_value = subprocess.CompletedProcess(
+                args=["zfs", "create", "pool/test"],
+                returncode=0,
+                stdout="",
+                stderr="",
+            )
+
+            runner.run(["zfs", "create", "pool/test"], timeout_seconds=123.0)
+
+        self.assertEqual(run_mock.call_args.kwargs["timeout"], 123.0)
+
 
 if __name__ == "__main__":
     unittest.main()

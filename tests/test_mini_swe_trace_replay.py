@@ -91,6 +91,81 @@ class MiniSWETraceReplayTests(unittest.TestCase):
         self.assertEqual(sleep.call_count, 1)
         sleep.assert_called_with(2.0)
 
+    def test_snapshot_reports_delay_clamp_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.traj.json"
+            trace_path.write_text(json.dumps(_trace_payload()), encoding="utf-8")
+            state = TraceReplayLLMState(
+                llm_service_config={
+                    "trace_path": str(trace_path),
+                    "response_delay_policy": "trace_replay",
+                    "response_delay_scaling_factor": 2.0,
+                    "minimal_delay": 100.0,
+                    "maximal_delay": 900.0,
+                }
+            )
+
+        snapshot = state.snapshot()
+
+        self.assertEqual(snapshot["response_delay_policy"], "trace_replay")
+        self.assertEqual(snapshot["response_delay_scaling_factor"], 2.0)
+        self.assertEqual(snapshot["minimal_delay"], 100.0)
+        self.assertEqual(snapshot["maximal_delay"], 900.0)
+
+    def test_trace_replay_policy_applies_min_and_max_delay_clamps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.traj.json"
+            trace_path.write_text(json.dumps(_trace_payload()), encoding="utf-8")
+            state = TraceReplayLLMState(
+                llm_service_config={
+                    "trace_path": str(trace_path),
+                    "response_delay_policy": "trace_replay",
+                    "response_delay_scaling_factor": 0.01,
+                    "minimal_delay": 150.0,
+                    "maximal_delay": 200.0,
+                }
+            )
+
+            with patch("integrations.llm_services.mini_swe_trace_replay.service.time.sleep") as sleep:
+                state.handle_request(path="/v1/chat/completions", headers={}, payload={})
+                state.handle_request(path="/v1/chat/completions", headers={}, payload={})
+
+        self.assertEqual(sleep.call_count, 2)
+        sleep.assert_any_call(0.15)
+        self.assertEqual(sleep.call_args_list[-1].args, (0.15,))
+
+    def test_fixed_policy_applies_maximum_delay_clamp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.traj.json"
+            trace_path.write_text(json.dumps(_trace_payload()), encoding="utf-8")
+            state = TraceReplayLLMState(
+                llm_service_config={
+                    "trace_path": str(trace_path),
+                    "response_delay_policy": "fixed",
+                    "response_delay_ms": 4000,
+                    "maximal_delay": 2500,
+                }
+            )
+
+            with patch("integrations.llm_services.mini_swe_trace_replay.service.time.sleep") as sleep:
+                state.handle_request(path="/v1/chat/completions", headers={}, payload={})
+
+        sleep.assert_called_once_with(2.5)
+
+    def test_invalid_delay_clamp_range_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.traj.json"
+            trace_path.write_text(json.dumps(_trace_payload()), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "maximal_delay"):
+                TraceReplayLLMState(
+                    llm_service_config={
+                        "trace_path": str(trace_path),
+                        "minimal_delay": 10,
+                        "maximal_delay": 5,
+                    }
+                )
+
     def test_invalid_response_delay_policy_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "trace.traj.json"

@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from threading import Lock
@@ -22,7 +23,10 @@ logger = logging.getLogger(__name__)
 _HOST_INSPECTOR_REGISTER_ATTEMPTS = 3
 _HOST_INSPECTOR_REGISTER_RETRY_DELAY_S = 0.2
 _RESILIENT_EXEC_RECOVERY_TIMEOUT_S = 300.0
+_DEFAULT_RUNTIME_COMMAND_TIMEOUT_SECONDS = 60.0
+_DEFAULT_ZFS_PREPARE_TIMEOUT_SECONDS = 300.0
 _LAUNCH_PREPARED_METADATA_KEY = "_agent_cr_runtime_prepared"
+_LAUNCH_REUSE_EXISTING_ROOTFS_METADATA_KEY = "_agent_cr_runtime_reuse_existing_rootfs"
 _SHARED_ROOTFS_KEY_METADATA_KEY = "shared_rootfs_key"
 _SHARED_ROOTFS_PERSIST_METADATA_KEY = "shared_rootfs_persist"
 _SHARED_ROOTFS_SNAPSHOT_NAME = "base"
@@ -34,6 +38,82 @@ _RESILIENT_EXEC_RETRYABLE_ERROR_FRAGMENTS = (
     "failed to exec in container",
     "cannot allocate tty",
 )
+_POSTFIX_QUEUE_DIRS = (
+    "active",
+    "bounce",
+    "corrupt",
+    "defer",
+    "deferred",
+    "flush",
+    "incoming",
+    "private",
+    "saved",
+)
+_POSTFIX_POSTDROP_DIRS = {
+    "maildrop": 0o1730,
+    "public": 0o2710,
+}
+
+
+def _lookup_unix_id(path: Path, name: str, *, field_index: int) -> int | None:
+    try:
+        content = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    for line in content.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(":")
+        if len(parts) <= field_index or parts[0] != name:
+            continue
+        try:
+            return int(parts[field_index])
+        except ValueError:
+            return None
+    return None
+
+
+def _repair_postfix_rootfs_permissions(rootfs_path: Path) -> None:
+    spool_root = rootfs_path / "var" / "spool" / "postfix"
+    if not spool_root.is_dir():
+        return
+    postfix_uid = _lookup_unix_id(rootfs_path / "etc" / "passwd", "postfix", field_index=2)
+    postfix_gid = _lookup_unix_id(rootfs_path / "etc" / "group", "postfix", field_index=2)
+    postdrop_gid = _lookup_unix_id(rootfs_path / "etc" / "group", "postdrop", field_index=2)
+    if postfix_uid is None or postfix_gid is None or postdrop_gid is None:
+        return
+
+    os.chown(spool_root, 0, 0)
+    os.chmod(spool_root, 0o755)
+
+    for name in _POSTFIX_QUEUE_DIRS:
+        path = spool_root / name
+        if not path.exists():
+            continue
+        os.chown(path, postfix_uid, postfix_gid)
+        os.chmod(path, 0o700)
+
+    for name, mode in _POSTFIX_POSTDROP_DIRS.items():
+        path = spool_root / name
+        if not path.exists():
+            continue
+        os.chown(path, postfix_uid, postdrop_gid)
+        os.chmod(path, mode)
+
+    pid_dir = spool_root / "pid"
+    if pid_dir.exists():
+        os.chown(pid_dir, 0, 0)
+        os.chmod(pid_dir, 0o755)
+
+    restart_marker = spool_root / "restart"
+    if restart_marker.exists():
+        os.chown(restart_marker, 0, 0)
+        os.chmod(restart_marker, 0o644)
+
+    var_lib_postfix = rootfs_path / "var" / "lib" / "postfix"
+    if var_lib_postfix.exists():
+        os.chown(var_lib_postfix, postfix_uid, postdrop_gid)
+        os.chmod(var_lib_postfix, 0o755)
 
 
 @dataclass(frozen=True)
@@ -65,6 +145,8 @@ class RuncRestoreOptions:
 class RuncRuntimeOptions:
     checkpoint: RuncCheckpointOptions = field(default_factory=RuncCheckpointOptions)
     restore: RuncRestoreOptions = field(default_factory=RuncRestoreOptions)
+    command_timeout_seconds: float = _DEFAULT_RUNTIME_COMMAND_TIMEOUT_SECONDS
+    zfs_prepare_timeout_seconds: float = _DEFAULT_ZFS_PREPARE_TIMEOUT_SECONDS
 
 
 class RuncRuntime(Runtime):
@@ -85,13 +167,14 @@ class RuncRuntime(Runtime):
         self._version = version
         resolved_options = options or RuncRuntimeOptions()
         self._paths = paths or RuncRuntimePaths()
-        self._runner = command_runner or SubprocessCommandRunner()
+        self._runner = command_runner or SubprocessCommandRunner(timeout_seconds=resolved_options.command_timeout_seconds)
         self._runtime_bin = runtime_bin
         self._zfs_bin = zfs_bin
         self._host_inspector_client = host_inspector_client
         self._telemetry = telemetry or NoopTelemetrySink()
         self._checkpoint_options = checkpoint_options or resolved_options.checkpoint
         self._restore_options = restore_options or resolved_options.restore
+        self._zfs_prepare_timeout_seconds = float(resolved_options.zfs_prepare_timeout_seconds)
         self._lock = Lock()
         self._items: dict[SandboxId, SandboxDescription] = {}
         self._paths.metadata_root.mkdir(parents=True, exist_ok=True)
@@ -352,6 +435,22 @@ class RuncRuntime(Runtime):
         try:
             bundle_path.mkdir(parents=True, exist_ok=True)
             rootfs_path.mkdir(parents=True, exist_ok=True)
+            reuse_existing_rootfs = bool(md.get(_LAUNCH_REUSE_EXISTING_ROOTFS_METADATA_KEY, False))
+            if reuse_existing_rootfs and self._zfs_dataset_exists(dataset):
+                if metadata is not None:
+                    metadata["rootfs_path"] = str(rootfs_path)
+                    metadata["zfs_dataset"] = dataset
+                    metadata[_LAUNCH_PREPARED_METADATA_KEY] = True
+                logger.info(
+                    "Prepared runtime launch sandbox=%s bundle_path=%s rootfs_path=%s dataset=%s "
+                    "reason=reusing_existing_rootfs",
+                    sandbox_id,
+                    bundle_path,
+                    rootfs_path,
+                    dataset,
+                )
+                operation.finish(status="succeeded", attributes={"already_prepared": False, "reused_existing_rootfs": True})
+                return sandbox_id
             if shared_rootfs_key:
                 shared_dataset, shared_rootfs_path = self._ensure_shared_rootfs_base(
                     shared_rootfs_key,
@@ -387,8 +486,10 @@ class RuncRuntime(Runtime):
                     operation="sandbox.zfs_create",
                     sandbox_id=sandbox_id,
                     metadata={"dataset": dataset, "mountpoint": str(rootfs_path)},
+                    timeout_seconds=self._zfs_prepare_timeout_seconds,
                 )
                 self._materialize_rootfs(rootfs_path, md, sandbox_id=sandbox_id)
+            _repair_postfix_rootfs_permissions(rootfs_path)
             if metadata is not None:
                 metadata["rootfs_path"] = str(rootfs_path)
                 metadata["zfs_dataset"] = dataset
@@ -409,7 +510,11 @@ class RuncRuntime(Runtime):
     def launch(self, runtime_name: str, metadata: dict[str, object] | None = None) -> SandboxId:
         self.prepare_launch(runtime_name, metadata)
         sandbox_id, md, bundle_path, rootfs_path, dataset = self._resolve_launch_request(runtime_name, metadata)
-        description_metadata = {key: value for key, value in md.items() if key != _LAUNCH_PREPARED_METADATA_KEY}
+        description_metadata = {
+            key: value
+            for key, value in md.items()
+            if key not in {_LAUNCH_PREPARED_METADATA_KEY, _LAUNCH_REUSE_EXISTING_ROOTFS_METADATA_KEY}
+        }
         logger.info(
             "Launching prepared runtime sandbox=%s bundle_path=%s dataset=%s",
             sandbox_id,
@@ -935,7 +1040,38 @@ class RuncRuntime(Runtime):
         )
         if result.returncode != 0 and ignore_missing:
             stderr = result.stderr.strip()
-            if "does not exist" not in stderr and "container not found" not in stderr:
+            if "container init still running" in stderr:
+                logger.warning(
+                    "Runtime delete reported a still-running init process; sending KILL and retrying delete sandbox=%s",
+                    sandbox_id,
+                )
+                kill_command = [self._runtime_bin, "--root", str(self._paths.state_root), "kill", str(sandbox_id), "KILL"]
+                kill_result = self._run_command(
+                    kill_command,
+                    operation="sandbox.runtime_kill_force",
+                    sandbox_id=sandbox_id,
+                    check=False,
+                )
+                kill_stderr = kill_result.stderr.strip()
+                if (
+                    kill_result.returncode != 0
+                    and "does not exist" not in kill_stderr
+                    and "container not found" not in kill_stderr
+                    and "container not running" not in kill_stderr
+                ):
+                    raise RuntimeError(
+                        f"command failed ({kill_result.returncode}): {' '.join(kill_command)}"
+                        f"\nstdout: {kill_result.stdout.strip()}"
+                        f"\nstderr: {kill_stderr}"
+                    )
+                result = self._run_command(
+                    command,
+                    operation="sandbox.runtime_delete_retry",
+                    sandbox_id=sandbox_id,
+                    check=False,
+                )
+                stderr = result.stderr.strip()
+            if result.returncode != 0 and "does not exist" not in stderr and "container not found" not in stderr:
                 raise RuntimeError(
                     f"command failed ({result.returncode}): {' '.join(command)}"
                     f"\nstdout: {result.stdout.strip()}"
@@ -1016,27 +1152,40 @@ class RuncRuntime(Runtime):
             return f"{self._paths.zfs_dataset_prefix}/{sandbox_id}"
         return str(description.metadata.get("zfs_dataset", f"{self._paths.zfs_dataset_prefix}/{sandbox_id}"))
 
+    def _zfs_dataset_exists(self, dataset: str) -> bool:
+        result = self._run_command(
+            [self._zfs_bin, "list", "-H", "-o", "name", dataset],
+            operation="sandbox.zfs_exists",
+            check=False,
+            metadata={"dataset": dataset},
+        )
+        return result.returncode == 0
+
     def process_work_path(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> Path:
         return self._paths.checkpoint_root / str(sandbox_id) / str(checkpoint_id) / "work"
 
     def _persist(self, description: SandboxDescription) -> None:
         path = self._metadata_path(description.sandbox_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(
-            json.dumps(
-                {
-                    "sandbox_id": str(description.sandbox_id),
-                    "runtime_name": description.runtime_name,
-                    "status": description.status,
-                    "metadata": description.metadata,
-                },
-                sort_keys=True,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        tmp.replace(path)
+        tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            tmp.write_text(
+                json.dumps(
+                    {
+                        "sandbox_id": str(description.sandbox_id),
+                        "runtime_name": description.runtime_name,
+                        "status": description.status,
+                        "metadata": description.metadata,
+                    },
+                    sort_keys=True,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            tmp.replace(path)
+        finally:
+            if tmp.exists():
+                tmp.unlink(missing_ok=True)
 
     def _register_with_host_inspector(self, description: SandboxDescription) -> None:
         if self._host_inspector_client is None:
@@ -1110,6 +1259,7 @@ class RuncRuntime(Runtime):
         check: bool = True,
         expected_error_substrings: tuple[str, ...] = (),
         metadata: dict[str, object] | None = None,
+        timeout_seconds: float | None = None,
     ) -> CommandResult:
         operation_context = start_operation(
             self._telemetry,
@@ -1122,7 +1272,7 @@ class RuncRuntime(Runtime):
                 metadata={**(metadata or {}), "cwd": None if cwd is None else str(cwd)},
             ),
         )
-        result = self._runner.run(command, cwd=cwd)
+        result = self._runner.run(command, cwd=cwd, timeout_seconds=timeout_seconds)
         stderr = result.stderr.strip()
         stdout = result.stdout.strip()
         success = result.returncode == 0

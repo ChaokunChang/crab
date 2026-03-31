@@ -20,7 +20,13 @@ class CommandResult:
 
 class CommandRunner(ABC):
     @abstractmethod
-    def run(self, command: list[str], *, cwd: Path | None = None) -> CommandResult:
+    def run(
+        self,
+        command: list[str],
+        *,
+        cwd: Path | None = None,
+        timeout_seconds: float | None = None,
+    ) -> CommandResult:
         raise NotImplementedError
 
 
@@ -28,7 +34,14 @@ class SubprocessCommandRunner(CommandRunner):
     def __init__(self, timeout_seconds: float = 60.0):
         self._timeout_seconds = timeout_seconds
 
-    def run(self, command: list[str], *, cwd: Path | None = None) -> CommandResult:
+    def run(
+        self,
+        command: list[str],
+        *,
+        cwd: Path | None = None,
+        timeout_seconds: float | None = None,
+    ) -> CommandResult:
+        timeout = self._timeout_seconds if timeout_seconds is None else float(timeout_seconds)
         detached = self._should_use_file_stdio(command)
         if detached:
             with tempfile.TemporaryFile(mode="w+") as stdout_file, tempfile.TemporaryFile(mode="w+") as stderr_file:
@@ -40,7 +53,7 @@ class SubprocessCommandRunner(CommandRunner):
                     stdout=stdout_file,
                     stderr=stderr_file,
                     text=True,
-                    timeout=self._timeout_seconds,
+                    timeout=timeout,
                 )
                 stdout_file.seek(0)
                 stderr_file.seek(0)
@@ -55,7 +68,7 @@ class SubprocessCommandRunner(CommandRunner):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=self._timeout_seconds,
+                timeout=timeout,
             )
             stdout = "" if completed.stdout is None else completed.stdout
             stderr = "" if completed.stderr is None else completed.stderr

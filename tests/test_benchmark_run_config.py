@@ -43,6 +43,8 @@ class BenchmarkConfigTests(unittest.TestCase):
                         "zpool_name: benchcache",
                         "zpool_image: cache/bench.zpool.img",
                         "reuse_zpool: true",
+                        "runtime_command_timeout_seconds: 180",
+                        "runtime_zfs_prepare_timeout_seconds: 420",
                         "storage_planes:",
                         "  runtime_root: runtime-plane",
                         "  storage_root: storage-plane",
@@ -69,10 +71,13 @@ class BenchmarkConfigTests(unittest.TestCase):
             self.assertEqual(config.effective_phase_workers.as_dict(), {"setup": 3, "run": 3, "verification": 3})
             self.assertEqual(config.log_file_mode, "write")
             self.assertEqual(config.benchmark_root, (root / "benchmark-runs").resolve())
+            self.assertFalse(config.clear_benchmark_root_after_run)
             self.assertEqual(config.zpool_size, "32G")
             self.assertEqual(config.zpool_name, "benchcache")
             self.assertEqual(config.zpool_image, (root / "cache" / "bench.zpool.img").resolve())
             self.assertTrue(config.reuse_zpool)
+            self.assertEqual(config.runtime_command_timeout_seconds, 180.0)
+            self.assertEqual(config.runtime_zfs_prepare_timeout_seconds, 420.0)
             self.assertEqual(config.storage_planes.runtime_root, (root / "runtime-plane").resolve())
             self.assertEqual(config.storage_planes.storage_root, (root / "storage-plane").resolve())
             self.assertEqual(config.storage_planes.agent_host_root, (root / "agent-plane").resolve())
@@ -230,6 +235,46 @@ class BenchmarkConfigTests(unittest.TestCase):
 
         self.assertFalse(config.rootfs_reuse.enabled)
         self.assertTrue(config.phase_merging.setup_and_run)
+        self.assertEqual(config.phase_merging.setup_and_run_executor_pool, "separate")
+
+    def test_load_config_supports_shared_setup_run_executor_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "bench.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "scenario: fault",
+                        "mode: auto",
+                        "phase_merging:",
+                        "  setup_and_run: true",
+                        "  setup_and_run_executor_pool: shared",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+        self.assertTrue(config.phase_merging.setup_and_run)
+        self.assertEqual(config.phase_merging.setup_and_run_executor_pool, "shared")
+
+    def test_load_config_rejects_unknown_setup_run_executor_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "bench.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "scenario: fault",
+                        "mode: auto",
+                        "phase_merging:",
+                        "  setup_and_run_executor_pool: combined",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "setup_and_run_executor_pool"):
+                load_config(config_path)
 
     def test_load_config_nested_telemetry_output_overrides_legacy_field(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -275,6 +320,7 @@ class BenchmarkConfigTests(unittest.TestCase):
                         "  max_retries: 2",
                         "  retry_backoff_seconds: 0.25",
                         "scheduler:",
+                        "  policy: no_checkpointing",
                         "  min_checkpoint_interval_seconds: 1.5",
                         "  force_checkpoint_after_seconds: 9.0",
                         "  require_change_signal: false",
@@ -308,6 +354,7 @@ class BenchmarkConfigTests(unittest.TestCase):
             self.assertEqual(resolved_executor.resolved_coordination_workers, 5)
             self.assertEqual(resolved_executor.resolved_composite_step_workers, 11)
             self.assertEqual(resolved_executor.max_checkpoint_queue_size, 123)
+            self.assertEqual(config.scheduler.policy, "no_checkpointing")
             self.assertEqual(resolved_executor.checkpoint_scheduling_policy, "reactive")
             self.assertEqual(resolved_executor.reactive_checkpoint_urgent_quota, 6)
             self.assertEqual(config.scheduler.min_checkpoint_interval_seconds, 1.5)
@@ -319,6 +366,25 @@ class BenchmarkConfigTests(unittest.TestCase):
             self.assertTrue(config.scheduler.inspect_without_pause)
             self.assertEqual(config.llm_server.launch_mode, "thread")
             self.assertEqual(config.host_inspector.launch_mode, "thread")
+
+    def test_load_config_rejects_invalid_scheduler_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "bench.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "scenario: fault",
+                        "mode: auto",
+                        "scheduler:",
+                        "  policy: not-a-policy",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "scheduler.policy must be one of"):
+                load_config(config_path)
 
     def test_resolve_task_records_merges_llm_service_options_without_overriding_dataset_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -350,6 +416,8 @@ class BenchmarkConfigTests(unittest.TestCase):
                         "  response_delay_policy: trace_replay",
                         "  response_delay_scaling_factor: 0.5",
                         "  response_delay_ms: 77",
+                        "  minimal_delay: 12",
+                        "  maximal_delay: 345",
                     ]
                 ),
                 encoding="utf-8",
@@ -368,6 +436,8 @@ class BenchmarkConfigTests(unittest.TestCase):
                 "response_delay_policy": "trace_replay",
                 "response_delay_scaling_factor": 0.5,
                 "response_delay_ms": 77,
+                "minimal_delay": 12,
+                "maximal_delay": 345,
             },
         )
         self.assertEqual(
@@ -377,8 +447,137 @@ class BenchmarkConfigTests(unittest.TestCase):
                 "response_delay_policy": "fixed",
                 "response_delay_scaling_factor": 0.5,
                 "response_delay_ms": 77,
+                "minimal_delay": 12,
+                "maximal_delay": 345,
             },
         )
+
+    def test_load_config_parses_timeout_scales(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "bench.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "scenario: fault",
+                        "mode: auto",
+                        "max_agent_timeout_scale: 2.5",
+                        "max_test_timeout_scale: 0.5",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+        self.assertEqual(config.max_agent_timeout_scale, 2.5)
+        self.assertEqual(config.max_test_timeout_scale, 0.5)
+
+    def test_load_config_parses_clear_benchmark_root_after_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "bench.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "scenario: fault",
+                        "mode: auto",
+                        "clear_benchmark_root_after_run: true",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+        self.assertTrue(config.clear_benchmark_root_after_run)
+
+    def test_resolve_task_records_scales_task_timeouts_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset_path = root / "tasks.jsonl"
+            dataset_path.write_text(
+                "\n".join(
+                    [
+                        (
+                            '{"agent_type":"iflow","llm_service_type":"iflow_trace_replay",'
+                            '"task_description":{"prompt":"task-a"},'
+                            '"task_config":{"options":{"max_agent_timeout_sec":120,"max_test_timeout_sec":30}}}'
+                        )
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config_path = root / "bench.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "scenario: fault",
+                        "mode: auto",
+                        "agent: iflow",
+                        "llm_service: iflow_trace_replay",
+                        "task_dataset: tasks.jsonl",
+                        "max_agent_timeout_scale: 2.0",
+                        "max_test_timeout_scale: 0.5",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+            records = resolve_task_records(
+                config,
+                default_task_description=TaskDescription("ignored"),
+                default_task_config=TaskConfig(),
+            )
+
+        self.assertEqual(records[0].task_config.options["max_agent_timeout_sec"], 240.0)
+        self.assertEqual(records[0].task_config.options["max_test_timeout_sec"], 15.0)
+
+    def test_resolve_task_records_leaves_missing_timeout_values_unset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset_path = root / "tasks.jsonl"
+            dataset_path.write_text(
+                "\n".join(
+                    [
+                        (
+                            '{"agent_type":"iflow","llm_service_type":"iflow_trace_replay",'
+                            '"task_description":{"prompt":"task-a"},'
+                            '"task_config":{"options":{"custom_timeout":42}}}'
+                        )
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config_path = root / "bench.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "scenario: fault",
+                        "mode: auto",
+                        "agent: iflow",
+                        "llm_service: iflow_trace_replay",
+                        "task_dataset: tasks.jsonl",
+                        "max_agent_timeout_scale: 2.0",
+                        "max_test_timeout_scale: 0.5",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+            records = resolve_task_records(
+                config,
+                default_task_description=TaskDescription("ignored"),
+                default_task_config=TaskConfig(),
+            )
+
+        self.assertNotIn("max_agent_timeout_sec", records[0].task_config.options)
+        self.assertNotIn("max_test_timeout_sec", records[0].task_config.options)
+        self.assertEqual(records[0].task_config.options["custom_timeout"], 42)
 
     def test_load_config_rejects_invalid_log_file_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -638,6 +837,108 @@ class BenchmarkRunDispatchTests(unittest.TestCase):
         self.assertEqual(calls[0]["telemetry_max_text_attribute_bytes"], 2048)
         self.assertEqual(calls[0]["benchmark_root"], Path("/tmp/bench-root"))
 
+    def test_run_benchmark_config_clears_explicit_benchmark_run_root_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            benchmark_run_root = root / "bench-root" / "20260330_000000"
+            benchmark_run_root.mkdir(parents=True, exist_ok=True)
+
+            class _HarnessContext:
+                def __init__(self, **kwargs) -> None:
+                    self.kwargs = kwargs
+                    self.root = benchmark_run_root
+                    self.uses_temporary_root = False
+
+                def __enter__(self):
+                    return {"kind": "fake-harness"}
+
+                def __exit__(self, exc_type, exc, tb) -> None:
+                    _ = (exc_type, exc, tb)
+
+            scenario = ScenarioDefinition(
+                name="fake",
+                supported_modes=frozenset({"manual"}),
+                build_harness_settings=lambda config: HarnessSettings(
+                    scheduler_config={"mode": config.mode},
+                    scheduler_policy=None,
+                    checkpoint_manager_factory=lambda base: base,
+                    max_workers=1,
+                ),
+                run_manual=lambda config, harness: [],
+                run_auto=None,
+                summarize=lambda config, rows: {},
+            )
+            config = BenchmarkConfig(
+                config_path=root / "bench.yaml",
+                scenario="fake",
+                mode="manual",
+                provider="openai",
+                agent="simulated",
+                llm_service="simulated",
+                benchmark_root=root / "bench-root",
+                clear_benchmark_root_after_run=True,
+            )
+
+            with patch("benchmarks.run.RealHostScenarioHarness", _HarnessContext), patch.dict(
+                "benchmarks.run.SCENARIOS",
+                {"fake": scenario},
+                clear=True,
+            ):
+                run_benchmark_config(config)
+
+            self.assertFalse(benchmark_run_root.exists())
+            self.assertTrue((root / "bench-root").exists())
+
+    def test_run_benchmark_config_leaves_tmpdir_backed_benchmark_root_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            benchmark_run_root = root / "agent_cr_scenario_bench_tmpdir"
+            benchmark_run_root.mkdir(parents=True, exist_ok=True)
+
+            class _HarnessContext:
+                def __init__(self, **kwargs) -> None:
+                    self.kwargs = kwargs
+                    self.root = benchmark_run_root
+                    self.uses_temporary_root = True
+
+                def __enter__(self):
+                    return {"kind": "fake-harness"}
+
+                def __exit__(self, exc_type, exc, tb) -> None:
+                    _ = (exc_type, exc, tb)
+
+            scenario = ScenarioDefinition(
+                name="fake",
+                supported_modes=frozenset({"manual"}),
+                build_harness_settings=lambda config: HarnessSettings(
+                    scheduler_config={"mode": config.mode},
+                    scheduler_policy=None,
+                    checkpoint_manager_factory=lambda base: base,
+                    max_workers=1,
+                ),
+                run_manual=lambda config, harness: [],
+                run_auto=None,
+                summarize=lambda config, rows: {},
+            )
+            config = BenchmarkConfig(
+                config_path=root / "bench.yaml",
+                scenario="fake",
+                mode="manual",
+                provider="openai",
+                agent="simulated",
+                llm_service="simulated",
+                clear_benchmark_root_after_run=True,
+            )
+
+            with patch("benchmarks.run.RealHostScenarioHarness", _HarnessContext), patch.dict(
+                "benchmarks.run.SCENARIOS",
+                {"fake": scenario},
+                clear=True,
+            ):
+                run_benchmark_config(config)
+
+            self.assertTrue(benchmark_run_root.exists())
+
     def test_run_benchmark_config_passes_telemetry_yaml_settings_to_harness(self) -> None:
         calls: list[dict[str, object]] = []
 
@@ -787,7 +1088,6 @@ class BenchmarkRunDispatchTests(unittest.TestCase):
             run_benchmark_config(config)
 
         self.assertFalse(calls[0]["rootfs_reuse_enabled"])
-
     def test_run_benchmark_config_write_mode_clears_existing_telemetry_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

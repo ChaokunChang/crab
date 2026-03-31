@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import errno
 import hashlib
 import json
@@ -52,6 +52,7 @@ from agent_cr import (
     RequestAwareSandboxInspector,
     RuncRuntime,
     RuncRuntimePaths,
+    RuncRuntimeOptions,
     SandboxDescription,
     SandboxExecResult,
     SandboxId,
@@ -111,6 +112,22 @@ _TERMNIUS_PROCESS_CAPABILITIES = [
     "CAP_SETUID",
     "CAP_SYS_CHROOT",
 ]
+_RUNTIME_LAUNCH_METADATA_LIST_KEYS = frozenset(
+    {
+        "rootfs_init_dirs",
+        "rootfs_copy_paths",
+        "host_inspector_ignore_process_rules",
+    }
+)
+_VERIFICATION_UV_TRANSIENT_ERROR_FRAGMENTS = (
+    "Temporary failure resolving",
+    "Failed to fetch",
+    "Could not get lock",
+    "Unable to lock directory",
+    "No installation candidate",
+    "Unable to locate package",
+)
+_VERIFICATION_NETWORK_READY_TIMEOUT_SECONDS = 60.0
 
 
 def checkpoint_guard_from_inspector(inspector):
@@ -144,6 +161,34 @@ def wait_for_http_json(url: str, *, timeout_s: float = 30.0) -> dict[str, object
             last_exc = exc
             time.sleep(0.2)
     raise RuntimeError(f"timed out waiting for {url}: {last_exc}")
+
+
+def _host_resolv_conf_path() -> Path | None:
+    host_resolv_conf = Path("/run/systemd/resolve/resolv.conf")
+    if host_resolv_conf.is_file():
+        return host_resolv_conf
+    host_resolv_conf = Path("/etc/resolv.conf")
+    if host_resolv_conf.is_file():
+        return host_resolv_conf
+    return None
+
+
+def _merge_runtime_launch_metadata(*parts: dict[str, object] | None) -> dict[str, object]:
+    merged: dict[str, object] = {}
+    for part in parts:
+        if not part:
+            continue
+        for key, value in part.items():
+            if key not in _RUNTIME_LAUNCH_METADATA_LIST_KEYS:
+                merged[key] = value
+                continue
+            incoming = value if isinstance(value, list) else []
+            current = list(merged.get(key, []))
+            for item in incoming:
+                if item not in current:
+                    current.append(item)
+            merged[key] = current
+    return merged
 
 
 def _find_free_port() -> int:
@@ -194,6 +239,391 @@ class PreparedBenchmarkSandbox:
 
 
 class RealHostScenarioHarness:
+    REPLAY_COMPLETION_TASK_FUTURE_GRACE_SECONDS = 10.0
+
+    @staticmethod
+    def _verification_uv_python_shim_script() -> str:
+        return """
+import importlib.util
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import traceback
+
+
+def _resolve_python(requested: str | None) -> str:
+    candidates: list[str] = []
+    if requested:
+        candidates.append(requested)
+        if requested and requested[0].isdigit():
+            candidates.append(f"python{requested}")
+    venv_root = os.environ.get("VIRTUAL_ENV")
+    if venv_root:
+        candidates.extend(
+            [
+                str(Path(venv_root) / "bin" / "python"),
+                str(Path(venv_root) / "bin" / "python3"),
+            ]
+        )
+    candidates.extend(["python3", "python", sys.executable])
+    for candidate in candidates:
+        if not candidate:
+            continue
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    raise SystemExit("uv shim could not find a python interpreter")
+
+
+def _python_version_tag(python: str) -> str:
+    result = subprocess.run(
+        [
+            python,
+            "-c",
+            "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def _venv_site_packages(venv_root: str, python: str) -> Path:
+    version_tag = _python_version_tag(python)
+    return Path(venv_root) / "lib" / f"python{version_tag}" / "site-packages"
+
+
+def _write_executable(path: Path, content: str) -> None:
+    path.write_text(content, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _create_lightweight_venv(destination: str, python: str) -> int:
+    venv_root = Path(destination)
+    shutil.rmtree(venv_root, ignore_errors=True)
+    bin_dir = venv_root / "bin"
+    site_packages = _venv_site_packages(destination, python)
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    site_packages.mkdir(parents=True, exist_ok=True)
+    (venv_root / ".agent_cr_fake_venv").write_text("", encoding="utf-8")
+    python_wrapper = (
+        "#!/bin/sh\\n"
+        f'PYTHONPATH="{site_packages}:${{PYTHONPATH:-}}" exec "{python}" "$@"\\n'
+    )
+    _write_executable(bin_dir / "python", python_wrapper)
+    _write_executable(bin_dir / "python3", python_wrapper)
+    _write_executable(
+        bin_dir / "pytest",
+        (
+            "#!/bin/sh\\n"
+            f'exec "{bin_dir / "python"}" -m pytest "$@"\\n'
+        ),
+    )
+    (bin_dir / "activate").write_text(
+        "\\n".join(
+            [
+                f'VIRTUAL_ENV="{venv_root}"',
+                "export VIRTUAL_ENV",
+                'PATH="$VIRTUAL_ENV/bin:$PATH"',
+                "export PATH",
+                f'PYTHONPATH="{site_packages}:${{PYTHONPATH:-}}"',
+                "export PYTHONPATH",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return 0
+
+
+def _consume_python_flag(args: list[str], index: int) -> tuple[str | None, int]:
+    arg = args[index]
+    if arg in {"-p", "--python"}:
+        if index + 1 >= len(args):
+            raise SystemExit("uv shim expected a value after --python/-p")
+        return args[index + 1], index + 2
+    if arg.startswith("--python="):
+        return arg.split("=", 1)[1], index + 1
+    return None, index
+
+
+def _run_venv(args: list[str]) -> int:
+    python = None
+    forwarded: list[str] = []
+    i = 0
+    while i < len(args):
+        requested, next_i = _consume_python_flag(args, i)
+        if next_i != i:
+            python = requested or python
+            i = next_i
+            continue
+        forwarded.append(args[i])
+        i += 1
+    if not forwarded:
+        raise SystemExit("uv shim: venv requires a destination")
+    resolved_python = _resolve_python(python)
+    status = subprocess.call([resolved_python, "-m", "venv", *forwarded])
+    if status == 0:
+        return 0
+    return _create_lightweight_venv(forwarded[-1], resolved_python)
+
+
+def _run_pip(args: list[str]) -> int:
+    python = None
+    forwarded: list[str] = []
+    i = 0
+    while i < len(args):
+        requested, next_i = _consume_python_flag(args, i)
+        if next_i != i:
+            python = requested or python
+            i = next_i
+            continue
+        if args[i] == "--system":
+            i += 1
+            continue
+        forwarded.append(args[i])
+        i += 1
+    if not forwarded:
+        raise SystemExit("uv shim: pip requires arguments")
+    resolved_python = _resolve_python(python)
+    venv_root = os.environ.get("VIRTUAL_ENV")
+    if forwarded[:1] == ["install"] and venv_root:
+        site_packages = _venv_site_packages(venv_root, resolved_python)
+        site_packages.mkdir(parents=True, exist_ok=True)
+        return subprocess.call(
+            [
+                resolved_python,
+                "-m",
+                "pip",
+                "install",
+                "--target",
+                str(site_packages),
+                *forwarded[1:],
+            ]
+        )
+    return subprocess.call([resolved_python, "-m", "pip", *forwarded])
+
+
+def _run_python(args: list[str]) -> int:
+    if args[:1] == ["pin"]:
+        return 0
+    return subprocess.call([_resolve_python(None), *args])
+
+
+def _using_fake_venv() -> bool:
+    venv_root = os.environ.get("VIRTUAL_ENV")
+    return bool(venv_root and (Path(venv_root) / ".agent_cr_fake_venv").exists())
+
+
+def _run_command(args: list[str]) -> int:
+    if not args:
+        raise SystemExit("uv shim: run requires a command")
+    if args[0] == "pytest":
+        pytest_executable = shutil.which("pytest")
+        if pytest_executable is not None:
+            return subprocess.call(args)
+        if os.environ.get("VIRTUAL_ENV"):
+            return subprocess.call([_resolve_python(None), "-m", "pytest", *args[1:]])
+        return _run_pytest_fallback(args[1:])
+    return subprocess.call(args)
+
+
+def _run_pytest_fallback(args: list[str]) -> int:
+    test_files = [arg for arg in args if arg.endswith(".py") and not arg.startswith("-")]
+    if not test_files:
+        return 0
+    failures: list[tuple[str, str, BaseException]] = []
+    test_results: list[tuple[str, str, bool, str | None]] = []
+    total = 0
+    for index, test_file in enumerate(test_files):
+        module_path = Path(test_file).resolve()
+        spec = importlib.util.spec_from_file_location(
+            f"agent_cr_pytest_fallback_{index}",
+            module_path,
+        )
+        if spec is None or spec.loader is None:
+            raise SystemExit(f"uv shim: unable to load test module {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        for name in sorted(dir(module)):
+            if not name.startswith("test_"):
+                continue
+            candidate = getattr(module, name)
+            if not callable(candidate):
+                continue
+            total += 1
+            try:
+                candidate()
+                test_results.append((str(module_path), name, True, None))
+            except BaseException as exc:  # noqa: BLE001
+                failures.append((str(module_path), name, exc))
+                test_results.append(
+                    (str(module_path), name, False, f"{exc.__class__.__name__}: {exc}")
+                )
+                traceback.print_exc()
+    print("=========================== short test summary info ============================")
+    for module_path, name, passed, details in test_results:
+        if passed:
+            print(f"PASSED {module_path}::{name}")
+        else:
+            print(f"FAILED {module_path}::{name} - {details}")
+    if failures:
+        print(f"{len(failures)}/{total} fallback tests failed", file=sys.stderr)
+        return 1
+    print(f"{total} fallback tests passed")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if not argv:
+        raise SystemExit("uv shim: missing subcommand")
+    command, *args = argv
+    if command == "venv":
+        return _run_venv(args)
+    if command == "pip":
+        return _run_pip(args)
+    if command == "run":
+        return _run_command(args)
+    if command == "python":
+        return _run_python(args)
+    raise SystemExit(f"uv shim: unsupported subcommand {command!r}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
+""".strip()
+
+    @staticmethod
+    def _verification_uv_bootstrap_script() -> str:
+        python_shim = RealHostScenarioHarness._verification_uv_python_shim_script()
+        return (
+            """
+set -euo pipefail
+shim_bin="$HOME/.local/agent-cr-verification/bin"
+wait_for_apt_lock() {
+  while pgrep -x apt-get >/dev/null 2>&1 || pgrep -x apt >/dev/null 2>&1 || pgrep -x dpkg >/dev/null 2>&1; do
+    sleep 1
+  done
+}
+need_python_packages=0
+if ! python3 -m venv --help >/dev/null 2>&1; then
+  need_python_packages=1
+fi
+if ! python3 -m pip --version >/dev/null 2>&1; then
+  need_python_packages=1
+fi
+install -d -m 755 "$shim_bin"
+export PATH="$shim_bin:$PATH"
+cat > "$shim_bin/apt-get" <<'EOF'
+#!/bin/sh
+REAL_APT_GET=/usr/bin/apt-get
+first_cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    -*) ;;
+    *)
+      first_cmd="$arg"
+      break
+      ;;
+  esac
+done
+if [ "$first_cmd" = "update" ]; then
+  exit 0
+fi
+if [ "$first_cmd" = "install" ]; then
+  can_skip=1
+  for arg in "$@"; do
+    case "$arg" in
+      install|-y|-q|-qq|--yes|--no-install-recommends)
+        ;;
+      curl)
+        if ! command -v /usr/bin/curl >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
+          can_skip=0
+        fi
+        ;;
+      python3-venv)
+        if ! python3 -m venv --help >/dev/null 2>&1; then
+          can_skip=0
+        fi
+        ;;
+      python3-pip)
+        if ! python3 -m pip --version >/dev/null 2>&1; then
+          can_skip=0
+        fi
+        ;;
+      *)
+        can_skip=0
+        ;;
+    esac
+  done
+  if [ "$can_skip" -eq 1 ]; then
+    exit 0
+  fi
+fi
+exec "$REAL_APT_GET" "$@"
+EOF
+chmod 755 "$shim_bin/apt-get"
+cat > "$shim_bin/curl" <<'EOF'
+#!/bin/sh
+for arg in "$@"; do
+  case "$arg" in
+    *astral.sh/uv/*/install.sh*)
+      printf '#!/bin/sh\nexit 0\n'
+      exit 0
+      ;;
+  esac
+done
+exec /usr/bin/curl "$@"
+EOF
+chmod 755 "$shim_bin/curl"
+if [ "$need_python_packages" -eq 1 ]; then
+  export DEBIAN_FRONTEND=noninteractive
+  wait_for_apt_lock
+  apt-get update >/dev/null
+  wait_for_apt_lock
+  apt-get install -y python3-venv python3-pip >/dev/null
+fi
+install -d -m 755 "$HOME/.local/bin"
+cat > "$HOME/.local/bin/env" <<'EOF'
+export PATH="$HOME/.local/agent-cr-verification/bin:$HOME/.local/bin:$PATH"
+EOF
+if [ ! -x "$HOME/.local/bin/uv" ]; then
+cat > "$HOME/.local/bin/uv" <<'EOF'
+#!/usr/bin/env python3
+__AGENT_CR_VERIFICATION_UV_PYTHON_SHIM__
+EOF
+chmod 755 "$HOME/.local/bin/uv"
+fi
+""".replace("__AGENT_CR_VERIFICATION_UV_PYTHON_SHIM__", python_shim).strip()
+        )
+
+    @staticmethod
+    def _verification_network_probe_script() -> str:
+        return """
+python3 - <<'PY'
+import socket
+import sys
+
+targets = [
+    ("archive.ubuntu.com", 80),
+    ("astral.sh", 443),
+]
+errors = []
+for host, port in targets:
+    try:
+        socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        errors.append(f"{host}:{port} {exc}")
+if errors:
+    print("\\n".join(errors), file=sys.stderr)
+    raise SystemExit(1)
+PY
+""".strip()
+
     @property
     def _active_runtime(self):
         if self.runtime is not None:
@@ -241,6 +671,8 @@ class RealHostScenarioHarness:
         zpool_name: str | None = None,
         zpool_image: Path | None = None,
         reuse_zpool: bool = False,
+        runtime_command_timeout_seconds: float = 60.0,
+        runtime_zfs_prepare_timeout_seconds: float = 300.0,
         image_cache_root: Path | None = None,
         run_id: str | None = None,
         monitoring_enabled: bool = True,
@@ -283,6 +715,8 @@ class RealHostScenarioHarness:
         self.configured_zpool_name = zpool_name
         self.configured_zpool_image = zpool_image
         self.reuse_zpool = reuse_zpool
+        self.runtime_command_timeout_seconds = float(runtime_command_timeout_seconds)
+        self.runtime_zfs_prepare_timeout_seconds = float(runtime_zfs_prepare_timeout_seconds)
         self.image_cache_root = (image_cache_root or _DEFAULT_IMAGE_CACHE_ROOT).resolve()
         self.run_id = "" if run_id is None else str(run_id)
         self.monitoring_enabled = monitoring_enabled
@@ -294,6 +728,7 @@ class RealHostScenarioHarness:
         self.expected_sandboxes = expected_sandboxes
         self.rootfs_reuse_enabled = bool(rootfs_reuse_enabled)
         self._tmpdir: tempfile.TemporaryDirectory[str] | None = None
+        self.uses_temporary_root = False
         self.root: Path | None = None
         self.runtime_root: Path | None = None
         self.storage_root: Path | None = None
@@ -476,8 +911,10 @@ class RealHostScenarioHarness:
         if benchmark_root is not None:
             suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.root = benchmark_root / suffix
+            self.uses_temporary_root = False
         else:
             self.root = Path(self._tmpdir.name)
+            self.uses_temporary_root = True
         unique_suffix = uuid.uuid4().hex[:10]
         self.pool_name = self.configured_zpool_name or f"agentcrbench{unique_suffix}"
         zpool_image_path = self.configured_zpool_image or (self.root / "zpool.img")
@@ -523,6 +960,10 @@ class RealHostScenarioHarness:
                 checkpoint_root=self.runtime_checkpoint_root,
                 metadata_root=self.runtime_metadata_root,
                 zfs_dataset_prefix=f"{self.pool_name}/agent-cr",
+            ),
+            options=RuncRuntimeOptions(
+                command_timeout_seconds=self.runtime_command_timeout_seconds,
+                zfs_prepare_timeout_seconds=self.runtime_zfs_prepare_timeout_seconds,
             ),
             host_inspector_client=self.host_inspector_client,
             telemetry=self.telemetry,
@@ -1132,15 +1573,17 @@ class RealHostScenarioHarness:
         )
         if network_lease is not None:
             self.network_manager.register_guest_ip(network_lease.guest_ip, sandbox_id)
-        launch_metadata = {
-            "sandbox_id": sandbox_name,
-            "bundle_path": str(handle.bundle_dir),
-            "work_dir_host_path": None if work_dir_host_path is None else str(work_dir_host_path),
-            "rootfs_init_dirs": task_run.rootfs_init_dirs(),
-            "rootfs_copy_paths": [{"source": str(sandbox_image.exported_rootfs), "destination": "/"}],
-            **task_run.extra_launch_metadata(),
-            **handle.launch_metadata.get("runtime", {}),
-        }
+        launch_metadata = _merge_runtime_launch_metadata(
+            {
+                "sandbox_id": sandbox_name,
+                "bundle_path": str(handle.bundle_dir),
+                "work_dir_host_path": None if work_dir_host_path is None else str(work_dir_host_path),
+                "rootfs_init_dirs": task_run.rootfs_init_dirs(),
+                "rootfs_copy_paths": [{"source": str(sandbox_image.exported_rootfs), "destination": "/"}],
+            },
+            task_run.extra_launch_metadata(),
+            handle.launch_metadata.get("runtime", {}),
+        )
         self._attach_shared_rootfs_launch_metadata(
             launch_metadata,
             agent_type=agent_type,
@@ -1242,14 +1685,9 @@ class RealHostScenarioHarness:
             ),
         )
 
-    def _bind_task_future_telemetry(self, handle: SandboxHandle, task_future) -> None:
-        if self.telemetry is None:
+    def _bind_task_future_telemetry(self, task_future, *, operation) -> None:
+        if operation is None:
             return
-        operation = start_operation(
-            self.telemetry,
-            "benchmark.task",
-            self.benchmark_telemetry_attributes(handle),
-        )
 
         def _finalize(future) -> None:
             try:
@@ -1260,6 +1698,43 @@ class RealHostScenarioHarness:
             operation.finish(status="succeeded")
 
         task_future.add_done_callback(_finalize)
+
+    def _wrap_task_future_execution(
+        self,
+        task_run: BaseAgent,
+        *,
+        task_attributes: dict[str, object],
+    ):
+        submitted_ns = time.perf_counter_ns()
+
+        def _run_task() -> None:
+            queue_wait_ms = max(0.0, (time.perf_counter_ns() - submitted_ns) / 1_000_000.0)
+            run_operation = None
+            if self.telemetry is not None:
+                metric_attributes = dict(task_attributes)
+                self.telemetry.emit_metric(
+                    "benchmark.task.queue_wait_ms",
+                    queue_wait_ms,
+                    metric_attributes,
+                )
+                run_operation = start_operation(
+                    self.telemetry,
+                    "benchmark.task.run",
+                    {
+                        **task_attributes,
+                        "queue_wait_ms": queue_wait_ms,
+                    },
+                )
+            try:
+                task_run.perform_task()
+            except Exception:
+                if run_operation is not None:
+                    run_operation.finish(status="failed")
+                raise
+            if run_operation is not None:
+                run_operation.finish(status="succeeded")
+
+        return _run_task
 
     def _run_benchmark_setup_step(
         self,
@@ -1312,8 +1787,16 @@ class RealHostScenarioHarness:
         task_run = self.build_task_run(agent_type, handle, task_description, task_config)
         handle.task_run = task_run
         self._task_attempts[str(handle.sandbox_id)] = self._task_attempts.get(str(handle.sandbox_id), 0) + 1
-        handle.task_future = self._task_executor.submit(task_run.perform_task)
-        self._bind_task_future_telemetry(handle, handle.task_future)
+        task_attributes = self.benchmark_telemetry_attributes(handle)
+        task_operation = None if self.telemetry is None else start_operation(
+            self.telemetry,
+            "benchmark.task",
+            dict(task_attributes),
+        )
+        handle.task_future = self._task_executor.submit(
+            self._wrap_task_future_execution(task_run, task_attributes=task_attributes)
+        )
+        self._bind_task_future_telemetry(handle.task_future, operation=task_operation)
         return task_run
 
     def launch_sandbox_and_task(
@@ -1493,15 +1976,17 @@ class RealHostScenarioHarness:
             setup_step="configure_bundle",
             fn=prelaunch_task_run.configure_bundle,
         )
-        handle.launch_metadata = {
-            "sandbox_id": sandbox_name,
-            "bundle_path": str(handle.bundle_dir),
-            "work_dir_host_path": None if work_dir_host_path is None else str(work_dir_host_path),
-            "rootfs_init_dirs": prelaunch_task_run.rootfs_init_dirs(),
-            "rootfs_copy_paths": [{"source": str(sandbox_image.exported_rootfs), "destination": "/"}],
-            **prelaunch_task_run.extra_launch_metadata(),
-            **handle.launch_metadata.get("runtime", {}),
-        }
+        handle.launch_metadata = _merge_runtime_launch_metadata(
+            {
+                "sandbox_id": sandbox_name,
+                "bundle_path": str(handle.bundle_dir),
+                "work_dir_host_path": None if work_dir_host_path is None else str(work_dir_host_path),
+                "rootfs_init_dirs": prelaunch_task_run.rootfs_init_dirs(),
+                "rootfs_copy_paths": [{"source": str(sandbox_image.exported_rootfs), "destination": "/"}],
+            },
+            prelaunch_task_run.extra_launch_metadata(),
+            handle.launch_metadata.get("runtime", {}),
+        )
         self._attach_shared_rootfs_launch_metadata(
             handle.launch_metadata,
             agent_type=task_record.agent_type,
@@ -1589,11 +2074,12 @@ class RealHostScenarioHarness:
             self._extend_termnius_rootfs_materialization(handle.launch_metadata["runtime"], task_record.task_root)
         self._ensure_termnius_dns_materialization(handle.launch_metadata["runtime"])
         self._configure_termnius_bundle_privileges(handle.bundle_dir)
-        runtime_metadata = handle.launch_metadata["runtime"]
-        runtime_metadata["rootfs_init_dirs"] = sorted(
-            set(runtime_metadata.get("rootfs_init_dirs", [])) | set(prelaunch_task_run.rootfs_init_dirs())
+        handle.launch_metadata["runtime"] = _merge_runtime_launch_metadata(
+            handle.launch_metadata["runtime"],
+            {"rootfs_init_dirs": prelaunch_task_run.rootfs_init_dirs()},
+            prelaunch_task_run.extra_launch_metadata(),
         )
-        runtime_metadata.update(prelaunch_task_run.extra_launch_metadata())
+        runtime_metadata = handle.launch_metadata["runtime"]
         self._attach_shared_rootfs_launch_metadata(
             runtime_metadata,
             agent_type=task_record.agent_type,
@@ -1793,11 +2279,11 @@ class RealHostScenarioHarness:
         self._ensure_termnius_dns_materialization(handle.launch_metadata["runtime"])
         self._configure_termnius_bundle_privileges(handle.bundle_dir)
         if prelaunch_task_run is not None:
-            runtime_metadata = handle.launch_metadata["runtime"]
-            runtime_metadata["rootfs_init_dirs"] = sorted(
-                set(runtime_metadata.get("rootfs_init_dirs", [])) | set(prelaunch_task_run.rootfs_init_dirs())
+            handle.launch_metadata["runtime"] = _merge_runtime_launch_metadata(
+                handle.launch_metadata["runtime"],
+                {"rootfs_init_dirs": prelaunch_task_run.rootfs_init_dirs()},
+                prelaunch_task_run.extra_launch_metadata(),
             )
-            runtime_metadata.update(prelaunch_task_run.extra_launch_metadata())
             prelaunch_task_run.configure_bundle()
         self._attach_shared_rootfs_launch_metadata(
             handle.launch_metadata["runtime"],
@@ -1872,10 +2358,8 @@ class RealHostScenarioHarness:
         runtime_metadata["rootfs_init_dirs"] = sorted(init_dirs)
 
     def _ensure_termnius_dns_materialization(self, runtime_metadata: dict[str, object]) -> None:
-        host_resolv_conf = Path("/run/systemd/resolve/resolv.conf")
-        if not host_resolv_conf.is_file():
-            host_resolv_conf = Path("/etc/resolv.conf")
-        if not host_resolv_conf.is_file():
+        host_resolv_conf = _host_resolv_conf_path()
+        if host_resolv_conf is None:
             return
         copy_paths = list(runtime_metadata.get("rootfs_copy_paths", []))
         resolv_item = {"source": str(host_resolv_conf), "destination": "/etc/resolv.conf"}
@@ -2029,8 +2513,10 @@ class RealHostScenarioHarness:
         if self.transfer_delay_ms > 0:
             time.sleep(self.transfer_delay_ms / 1000.0)
         result = self.system.restore_once(sandbox.sandbox_id, checkpoint_id)
-        if result.status.value == "succeeded" and sandbox.task_run is not None:
-            sandbox.task_run.on_restore_complete()
+        if result.status.value == "succeeded":
+            self._repair_sandbox_network_after_recovery(sandbox)
+            if sandbox.task_run is not None:
+                sandbox.task_run.on_restore_complete()
         return result
 
     def notify_fault(self, sandbox: SandboxHandle, *, reason: str = "fault") -> None:
@@ -2072,6 +2558,7 @@ class RealHostScenarioHarness:
         benchmark_support.wait_for(lambda: _matching_record() is not None, timeout_s=timeout_s)
         record = _matching_record()
         if record is not None and record.status in {"restored", "relaunched"} and sandbox.task_run is not None:
+            self._repair_sandbox_network_after_recovery(sandbox)
             sandbox.task_run.on_restore_complete()
             wait_for_task_ready = getattr(sandbox.task_run, "wait_for_task_ready", None)
             if callable(wait_for_task_ready):
@@ -2099,6 +2586,18 @@ class RealHostScenarioHarness:
                     checkpoint_id,
                 )
         return manifests
+
+    def _repair_sandbox_network_after_recovery(self, sandbox: SandboxHandle) -> None:
+        if not sandbox.agent_type:
+            return
+        if not self._agent_requires_benchmark_network(sandbox.agent_type):
+            return
+        repaired = self.network_manager.repair_lease(sandbox.sandbox_id)
+        if not repaired:
+            logger.debug(
+                "Skipped benchmark network repair sandbox=%s reason=no_lease_or_repair_failed",
+                sandbox.sandbox_id,
+            )
 
     def collect_tree_search_checkpoints(
         self,
@@ -2279,12 +2778,22 @@ class RealHostScenarioHarness:
         self.network_manager.release_lease(sandbox.sandbox_id)
         self._sandbox_by_id.pop(sandbox.sandbox_id, None)
 
-    def _relaunch_sandbox(self, sandbox_id: SandboxId, event_type: str) -> None:
+    def _relaunch_sandbox(
+        self,
+        sandbox_id: SandboxId,
+        event_type: str,
+        preserve_filesystem_state: bool = False,
+    ) -> None:
         _ = event_type
         handle = self._sandbox_by_id[sandbox_id]
-        self.relaunch_sandbox(handle)
+        self.relaunch_sandbox(handle, preserve_filesystem_state=preserve_filesystem_state)
 
-    def relaunch_sandbox(self, sandbox: SandboxHandle) -> dict[str, object]:
+    def relaunch_sandbox(
+        self,
+        sandbox: SandboxHandle,
+        *,
+        preserve_filesystem_state: bool = False,
+    ) -> dict[str, object]:
         assert self.base_inspector is not None
         assert self.runtime is not None
 
@@ -2299,7 +2808,10 @@ class RealHostScenarioHarness:
             and not (sandbox.launch_source == "compose" and sandbox.llm_service_type == "iflow_trace_replay")
         )
         self._delete_runtime(sandbox.sandbox_id)
-        self._destroy_filesystem_dataset(sandbox.sandbox_id)
+        if preserve_filesystem_state:
+            metadata["_agent_cr_runtime_reuse_existing_rootfs"] = True
+        else:
+            self._destroy_filesystem_dataset(sandbox.sandbox_id)
         self.runtime.launch("runc", metadata)
         if not preserve_task_run:
             self._reset_llm_service_state(sandbox.sandbox_id)
@@ -2489,7 +3001,7 @@ class RealHostScenarioHarness:
             if extra_launch_metadata:
                 description = replace(
                     description,
-                    metadata={**description.metadata, **extra_launch_metadata},
+                    metadata=_merge_runtime_launch_metadata(description.metadata, extra_launch_metadata),
                 )
                 self.runtime._items[target.sandbox_id] = description
                 self.runtime._persist(description)
@@ -2670,8 +3182,266 @@ class RealHostScenarioHarness:
 
     def wait_for_task_completion(self, sandbox: SandboxHandle, *, timeout_s: float | None = None) -> None:
         if sandbox.task_future is None:
+            future = None
+        else:
+            future = sandbox.task_future
+        deadline = None if timeout_s is None else time.monotonic() + max(0.0, float(timeout_s))
+        trace_response_count = benchmark_core.trace_response_count_for_sandbox(sandbox)
+        replay_completion_wait_started_at: float | None = None
+        replay_stop_requested = False
+        while True:
+            if benchmark_support.is_replay_llm_service_type(sandbox.llm_service_type):
+                status = benchmark_core.poll_sandbox_status(sandbox)
+                if benchmark_core.replay_status_is_complete(
+                    status,
+                    trace_response_count=trace_response_count,
+                ):
+                    if self.system is not None and self.system.has_pending_interceptor_signal(sandbox.sandbox_id):
+                        replay_completion_wait_started_at = None
+                        logger.debug(
+                            "Delaying replay task completion short-circuit until pending interceptor work clears "
+                            "sandbox=%s replay_final_trace_cursor=%d trace_response_count=%d",
+                            sandbox.sandbox_id,
+                            benchmark_core.replay_trace_cursor(status),
+                            trace_response_count,
+                        )
+                        time.sleep(0.05)
+                        continue
+                    if future is not None and not future.done():
+                        now = time.monotonic()
+                        if replay_completion_wait_started_at is None:
+                            replay_completion_wait_started_at = now
+                        wait_s = max(0.0, now - replay_completion_wait_started_at)
+                        if (
+                            not replay_stop_requested
+                            and wait_s >= self.REPLAY_COMPLETION_TASK_FUTURE_GRACE_SECONDS
+                            and sandbox.task_run is not None
+                        ):
+                            logger.warning(
+                                "Replay is complete but task future is still running; requesting stop "
+                                "sandbox=%s replay_final_trace_cursor=%d trace_response_count=%d wait_s=%.3f",
+                                sandbox.sandbox_id,
+                                benchmark_core.replay_trace_cursor(status),
+                                trace_response_count,
+                                wait_s,
+                            )
+                            sandbox.task_run.request_stop()
+                            replay_stop_requested = True
+                        logger.debug(
+                            "Delaying replay task completion short-circuit until task future completes "
+                            "sandbox=%s replay_final_trace_cursor=%d trace_response_count=%d wait_s=%.3f",
+                            sandbox.sandbox_id,
+                            benchmark_core.replay_trace_cursor(status),
+                            trace_response_count,
+                            wait_s,
+                        )
+                        time.sleep(0.05)
+                        continue
+                    replay_completion_wait_started_at = None
+                    if self.runtime is not None:
+                        try:
+                            self.runtime.resume(sandbox.sandbox_id)
+                        except Exception:
+                            logger.debug(
+                                "Best-effort runtime resume before replay completion short-circuit failed "
+                                "sandbox=%s",
+                                sandbox.sandbox_id,
+                                exc_info=True,
+                            )
+                    logger.info(
+                        "Benchmark task completion short-circuit sandbox=%s replay_final_trace_cursor=%d "
+                        "trace_response_count=%d",
+                        sandbox.sandbox_id,
+                        benchmark_core.replay_trace_cursor(status),
+                        trace_response_count,
+                    )
+                    return
+            if future is None:
+                return
+            wait_timeout = 1.0
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise TimeoutError
+                wait_timeout = min(wait_timeout, remaining)
+            try:
+                future.result(timeout=wait_timeout)
+                return
+            except FutureTimeoutError:
+                continue
+            except Exception:
+                if benchmark_support.is_replay_llm_service_type(sandbox.llm_service_type):
+                    status = benchmark_core.poll_sandbox_status(sandbox)
+                    if benchmark_core.replay_status_is_complete(
+                        status,
+                        trace_response_count=trace_response_count,
+                    ):
+                        if self.system is not None and self.system.has_pending_interceptor_signal(sandbox.sandbox_id):
+                            logger.debug(
+                                "Ignoring replay completion exception but waiting for pending interceptor work "
+                                "to clear sandbox=%s replay_final_trace_cursor=%d trace_response_count=%d",
+                                sandbox.sandbox_id,
+                                benchmark_core.replay_trace_cursor(status),
+                                trace_response_count,
+                            )
+                            time.sleep(0.05)
+                            continue
+                        if self.runtime is not None:
+                            try:
+                                self.runtime.resume(sandbox.sandbox_id)
+                            except Exception:
+                                logger.debug(
+                                    "Best-effort runtime resume before ignoring replay completion exception "
+                                    "failed sandbox=%s",
+                                    sandbox.sandbox_id,
+                                    exc_info=True,
+                                )
+                        logger.info(
+                            "Ignoring replay task completion exception after replay completed sandbox=%s "
+                            "replay_final_trace_cursor=%d trace_response_count=%d",
+                            sandbox.sandbox_id,
+                            benchmark_core.replay_trace_cursor(status),
+                            trace_response_count,
+                        )
+                        return
+                raise
+
+    def _ensure_verification_uv_timeout_seconds(self, timeout_s: float | None) -> float:
+        if timeout_s is None:
+            return 30.0
+        try:
+            return max(30.0, float(timeout_s))
+        except (TypeError, ValueError):
+            return 30.0
+
+    def _verification_uv_failure_is_transient(self, stderr: str) -> bool:
+        return any(fragment in stderr for fragment in _VERIFICATION_UV_TRANSIENT_ERROR_FRAGMENTS)
+
+    def _wait_for_verification_network(self, sandbox: SandboxHandle, *, timeout_s: float | None = None) -> None:
+        if not self._agent_requires_benchmark_network(sandbox.agent_type):
             return
-        sandbox.task_future.result(timeout=timeout_s)
+        total_timeout_s = min(
+            _VERIFICATION_NETWORK_READY_TIMEOUT_SECONDS,
+            self._ensure_verification_uv_timeout_seconds(timeout_s),
+        )
+        deadline = time.monotonic() + total_timeout_s
+        last_stderr = ""
+        attempt = 0
+        refreshed_resolv_conf = False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            attempt += 1
+            result = self.exec_in_sandbox(
+                sandbox,
+                ["/bin/bash", "-lc", self._verification_network_probe_script()],
+                cwd=self.sandbox_process_cwd(sandbox),
+                timeout_s=max(1.0, min(5.0, remaining)),
+            )
+            if result.returncode == 0:
+                if attempt > 1:
+                    logger.info(
+                        "Verification network became ready sandbox=%s attempts=%d",
+                        sandbox.sandbox_id,
+                        attempt,
+                    )
+                return
+            last_stderr = result.stderr.rstrip()
+            logger.debug(
+                "Waiting for verification network readiness sandbox=%s attempt=%d stderr=%s",
+                sandbox.sandbox_id,
+                attempt,
+                last_stderr,
+            )
+            if (
+                not refreshed_resolv_conf
+                and "Temporary failure" in last_stderr
+                and self._refresh_sandbox_resolv_conf(sandbox)
+            ):
+                refreshed_resolv_conf = True
+            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+        logger.warning(
+            "Verification network readiness probe timed out sandbox=%s stderr=%s",
+            sandbox.sandbox_id,
+            last_stderr,
+        )
+
+    def _refresh_sandbox_resolv_conf(self, sandbox: SandboxHandle) -> bool:
+        host_resolv_conf = _host_resolv_conf_path()
+        if host_resolv_conf is None:
+            return False
+        contents = host_resolv_conf.read_text(encoding="utf-8")
+        result = self.exec_in_sandbox(
+            sandbox,
+            [
+                "/bin/bash",
+                "-lc",
+                (
+                    "python3 - <<'PY'\n"
+                    "from pathlib import Path\n"
+                    f"Path('/etc/resolv.conf').write_text({contents!r}, encoding='utf-8')\n"
+                    "PY"
+                ),
+            ],
+            cwd=self.sandbox_process_cwd(sandbox),
+            timeout_s=10.0,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "Failed to refresh sandbox resolv.conf sandbox=%s source=%s exit_code=%s stderr=%s",
+                sandbox.sandbox_id,
+                host_resolv_conf,
+                result.returncode,
+                result.stderr.rstrip(),
+            )
+            return False
+        logger.info(
+            "Refreshed sandbox resolv.conf before verification sandbox=%s source=%s",
+            sandbox.sandbox_id,
+            host_resolv_conf,
+        )
+        return True
+
+    def _ensure_verification_uv(self, sandbox: SandboxHandle, *, timeout_s: float | None = None) -> None:
+        total_timeout_s = self._ensure_verification_uv_timeout_seconds(timeout_s)
+        deadline = time.monotonic() + total_timeout_s
+        last_result = None
+        for attempt in range(1, 4):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            result = self.exec_in_sandbox(
+                sandbox,
+                ["/bin/bash", "-lc", self._verification_uv_bootstrap_script()],
+                cwd=self.sandbox_process_cwd(sandbox),
+                timeout_s=max(1.0, remaining),
+            )
+            if result.returncode == 0:
+                return
+            last_result = result
+            stderr = result.stderr.rstrip()
+            if attempt >= 3 or not self._verification_uv_failure_is_transient(stderr):
+                break
+            backoff_s = min(float(attempt), max(0.0, deadline - time.monotonic()))
+            logger.warning(
+                "Retrying transient verification uv bootstrap failure sandbox=%s attempt=%d exit_code=%s stderr=%s",
+                sandbox.sandbox_id,
+                attempt,
+                result.returncode,
+                stderr,
+            )
+            if backoff_s > 0.0:
+                time.sleep(backoff_s)
+        if last_result is None:
+            raise RuntimeError(
+                f"failed to prepare verification uv shim sandbox={sandbox.sandbox_id} before timeout elapsed"
+            )
+        raise RuntimeError(
+            "failed to prepare verification uv shim "
+            f"sandbox={sandbox.sandbox_id} exit_code={last_result.returncode} "
+            f"stderr={last_result.stderr.rstrip()}"
+        )
 
     def verify_task_accuracy(
         self,
@@ -2690,6 +3460,8 @@ class RealHostScenarioHarness:
             "benchmark.task.verify",
             self.benchmark_telemetry_attributes(sandbox),
         )
+        self._wait_for_verification_network(sandbox, timeout_s=timeout_s)
+        self._ensure_verification_uv(sandbox, timeout_s=timeout_s)
         verification_command = "bash /tests/run-tests.sh"
         if swebench_instance_id:
             verification_command = "bash /tests/run-tests.sh 2>&1"
@@ -2697,7 +3469,13 @@ class RealHostScenarioHarness:
             sandbox,
             ["/bin/bash", "-lc", verification_command],
             cwd=self.sandbox_process_cwd(sandbox),
-            env={"TEST_DIR": "/tests"},
+            env={
+                "TEST_DIR": "/tests",
+                "PATH": (
+                    "/root/.local/agent-cr-verification/bin:/root/.local/bin:"
+                    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+                ),
+            },
             timeout_s=timeout_s,
         )
         verification_ms = (time.perf_counter() - command_started) * 1000.0
@@ -2801,35 +3579,31 @@ class RealHostScenarioHarness:
             except Exception:
                 logger.debug("Failed to poll task status for llm checkpoint metadata sandbox=%s", sandbox_id, exc_info=True)
             else:
-                try:
-                    trace_cursor = max(0, int(status.get("replay_trace_cursor", -1)))
-                except (TypeError, ValueError):
-                    trace_cursor = -1
-                if trace_cursor >= 0:
+                trace_cursor = self._benchmark_trace_cursor_from_status(status)
+                if trace_cursor is not None:
                     return {"benchmark_trace_cursor": trace_cursor}
         try:
             snapshot = self._snapshot_llm_services(sandbox_id)
         except Exception:
-            logger.exception("Failed to capture llm service checkpoint metadata for sandbox=%s", sandbox_id)
+            logger.debug("Failed to capture llm service checkpoint metadata for sandbox=%s", sandbox_id, exc_info=True)
             return {}
         if snapshot is None:
             return {}
         sandbox_snapshot = snapshot if isinstance(snapshot, dict) and "state" in snapshot else snapshot.get(str(sandbox_id))
         if not isinstance(sandbox_snapshot, dict):
             return {}
-        if sandbox_snapshot.get("llm_service_type") not in {"iflow_trace_replay", "mini_swe_trace_replay"}:
+        if sandbox_snapshot.get("llm_service_type") not in {
+            "iflow_trace_replay",
+            "mini_swe_trace_replay",
+            "claude_code_trace_replay",
+        }:
             return {}
         state = sandbox_snapshot.get("state")
         if not isinstance(state, dict):
             return {}
-        try:
-            consumed_response_count = max(0, int(state.get("consumed_response_count", 0)))
-        except (TypeError, ValueError):
+        trace_cursor = self._benchmark_trace_cursor_from_snapshot_state(state)
+        if trace_cursor is None:
             return {}
-        try:
-            trace_cursor = max(0, int(state.get("trace_cursor", consumed_response_count)))
-        except (TypeError, ValueError):
-            trace_cursor = consumed_response_count
         return {"benchmark_trace_cursor": trace_cursor}
 
     def _reset_llm_service_state(self, sandbox_id: SandboxId) -> None:
@@ -2843,6 +3617,26 @@ class RealHostScenarioHarness:
     @staticmethod
     def _benchmark_trace_cursor_from_metadata(metadata: dict[str, object]) -> int | None:
         raw_value = metadata.get("benchmark_trace_cursor")
+        try:
+            return max(0, int(raw_value))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _benchmark_trace_cursor_from_status(status: object) -> int | None:
+        if not isinstance(status, dict):
+            return None
+        raw_value = status.get("replay_trace_cursor")
+        try:
+            return max(0, int(raw_value))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _benchmark_trace_cursor_from_snapshot_state(state: object) -> int | None:
+        if not isinstance(state, dict):
+            return None
+        raw_value = state.get("trace_cursor", state.get("consumed_response_count"))
         try:
             return max(0, int(raw_value))
         except (TypeError, ValueError):

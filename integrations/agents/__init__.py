@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from integrations.agents.base import BaseAgent, TaskConfig, TaskDescription
+from integrations.agents.claude_code import ClaudeCodeAgent
 from integrations.agents.contracts import SandboxHandle
 from integrations.agents.iflow import IFlowAgent
 from integrations.agents.mini_swe import MiniSweAgent
@@ -12,11 +13,13 @@ def build_agent_registry() -> dict[str, type[BaseAgent]]:
         SimulatedAgent.agent_type: SimulatedAgent,
         IFlowAgent.agent_type: IFlowAgent,
         MiniSweAgent.agent_type: MiniSweAgent,
+        ClaudeCodeAgent.agent_type: ClaudeCodeAgent,
     }
 
 
 __all__ = [
     "BaseAgent",
+    "ClaudeCodeAgent",
     "IFlowAgent",
     "MiniSweAgent",
     "SandboxHandle",

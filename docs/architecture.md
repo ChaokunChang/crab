@@ -199,7 +199,7 @@ The benchmark runner now coordinates three phases across the whole run:
 2. `run`
 3. `verification`
 
-By default, `run` does not begin until all sandboxes finish `setup`, and `verification` does not begin until all sandboxes finish `run`. When `phase_merging.setup_and_run` is enabled, eligible per-sandbox flows can pipeline setup directly into run so each sandbox starts run work immediately after its own setup completes. The verification barrier remains unchanged. Each phase has its own configurable worker limit from benchmark YAML.
+By default, `run` does not begin until all sandboxes finish `setup`, and `verification` does not begin until all sandboxes finish `run`. When `phase_merging.setup_and_run` is enabled, eligible per-sandbox flows can pipeline setup directly into run so each sandbox starts run work immediately after its own setup completes. The verification barrier remains unchanged. By default, merged setup/run scheduling still uses separate setup and run executor pools. Setting `phase_merging.setup_and_run_executor_pool: shared` switches merged flows to a single executor pool that runs one combined `setup+run` task per sandbox.
 
 The main benchmark entrypoints and configuration surface are:
 

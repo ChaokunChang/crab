@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
+import shutil
 import time
 
 from benchmarks.config import BenchmarkConfig, load_config
@@ -41,6 +42,24 @@ def _prepare_telemetry_output_path(path: Path, *, file_mode: str) -> None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     path.unlink(missing_ok=True)
+
+
+def _clear_benchmark_root_if_needed(config: BenchmarkConfig, harness_context: object | None) -> None:
+    if not config.clear_benchmark_root_after_run or harness_context is None:
+        return
+    if bool(getattr(harness_context, "uses_temporary_root", False)):
+        return
+    benchmark_run_root = getattr(harness_context, "root", None)
+    if benchmark_run_root is None:
+        return
+    root_path = Path(benchmark_run_root).expanduser().resolve()
+    if not root_path.exists():
+        return
+    logger.info("Clearing benchmark run root %s", root_path)
+    try:
+        shutil.rmtree(root_path)
+    except Exception:
+        logger.exception("Failed to clear benchmark run root %s", root_path)
 
 
 def parse_args() -> argparse.Namespace:
@@ -191,9 +210,10 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
     _prepare_telemetry_output_path(telemetry_output, file_mode=config.telemetry_file_mode)
     executor_default_workers = max(settings.max_workers, config.effective_phase_workers.run)
     executor_config = config.executor.resolve(default_workers=executor_default_workers)
+    harness_context: object | None = None
     try:
         teardown_started_at: float | None = None
-        with RealHostScenarioHarness(
+        harness_context = RealHostScenarioHarness(
             provider=config.provider,
             transfer_delay_ms=config.transfer_delay_ms,
             scheduler_config=settings.scheduler_config,
@@ -219,6 +239,8 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
             zpool_name=config.zpool_name,
             zpool_image=config.zpool_image,
             reuse_zpool=config.reuse_zpool,
+            runtime_command_timeout_seconds=config.runtime_command_timeout_seconds,
+            runtime_zfs_prepare_timeout_seconds=config.runtime_zfs_prepare_timeout_seconds,
             image_cache_root=config.image_cache_root,
             run_id=str(run_context["run_id"]),
             monitoring_enabled=config.monitoring.enabled,
@@ -232,7 +254,8 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
             agent_host_root=config.storage_planes.agent_host_root,
             expected_sandboxes=config.sandboxes,
             rootfs_reuse_enabled=config.rootfs_reuse.enabled,
-        ) as harness:
+        )
+        with harness_context as harness:
             if scenario.prepare_harness is not None:
                 scenario.prepare_harness(config, harness)
             rows = scenario.runner_for_mode(config.mode)(config, harness)
@@ -327,6 +350,8 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
             benchmark_run_duration_seconds(run_context),
         )
         raise
+    finally:
+        _clear_benchmark_root_if_needed(config, harness_context)
 
 
 def main() -> None:

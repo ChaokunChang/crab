@@ -53,8 +53,9 @@ class FakeCommandRunner(CommandRunner):
         self.commands: list[tuple[str, ...]] = []
         self._running_sandboxes: set[str] = set()
 
-    def run(self, command: list[str], *, cwd: Path | None = None):
+    def run(self, command: list[str], *, cwd: Path | None = None, timeout_seconds: float | None = None):
         _ = cwd
+        _ = timeout_seconds
         self.commands.append(tuple(command))
         if "start" in command:
             self._running_sandboxes.add(command[-1])
@@ -84,8 +85,8 @@ class FakeCommandRunner(CommandRunner):
 
 
 class FailingRestoreRunner(FakeCommandRunner):
-    def run(self, command: list[str], *, cwd: Path | None = None):
-        result = super().run(command, cwd=cwd)
+    def run(self, command: list[str], *, cwd: Path | None = None, timeout_seconds: float | None = None):
+        result = super().run(command, cwd=cwd, timeout_seconds=timeout_seconds)
         if "restore" in command:
             return type(
                 "Result",
@@ -100,8 +101,8 @@ class RestoreMissingRuntimeRunner(FakeCommandRunner):
         super().__init__()
         self._restore_attempted = False
 
-    def run(self, command: list[str], *, cwd: Path | None = None):
-        result = super().run(command, cwd=cwd)
+    def run(self, command: list[str], *, cwd: Path | None = None, timeout_seconds: float | None = None):
+        result = super().run(command, cwd=cwd, timeout_seconds=timeout_seconds)
         if "restore" in command:
             self._restore_attempted = True
             return result
@@ -920,14 +921,16 @@ class SystemIntegrationTests(unittest.TestCase):
             collector = InMemoryEBPFEventCollector()
             inspector = EBPFSandboxInspector(collector)
             request_store = InMemoryRequestStateStore()
-            relaunched: list[tuple[SandboxId, str]] = []
+            relaunched: list[tuple[SandboxId, str, bool]] = []
             system, executor = self._build_runc_system(
                 root=root,
                 runner=runner,
                 telemetry=telemetry,
                 inspector=inspector,
                 request_store=request_store,
-                relaunch_handler=lambda sandbox_id, event_type: relaunched.append((sandbox_id, event_type)),
+                relaunch_handler=lambda sandbox_id, event_type, preserve_fs: relaunched.append(
+                    (sandbox_id, event_type, preserve_fs)
+                ),
                 enforce_restore_checkpoint_validation=True,
             )
             sandbox_id = system.sandbox_manager.launch(
@@ -981,7 +984,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 executor.shutdown()
 
             self.assertEqual(record.status, "relaunched")
-            self.assertEqual(relaunched, [(sandbox_id, "fault")])
+            self.assertEqual(relaunched, [(sandbox_id, "fault", False)])
             self.assertFalse(any(command[3] == "restore" for command in runner.commands if len(command) > 3))
 
     def test_fault_notification_relaunches_when_restore_fails(self) -> None:
@@ -992,7 +995,8 @@ class SystemIntegrationTests(unittest.TestCase):
             collector = InMemoryEBPFEventCollector()
             inspector = EBPFSandboxInspector(collector)
             request_store = InMemoryRequestStateStore()
-            relaunched: list[tuple[SandboxId, str]] = []
+            relaunched: list[tuple[SandboxId, str, bool]] = []
+            restored_metadata: list[tuple[SandboxId, object]] = []
 
             runtime = RuncRuntimeAdapter(
                 command_runner=runner,
@@ -1049,7 +1053,12 @@ class SystemIntegrationTests(unittest.TestCase):
                 runtime=sandbox_manager,
                 telemetry=telemetry,
                 request_state_store=request_store,
-                relaunch_handler=lambda sandbox_id, event_type: relaunched.append((sandbox_id, event_type)),
+                relaunch_handler=lambda sandbox_id, event_type, preserve_fs: relaunched.append(
+                    (sandbox_id, event_type, preserve_fs)
+                ),
+                restore_metadata_handler=lambda sandbox_id, manifest: restored_metadata.append(
+                    (sandbox_id, manifest.checkpoint_id)
+                ),
             )
             sandbox_id = system.sandbox_manager.launch(
                 "runc",
@@ -1091,7 +1100,8 @@ class SystemIntegrationTests(unittest.TestCase):
                 executor.shutdown()
 
             self.assertEqual(record.status, "relaunched")
-            self.assertEqual(relaunched, [(sandbox_id, "fault")])
+            self.assertEqual(relaunched, [(sandbox_id, "fault", True)])
+            self.assertEqual(restored_metadata, [(sandbox_id, checkpoint_result.checkpoint_id)])
 
     def test_restore_once_fails_when_runtime_does_not_come_back(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
@@ -1132,6 +1142,62 @@ class SystemIntegrationTests(unittest.TestCase):
             self.assertEqual(result.status, JobStatus.FAILED)
             self.assertEqual(result.failure_code, FailureCode.RUNTIME_ERROR)
             self.assertIn("is not running", result.message or "")
+
+    def test_restore_once_preloads_restore_metadata_before_process_resume(self) -> None:
+        class RestoreOrderingRunner(FakeCommandRunner):
+            def __init__(self, events: list[str]) -> None:
+                super().__init__()
+                self._events = events
+
+            def run(self, command: list[str], *, cwd: Path | None = None, timeout_seconds: float | None = None):
+                if "restore" in command:
+                    self._events.append("restore_command")
+                return super().run(command, cwd=cwd, timeout_seconds=timeout_seconds)
+
+        with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
+            root = Path(tmp)
+            events: list[str] = []
+            runner = RestoreOrderingRunner(events)
+            telemetry = InMemoryTelemetrySink()
+            collector = InMemoryEBPFEventCollector()
+            inspector = EBPFSandboxInspector(collector)
+            system, executor = self._build_runc_system(
+                root=root,
+                runner=runner,
+                telemetry=telemetry,
+                inspector=inspector,
+            )
+            system.restore_metadata_handler = lambda sandbox_id, manifest: events.append(
+                f"restore_metadata:{sandbox_id}:{manifest.checkpoint_id}"
+            )
+            sandbox_id = system.sandbox_manager.launch(
+                "runc",
+                {
+                    "sandbox_id": "sbx-preload-restore-metadata",
+                    "bundle_path": str(root / "bundles" / "sbx-preload-restore-metadata"),
+                },
+            )
+            inspector.upsert_snapshot(
+                SandboxSnapshot(
+                    sandbox_id=sandbox_id,
+                    runtime_name="runc",
+                    is_running=True,
+                    process_changed=True,
+                    filesystem_changed=True,
+                    observed_at=utc_now(),
+                )
+            )
+            checkpoint_result = system.checkpoint_if_due(sandbox_id)
+            self.assertIsNotNone(checkpoint_result)
+
+            result = system.restore_once(sandbox_id, checkpoint_result.checkpoint_id)
+            executor.shutdown()
+
+            self.assertEqual(result.status, JobStatus.SUCCEEDED)
+            self.assertTrue(events)
+            self.assertTrue(events[0].startswith("restore_metadata:"))
+            self.assertIn("restore_command", events)
+            self.assertLess(events.index(next(event for event in events if event.startswith("restore_metadata:"))), events.index("restore_command"))
 
     def test_preemption_notification_checkpoints_then_restores(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:

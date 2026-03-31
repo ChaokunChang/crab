@@ -21,7 +21,7 @@ from benchmarks.core import (
     trace_response_count_for_sandbox,
 )
 from benchmarks.scenarios import HarnessSettings, ScenarioDefinition
-from benchmarks.scenarios.common import cleanup_finished_replay_sandbox_after_run
+from benchmarks.scenarios.common import cleanup_finished_replay_sandbox_after_run, resolve_scheduler_policy_override
 from benchmarks.support import (
     compute_summary,
     is_replay_llm_service_type,
@@ -54,7 +54,10 @@ def build_harness_settings(config: BenchmarkConfig) -> HarnessSettings:
     )
     return HarnessSettings(
         scheduler_config=scheduler_config,
-        scheduler_policy=None,
+        scheduler_policy=resolve_scheduler_policy_override(
+            config,
+            scenario_default_policy=None,
+        ),
         checkpoint_manager_factory=lambda base: base,
         max_workers=config.effective_max_workers,
     )
@@ -181,6 +184,7 @@ def run_manual(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
                     sandbox_name=prepared.sandbox_name,
                     sandbox=prepared.handle,
                 ),
+                executor_pool=config.phase_merging.setup_and_run_executor_pool,
             )
         else:
             prepared = setup_task_records_phase(

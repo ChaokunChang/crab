@@ -34,6 +34,7 @@ from benchmarks.support import (
     build_tree_search_checkpoint_index,
     compute_summary,
 )
+from benchmarks.scenarios.common import resolve_scheduler_policy_override
 
 
 _TASK_STOP_REQUEST_GRACE_SECONDS = 1.0
@@ -88,7 +89,10 @@ def build_harness_settings(config: BenchmarkConfig) -> HarnessSettings:
     )
     return HarnessSettings(
         scheduler_config=scheduler_config,
-        scheduler_policy=TreeSearchCheckpointingPolicy(),
+        scheduler_policy=resolve_scheduler_policy_override(
+            config,
+            scenario_default_policy=TreeSearchCheckpointingPolicy(),
+        ),
         checkpoint_manager_factory=lambda base: KeepAllCheckpointManager(base),
         max_workers=max(1, config.effective_max_workers * max(1, options.branch_points + 1)),
     )
@@ -523,6 +527,7 @@ def run_manual(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
                 sandbox_name=prepared.sandbox_name,
                 sandbox=prepared.handle,
             ),
+            executor_pool=config.phase_merging.setup_and_run_executor_pool,
         )
     else:
         prepared_sources = _setup_source_specs(config, harness)
@@ -601,6 +606,7 @@ def run_auto(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
                     sandbox_name=prepared.sandbox_name,
                     sandbox=prepared.handle,
                 ),
+                executor_pool=config.phase_merging.setup_and_run_executor_pool,
             )
         else:
             prepared_sources = _setup_source_specs(config, harness)

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import logging
 import math
 import random
 import time
 
 from agent_cr import CheckpointId
+from agent_cr.models import SchedulerCheckpointDecision
 from integrations.agents import SandboxHandle, TaskConfig
 
 from benchmarks.config import BenchmarkConfig
@@ -12,11 +14,48 @@ from benchmarks.core import (
     annotate_row,
     emit_row_telemetry,
     poll_sandbox_status,
+    replay_action_count_wait_error,
+    replay_status_is_complete,
+    replay_trace_cursor,
     task_completion_timeout_seconds,
     trace_response_count_for_sandbox,
     verify_task_accuracy,
 )
 from benchmarks.support import average, task_timeout_seconds, total_actions
+
+logger = logging.getLogger(__name__)
+
+
+class NoCheckpointingPolicy:
+    def __init__(self, *, reason: str = "scheduler_policy_no_checkpointing") -> None:
+        self._reason = reason
+
+    @property
+    def name(self) -> str:
+        return "no-checkpointing"
+
+    def evaluate(self, snapshot) -> SchedulerCheckpointDecision:
+        return SchedulerCheckpointDecision(
+            should_checkpoint=False,
+            checkpoint_process=False,
+            checkpoint_filesystem=False,
+            leave_running=False,
+            reason=self._reason,
+            policy_name=self.name,
+        )
+
+
+def resolve_scheduler_policy_override(
+    config: BenchmarkConfig,
+    *,
+    scenario_default_policy,
+):
+    policy = config.scheduler.policy
+    if policy in (None, "scenario_default"):
+        return scenario_default_policy
+    if policy == "no_checkpointing":
+        return NoCheckpointingPolicy()
+    raise ValueError(f"unsupported scheduler.policy={policy!r} for scenario {config.scenario!r}")
 
 
 def should_inject_event(
@@ -55,14 +94,6 @@ def wait_for_iteration_progress(
     if iteration == 1:
         return sandbox.task_run.wait_for_progress(minimum_actions=initial_actions)
     return sandbox.task_run.wait_for_action_delta(delta=later_action_delta)
-
-
-def replay_status_is_complete(status: dict[str, object], *, trace_response_count: int) -> bool:
-    if bool(status.get("replay_is_complete", False)):
-        return True
-    if trace_response_count <= 0:
-        return False
-    return total_actions(status) >= trace_response_count
 
 
 def manifest_trace_cursor(manifest) -> int:
@@ -153,25 +184,47 @@ def finalize_replay_row(
     success_ratio: float | None = None,
 ) -> dict[str, object]:
     trace_response_count = trace_response_count_for_sandbox(sandbox)
+    pre_verification_status = poll_sandbox_status(sandbox)
+    pre_verification_replay_is_complete = replay_status_is_complete(
+        pre_verification_status,
+        trace_response_count=trace_response_count,
+    )
+    normalized_task_error = task_error
+    if pre_verification_replay_is_complete and replay_action_count_wait_error(task_error):
+        logger.info(
+            "Ignoring stale replay progress error after replay completed sandbox=%s task=%s error=%r "
+            "replay_final_trace_cursor=%d trace_response_count=%d",
+            sandbox.sandbox_id,
+            getattr(sandbox.sandbox_id, "value", str(sandbox.sandbox_id)),
+            task_error,
+            replay_trace_cursor(pre_verification_status),
+            trace_response_count,
+        )
+        normalized_task_error = ""
     should_verify = verify_task_accuracy_result and config.verification_enabled
+    initial_task_error = task_error
     if should_verify:
         verification = {
-            "verification_status": "task_failed" if task_error else "verification_skipped",
+            "verification_status": "task_failed" if normalized_task_error else "verification_skipped",
             "verification_exit_code": -1,
             "verification_ms": 0.0,
         }
-        if not task_error:
-            task_error, verification = verify_task_accuracy(harness, sandbox)
+        if not normalized_task_error:
+            normalized_task_error, verification = verify_task_accuracy(harness, sandbox)
     else:
         verification = {}
     status = poll_sandbox_status(sandbox)
-    replay_is_complete = replay_status_is_complete(status, trace_response_count=trace_response_count)
-    raw_replay_final_trace_cursor = int(status.get("replay_trace_cursor", status.get("total_actions", 0)))
+    post_verification_replay_is_complete = replay_status_is_complete(status, trace_response_count=trace_response_count)
+    replay_is_complete = pre_verification_replay_is_complete or post_verification_replay_is_complete
+    raw_replay_final_trace_cursor = max(
+        replay_trace_cursor(pre_verification_status),
+        replay_trace_cursor(status),
+    )
     replay_final_trace_cursor = raw_replay_final_trace_cursor
     if replay_is_complete and trace_response_count > 0:
-        replay_final_trace_cursor = min(replay_final_trace_cursor, trace_response_count)
-    if not task_error and str(status.get("state", "")) == "finished" and not replay_is_complete:
-        task_error = (
+        replay_final_trace_cursor = trace_response_count
+    if not normalized_task_error and str(status.get("state", "")) == "finished" and not replay_is_complete:
+        normalized_task_error = (
             "replay task finished before reaching the end of the trace "
             f"(replay_final_trace_cursor={raw_replay_final_trace_cursor}, trace_response_count={trace_response_count})"
         )
@@ -189,16 +242,52 @@ def finalize_replay_row(
         **verification,
     }
     if should_verify:
-        resolved_success_ratio = 1.0 if not task_error and verification["verification_status"] == "passed" else 0.0
+        resolved_success_ratio = (
+            1.0 if not normalized_task_error and verification["verification_status"] == "passed" else 0.0
+        )
     else:
-        resolved_success_ratio = 0.0 if task_error else (1.0 if success_ratio is None else float(success_ratio))
+        resolved_success_ratio = (
+            0.0 if normalized_task_error else (1.0 if success_ratio is None else float(success_ratio))
+        )
     annotated = annotate_row(
         config,
         sandbox,
         iteration=iteration,
         success_ratio=resolved_success_ratio,
-        task_error=task_error,
+        task_error=normalized_task_error,
         row=row_payload,
+    )
+    emit_event = getattr(harness, "emit_benchmark_event", None)
+    if callable(emit_event):
+        emit_event(
+            "benchmark.replay.row",
+            sandbox,
+            iteration=iteration,
+            event_type=None if row.get("event_type") is None else str(row.get("event_type")),
+            extra={
+                "should_verify": bool(should_verify),
+                "initial_task_error": str(initial_task_error),
+                "task_error": str(normalized_task_error),
+                "verification_status": str(row_payload.get("verification_status", "")),
+                "replay_is_complete": bool(replay_is_complete),
+                "replay_final_trace_cursor": int(replay_final_trace_cursor),
+                "trace_response_count": int(trace_response_count),
+            },
+        )
+    logger.info(
+        "Replay row finalized sandbox=%s task=%s should_verify=%s initial_task_error=%r task_error=%r "
+        "verification_status=%s replay_final_trace_cursor=%d trace_response_count=%d replay_is_complete=%s "
+        "success_ratio=%.3f",
+        sandbox.sandbox_id,
+        annotated.get("task_id", ""),
+        should_verify,
+        initial_task_error,
+        normalized_task_error,
+        row_payload.get("verification_status", ""),
+        replay_final_trace_cursor,
+        trace_response_count,
+        replay_is_complete,
+        resolved_success_ratio,
     )
     emit_row_telemetry(harness, sandbox, annotated, iteration=iteration)
     return annotated

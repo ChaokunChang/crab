@@ -10,7 +10,22 @@ from pathlib import Path
 from typing import Any
 
 _DEFAULT_RESPONSE_DELAY_MS = 0
+_DEFAULT_MINIMAL_DELAY_MS = 0.0
+_DEFAULT_MAXIMAL_DELAY_MS = 1_000_000_000.0
 _RESPONSE_DELAY_POLICIES = {"fixed", "trace_replay"}
+
+
+def _config_with_legacy_alias(
+    config: dict[str, object],
+    key: str,
+    legacy_key: str,
+    default: object,
+) -> object:
+    if key in config:
+        return config[key]
+    if legacy_key in config:
+        return config[legacy_key]
+    return default
 
 
 @dataclass(frozen=True)
@@ -88,6 +103,39 @@ class TraceReplayLLMState:
             self._response_delay_scaling_factor = max(0.0, float(config.get("response_delay_scaling_factor", 1.0)))
         except (TypeError, ValueError):
             self._response_delay_scaling_factor = 1.0
+        try:
+            self._minimal_delay_ms = max(
+                0.0,
+                float(
+                    _config_with_legacy_alias(
+                        config,
+                        "minimal_delay",
+                        "minimal-delay",
+                        _DEFAULT_MINIMAL_DELAY_MS,
+                    )
+                ),
+            )
+        except (TypeError, ValueError):
+            self._minimal_delay_ms = _DEFAULT_MINIMAL_DELAY_MS
+        try:
+            self._maximal_delay_ms = max(
+                0.0,
+                float(
+                    _config_with_legacy_alias(
+                        config,
+                        "maximal_delay",
+                        "maximal-delay",
+                        _DEFAULT_MAXIMAL_DELAY_MS,
+                    )
+                ),
+            )
+        except (TypeError, ValueError):
+            self._maximal_delay_ms = _DEFAULT_MAXIMAL_DELAY_MS
+        if self._maximal_delay_ms < self._minimal_delay_ms:
+            raise ValueError(
+                "maximal_delay must be greater than or equal to minimal_delay, "
+                f"got {self._maximal_delay_ms!r} < {self._minimal_delay_ms!r}"
+            )
         self._response_delay_policy = raw_policy
         self._lock = threading.Lock()
         self._trace_cursor = 0
@@ -114,6 +162,8 @@ class TraceReplayLLMState:
             "response_delay_policy": self._response_delay_policy,
             "response_delay_ms": self._response_delay_ms,
             "response_delay_scaling_factor": self._response_delay_scaling_factor,
+            "minimal_delay": self._minimal_delay_ms,
+            "maximal_delay": self._maximal_delay_ms,
             "trace_cursor": trace_cursor,
             "total_responses": len(self._parsed.assistant_messages),
             "is_complete": trace_cursor >= len(self._parsed.assistant_messages),
@@ -136,9 +186,12 @@ class TraceReplayLLMState:
     def _effective_delay_ms(self, trace_delay_ms: float | None) -> float:
         if self._response_delay_policy == "trace_replay":
             if trace_delay_ms is not None:
-                return trace_delay_ms * self._response_delay_scaling_factor
-            return float(self._response_delay_ms)
-        return float(self._response_delay_ms)
+                delay_ms = trace_delay_ms * self._response_delay_scaling_factor
+            else:
+                delay_ms = float(self._response_delay_ms)
+        else:
+            delay_ms = float(self._response_delay_ms)
+        return min(self._maximal_delay_ms, max(self._minimal_delay_ms, delay_ms))
 
 
 def _completion_response(message: dict[str, Any], *, trace_index: int) -> dict[str, Any]:

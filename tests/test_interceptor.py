@@ -6,6 +6,7 @@ import threading
 import time
 import unittest
 import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from agent_cr import (
@@ -629,6 +630,52 @@ class InterceptorTests(unittest.TestCase):
         self.assertEqual(payload["ok"], True)
         self.assertEqual(payload["upstream_url"], "http://127.0.0.1:9999")
 
+    def test_interceptor_server_forwards_anthropic_count_tokens_requests(self) -> None:
+        captured_paths: list[str] = []
+
+        class _UpstreamHandler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                captured_paths.append(self.path)
+                length = int(self.headers.get("Content-Length", "0"))
+                _ = self.rfile.read(length) if length else b"{}"
+                body = json.dumps({"input_tokens": 7}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args) -> None:
+                _ = (format, args)
+                return
+
+        upstream = HTTPServer(("127.0.0.1", 0), _UpstreamHandler)
+        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+        self.addCleanup(upstream.shutdown)
+        self.addCleanup(upstream.server_close)
+        self.addCleanup(upstream_thread.join, 5.0)
+
+        server = AgentCRRequestInterceptorServer(
+            upstream_url=f"http://127.0.0.1:{upstream.server_address[1]}",
+            request_state_store=InMemoryRequestStateStore(),
+            port=0,
+        )
+        server.start()
+        try:
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.port}/v1/messages/count_tokens",
+                data=json.dumps({"messages": [{"role": "user", "content": "task"}]}).encode("utf-8"),
+                headers={"Content-Type": "application/json", "X-Agent-Sandbox-Id": "sbx-count"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=2.0) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        finally:
+            server.stop()
+
+        self.assertEqual(payload["input_tokens"], 7)
+        self.assertEqual(captured_paths, ["/v1/messages/count_tokens"])
     def test_interceptor_server_stop_closes_upstream_connections_before_server_close(self) -> None:
         server = AgentCRRequestInterceptorServer(
             upstream_url="http://127.0.0.1:9999",

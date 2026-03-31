@@ -29,6 +29,7 @@ from benchmarks.scenarios.common import (
     cleanup_finished_replay_sandbox_after_run,
     finalize_replay_row,
     required_event_was_missed,
+    resolve_scheduler_policy_override,
     replay_status_is_complete,
     should_inject_event,
     wait_for_auto_replay_checkpoint,
@@ -41,7 +42,6 @@ class FaultOptions:
     injection_rate: float = 0.5
     first_forced_event_chunk: int = 0
     delete_filesystem_checkpoints: bool = False
-
 
 def benchmark_task_description() -> TaskDescription:
     return TaskDescription("Continuously work on the benchmark task inside the sandbox.")
@@ -85,7 +85,10 @@ def build_harness_settings(config: BenchmarkConfig) -> HarnessSettings:
     )
     return HarnessSettings(
         scheduler_config=scheduler_config,
-        scheduler_policy=FaultToleranceCheckpointingPolicy(scheduler_config),
+        scheduler_policy=resolve_scheduler_policy_override(
+            config,
+            scenario_default_policy=FaultToleranceCheckpointingPolicy(scheduler_config),
+        ),
         checkpoint_manager_factory=lambda base: LatestOnlyCheckpointManager(
             base,
             delete_filesystem_checkpoints=options.delete_filesystem_checkpoints,
@@ -721,6 +724,7 @@ def run_manual(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
                 phase="run",
                 prepared=prepared,
             ),
+            executor_pool=config.phase_merging.setup_and_run_executor_pool,
         )
     else:
         prepared = setup_task_records_phase(
@@ -811,6 +815,7 @@ def run_auto(config: BenchmarkConfig, harness) -> list[dict[str, object]]:
                 phase="run",
                 prepared=prepared,
             ),
+            executor_pool=config.phase_merging.setup_and_run_executor_pool,
         )
     else:
         prepared = setup_task_records_phase(

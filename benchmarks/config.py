@@ -31,7 +31,9 @@ _HOST_INSPECTOR_LAUNCH_MODES = {"process", "thread"}
 _TELEMETRY_WRITER_MODES = {"sync", "async"}
 _TELEMETRY_OVERFLOW_POLICIES = {"drop_new", "block"}
 _TELEMETRY_SERIALIZERS = {"auto", "stdlib", "orjson"}
+_SCHEDULER_POLICIES = {"scenario_default", "no_checkpointing"}
 _CHECKPOINT_SCHEDULING_POLICIES = {"fifo", "reactive"}
+_SETUP_RUN_EXECUTOR_POOLS = {"separate", "shared"}
 _SUPPORTED_MODES = {
     "e2e": {"manual"},
     "fault": {"manual", "auto"},
@@ -144,6 +146,7 @@ class BenchmarkExecutorConfig:
 
 @dataclass(frozen=True)
 class BenchmarkSchedulerConfig:
+    policy: str | None = None
     min_checkpoint_interval_seconds: float | None = None
     force_checkpoint_after_seconds: float | None = None
     require_change_signal: bool | None = None
@@ -151,6 +154,14 @@ class BenchmarkSchedulerConfig:
     prefer_checkpoint_during_llm_request: bool | None = None
     require_llm_request_for_checkpoint: bool | None = None
     inspect_without_pause: bool | None = None
+
+    def __post_init__(self) -> None:
+        if self.policy is None:
+            return
+        if self.policy not in _SCHEDULER_POLICIES:
+            raise ValueError(
+                f"scheduler.policy must be one of {sorted(_SCHEDULER_POLICIES)}, got {self.policy!r}"
+            )
 
     def apply(self, base: SchedulerConfig) -> SchedulerConfig:
         return SchedulerConfig(
@@ -231,6 +242,14 @@ class BenchmarkRootfsReuseConfig:
 @dataclass(frozen=True)
 class BenchmarkPhaseMergingConfig:
     setup_and_run: bool = False
+    setup_and_run_executor_pool: str = "separate"
+
+    def __post_init__(self) -> None:
+        if self.setup_and_run_executor_pool not in _SETUP_RUN_EXECUTOR_POOLS:
+            raise ValueError(
+                "phase_merging.setup_and_run_executor_pool must be one of "
+                f"{sorted(_SETUP_RUN_EXECUTOR_POOLS)}, got {self.setup_and_run_executor_pool!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -263,16 +282,21 @@ class BenchmarkConfig:
     log_file_mode: str = "append"
     verification_enabled: bool = True
     benchmark_root: Path | None = None
+    clear_benchmark_root_after_run: bool = False
     zpool_size: str = "10G"
     zpool_name: str | None = None
     zpool_image: Path | None = None
     reuse_zpool: bool = False
+    runtime_command_timeout_seconds: float = 60.0
+    runtime_zfs_prepare_timeout_seconds: float = 300.0
     image_cache_root: Path | None = None
     log_level: str = "info"
     transfer_delay_ms: float = 0.0
     work_dir_host_root: Path | None = None
     scenario_options: dict[str, object] = field(default_factory=dict)
     llm_service_options: dict[str, object] = field(default_factory=dict)
+    max_agent_timeout_scale: float = 1.0
+    max_test_timeout_scale: float = 1.0
     telemetry_report: TelemetryReportConfig = field(default_factory=TelemetryReportConfig)
     monitoring: MonitoringConfig = field(default_factory=MonitoringConfig)
     executor: BenchmarkExecutorConfig = field(default_factory=BenchmarkExecutorConfig)
@@ -367,6 +391,11 @@ def _load_scheduler_config(payload: object) -> BenchmarkSchedulerConfig:
         return BenchmarkSchedulerConfig()
     data = _require_object(payload, label="scheduler")
     return BenchmarkSchedulerConfig(
+        policy=(
+            None
+            if data.get("policy") is None
+            else str(data["policy"]).strip().lower()
+        ),
         min_checkpoint_interval_seconds=(
             None
             if data.get("min_checkpoint_interval_seconds") is None
@@ -445,6 +474,7 @@ def _load_phase_merging_config(payload: object) -> BenchmarkPhaseMergingConfig:
     data = _require_object(payload, label="phase_merging")
     return BenchmarkPhaseMergingConfig(
         setup_and_run=bool(data.get("setup_and_run", False)),
+        setup_and_run_executor_pool=str(data.get("setup_and_run_executor_pool", "separate")).strip().lower(),
     )
 
 
@@ -497,6 +527,12 @@ def load_config(path: Path) -> BenchmarkConfig:
     if llm_service_options is None:
         llm_service_options = {}
     llm_service_options = _require_object(llm_service_options, label="llm_service_options")
+    max_agent_timeout_scale = float(data.get("max_agent_timeout_scale", 1.0))
+    if max_agent_timeout_scale < 0:
+        raise ValueError(f"max_agent_timeout_scale must be non-negative, got {max_agent_timeout_scale!r}")
+    max_test_timeout_scale = float(data.get("max_test_timeout_scale", 1.0))
+    if max_test_timeout_scale < 0:
+        raise ValueError(f"max_test_timeout_scale must be non-negative, got {max_test_timeout_scale!r}")
 
     base_dir = config_path.parent
     telemetry_options = data.get("telemetry", {})
@@ -650,16 +686,21 @@ def load_config(path: Path) -> BenchmarkConfig:
         log_file_mode=log_file_mode,
         verification_enabled=verification_enabled,
         benchmark_root=_resolve_optional_path(base_dir, data.get("benchmark_root")),
+        clear_benchmark_root_after_run=bool(data.get("clear_benchmark_root_after_run", False)),
         zpool_size=str(data.get("zpool_size", "10G")),
         zpool_name=None if data.get("zpool_name") is None else str(data.get("zpool_name")),
         zpool_image=_resolve_optional_path(base_dir, data.get("zpool_image")),
         reuse_zpool=bool(data.get("reuse_zpool", False)),
+        runtime_command_timeout_seconds=float(data.get("runtime_command_timeout_seconds", 60.0)),
+        runtime_zfs_prepare_timeout_seconds=float(data.get("runtime_zfs_prepare_timeout_seconds", 300.0)),
         image_cache_root=_resolve_optional_path(base_dir, data.get("image_cache_root")),
         log_level=log_level,
         transfer_delay_ms=float(data.get("transfer_delay_ms", 0.0)),
         work_dir_host_root=_resolve_optional_path(base_dir, data.get("work_dir_host_root")),
         scenario_options=scenario_options,
         llm_service_options=llm_service_options,
+        max_agent_timeout_scale=max_agent_timeout_scale,
+        max_test_timeout_scale=max_test_timeout_scale,
         telemetry_report=telemetry_report,
         monitoring=monitoring,
         executor=executor,
