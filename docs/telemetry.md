@@ -169,6 +169,7 @@ These metrics explain why checkpointing decisions were made and how much schedul
 | `executor.job_queue_wait_ms` | Time from job submission to start of execution by the executor worker pool. This now reflects real worker contention instead of a forced single-checkpoint-thread bottleneck. |
 | `executor.job.duration_ms` | Total execution time of a checkpoint or restore job. |
 | `executor.job_duration_ms` | Legacy alias for `executor.job.duration_ms`. |
+| `recovery.queue_wait_ms` | Time from recovery event enqueue to the start of recovery handling. This captures queueing before checkpoint selection and restore submission. |
 | `recovery.restore.duration_ms` | Recovery-time wrapper around `restore_once(...)`. This lets reports separate restore execution from checkpoint selection and post-restore release/bookkeeping. |
 
 ### Executor Lifecycle

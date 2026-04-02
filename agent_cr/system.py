@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 import logging
 from pathlib import Path
 from queue import Empty, Queue
@@ -107,7 +107,9 @@ class AgentCRSystem:
     _recovery_records: dict[SandboxId, RecoveryRecord] = field(init=False, repr=False)
     _stop_event: Event = field(init=False, repr=False)
     _monitor_thread: Thread | None = field(init=False, repr=False, default=None)
-    _recovery_thread: Thread | None = field(init=False, repr=False, default=None)
+    _recovery_pool: ThreadPoolExecutor | None = field(init=False, repr=False, default=None)
+    _recovery_futures: list[Future[None]] = field(init=False, repr=False, default_factory=list)
+    _recovery_worker_count: int = field(init=False, repr=False, default=0)
     _coordination_pool: ThreadPoolExecutor | None = field(init=False, repr=False, default=None)
 
     @property
@@ -133,7 +135,9 @@ class AgentCRSystem:
     def start(self) -> None:
         with self._coordination_lock:
             request_running = self._monitor_thread is not None and self._monitor_thread.is_alive()
-            recovery_running = self._recovery_thread is not None and self._recovery_thread.is_alive()
+            recovery_running = self._recovery_pool is not None and any(
+                not future.done() for future in self._recovery_futures
+            )
             if request_running and recovery_running:
                 return
             self._stop_event.clear()
@@ -148,8 +152,16 @@ class AgentCRSystem:
                 self._monitor_thread = Thread(target=self._run_monitor_loop, name="agent-cr-system", daemon=True)
                 self._monitor_thread.start()
             if not recovery_running:
-                self._recovery_thread = Thread(target=self._run_recovery_loop, name="agent-cr-recovery", daemon=True)
-                self._recovery_thread.start()
+                recovery_workers = self.executor.config.resolved_restore_workers
+                self._recovery_worker_count = recovery_workers
+                self._recovery_pool = ThreadPoolExecutor(
+                    max_workers=recovery_workers,
+                    thread_name_prefix="agent-cr-recovery",
+                )
+                self._recovery_futures = [
+                    self._recovery_pool.submit(self._run_recovery_loop)
+                    for _ in range(recovery_workers)
+                ]
         logger.info("Started AgentCRSystem background loops")
 
     def stop(self) -> None:
@@ -158,15 +170,18 @@ class AgentCRSystem:
             self.response_gate_registry.disable()
         if self.request_state_store is not None:
             self.request_state_store.notify_waiters()
-        self._recovery_queue.put(None)
+        for _ in range(self._recovery_worker_count):
+            self._recovery_queue.put(None)
         thread = self._monitor_thread
         if thread is not None:
             thread.join(timeout=5.0)
         self._monitor_thread = None
-        recovery_thread = self._recovery_thread
-        if recovery_thread is not None:
-            recovery_thread.join(timeout=5.0)
-        self._recovery_thread = None
+        recovery_pool = self._recovery_pool
+        self._recovery_pool = None
+        self._recovery_futures = []
+        self._recovery_worker_count = 0
+        if recovery_pool is not None:
+            recovery_pool.shutdown(wait=True, cancel_futures=False)
         coordination_pool = self._coordination_pool
         self._coordination_pool = None
         if coordination_pool is not None:
@@ -566,6 +581,17 @@ class AgentCRSystem:
                 event.sandbox_id,
                 event.event_type,
                 event.reason,
+            )
+            queue_wait_ms = max(0.0, (started - event.received_at).total_seconds() * 1000.0)
+            self.telemetry.emit_metric(
+                "recovery.queue_wait_ms",
+                queue_wait_ms,
+                self._telemetry_attrs(
+                    event.sandbox_id,
+                    component="recovery",
+                    event_type=event.event_type,
+                    extra={"reason": event.reason},
+                ),
             )
             self.telemetry.emit_event(
                 "recovery.started",

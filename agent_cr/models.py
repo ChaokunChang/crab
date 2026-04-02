@@ -397,6 +397,7 @@ class RecoveryEvent:
     sandbox_id: SandboxId
     event_type: str
     observed_at: datetime
+    received_at: datetime = field(default_factory=utc_now)
     reason: str = ""
     grace_remaining_seconds: float | None = None
 

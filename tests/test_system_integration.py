@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import timedelta
 import json
 import threading
 import tempfile
@@ -39,7 +40,7 @@ from agent_cr import (
     SpotPreemptionCheckpointingPolicy,
     StorageConfig,
 )
-from agent_cr.models import JobStatus, RecoveryEvent, utc_now
+from agent_cr.models import JobStatus, RecoveryEvent, RecoveryRecord, utc_now
 from integrations.llm_services.simulated.service import SimulatedLLMState, handle_request
 from agent_cr.runtime import CommandRunner
 
@@ -113,6 +114,21 @@ class RestoreMissingRuntimeRunner(FakeCommandRunner):
                 {"command": tuple(command), "returncode": 1, "stdout": "", "stderr": "container does not exist"},
             )()
         return result
+
+
+class EmptyCheckpointManager:
+    def list_checkpoints(self, sandbox_id: SandboxId) -> list[object]:
+        _ = sandbox_id
+        return []
+
+
+class MinimalExecutor:
+    def __init__(self, *, restore_workers: int, coordination_workers: int | None = None) -> None:
+        self.config = ExecutorConfig(
+            max_workers=restore_workers,
+            restore_workers=restore_workers,
+            coordination_workers=coordination_workers,
+        )
 
 
 class SystemIntegrationTests(unittest.TestCase):
@@ -197,6 +213,117 @@ class SystemIntegrationTests(unittest.TestCase):
             enforce_restore_checkpoint_validation=enforce_restore_checkpoint_validation,
         )
         return system, executor
+
+    def test_recovery_workers_match_restore_workers_and_run_different_sandboxes_in_parallel(self) -> None:
+        class BlockingRecoverySystem(AgentCRSystem):
+            def __post_init__(self) -> None:
+                super().__post_init__()
+                self.release_event = threading.Event()
+                self.started_pair = threading.Event()
+                self._active_workers_lock = threading.Lock()
+                self.active_workers = 0
+                self.max_active_workers = 0
+                self.started_sandboxes: list[str] = []
+
+            def _handle_recovery_event(self, event: RecoveryEvent) -> None:
+                if not self._acquire_coordination(event.sandbox_id):
+                    return
+                started = utc_now()
+                try:
+                    with self._active_workers_lock:
+                        self.active_workers += 1
+                        self.max_active_workers = max(self.max_active_workers, self.active_workers)
+                        self.started_sandboxes.append(str(event.sandbox_id))
+                        if len(self.started_sandboxes) >= 2:
+                            self.started_pair.set()
+                    self.release_event.wait(timeout=5.0)
+                finally:
+                    finished = utc_now()
+                    record = RecoveryRecord(
+                        sandbox_id=event.sandbox_id,
+                        event_type=event.event_type,
+                        started_at=started,
+                        finished_at=finished,
+                        status="restored",
+                    )
+                    with self._recovery_lock:
+                        self._recovery_records[event.sandbox_id] = record
+                    with self._active_workers_lock:
+                        self.active_workers -= 1
+                    self._release_coordination(event.sandbox_id)
+
+        telemetry = InMemoryTelemetrySink()
+        restore_workers = 3
+        system = BlockingRecoverySystem(
+            scheduler=object(),  # type: ignore[arg-type]
+            executor=MinimalExecutor(restore_workers=restore_workers),  # type: ignore[arg-type]
+            storage=EmptyCheckpointManager(),  # type: ignore[arg-type]
+            inspector=object(),  # type: ignore[arg-type]
+            runtime=object(),  # type: ignore[arg-type]
+            telemetry=telemetry,
+        )
+
+        system.start()
+        try:
+            self.assertEqual(system._recovery_worker_count, restore_workers)
+            self.assertEqual(len(system._recovery_futures), restore_workers)
+            for sandbox_name in ("sbx-a", "sbx-b"):
+                system._recovery_queue.put(
+                    RecoveryEvent(
+                        sandbox_id=SandboxId(sandbox_name),
+                        event_type="fault",
+                        observed_at=utc_now(),
+                        reason="fault",
+                    )
+                )
+            self.assertTrue(system.started_pair.wait(timeout=2.0))
+            self.assertGreaterEqual(system.max_active_workers, 2)
+
+            system.release_event.set()
+            record_a = self._wait_for_record(system, SandboxId("sbx-a"), "fault")
+            record_b = self._wait_for_record(system, SandboxId("sbx-b"), "fault")
+        finally:
+            system.release_event.set()
+            system.stop()
+
+        self.assertEqual(record_a.status, "restored")
+        self.assertEqual(record_b.status, "restored")
+
+    def test_recovery_queue_wait_metric_is_emitted(self) -> None:
+        telemetry = InMemoryTelemetrySink()
+        system = AgentCRSystem(
+            scheduler=object(),  # type: ignore[arg-type]
+            executor=MinimalExecutor(restore_workers=1),  # type: ignore[arg-type]
+            storage=EmptyCheckpointManager(),  # type: ignore[arg-type]
+            inspector=object(),  # type: ignore[arg-type]
+            runtime=object(),  # type: ignore[arg-type]
+            telemetry=telemetry,
+        )
+
+        event = RecoveryEvent(
+            sandbox_id=SandboxId("sbx-queue-wait"),
+            event_type="fault",
+            observed_at=utc_now(),
+            received_at=utc_now() - timedelta(milliseconds=50),
+            reason="fault",
+        )
+
+        system._handle_recovery_event(event)
+
+        queue_wait_metrics = [
+            (value, attributes)
+            for name, value, attributes in telemetry.metrics
+            if name == "recovery.queue_wait_ms"
+        ]
+        self.assertEqual(len(queue_wait_metrics), 1)
+        metric_value, metric_attributes = queue_wait_metrics[0]
+        self.assertGreaterEqual(metric_value, 40.0)
+        self.assertEqual(metric_attributes["sandbox_id"], "sbx-queue-wait")
+        self.assertEqual(metric_attributes["event_type"], "fault")
+        record = system.get_last_recovery_record(SandboxId("sbx-queue-wait"))
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.status, "no_checkpoint")
 
     def test_runc_system_checkpoint_restore_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
