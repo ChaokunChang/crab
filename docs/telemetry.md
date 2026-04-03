@@ -79,6 +79,7 @@ Not every record contains every key, but these are the standard correlation fiel
 | `job_id` | Executor job identity. Used for queue wait and execution analysis. |
 | `event_type` | Benchmark/recovery event type such as `fault` or `preemption`. |
 | `component` | Producing subsystem, such as `interceptor`, `llm_service`, `scheduler`, `runtime`, `checkpoint`, `restore`, `recovery`, `benchmark`, or `system`. |
+| `request_kind` | Optional classifier for request families such as Claude Code `main_loop`, `helper`, and `count_tokens`. |
 | `status` | Usually `succeeded`, `failed`, or `skipped` on finish/duration records. |
 | `operation` | Runtime command operation name for generic command telemetry. |
 
@@ -87,6 +88,14 @@ Not every record contains every key, but these are the standard correlation fiel
 ## 1. Interceptor And LLM Path
 
 These metrics describe the request path from the sandbox, through the interceptor, to the benchmark LLM service, and back to the sandbox.
+
+For Claude Code replay workloads, interceptor telemetry now distinguishes auxiliary traffic from scheduler-visible turns:
+
+- `request_kind="main_loop"` for replay-turn Anthropic `POST /v1/messages` requests
+- `request_kind="helper"` for auxiliary helper-model `POST /v1/messages` requests
+- `request_kind="count_tokens"` for `POST /v1/messages/count_tokens`
+
+Only gated requests emit non-zero `llm.gate_wait_ms` or `interceptor.response_gate.wait.duration_ms`. In current Claude replay runs, that means `main_loop` requests remain gate-visible while `helper` and `count_tokens` requests bypass the response gate.
 
 ### Lifecycle Events
 
@@ -140,6 +149,8 @@ The main latency relationships are:
 - `llm.gate_wait_ms` is the explicit blocking portion of that delay.
 - `interceptor.response_gate.wait.duration_ms` and `llm.gate_wait_ms` should now be very close; large persistent gaps usually indicate real wrapper work or clocking issues rather than telemetry overhead.
 - `llm.interceptor_total_ms` is the end-to-end interceptor latency and therefore is usually the largest of the LLM path timing metrics.
+
+When `response_gate_enabled=false` in request attributes, expect both response-gate metrics to be absent or zero for that request. This is the intended behavior for auxiliary Claude helper and token-count traffic.
 
 For overlapping requests from the same sandbox, correlate by both `request_id` and `request_generation` when available. Response-gate release is generation-specific.
 
@@ -529,7 +540,19 @@ Any systematic mismatch suggests:
 - a bug in instrumentation coverage
 - a truncated telemetry file
 
-## Recommended Queries
+## 8. Report-Specific Notes
+
+The HTML telemetry report keeps its existing aggregate sections and now adds two request-level views that are especially useful for Claude replay diagnosis:
+
+- `Turn Analysis` now includes aggregate `all` rows plus per-`request_kind` rows and time-series figures when `request_kind` is present in telemetry.
+- `Overhead Analysis` now includes a dedicated `llm.gate_wait` CDF figure, which helps distinguish a mostly-zero distribution with a long tail from a uniformly elevated gate cost.
+
+CSV exports now mirror those views:
+
+- `turn_analysis.csv`, `turn_timeseries.csv`, and `turn_cdf.csv` include a `request_kind` column
+- `overhead_cdf.csv` exports the CDF points used by the overhead plots
+
+## 9. Recommended Queries
 
 For future analysis/reporting code, the most useful first-pass queries are:
 
@@ -559,7 +582,7 @@ For future analysis/reporting code, the most useful first-pass queries are:
    - `benchmark.task.success_ratio`
    - `benchmark.lost_actions`
 
-## Scope And Maintenance Note
+## 10. Scope And Maintenance Note
 
 This document describes the telemetry currently emitted by:
 

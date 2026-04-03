@@ -159,6 +159,7 @@ Key behaviors:
 
 Implemented in:
 
+- [request_classification.py](/root/workspace/agent-cr/integrations/llm_services/claude_code_trace_replay/request_classification.py)
 - [service.py](/root/workspace/agent-cr/integrations/llm_services/claude_code_trace_replay/service.py)
 
 Key behaviors:
@@ -166,13 +167,76 @@ Key behaviors:
 - parses the ATIF `agent/trajectory.json` format
 - merges recorded agent steps into actual Anthropic response turns
 - serves SSE in Anthropic Messages format
-- ignores `count_tokens` preflight requests
+- classifies Claude requests into `main_loop`, `helper`, `count_tokens`, and defensive `other`
+- treats only `main_loop` requests as replay turn boundaries
+- returns synthetic `count_tokens` responses without consuming replay turns
 - handles helper-model side requests without consuming main trace turns
 - supports non-strict `Task` sidechains via recorded subagent JSONL files
 - rewrites recorded background task IDs to live task IDs
 - remaps dynamic filenames when the task regenerates randomized asset names
 - rewrites brittle Git hash literals when runtime commit IDs differ
 - applies narrow runtime-specific normalization for dirty traces, including the Mailman/Postfix `relay_domains` conflict
+
+### Request taxonomy and turn boundaries
+
+For the replayable Claude benchmark corpus, the request classifier uses the following model:
+
+- `main_loop`:
+  - `POST /v1/messages`
+  - model family matches the replay trace's main model family, which is currently Opus in the benchmark dataset
+  - these are the user-visible assistant turns recorded in `agent/trajectory.json`
+  - example:
+    - request path: `POST /v1/messages`
+    - request model: `claude-opus-4-6`
+    - typical effect: returns the next replayed assistant turn, for example an Opus response that emits a `Bash` tool call
+- `helper`:
+  - `POST /v1/messages`
+  - model family differs from the replay trace's main model family
+  - in the replayable benchmark dataset, these are the fast Haiku-family helper calls Claude Code uses around local tool execution
+  - example:
+    - request path: `POST /v1/messages`
+    - request model: `claude-haiku-4-5-20251001`
+    - typical effect: returns a short helper response around local tool execution and does not consume the next replay turn
+- `count_tokens`:
+  - `POST /v1/messages/count_tokens`
+  - token-count probes used by the Claude client
+  - example:
+    - request path: `POST /v1/messages/count_tokens`
+    - request payload: the current Claude conversation is sent for token estimation
+    - typical effect: returns a synthetic token-count response such as `{"input_tokens": ...}` and does not consume replay progress
+- `other`:
+  - any unexpected path we handle defensively without letting it advance replay progress
+  - example:
+    - request path: anything outside the replayed Anthropic Messages endpoints, such as `/v1/models`
+    - typical effect: classified defensively as non-turn traffic and never allowed to advance `trace_cursor`
+
+Important consequences:
+
+- `trace_cursor` tracks committed `main_loop` turns only
+- helper and `count_tokens` traffic never advances `trace_cursor`
+- benchmark checkpoint metadata keeps reading `snapshot().trace_cursor`, so `benchmark_trace_cursor` now means main-loop replay progress, not all Claude API requests
+- replay restore still keys off consumed main-loop responses only
+
+Tool blocks such as `TodoWrite`, `WebFetch`, and `WebSearch` are still part of a containing `main_loop` turn. They are not separate request kinds.
+
+### Response gating and checkpoint capture
+
+Claude Code replay now uses the same request taxonomy in the live interceptor path as in the replay service.
+
+Implemented in:
+
+- [interceptor.py](/root/workspace/agent-cr/agent_cr/interceptor.py)
+- [system.py](/root/workspace/agent-cr/agent_cr/system.py)
+- [real_host_scenario_base.py](/root/workspace/agent-cr/benchmarks/real_host_scenario_base.py)
+
+Behavior:
+
+- only `main_loop` Claude requests arm the response gate
+- `helper` and `count_tokens` requests still flow through the interceptor and telemetry, but bypass response-gate blocking
+- live-request checkpoint metadata is only captured for gated requests, so auxiliary Claude traffic does not create a checkpoint/restore dependency
+- replay snapshots expose diagnostic counters such as `main_loop_request_count`, `helper_request_count`, and `count_tokens_request_count` without changing restore semantics
+
+This split matters because the replayable benchmark dataset records main-loop progress in `trajectory.json`, while helper and token-count traffic is auxiliary client behavior. Treating all Claude requests as turn boundaries caused unnecessary checkpoint scheduling, large gate waits, and misleading latency analysis.
 
 ### Runtime and benchmark fixes
 
@@ -439,5 +503,6 @@ As of the current integration state:
 - the strict deduplicated benchmark dataset contains 51 rows for 51 tasks
 - the `mailman` benchmark row now points at empirically passing trial `46c2e780-0160-4acf-a1e6-668cc5ca506b`
 - the strict duplicated benchmark dataset contains 167 rows after filtering the known bad duplicate trials above
+- in that duplicated benchmark dataset, replay progress comes from the recorded main Opus turns; helper-model traffic and `count_tokens` probes are treated as auxiliary and do not contribute to benchmark turn boundaries
 
 This should be treated as the current curated benchmark set, not as a mechanically perfect projection of all manifest-pass traces.

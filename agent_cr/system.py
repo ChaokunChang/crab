@@ -916,6 +916,14 @@ class AgentCRSystem:
         request_context = self.request_state_store.get_request_context(sandbox_id, pending.request_id)
         if request_context is None:
             return metadata
+        if not bool(request_context.metadata.get("response_gate_enabled", True)):
+            logger.debug(
+                "Skipping live-request checkpoint capture for auxiliary request sandbox=%s request_id=%s kind=%s",
+                sandbox_id,
+                pending.request_id,
+                request_context.metadata.get("request_kind"),
+            )
+            return metadata
         metadata[_CAPTURES_INFLIGHT_LLM] = True
         metadata[_CAPTURED_REQUEST_ID] = pending.request_id
         metadata[_CAPTURED_REQUEST_GENERATION] = pending.generation

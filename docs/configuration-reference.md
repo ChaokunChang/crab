@@ -395,6 +395,10 @@ The telemetry report's `Turn Analysis` section derives four timing views from re
 
 Each metric is reported with summary statistics, a CDF, and a time-series chart that honors `--figure-window-seconds`.
 
+When request telemetry includes `request_kind`, the report keeps the aggregate `all` view and also emits per-kind rows and figures. This is particularly useful for Claude Code replay, where `main_loop`, `helper`, and `count_tokens` requests have different checkpoint and gating behavior.
+
+The `Overhead Analysis` section also includes a dedicated `llm.gate_wait` CDF so long-tail checkpoint delay is easier to separate from the median case.
+
 ### LLM Server YAML Block (`llm_server:`)
 
 | YAML Key | Type | Default | Description |

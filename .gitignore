@@ -24,5 +24,7 @@ data/
 .cache/
 integrations/sandboxes/iflow/cache/
 .codex
-logs*
-benchmarks/evaluation*
+benchmarks/evaluation
+logs.old
+test.png
+tmp/

@@ -53,6 +53,12 @@ def _format_metric_label(metric_name: str) -> str:
     return metric_name.replace(".duration_ms", "").replace("_", " ")
 
 
+def _format_request_kind_label(request_kind: str) -> str:
+    if not request_kind:
+        return "all"
+    return request_kind.replace("_", " ")
+
+
 _OVERHEAD_METRIC_LABELS = {
     "llm.gate_wait_ms": "llm.gate_wait",
     "llm.agentcr_delay_ms": "llm.agentcr_delay",
@@ -471,8 +477,14 @@ def _overhead_series(
 def _turn_series(
     turn_analysis: TurnAnalysisSummary,
     *,
+    request_kind: str | None = None,
     window_size_seconds: float | None = None,
 ) -> list[tuple[str, list[tuple[float, float]]]]:
+    source = (
+        turn_analysis.time_series
+        if request_kind is None
+        else turn_analysis.time_series_by_request_kind.get(request_kind, {})
+    )
     return [
         (
             _format_turn_metric_label(metric_name),
@@ -481,7 +493,7 @@ def _turn_series(
                 window_size_seconds=window_size_seconds,
             ),
         )
-        for metric_name, points in turn_analysis.time_series.items()
+        for metric_name, points in source.items()
         if points
     ]
 _CHECKPOINT_LATENCY_FIGURES = (
@@ -671,6 +683,13 @@ def build_figure_svgs(
             _overhead_series(analysis.overhead_analysis, window_size_seconds=window_size_seconds),
             formatter=_format_ms,
         )
+        gate_wait_cdf = analysis.overhead_analysis.cdf_series.get("llm.gate_wait_ms", [])
+        if gate_wait_cdf:
+            figures["overhead_llm.gate_wait_cdf.svg"] = _svg_cdf_chart(
+                "llm.gate_wait CDF",
+                gate_wait_cdf,
+                formatter=_format_ms,
+            )
     if analysis.turn_analysis is not None:
         figures["turn_timing.svg"] = _svg_line_chart(
             "Turn Timing Over Time",
@@ -683,6 +702,18 @@ def build_figure_svgs(
                 points,
                 formatter=_format_ms,
             )
+        for request_kind in sorted(analysis.turn_analysis.time_series_by_request_kind):
+            kind_series = _turn_series(
+                analysis.turn_analysis,
+                request_kind=request_kind,
+                window_size_seconds=window_size_seconds,
+            )
+            if kind_series:
+                figures[f"turn_timing_{request_kind}.svg"] = _svg_line_chart(
+                    f"Turn Timing Over Time ({_format_request_kind_label(request_kind)})",
+                    kind_series,
+                    formatter=_format_ms,
+                )
     if analysis.restore_analysis is not None:
         figures["restore_load_jobs.svg"] = _svg_line_chart(
             "Restore Load Over Time (Jobs)",
@@ -970,6 +1001,9 @@ def render_report_html(
             "<section><h3>Window-Aggregated Overhead Over Time</h3>"
             f"{figures.get('overhead_latency.svg', '<p>No data.</p>')}"
             "</section>"
+            "<section><h3>llm.gate_wait CDF</h3>"
+            f"{figures.get('overhead_llm.gate_wait_cdf.svg', '<p>No data.</p>')}"
+            "</section>"
             "</section>"
         )
 
@@ -977,11 +1011,13 @@ def render_report_html(
     if analysis.turn_analysis is not None and analysis.turn_analysis.metrics:
         turn = analysis.turn_analysis
         turn_note = _window_agg_note(window_size_seconds)
-        turn_summary = _html_table(
-            ["Metric", "Count", "Mean (ms)", "Median (ms)", "P95 (ms)", "P99 (ms)", "Min (ms)", "Max (ms)"],
-            [
+        metric_rows = []
+        by_kind_lookup = turn.metrics_by_request_kind
+        for item in turn.metrics:
+            metric_rows.append(
                 (
                     _format_turn_metric_label(item.metric_name),
+                    "all",
                     item.count,
                     f"{item.mean_ms:.2f}",
                     f"{item.p50_ms:.2f}",
@@ -990,14 +1026,40 @@ def render_report_html(
                     f"{item.min_ms:.2f}",
                     f"{item.max_ms:.2f}",
                 )
-                for item in turn.metrics
-            ],
+            )
+            for request_kind in sorted(by_kind_lookup):
+                for kind_item in by_kind_lookup[request_kind]:
+                    if kind_item.metric_name != item.metric_name:
+                        continue
+                    metric_rows.append(
+                        (
+                            _format_turn_metric_label(kind_item.metric_name),
+                            _format_request_kind_label(request_kind),
+                            kind_item.count,
+                            f"{kind_item.mean_ms:.2f}",
+                            f"{kind_item.p50_ms:.2f}",
+                            f"{kind_item.p95_ms:.2f}",
+                            f"{kind_item.p99_ms:.2f}",
+                            f"{kind_item.min_ms:.2f}",
+                            f"{kind_item.max_ms:.2f}",
+                        )
+                    )
+        turn_summary = _html_table(
+            ["Metric", "Type", "Count", "Mean (ms)", "Median (ms)", "P95 (ms)", "P99 (ms)", "Min (ms)", "Max (ms)"],
+            metric_rows,
         )
         cdf_blocks = "".join(
             f"<section><h3>{escape(_format_turn_metric_label(item.metric_name))} CDF</h3>"
             f"{figures.get(f'turn_{item.metric_name}_cdf.svg', '<p>No data.</p>')}"
             "</section>"
             for item in turn.metrics
+        )
+        by_kind_blocks = "".join(
+            f"<section><h3>Turn Timing Over Time ({escape(_format_request_kind_label(request_kind))})</h3>"
+            f"{figures.get(f'turn_timing_{request_kind}.svg', '<p>No data.</p>')}"
+            "</section>"
+            for request_kind in sorted(turn.time_series_by_request_kind)
+            if figures.get(f'turn_timing_{request_kind}.svg')
         )
         turn_section = (
             "<section><h2>Turn Analysis</h2>"
@@ -1006,6 +1068,9 @@ def render_report_html(
             "<section><h3>Window-Aggregated Turn Timing Over Time</h3>"
             f"{figures.get('turn_timing.svg', '<p>No data.</p>')}"
             "</section>"
+            "<div class='grid'>"
+            f"{by_kind_blocks}"
+            "</div>"
             "<div class='grid'>"
             f"{cdf_blocks}"
             "</div>"
@@ -1390,12 +1455,13 @@ def _overhead_rows_for_csv(overhead: OverheadAnalysisSummary | None) -> tuple[li
 
 
 def _turn_rows_for_csv(turn: TurnAnalysisSummary | None) -> tuple[list[str], list[dict[str, object]]]:
-    headers = ["metric_name", "count", "mean_ms", "p50_ms", "min_ms", "max_ms", "p95_ms", "p99_ms"]
+    headers = ["metric_name", "request_kind", "count", "mean_ms", "p50_ms", "min_ms", "max_ms", "p95_ms", "p99_ms"]
     if turn is None:
         return headers, []
     rows = [
         {
             "metric_name": item.metric_name,
+            "request_kind": "all",
             "count": item.count,
             "mean_ms": f"{item.mean_ms:.6f}",
             "p50_ms": f"{item.p50_ms:.6f}",
@@ -1406,6 +1472,21 @@ def _turn_rows_for_csv(turn: TurnAnalysisSummary | None) -> tuple[list[str], lis
         }
         for item in turn.metrics
     ]
+    for request_kind in sorted(turn.metrics_by_request_kind):
+        rows.extend(
+            {
+                "metric_name": item.metric_name,
+                "request_kind": request_kind,
+                "count": item.count,
+                "mean_ms": f"{item.mean_ms:.6f}",
+                "p50_ms": f"{item.p50_ms:.6f}",
+                "min_ms": f"{item.min_ms:.6f}",
+                "max_ms": f"{item.max_ms:.6f}",
+                "p95_ms": f"{item.p95_ms:.6f}",
+                "p99_ms": f"{item.p99_ms:.6f}",
+            }
+            for item in turn.metrics_by_request_kind[request_kind]
+        )
     return headers, rows
 def _resource_rows_for_csv(resource: ResourceAnalysisSummary | None) -> tuple[list[str], list[dict[str, object]]]:
     headers = ["metric_name", "sandbox_id", "sample_count", "mean_value", "max_value"]
@@ -1601,25 +1682,8 @@ def generate_report_bundle(
             for point in points
         ],
     )
-
-    headers, rows = _turn_rows_for_csv(analysis.turn_analysis)
-    _write_csv(target_dir / "turn_analysis.csv", headers, rows)
     _write_csv(
-        target_dir / "turn_timeseries.csv",
-        ["metric_name", "timestamp", "offset_seconds", "value_ms"],
-        [
-            {
-                "metric_name": metric_name,
-                "timestamp": point.timestamp,
-                "offset_seconds": f"{point.offset_seconds:.6f}",
-                "value_ms": f"{point.value:.6f}",
-            }
-            for metric_name, points in ([] if analysis.turn_analysis is None else analysis.turn_analysis.time_series.items())
-            for point in points
-        ],
-    )
-    _write_csv(
-        target_dir / "turn_cdf.csv",
+        target_dir / "overhead_cdf.csv",
         ["metric_name", "value_ms", "cumulative_probability"],
         [
             {
@@ -1627,7 +1691,62 @@ def generate_report_bundle(
                 "value_ms": f"{point.value:.6f}",
                 "cumulative_probability": f"{point.cumulative_probability:.6f}",
             }
+            for metric_name, points in ([] if analysis.overhead_analysis is None else analysis.overhead_analysis.cdf_series.items())
+            for point in points
+        ],
+    )
+
+    headers, rows = _turn_rows_for_csv(analysis.turn_analysis)
+    _write_csv(target_dir / "turn_analysis.csv", headers, rows)
+    _write_csv(
+        target_dir / "turn_timeseries.csv",
+        ["metric_name", "request_kind", "timestamp", "offset_seconds", "value_ms"],
+        [
+            {
+                "metric_name": metric_name,
+                "request_kind": "all",
+                "timestamp": point.timestamp,
+                "offset_seconds": f"{point.offset_seconds:.6f}",
+                "value_ms": f"{point.value:.6f}",
+            }
+            for metric_name, points in ([] if analysis.turn_analysis is None else analysis.turn_analysis.time_series.items())
+            for point in points
+        ]
+        + [
+            {
+                "metric_name": metric_name,
+                "request_kind": request_kind,
+                "timestamp": point.timestamp,
+                "offset_seconds": f"{point.offset_seconds:.6f}",
+                "value_ms": f"{point.value:.6f}",
+            }
+            for request_kind, series_by_metric in ([] if analysis.turn_analysis is None else analysis.turn_analysis.time_series_by_request_kind.items())
+            for metric_name, points in series_by_metric.items()
+            for point in points
+        ],
+    )
+    _write_csv(
+        target_dir / "turn_cdf.csv",
+        ["metric_name", "request_kind", "value_ms", "cumulative_probability"],
+        [
+            {
+                "metric_name": metric_name,
+                "request_kind": "all",
+                "value_ms": f"{point.value:.6f}",
+                "cumulative_probability": f"{point.cumulative_probability:.6f}",
+            }
             for metric_name, points in ([] if analysis.turn_analysis is None else analysis.turn_analysis.cdf_series.items())
+            for point in points
+        ]
+        + [
+            {
+                "metric_name": metric_name,
+                "request_kind": request_kind,
+                "value_ms": f"{point.value:.6f}",
+                "cumulative_probability": f"{point.cumulative_probability:.6f}",
+            }
+            for request_kind, series_by_metric in ([] if analysis.turn_analysis is None else analysis.turn_analysis.cdf_series_by_request_kind.items())
+            for metric_name, points in series_by_metric.items()
             for point in points
         ],
     )

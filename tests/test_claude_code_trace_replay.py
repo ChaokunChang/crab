@@ -1188,9 +1188,15 @@ class ClaudeCodeTraceReplayTests(unittest.TestCase):
                 headers={},
                 payload={"messages": [{"role": "user", "content": "task"}], "tools": [{"name": "Read"}]},
             )
+            snapshot_after_token = state.snapshot()
             replay_response = state.handle_request(path="/v1/messages", headers={}, payload={})
 
         self.assertGreaterEqual(token_response["input_tokens"], 1)
+        self.assertEqual(snapshot_after_token["trace_cursor"], 0)
+        self.assertEqual(snapshot_after_token["main_loop_request_count"], 0)
+        self.assertEqual(snapshot_after_token["helper_request_count"], 0)
+        self.assertEqual(snapshot_after_token["count_tokens_request_count"], 1)
+        self.assertEqual(state.snapshot()["trace_cursor"], 1)
         self.assertEqual(replay_response["content"][0]["type"], "text")
         self.assertEqual(replay_response["content"][0]["text"], "Read the file first")
         self.assertEqual(replay_response["content"][1]["type"], "tool_use")
@@ -1241,6 +1247,7 @@ class ClaudeCodeTraceReplayTests(unittest.TestCase):
                 headers={},
                 payload={"model": "claude-haiku-4-5-20251001", "messages": [{"role": "user", "content": "helper"}]},
             )
+            snapshot_after_helper = state.snapshot()
             replay_response = state.handle_request(
                 path="/v1/messages",
                 headers={},
@@ -1248,8 +1255,213 @@ class ClaudeCodeTraceReplayTests(unittest.TestCase):
             )
 
         self.assertEqual(helper_response["content"], [{"type": "text", "text": ""}])
+        self.assertEqual(snapshot_after_helper["trace_cursor"], 0)
+        self.assertEqual(snapshot_after_helper["main_loop_request_count"], 0)
+        self.assertEqual(snapshot_after_helper["helper_request_count"], 1)
+        self.assertEqual(snapshot_after_helper["count_tokens_request_count"], 0)
+        self.assertEqual(state.snapshot()["trace_cursor"], 1)
         self.assertEqual(replay_response["content"][0]["type"], "text")
         self.assertEqual(replay_response["content"][0]["text"], "Read the file first")
+
+    def test_auxiliary_requests_do_not_advance_main_loop_trace_cursor(self) -> None:
+        payload = _base_trace_payload()
+        payload["steps"] = [
+            {"source": "user", "message": "task", "timestamp": "2026-02-07T00:00:00Z", "extra": {}},
+            {
+                "source": "agent",
+                "message": "First",
+                "timestamp": "2026-02-07T00:00:01Z",
+                "model_name": "claude-opus-4-6",
+                "extra": {},
+            },
+            {
+                "source": "agent",
+                "message": "Executed Bash toolu_1",
+                "timestamp": "2026-02-07T00:00:02Z",
+                "model_name": "claude-opus-4-6",
+                "tool_calls": [
+                    {
+                        "tool_call_id": "toolu_1",
+                        "function_name": "Bash",
+                        "arguments": {"command": "echo first", "description": "first"},
+                    }
+                ],
+                "observation": {"results": [{"source_call_id": "toolu_1", "content": "first"}]},
+                "extra": {"tool_result_metadata": {"tool_use_result": {"stdout": "first"}}},
+            },
+            {
+                "source": "agent",
+                "message": "Second",
+                "timestamp": "2026-02-07T00:00:03Z",
+                "model_name": "claude-opus-4-6",
+                "extra": {},
+            },
+            {
+                "source": "agent",
+                "message": "Executed Bash toolu_2",
+                "timestamp": "2026-02-07T00:00:04Z",
+                "model_name": "claude-opus-4-6",
+                "tool_calls": [
+                    {
+                        "tool_call_id": "toolu_2",
+                        "function_name": "Bash",
+                        "arguments": {"command": "echo second", "description": "second"},
+                    }
+                ],
+                "observation": {"results": [{"source_call_id": "toolu_2", "content": "second"}]},
+                "extra": {"tool_result_metadata": {"tool_use_result": {"stdout": "second"}}},
+            },
+            {
+                "source": "agent",
+                "message": "Third",
+                "timestamp": "2026-02-07T00:00:05Z",
+                "model_name": "claude-opus-4-6",
+                "extra": {},
+            },
+            {
+                "source": "agent",
+                "message": "Executed Bash toolu_3",
+                "timestamp": "2026-02-07T00:00:06Z",
+                "model_name": "claude-opus-4-6",
+                "tool_calls": [
+                    {
+                        "tool_call_id": "toolu_3",
+                        "function_name": "Bash",
+                        "arguments": {"command": "echo third", "description": "third"},
+                    }
+                ],
+                "observation": {"results": [{"source_call_id": "toolu_3", "content": "third"}]},
+                "extra": {"tool_result_metadata": {"tool_use_result": {"stdout": "third"}}},
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.json"
+            trace_path.write_text(json.dumps(payload), encoding="utf-8")
+            state = TraceReplayLLMState(llm_service_config={"trace_path": str(trace_path)})
+
+            first = state.handle_request(path="/v1/messages", headers={}, payload={"model": "claude-opus-4-6"})
+            snapshot_after_first = state.snapshot()
+            helper_one = state.handle_request(
+                path="/v1/messages",
+                headers={},
+                payload={"model": "claude-haiku-4-5-20251001", "messages": [{"role": "user", "content": "helper-1"}]},
+            )
+            helper_two = state.handle_request(
+                path="/v1/messages",
+                headers={},
+                payload={"model": "claude-haiku-4-5-20251001", "messages": [{"role": "user", "content": "helper-2"}]},
+            )
+            snapshot_after_helpers = state.snapshot()
+            second = state.handle_request(path="/v1/messages", headers={}, payload={"model": "claude-opus-4-6"})
+            token_response = state.handle_request(
+                path="/v1/messages/count_tokens",
+                headers={},
+                payload={"messages": [{"role": "user", "content": "task"}]},
+            )
+            snapshot_after_count_tokens = state.snapshot()
+            third = state.handle_request(path="/v1/messages", headers={}, payload={"model": "claude-opus-4-6"})
+
+        self.assertEqual(first["content"][0]["text"], "First")
+        self.assertEqual(helper_one["content"], [{"type": "text", "text": ""}])
+        self.assertEqual(helper_two["content"], [{"type": "text", "text": ""}])
+        self.assertGreaterEqual(token_response["input_tokens"], 1)
+        self.assertEqual(second["content"][0]["text"], "Second")
+        self.assertEqual(third["content"][0]["text"], "Third")
+        self.assertEqual(snapshot_after_first["trace_cursor"], 1)
+        self.assertEqual(snapshot_after_helpers["trace_cursor"], 1)
+        self.assertEqual(snapshot_after_count_tokens["trace_cursor"], 2)
+        self.assertEqual(state.snapshot()["trace_cursor"], 3)
+        self.assertEqual(state.snapshot()["main_loop_request_count"], 3)
+        self.assertEqual(state.snapshot()["helper_request_count"], 2)
+        self.assertEqual(state.snapshot()["count_tokens_request_count"], 1)
+
+    def test_restore_uses_main_loop_turns_even_after_auxiliary_requests(self) -> None:
+        payload = _base_trace_payload()
+        payload["steps"] = [
+            {"source": "user", "message": "task", "timestamp": "2026-02-07T00:00:00Z", "extra": {}},
+            {
+                "source": "agent",
+                "message": "First",
+                "timestamp": "2026-02-07T00:00:01Z",
+                "model_name": "claude-opus-4-6",
+                "extra": {},
+            },
+            {
+                "source": "agent",
+                "message": "Executed Bash toolu_1",
+                "timestamp": "2026-02-07T00:00:02Z",
+                "model_name": "claude-opus-4-6",
+                "tool_calls": [
+                    {
+                        "tool_call_id": "toolu_1",
+                        "function_name": "Bash",
+                        "arguments": {"command": "echo first", "description": "first"},
+                    }
+                ],
+                "observation": {"results": [{"source_call_id": "toolu_1", "content": "first"}]},
+                "extra": {"tool_result_metadata": {"tool_use_result": {"stdout": "first"}}},
+            },
+            {
+                "source": "agent",
+                "message": "Second",
+                "timestamp": "2026-02-07T00:00:03Z",
+                "model_name": "claude-opus-4-6",
+                "extra": {},
+            },
+            {
+                "source": "agent",
+                "message": "Executed Bash toolu_2",
+                "timestamp": "2026-02-07T00:00:04Z",
+                "model_name": "claude-opus-4-6",
+                "tool_calls": [
+                    {
+                        "tool_call_id": "toolu_2",
+                        "function_name": "Bash",
+                        "arguments": {"command": "echo second", "description": "second"},
+                    }
+                ],
+                "observation": {"results": [{"source_call_id": "toolu_2", "content": "second"}]},
+                "extra": {"tool_result_metadata": {"tool_use_result": {"stdout": "second"}}},
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.json"
+            trace_path.write_text(json.dumps(payload), encoding="utf-8")
+            state = TraceReplayLLMState(llm_service_config={"trace_path": str(trace_path)})
+
+            first = state.handle_request(path="/v1/messages", headers={}, payload={"model": "claude-opus-4-6"})
+            state.handle_request(
+                path="/v1/messages",
+                headers={},
+                payload={"model": "claude-haiku-4-5-20251001", "messages": [{"role": "user", "content": "helper"}]},
+            )
+            state.handle_request(
+                path="/v1/messages/count_tokens",
+                headers={},
+                payload={"messages": [{"role": "user", "content": "task"}]},
+            )
+            state.restore(consumed_response_count=1)
+            restored_snapshot = state.snapshot()
+            second = state.handle_request(
+                path="/v1/messages",
+                headers={},
+                payload={
+                    "model": "claude-opus-4-6",
+                    "messages": [
+                        {"role": "assistant", "content": first["content"]},
+                        {"role": "user", "content": "continue"},
+                    ],
+                },
+            )
+
+        self.assertEqual(restored_snapshot["trace_cursor"], 1)
+        self.assertEqual(restored_snapshot["main_loop_request_count"], 1)
+        self.assertEqual(restored_snapshot["helper_request_count"], 1)
+        self.assertEqual(restored_snapshot["count_tokens_request_count"], 1)
+        self.assertEqual(second["content"][0]["text"], "Second")
+        self.assertEqual(state.snapshot()["trace_cursor"], 2)
 
     def test_helper_model_request_replays_task_sidechain_from_results_bundle(self) -> None:
         prompt = "Create /app/attack.py"

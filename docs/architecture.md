@@ -69,11 +69,13 @@ Flow:
 
 1. The interceptor sees an outbound LLM request from a sandbox.
 2. It records request state in `InMemoryRequestStateStore`.
-3. If response gating is enabled, it arms `SandboxResponseGateRegistry` with the sandbox ID, request ID, and a monotonically increasing request generation.
+3. If response gating is enabled for that request, it arms `SandboxResponseGateRegistry` with the sandbox ID, request ID, and a monotonically increasing request generation.
 4. The interceptor notifies `AgentCRSystem.notify_interceptor_state_change(...)`.
 5. The system monitor loop coordinates pending gated requests for that sandbox generation by generation and keeps looping until no pending request remains.
 6. `_execute_checkpoint_flow(...)` asks `CRScheduler` whether a checkpoint should run for the current pending request generation.
 7. If a checkpoint runs while the request is still in flight and the pending gate matches, `_build_checkpoint_metadata(...)` stores live-request metadata in the checkpoint manifest, including the request generation.
+
+For Claude Code replay, the interceptor now classifies requests as `main_loop`, `helper`, or `count_tokens`. Only `main_loop` requests participate in response gating and live-request checkpoint capture. Auxiliary Claude requests still produce request telemetry and service responses, but they do not create scheduler-visible checkpoint windows.
 
 That metadata is what `_validate_restore_checkpoint(...)` inspects when restore validation is enabled.
 

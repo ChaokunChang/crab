@@ -3769,6 +3769,9 @@ PY
     def _benchmark_trace_cursor_from_snapshot_state(state: object) -> int | None:
         if not isinstance(state, dict):
             return None
+        # Claude Code replay exposes trace_cursor as committed main-loop replay
+        # progress only. Helper/count-tokens requests are auxiliary and must not
+        # affect checkpoint metadata.
         raw_value = state.get("trace_cursor", state.get("consumed_response_count"))
         try:
             return max(0, int(raw_value))

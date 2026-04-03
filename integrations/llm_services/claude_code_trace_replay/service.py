@@ -13,6 +13,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .request_classification import (
+    DEFAULT_REPLAY_MODEL_NAME,
+    REQUEST_KIND_COUNT_TOKENS,
+    REQUEST_KIND_HELPER,
+    REQUEST_KIND_MAIN_LOOP,
+    REQUEST_KIND_OTHER,
+    classify_replay_request,
+    is_helper_model_request,
+    normalize_model_family,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -28,13 +39,12 @@ def _config_with_legacy_alias(
         return config[legacy_key]
     return default
 
-_DEFAULT_MODEL_NAME = "claude-opus-4-6"
+_DEFAULT_MODEL_NAME = DEFAULT_REPLAY_MODEL_NAME
 _DEFAULT_RESPONSE_DELAY_MS = 0
 _DEFAULT_MINIMAL_DELAY_MS = 0.0
 _DEFAULT_MAXIMAL_DELAY_MS = 1_000_000_000.0
 _NOOP_BASH_TIMEOUT_MS = 1_000
 _RESPONSE_DELAY_POLICIES = {"fixed", "trace_replay"}
-
 _PLACEHOLDER_RE = re.compile(r"^\$[0-9A-Fa-f]{2,4}$")
 _BACKGROUND_TASK_ID_RE = re.compile(r"Command running in background with ID:\s*([A-Za-z0-9_-]+)")
 _MAILMAN_RELAY_DOMAINS_LINE_RE = re.compile(
@@ -189,6 +199,10 @@ class TraceReplayLLMState:
         self._lock = threading.Lock()
         self._trace_cursor = 0
         self._duplicate_response_count = 0
+        self._main_loop_request_count = 0
+        self._helper_request_count = 0
+        self._count_tokens_request_count = 0
+        self._other_request_count = 0
         self._catchup_restore_cursor: int | None = None
         self._sticky_recovered_git_commit_hash: str | None = None
         self._sticky_background_task_aliases: dict[str, str] = {}
@@ -198,6 +212,10 @@ class TraceReplayLLMState:
         with self._lock:
             self._trace_cursor = 0
             self._duplicate_response_count = 0
+            self._main_loop_request_count = 0
+            self._helper_request_count = 0
+            self._count_tokens_request_count = 0
+            self._other_request_count = 0
             self._catchup_restore_cursor = None
             self._sticky_recovered_git_commit_hash = None
             self._sticky_background_task_aliases = {}
@@ -214,6 +232,10 @@ class TraceReplayLLMState:
         with self._lock:
             trace_cursor = self._trace_cursor
             duplicate_response_count = self._duplicate_response_count
+            main_loop_request_count = self._main_loop_request_count
+            helper_request_count = self._helper_request_count
+            count_tokens_request_count = self._count_tokens_request_count
+            other_request_count = self._other_request_count
         return {
             "trace_path": str(self._parsed.trace_path),
             "response_delay_policy": self._response_delay_policy,
@@ -221,25 +243,54 @@ class TraceReplayLLMState:
             "response_delay_scaling_factor": self._response_delay_scaling_factor,
             "minimal_delay": self._minimal_delay_ms,
             "maximal_delay": self._maximal_delay_ms,
+            # trace_cursor tracks committed replay progress for scheduler-facing
+            # Claude Code main-loop turns only. Helper and count-tokens traffic
+            # are intentionally excluded because they are auxiliary requests.
             "trace_cursor": trace_cursor,
             "total_responses": len(self._parsed.agent_steps),
             "is_complete": trace_cursor >= len(self._parsed.agent_steps),
             "sidechain_count": len(self._sidechains_by_agent_id),
             "duplicate_response_count": duplicate_response_count,
+            "main_loop_request_count": main_loop_request_count,
+            "helper_request_count": helper_request_count,
+            "count_tokens_request_count": count_tokens_request_count,
+            "other_request_count": other_request_count,
         }
 
     def handle_request(self, *, path: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
-        _ = (path, headers)
-        if path == "/v1/messages/count_tokens":
-            return _anthropic_count_tokens_response(payload)
+        _ = headers
         is_streaming = bool(payload.get("stream", False))
         requested_model = _coerce_string(payload.get("model"))
+        request_kind = classify_replay_request(
+            path=path,
+            requested_model=requested_model,
+            replay_model=self._parsed.model_name,
+        )
+        if request_kind == REQUEST_KIND_COUNT_TOKENS:
+            with self._lock:
+                self._count_tokens_request_count += 1
+            return _anthropic_count_tokens_response(payload)
+        if request_kind == REQUEST_KIND_OTHER:
+            with self._lock:
+                self._other_request_count += 1
+            logger.warning(
+                "Ignoring non-replay Claude Code request path=%s model=%s trace_path=%s",
+                path,
+                requested_model,
+                self._parsed.trace_path,
+            )
+            return _end_turn_response(
+                model_name=requested_model or self._parsed.model_name,
+                is_streaming=is_streaming,
+            )
         request_context = _request_context_from_payload(
             payload,
             background_task_ids_by_tool_use_id=self._background_task_ids_by_tool_use_id,
             recorded_observations_by_tool_use_id=self._recorded_observations_by_tool_use_id,
         )
-        if _is_helper_model_request(requested_model, replay_model=self._parsed.model_name):
+        if request_kind == REQUEST_KIND_HELPER:
+            with self._lock:
+                self._helper_request_count += 1
             sidechain = self._resolve_sidechain_for_request(payload)
             if sidechain is not None:
                 return self._handle_sidechain_request(
@@ -253,6 +304,7 @@ class TraceReplayLLMState:
         has_request_history = isinstance(messages, list)
         requested_assistant_count = _assistant_message_count_from_request(payload)
         with self._lock:
+            self._main_loop_request_count += 1
             if request_context.recovered_git_commit_hash is not None:
                 self._sticky_recovered_git_commit_hash = request_context.recovered_git_commit_hash
             self._sticky_background_task_aliases.update(request_context.background_task_aliases)
@@ -793,23 +845,6 @@ def _anthropic_count_tokens_response(payload: dict[str, Any]) -> dict[str, Any]:
         "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": 0,
     }
-
-
-def _normalize_model_family(model_name: str | None) -> str | None:
-    if not isinstance(model_name, str):
-        return None
-    stripped = model_name.strip()
-    if not stripped:
-        return None
-    if re.search(r"-\d{8}$", stripped):
-        return stripped.rsplit("-", 1)[0]
-    return stripped
-
-
-def _is_helper_model_request(requested_model: str | None, *, replay_model: str) -> bool:
-    requested_family = _normalize_model_family(requested_model)
-    replay_family = _normalize_model_family(replay_model)
-    return requested_family is not None and replay_family is not None and requested_family != replay_family
 
 
 def _coerce_string(

@@ -613,6 +613,171 @@ class InterceptorTests(unittest.TestCase):
         self.assertLess(abs(gate_operation - gate_wait), 25.0)
         self.assertLess(abs(agentcr_delay - gate_wait), 25.0)
 
+    def test_anthropic_count_tokens_request_bypasses_response_gate(self) -> None:
+        request_state_store = InMemoryRequestStateStore()
+        response_gate_registry = SandboxResponseGateRegistry()
+        response_gate_registry.enable()
+        telemetry = InMemoryTelemetrySink()
+        interceptor = AgentCRRequestInterceptor(
+            upstream_transport=lambda path, headers, body: (
+                200,
+                [("Content-Type", "application/json")],
+                json.dumps({"input_tokens": 7}).encode("utf-8"),
+            ),
+            request_state_store=request_state_store,
+            response_gate_registry=response_gate_registry,
+            telemetry=telemetry,
+        )
+
+        interceptor.intercept(
+            path="/v1/messages/count_tokens",
+            headers={
+                "Content-Type": "application/json",
+                "X-Agent-Sandbox-Id": "sbx-count",
+                "X-Request-Id": "req-count",
+            },
+            body=json.dumps({"messages": [{"role": "user", "content": "task"}]}).encode("utf-8"),
+        )
+
+        self.assertIsNone(response_gate_registry.get_pending(SandboxId("sbx-count")))
+        metric_map = {
+            name: value
+            for name, value, attributes in telemetry.metrics
+            if attributes.get("request_id") == "req-count"
+        }
+        self.assertEqual(metric_map["llm.gate_wait_ms"], 0.0)
+        request_events = [
+            (name, attributes)
+            for name, attributes in telemetry.events
+            if attributes.get("request_id") == "req-count"
+        ]
+        received_attrs = next(attrs for name, attrs in request_events if name == "interceptor.request.received")
+        self.assertEqual(received_attrs["request_kind"], "count_tokens")
+        self.assertEqual(received_attrs["response_gate_enabled"], False)
+
+    def test_anthropic_helper_request_bypasses_response_gate(self) -> None:
+        request_state_store = InMemoryRequestStateStore()
+        response_gate_registry = SandboxResponseGateRegistry()
+        response_gate_registry.enable()
+        telemetry = InMemoryTelemetrySink()
+        interceptor = AgentCRRequestInterceptor(
+            upstream_transport=lambda path, headers, body: (
+                200,
+                [("Content-Type", "text/event-stream")],
+                (
+                    b'event: message_start\n'
+                    b'data: {"type":"message_start","message":{"id":"msg_helper","type":"message","role":"assistant","content":[],"model":"claude-haiku-4-5-20251001","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}\n\n'
+                    b'event: message_stop\n'
+                    b'data: {"type":"message_stop"}\n\n'
+                ),
+            ),
+            request_state_store=request_state_store,
+            response_gate_registry=response_gate_registry,
+            telemetry=telemetry,
+        )
+
+        interceptor.intercept(
+            path="/v1/messages",
+            headers={
+                "Content-Type": "application/json",
+                "X-Agent-Sandbox-Id": "sbx-helper",
+                "X-Request-Id": "req-helper",
+            },
+            body=json.dumps(
+                {
+                    "model": "claude-haiku-4-5-20251001",
+                    "messages": [{"role": "user", "content": "helper"}],
+                }
+            ).encode("utf-8"),
+        )
+
+        self.assertIsNone(response_gate_registry.get_pending(SandboxId("sbx-helper")))
+        metric_map = {
+            name: value
+            for name, value, attributes in telemetry.metrics
+            if attributes.get("request_id") == "req-helper"
+        }
+        self.assertEqual(metric_map["llm.gate_wait_ms"], 0.0)
+        received_attrs = next(
+            attributes
+            for name, attributes in telemetry.events
+            if name == "interceptor.request.received" and attributes.get("request_id") == "req-helper"
+        )
+        self.assertEqual(received_attrs["request_kind"], "helper")
+        self.assertEqual(received_attrs["response_gate_enabled"], False)
+
+    def test_anthropic_main_loop_request_still_uses_response_gate(self) -> None:
+        request_state_store = InMemoryRequestStateStore()
+        response_gate_registry = SandboxResponseGateRegistry()
+        response_gate_registry.enable()
+        telemetry = InMemoryTelemetrySink()
+        interceptor = AgentCRRequestInterceptor(
+            upstream_transport=lambda path, headers, body: (
+                200,
+                [("Content-Type", "text/event-stream")],
+                (
+                    b'event: message_start\n'
+                    b'data: {"type":"message_start","message":{"id":"msg_main","type":"message","role":"assistant","content":[],"model":"claude-opus-4-6","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}\n\n'
+                    b'event: message_stop\n'
+                    b'data: {"type":"message_stop"}\n\n'
+                ),
+            ),
+            request_state_store=request_state_store,
+            response_gate_registry=response_gate_registry,
+            telemetry=telemetry,
+        )
+
+        finished = threading.Event()
+
+        def _run_request() -> None:
+            interceptor.intercept(
+                path="/v1/messages",
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Agent-Sandbox-Id": "sbx-main",
+                    "X-Request-Id": "req-main",
+                },
+                body=json.dumps(
+                    {
+                        "model": "claude-opus-4-6",
+                        "messages": [{"role": "user", "content": "continue"}],
+                    }
+                ).encode("utf-8"),
+            )
+            finished.set()
+
+        thread = threading.Thread(target=_run_request)
+        thread.start()
+        pending = None
+        for _ in range(100):
+            pending = response_gate_registry.find_pending_request(SandboxId("sbx-main"), "req-main")
+            if pending is not None:
+                break
+            time.sleep(0.005)
+        self.assertIsNotNone(pending)
+        assert pending is not None
+        active_context = request_state_store.get_request_context(SandboxId("sbx-main"), "req-main")
+        self.assertIsNotNone(active_context)
+        assert active_context is not None
+        self.assertEqual(active_context.metadata["request_kind"], "main_loop")
+        self.assertEqual(active_context.metadata["response_gate_enabled"], True)
+
+        time.sleep(0.02)
+        response_gate_registry.release_pending(
+            SandboxId("sbx-main"),
+            request_id="req-main",
+            generation=pending.generation,
+        )
+        thread.join(timeout=2.0)
+
+        self.assertTrue(finished.is_set())
+        metric_map = {
+            name: value
+            for name, value, attributes in telemetry.metrics
+            if attributes.get("request_id") == "req-main"
+        }
+        self.assertGreater(metric_map["llm.gate_wait_ms"], 0.0)
+
     def test_interceptor_server_healthz_returns_json(self) -> None:
         server = AgentCRRequestInterceptorServer(
             upstream_url="http://127.0.0.1:9999",

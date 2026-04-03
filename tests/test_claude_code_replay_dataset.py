@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from benchmarks.generate_claude_code_replay_dataset import generate_dataset
+from integrations.llm_services.claude_code_trace_replay.service import TraceReplayLLMState
 
 
 def _trace_payload(
@@ -107,6 +108,9 @@ class ClaudeCodeReplayDatasetTests(unittest.TestCase):
         agent_root.mkdir(parents=True, exist_ok=True)
         (agent_root / "trajectory.json").write_text(json.dumps(payload), encoding="utf-8")
         return results_path
+
+    def _repo_root(self) -> Path:
+        return Path(__file__).resolve().parents[1]
 
     def test_generate_dataset_uses_manifest_pass_rows_and_round_robins_duplicates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -275,6 +279,55 @@ class ClaudeCodeReplayDatasetTests(unittest.TestCase):
             )
 
         self.assertEqual([row["task_id"] for row in rows], ["alpha"])
+
+    def test_selected_replay_dataset_has_no_sidechains_and_helper_requests_do_not_advance_cursor(self) -> None:
+        repo_root = self._repo_root()
+        dataset_path = repo_root / "results" / "datasets" / "claude_code_replay_benchmark_with_duplicates.jsonl"
+        if not dataset_path.is_file():
+            self.skipTest(f"dataset not present: {dataset_path}")
+
+        rows = [json.loads(line) for line in dataset_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertTrue(rows)
+
+        traces_with_subagents: list[str] = []
+        helper_trace_path: Path | None = None
+        for row in rows:
+            trace_path = (dataset_path.parent / row["llm_service_config"]["trace_path"]).resolve()
+            subagents = list((trace_path.parent / "sessions" / "projects").glob("**/subagents/agent-*.jsonl"))
+            if subagents:
+                traces_with_subagents.append(str(trace_path))
+            if helper_trace_path is None:
+                debug_logs = list((trace_path.parent / "sessions" / "debug").glob("*.txt"))
+                if debug_logs:
+                    debug_text = debug_logs[0].read_text(encoding="utf-8", errors="ignore")
+                    if "Tool search disabled for model 'claude-haiku-4-5-20251001'" in debug_text:
+                        helper_trace_path = trace_path
+
+        self.assertEqual(traces_with_subagents, [])
+        self.assertIsNotNone(helper_trace_path)
+        assert helper_trace_path is not None
+
+        state = TraceReplayLLMState(llm_service_config={"trace_path": str(helper_trace_path)})
+        before = state.snapshot()
+        helper_response = state.handle_request(
+            path="/v1/messages",
+            headers={},
+            payload={"model": "claude-haiku-4-5-20251001", "messages": [{"role": "user", "content": "helper"}]},
+        )
+        after_helper = state.snapshot()
+        main_response = state.handle_request(
+            path="/v1/messages",
+            headers={},
+            payload={"model": "claude-opus-4-6", "messages": [{"role": "user", "content": "task"}]},
+        )
+        after_main = state.snapshot()
+
+        self.assertEqual(helper_response["content"], [{"type": "text", "text": ""}])
+        self.assertEqual(before["trace_cursor"], 0)
+        self.assertEqual(after_helper["trace_cursor"], 0)
+        self.assertEqual(after_helper["helper_request_count"], 1)
+        self.assertEqual(after_main["trace_cursor"], 1)
+        self.assertGreaterEqual(len(main_response["content"]), 1)
 
     def test_generate_dataset_excludes_default_bad_trials(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

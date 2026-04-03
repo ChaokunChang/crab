@@ -390,6 +390,7 @@ class ResourceAnalysisSummary:
 class OverheadAnalysisSummary:
     metrics: list[MetricSummary]
     time_series: dict[str, list[TimeSeriesPoint]]
+    cdf_series: dict[str, list[CDFPoint]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -408,6 +409,7 @@ class TurnMetricSummary:
     p95_ms: float
     p99_ms: float
     max_ms: float
+    request_kind: str = ""
 
 
 @dataclass(frozen=True)
@@ -415,6 +417,9 @@ class TurnAnalysisSummary:
     metrics: list[TurnMetricSummary]
     cdf_series: dict[str, list[CDFPoint]]
     time_series: dict[str, list[TimeSeriesPoint]]
+    metrics_by_request_kind: dict[str, list[TurnMetricSummary]] = field(default_factory=dict)
+    cdf_series_by_request_kind: dict[str, dict[str, list[CDFPoint]]] = field(default_factory=dict)
+    time_series_by_request_kind: dict[str, dict[str, list[TimeSeriesPoint]]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -668,6 +673,7 @@ class _RequestMetricAccumulator:
     sandbox_id: str
     request_id: str
     task_id: str = ""
+    request_kind: str = ""
     llm_response_metric_name: str | None = None
     llm_response_timestamp: datetime | None = None
     llm_response_time_ms: float | None = None
@@ -681,9 +687,12 @@ class _RequestMetricAccumulator:
         timestamp: datetime,
         value_ms: float,
         task_id: str,
+        request_kind: str,
     ) -> None:
         if task_id:
             self.task_id = task_id
+        if request_kind:
+            self.request_kind = request_kind
         if metric_name == _TURN_ANALYSIS_PURE_LLM_METRIC:
             self.pure_llm_timestamp = timestamp
             self.pure_llm_time_ms = value_ms
@@ -707,6 +716,7 @@ class _ResolvedRequestTiming:
     sandbox_id: str
     request_id: str
     task_id: str
+    request_kind: str
     start_time: datetime
     finish_time: datetime
     llm_response_time_ms: float
@@ -717,7 +727,12 @@ def _metric_start_time(timestamp: datetime, duration_ms: float) -> datetime:
     return timestamp - timedelta(milliseconds=duration_ms)
 
 
-def _build_turn_metric_summary(metric_name: str, values: list[float]) -> TurnMetricSummary:
+def _build_turn_metric_summary(
+    metric_name: str,
+    values: list[float],
+    *,
+    request_kind: str = "",
+) -> TurnMetricSummary:
     sorted_values = sorted(values)
     count = len(sorted_values)
     mean_ms = (sum(sorted_values) / count) if count else 0.0
@@ -730,7 +745,40 @@ def _build_turn_metric_summary(metric_name: str, values: list[float]) -> TurnMet
         p95_ms=_percentile(sorted_values, 0.95),
         p99_ms=_percentile(sorted_values, 0.99),
         max_ms=0.0 if not count else sorted_values[-1],
+        request_kind=request_kind,
     )
+
+
+def _build_turn_analysis_view(
+    *,
+    started_at: datetime | None,
+    metric_values: dict[str, list[float]],
+    metric_points: dict[str, list[tuple[datetime, float]]],
+    request_kind: str = "",
+) -> tuple[list[TurnMetricSummary], dict[str, list[CDFPoint]], dict[str, list[TimeSeriesPoint]]]:
+    metrics = [
+        _build_turn_metric_summary(metric_name, metric_values[metric_name], request_kind=request_kind)
+        for metric_name in _TURN_ANALYSIS_METRIC_ORDER
+        if metric_values.get(metric_name)
+    ]
+    cdf_series = {
+        metric_name: _build_cdf_points(metric_values[metric_name])
+        for metric_name in _TURN_ANALYSIS_METRIC_ORDER
+        if metric_values.get(metric_name)
+    }
+    time_series = {
+        metric_name: [
+            TimeSeriesPoint(
+                timestamp=timestamp.isoformat(),
+                offset_seconds=_offset_seconds(timestamp, started_at),
+                value=value,
+            )
+            for timestamp, value in sorted(metric_points.get(metric_name, []))
+        ]
+        for metric_name in _TURN_ANALYSIS_METRIC_ORDER
+        if metric_points.get(metric_name)
+    }
+    return metrics, cdf_series, time_series
 
 
 def _build_cdf_points(values: list[float]) -> list[CDFPoint]:
@@ -752,11 +800,27 @@ def _build_turn_analysis(
     resolved_requests_by_sandbox: dict[str, list[_ResolvedRequestTiming]] = defaultdict(list)
     metric_values: dict[str, list[float]] = defaultdict(list)
     metric_points: dict[str, list[tuple[datetime, float]]] = defaultdict(list)
+    metric_values_by_request_kind: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    metric_points_by_request_kind: dict[str, dict[str, list[tuple[datetime, float]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+
+    def _record_metric(metric_name: str, timestamp: datetime, value_ms: float, *, request_kind: str = "") -> None:
+        metric_values[metric_name].append(value_ms)
+        metric_points[metric_name].append((timestamp, value_ms))
+        if request_kind:
+            metric_values_by_request_kind[request_kind][metric_name].append(value_ms)
+            metric_points_by_request_kind[request_kind][metric_name].append((timestamp, value_ms))
+
     for item in request_metric_records.values():
         if item.pure_llm_timestamp is not None and item.pure_llm_time_ms is not None:
             pure_llm_start_time = _metric_start_time(item.pure_llm_timestamp, item.pure_llm_time_ms)
-            metric_values["pure_llm_time"].append(item.pure_llm_time_ms)
-            metric_points["pure_llm_time"].append((pure_llm_start_time, item.pure_llm_time_ms))
+            _record_metric(
+                "pure_llm_time",
+                pure_llm_start_time,
+                item.pure_llm_time_ms,
+                request_kind=item.request_kind,
+            )
         if item.llm_response_timestamp is None or item.llm_response_time_ms is None:
             continue
         start_time = _metric_start_time(item.llm_response_timestamp, item.llm_response_time_ms)
@@ -766,6 +830,7 @@ def _build_turn_analysis(
                 sandbox_id=item.sandbox_id,
                 request_id=item.request_id,
                 task_id=item.task_id,
+                request_kind=item.request_kind,
                 start_time=start_time,
                 finish_time=finish_time,
                 llm_response_time_ms=item.llm_response_time_ms,
@@ -776,32 +841,32 @@ def _build_turn_analysis(
     if not resolved_requests_by_sandbox:
         if not metric_values:
             return None
-        metrics = [
-            _build_turn_metric_summary(metric_name, metric_values[metric_name])
-            for metric_name in _TURN_ANALYSIS_METRIC_ORDER
-            if metric_values.get(metric_name)
-        ]
-        cdf_series = {
-            metric_name: _build_cdf_points(metric_values[metric_name])
-            for metric_name in _TURN_ANALYSIS_METRIC_ORDER
-            if metric_values.get(metric_name)
-        }
-        time_series = {
-            metric_name: [
-                TimeSeriesPoint(
-                    timestamp=timestamp.isoformat(),
-                    offset_seconds=_offset_seconds(timestamp, started_at),
-                    value=value,
-                )
-                for timestamp, value in sorted(metric_points.get(metric_name, []))
-            ]
-            for metric_name in _TURN_ANALYSIS_METRIC_ORDER
-            if metric_points.get(metric_name)
-        }
+        metrics, cdf_series, time_series = _build_turn_analysis_view(
+            started_at=started_at,
+            metric_values=metric_values,
+            metric_points=metric_points,
+        )
+        metrics_by_request_kind: dict[str, list[TurnMetricSummary]] = {}
+        cdf_series_by_request_kind: dict[str, dict[str, list[CDFPoint]]] = {}
+        time_series_by_request_kind: dict[str, dict[str, list[TimeSeriesPoint]]] = {}
+        for request_kind in sorted(metric_values_by_request_kind):
+            kind_metrics, kind_cdf_series, kind_time_series = _build_turn_analysis_view(
+                started_at=started_at,
+                metric_values=metric_values_by_request_kind[request_kind],
+                metric_points=metric_points_by_request_kind[request_kind],
+                request_kind=request_kind,
+            )
+            if kind_metrics:
+                metrics_by_request_kind[request_kind] = kind_metrics
+                cdf_series_by_request_kind[request_kind] = kind_cdf_series
+                time_series_by_request_kind[request_kind] = kind_time_series
         return TurnAnalysisSummary(
             metrics=metrics,
             cdf_series=cdf_series,
             time_series=time_series,
+            metrics_by_request_kind=metrics_by_request_kind,
+            cdf_series_by_request_kind=cdf_series_by_request_kind,
+            time_series_by_request_kind=time_series_by_request_kind,
         )
 
     for sandbox_id in sorted(resolved_requests_by_sandbox):
@@ -810,47 +875,49 @@ def _build_turn_analysis(
             key=lambda item: (item.start_time, item.finish_time, item.request_id),
         )
         for index, request in enumerate(requests):
-            metric_values["llm_response_time"].append(request.llm_response_time_ms)
-            metric_points["llm_response_time"].append((request.start_time, request.llm_response_time_ms))
+            _record_metric(
+                "llm_response_time",
+                request.start_time,
+                request.llm_response_time_ms,
+                request_kind=request.request_kind,
+            )
             if index + 1 >= len(requests):
                 continue
             next_request = requests[index + 1]
             action_time_ms = max(0.0, (next_request.start_time - request.finish_time).total_seconds() * 1000.0)
             turn_time_ms = request.llm_response_time_ms + action_time_ms
-            metric_values["action_time"].append(action_time_ms)
-            metric_values["turn_time"].append(turn_time_ms)
-            metric_points["action_time"].append((request.start_time, action_time_ms))
-            metric_points["turn_time"].append((request.start_time, turn_time_ms))
+            _record_metric("action_time", request.start_time, action_time_ms, request_kind=request.request_kind)
+            _record_metric("turn_time", request.start_time, turn_time_ms, request_kind=request.request_kind)
 
     if not metric_values:
         return None
 
-    metrics = [
-        _build_turn_metric_summary(metric_name, metric_values[metric_name])
-        for metric_name in _TURN_ANALYSIS_METRIC_ORDER
-        if metric_values.get(metric_name)
-    ]
-    cdf_series = {
-        metric_name: _build_cdf_points(metric_values[metric_name])
-        for metric_name in _TURN_ANALYSIS_METRIC_ORDER
-        if metric_values.get(metric_name)
-    }
-    time_series = {
-        metric_name: [
-            TimeSeriesPoint(
-                timestamp=timestamp.isoformat(),
-                offset_seconds=_offset_seconds(timestamp, started_at),
-                value=value,
-            )
-            for timestamp, value in sorted(metric_points.get(metric_name, []))
-        ]
-        for metric_name in _TURN_ANALYSIS_METRIC_ORDER
-        if metric_points.get(metric_name)
-    }
+    metrics, cdf_series, time_series = _build_turn_analysis_view(
+        started_at=started_at,
+        metric_values=metric_values,
+        metric_points=metric_points,
+    )
+    metrics_by_request_kind: dict[str, list[TurnMetricSummary]] = {}
+    cdf_series_by_request_kind: dict[str, dict[str, list[CDFPoint]]] = {}
+    time_series_by_request_kind: dict[str, dict[str, list[TimeSeriesPoint]]] = {}
+    for request_kind in sorted(metric_values_by_request_kind):
+        kind_metrics, kind_cdf_series, kind_time_series = _build_turn_analysis_view(
+            started_at=started_at,
+            metric_values=metric_values_by_request_kind[request_kind],
+            metric_points=metric_points_by_request_kind[request_kind],
+            request_kind=request_kind,
+        )
+        if kind_metrics:
+            metrics_by_request_kind[request_kind] = kind_metrics
+            cdf_series_by_request_kind[request_kind] = kind_cdf_series
+            time_series_by_request_kind[request_kind] = kind_time_series
     return TurnAnalysisSummary(
         metrics=metrics,
         cdf_series=cdf_series,
         time_series=time_series,
+        metrics_by_request_kind=metrics_by_request_kind,
+        cdf_series_by_request_kind=cdf_series_by_request_kind,
+        time_series_by_request_kind=time_series_by_request_kind,
     )
 
 
@@ -1642,6 +1709,7 @@ def analyze_telemetry_file(
                 timestamp=timestamp,
                 value_ms=value,
                 task_id=task_id,
+                request_kind=_maybe_str(enriched_attributes.get("request_kind")),
             )
         if timestamp is not None and name in _OVERHEAD_ANALYSIS_METRICS:
             overhead_series_raw[name].append((timestamp, value))
@@ -1784,11 +1852,17 @@ def analyze_telemetry_file(
         for metric_name in _OVERHEAD_ANALYSIS_METRICS
         if overhead_series_raw.get(metric_name)
     }
+    overhead_cdf_series = {
+        metric_name: _build_cdf_points([value for _, value in sorted(overhead_series_raw.get(metric_name, []))])
+        for metric_name in _OVERHEAD_ANALYSIS_METRICS
+        if overhead_series_raw.get(metric_name)
+    }
     overhead_analysis = None
     if overhead_metrics or overhead_time_series:
         overhead_analysis = OverheadAnalysisSummary(
             metrics=overhead_metrics,
             time_series=overhead_time_series,
+            cdf_series=overhead_cdf_series,
         )
     turn_analysis = _build_turn_analysis(
         started_at=detail_started_at or started_at,

@@ -70,6 +70,40 @@ class MiniSWEBenchmarkHelperTests(unittest.TestCase):
 
         self.assertEqual(metadata, {"benchmark_trace_cursor": 9})
 
+    def test_llm_service_checkpoint_metadata_ignores_claude_auxiliary_request_counters(self) -> None:
+        sandbox_id = SandboxId("sbx-claude-meta-aux")
+        sandbox = SandboxHandle(
+            sandbox_id=sandbox_id,
+            bundle_dir=Path("/tmp/bundle"),
+            status_port=8123,
+            last_status={},
+            llm_service_type="claude_code_trace_replay",
+        )
+        sandbox.task_run = Mock()
+        sandbox.task_run.poll_status.side_effect = RuntimeError("timed out")
+
+        harness = RealHostScenarioHarness.__new__(RealHostScenarioHarness)
+        harness._sandbox_by_id = {sandbox_id: sandbox}
+        harness._snapshot_llm_services = Mock(
+            return_value={
+                str(sandbox_id): {
+                    "llm_service_type": "claude_code_trace_replay",
+                    "state": {
+                        "trace_cursor": 4,
+                        "total_responses": 23,
+                        "is_complete": False,
+                        "main_loop_request_count": 4,
+                        "helper_request_count": 12,
+                        "count_tokens_request_count": 7,
+                    },
+                }
+            }
+        )
+
+        metadata = RealHostScenarioHarness._llm_service_checkpoint_metadata(harness, sandbox_id)
+
+        self.assertEqual(metadata, {"benchmark_trace_cursor": 4})
+
     def test_restore_llm_service_state_records_restore_trace_cursor_for_task_run(self) -> None:
         sandbox_id = SandboxId("sbx-mini-restore-cursor")
         sandbox = SandboxHandle(

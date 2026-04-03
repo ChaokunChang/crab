@@ -16,10 +16,39 @@ from .ids import SandboxId
 from .json_codec import get_json_codec
 from .models import RequestContext, RequestState, RequestStateChange, SandboxSnapshot, utc_now
 from .telemetry import start_operation
+from integrations.llm_services.claude_code_trace_replay.request_classification import (
+    REQUEST_KIND_MAIN_LOOP,
+    infer_live_request_kind,
+)
 
 
 logger = logging.getLogger(__name__)
 _JSON_CODEC = get_json_codec("auto")
+
+
+def _maybe_requested_model(path: str, body: bytes) -> str | None:
+    if path != "/v1/messages":
+        return None
+    try:
+        payload = _JSON_CODEC.loads(body)
+    except Exception:
+        logger.debug("Failed to decode interceptor request body for model classification", exc_info=True)
+        return None
+    if not isinstance(payload, dict):
+        return None
+    model = payload.get("model")
+    if not isinstance(model, str):
+        return None
+    stripped = model.strip()
+    return stripped or None
+
+
+def _claude_request_gate_policy(path: str, body: bytes) -> tuple[str | None, bool]:
+    if path not in {"/v1/messages", "/v1/messages/count_tokens"}:
+        return None, True
+    requested_model = _maybe_requested_model(path, body)
+    request_kind = infer_live_request_kind(path=path, requested_model=requested_model)
+    return request_kind, request_kind == REQUEST_KIND_MAIN_LOOP
 
 class CompositeRequestInterceptorHook(RequestInterceptorHook):
     def __init__(self, hooks: list[RequestInterceptorHook] | None = None):
@@ -483,11 +512,19 @@ class AgentCRRequestInterceptor:
         upstream_headers = dict(headers)
         upstream_headers["X-Agent-Sandbox-Id"] = sandbox_id_raw
         provider = "openai" if path == "/v1/chat/completions" else "anthropic"
+        request_kind, response_gate_enabled = _claude_request_gate_policy(path, body)
+        metadata = {
+            "provider": provider,
+            "path": path,
+            "response_gate_enabled": response_gate_enabled,
+        }
+        if request_kind is not None:
+            metadata["request_kind"] = request_kind
         context = RequestContext(
             request_id=upstream_headers.get("X-Request-Id", "").strip() or str(uuid.uuid4()),
             sandbox_id=SandboxId(sandbox_id_raw),
             started_at=utc_now(),
-            metadata={"provider": provider, "path": path},
+            metadata=metadata,
         )
         upstream_headers["X-Request-Id"] = context.request_id
         upstream_headers["X-AgentCR-Request-Id"] = context.request_id
@@ -497,7 +534,10 @@ class AgentCRRequestInterceptor:
             "sandbox_id": str(context.sandbox_id),
             "provider": provider,
             "path": path,
+            "response_gate_enabled": response_gate_enabled,
         }
+        if request_kind is not None:
+            request_attributes["request_kind"] = request_kind
         if self._telemetry is not None:
             self._telemetry.emit_event("interceptor.request.received", request_attributes)
         logger.debug(
@@ -514,8 +554,16 @@ class AgentCRRequestInterceptor:
         gate_generation = None
         request_started = time.perf_counter()
         agentcr_delay_started_at: float | None = None
-        if self._response_gate_registry is not None:
+        if self._response_gate_registry is not None and response_gate_enabled:
             gate_generation = self._response_gate_registry.arm(context.sandbox_id, context.request_id)
+        elif self._response_gate_registry is not None and request_kind is not None:
+            logger.debug(
+                "Skipped response gate for auxiliary Claude request: sandbox_id=%s request_id=%s kind=%s path=%s",
+                context.sandbox_id,
+                context.request_id,
+                request_kind,
+                path,
+            )
         self._notify(context.sandbox_id)
         try:
             forward_operation = None if self._telemetry is None else start_operation(
@@ -534,7 +582,7 @@ class AgentCRRequestInterceptor:
                     request_attributes,
                 )
             agentcr_delay_started_at = time.perf_counter()
-            if self._on_response_ready is not None:
+            if self._on_response_ready is not None and gate_generation is not None:
                 try:
                     self._on_response_ready(context.sandbox_id, context.request_id, gate_generation)
                 except Exception:
@@ -556,7 +604,7 @@ class AgentCRRequestInterceptor:
         finally:
             gate_wait_ms = 0.0
             released_at = time.perf_counter()
-            if self._response_gate_registry is not None:
+            if self._response_gate_registry is not None and gate_generation is not None:
                 gate_operation = None if self._telemetry is None else start_operation(
                     self._telemetry,
                     "interceptor.response_gate.wait",

@@ -162,6 +162,12 @@ When response gating is enabled:
 - overlapping requests from the same sandbox stay isolated from each other during coordination and recovery
 - a buffered response is released only after that exact request generation has finished coordination and any submitted checkpoint work for it has completed or been skipped
 
+For Claude Code replay workloads, response gating is now request-kind aware:
+
+- `main_loop` Anthropic `POST /v1/messages` requests remain fully gated and checkpoint-visible
+- auxiliary `helper` requests and `count_tokens` probes are tagged in interceptor metadata but bypass response gating
+- live-request checkpoint metadata is only captured for gated requests, so auxiliary Claude traffic no longer creates misleading checkpoint windows or inflated `llm.gate_wait_ms`
+
 That same request-generation metadata is also stored in live-request checkpoints, so restore-time response release can target the matching buffered response without accidentally releasing a newer one.
 
 ## Runtime Notes
@@ -451,6 +457,8 @@ Logging notes:
 - `phase_merging.setup_and_run_executor_pool` defaults to `separate`. Set it to `shared` to use one executor pool for merged `setup+run` work.
 - Phase telemetry now emits distinct phase-qualified records such as `benchmark.phase.setup.*`, `benchmark.phase.run.*`, `benchmark.phase.verification.*`, and `benchmark.phase.<phase>.item.*` so JSONL output shows phase timing and configured concurrency.
 - The telemetry HTML report now includes a `Turn Analysis` section with stats, CDFs, and over-time charts for `llm_response_time`, `pure_llm_time`, `action_time`, and `turn_time`.
+- `Turn Analysis` keeps the aggregate `all` view and now also breaks those same metrics out by `request_kind` when telemetry includes it, so Claude runs can separate `main_loop`, `helper`, and `count_tokens` behavior.
+- `Overhead Analysis` now includes a dedicated `llm.gate_wait` CDF figure in addition to the existing summary tables and latency charts.
 - `llm_response_time` is the observed interceptor-side latency for a request, while `pure_llm_time` is the underlying `llm.service.request` duration from the LLM service itself.
 - `zpool_size` controls the backing file size for ephemeral benchmark zpools.
 - `reuse_zpool: true` keeps the zpool across runs instead of recreating it every time.

@@ -4,8 +4,8 @@ provider: openai
 agent: claude_code
 llm_service: claude_code_trace_replay
 task_dataset: /root/workspace/agent-cr/results/datasets/claude_code_replay_benchmark_with_duplicates.jsonl
-sandboxes: 10
-max_workers: 32
+sandboxes: 100
+max_workers: 48
 phase_workers:
   setup: 32
   run: 32
@@ -37,11 +37,11 @@ llm_server:
 host_inspector:
   launch_mode: process
 iterations: 10
-output: /root/workspace/agent-cr/logs/claude_code.fault.auto.10tasks.norelaunch.debug.csv
-log_file: /root/workspace/agent-cr/logs/claude_code.fault.auto.10tasks.norelaunch.debug.log
+output: /root/workspace/agent-cr/logs/claude_code.fault.auto.100tasks.norelaunch.debug.csv
+log_file: /root/workspace/agent-cr/logs/claude_code.fault.auto.100tasks.norelaunch.debug.log
 log_file_mode: write
 telemetry:
-  output: /root/workspace/agent-cr/logs/claude_code.fault.auto.10tasks.norelaunch.debug.telemetry.jsonl
+  output: /root/workspace/agent-cr/logs/claude_code.fault.auto.100tasks.norelaunch.debug.telemetry.jsonl
   file_mode: write
   detail_level: detailed
   capture_command_output: false
@@ -55,7 +55,7 @@ telemetry:
   serializer: auto
   report:
     enabled: true
-    output_dir: /root/workspace/agent-cr/logs/claude_code.fault.auto.10tasks.norelaunch.debug.report
+    output_dir: /root/workspace/agent-cr/logs/claude_code.fault.auto.100tasks.norelaunch.debug.report
     top_k: 50
     log_scale_charts: false
     export_svg: true
