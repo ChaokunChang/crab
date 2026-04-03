@@ -22,6 +22,7 @@ logs/
 integrations/sandboxes/3rdparty/
 data/
 .cache/
+benchmarks/reports/
 integrations/sandboxes/iflow/cache/
 .codex
 benchmarks/evaluation
