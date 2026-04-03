@@ -42,11 +42,13 @@ from benchmarks.support import (
     BenchmarkTaskRecord,
     TreeSearchCheckpointRecord,
     bounded_probability,
-    compute_summary_aliases,
-    compute_telemetry_summary,
     build_tree_search_checkpoint_index,
     compute_summary,
+    compute_summary_aliases,
+    compute_telemetry_summary,
+    effective_trace_replay_progress_count,
     resolve_checkpoint_copy_plan,
+    resolve_tree_search_replay_checkpoint,
     resolve_work_dir_host_path,
     select_injected_indices,
     total_actions,
@@ -896,6 +898,36 @@ class BenchmarkHelperTests(unittest.TestCase):
                 3: TreeSearchCheckpointRecord(CheckpointId("ckpt-3"), replay_actions=3),
             },
         )
+
+    def test_resolve_tree_search_replay_checkpoint_uses_latest_prior_step(self) -> None:
+        indexed = {
+            1: TreeSearchCheckpointRecord(CheckpointId("ckpt-1"), replay_actions=1),
+            3: TreeSearchCheckpointRecord(CheckpointId("ckpt-3"), replay_actions=3),
+        }
+
+        checkpoint_step, checkpoint = resolve_tree_search_replay_checkpoint(indexed, 2)
+
+        self.assertEqual(checkpoint_step, 1)
+        self.assertEqual(checkpoint, indexed[1])
+
+    def test_resolve_tree_search_replay_checkpoint_rejects_missing_ancestor(self) -> None:
+        indexed = {
+            2: TreeSearchCheckpointRecord(CheckpointId("ckpt-2"), replay_actions=2),
+        }
+
+        with self.assertRaisesRegex(ValueError, "no tree-search checkpoint available at or before replay step 1"):
+            resolve_tree_search_replay_checkpoint(indexed, 1)
+
+    def test_effective_trace_replay_progress_count_falls_back_to_trace_response_count(self) -> None:
+        record = BenchmarkTaskRecord(
+            agent_type="iflow",
+            task_description=TaskDescription(""),
+            task_config=TaskConfig(),
+            trace_replay_progress_count=None,
+            trace_response_count=7,
+        )
+
+        self.assertEqual(effective_trace_replay_progress_count(record), 7)
 
     def test_compute_summary_averages_metrics(self) -> None:
         rows = [

@@ -2,16 +2,24 @@ from __future__ import annotations
 
 from concurrent.futures import Future
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
+import tempfile
 import threading
 import time
 from types import SimpleNamespace
 import unittest
 
 from agent_cr import CheckpointId, SandboxId
-from integrations.agents import SandboxHandle
+from integrations.agents import SandboxHandle, TaskConfig, TaskDescription
 from benchmarks.config import BenchmarkConfig
-from benchmarks.scenarios.tree import choose_replay_steps, run_auto, run_manual
+from benchmarks.scenarios.tree import (
+    _source_specs,
+    choose_random_replay_steps,
+    choose_replay_steps,
+    run_auto,
+    run_manual,
+)
 from benchmarks.support import BenchmarkTaskRecord, TreeSearchCheckpointRecord
 
 
@@ -105,6 +113,8 @@ class _FakeHarness:
         self.action_delta_calls: list[tuple[str, int]] = []
         self.manual_checkpoint_calls: list[tuple[str, bool]] = []
         self.wait_for_tree_search_calls: list[tuple[str, int]] = []
+        self.wait_for_tree_search_require_complete: list[bool] = []
+        self.auto_checkpoint_steps: dict[str, list[int]] = {}
         self.deactivated: list[str] = []
         self.destroyed: list[str] = []
         self.events: list[tuple[str, str, int]] = []
@@ -119,6 +129,8 @@ class _FakeHarness:
         self.source_task_completion_delta: int | None = None
         self.fork_task_completion_delta: int | None = None
         self.interceptor_hooks: list[object] = []
+        self.restore_should_fail = False
+        self.restore_fallbacks: list[str] = []
 
     def _completion_delta_for(self, sandbox_id: str) -> int | None:
         if sandbox_id.startswith("tree-fork-"):
@@ -142,10 +154,16 @@ class _FakeHarness:
             status_port=self._next_port,
             last_status={"total_actions": 0},
             status_host="10.250.0.2",
-            agent_type="simulated",
-            task_description=SimpleNamespace(prompt=""),
-            task_config=SimpleNamespace(),
-            launch_metadata={"benchmark": {"task_id": sandbox_name}},
+            agent_type=record.agent_type,
+            llm_service_type=record.llm_service_type or "simulated",
+            task_description=record.task_description if isinstance(record.task_description, TaskDescription) else TaskDescription(""),
+            task_config=record.task_config if isinstance(record.task_config, TaskConfig) else TaskConfig(),
+            launch_metadata={
+                "benchmark": {
+                    "task_id": record.task_id or sandbox_name,
+                    "trace_response_count": record.trace_response_count,
+                }
+            },
         )
         self._next_port += 1
         self._source_launches.append(sandbox_name)
@@ -173,13 +191,15 @@ class _FakeHarness:
         return 0
 
     def set_snapshot_metadata(self, sandbox: SandboxHandle, **metadata: object) -> None:
-        step = int(metadata["tree_search_step"])
         sandbox_id = str(sandbox.sandbox_id)
-        self._snapshot_steps[sandbox_id].append(step)
-        self._checkpoint_steps[sandbox_id] = step
+        if "tree_search_step" in metadata:
+            step = int(metadata["tree_search_step"])
+            self._snapshot_steps[sandbox_id].append(step)
+            self._checkpoint_steps[sandbox_id] = step
 
     def set_snapshot_metadata_by_id(self, sandbox_id: SandboxId, **metadata: object) -> None:
-        self._snapshot_steps[str(sandbox_id)].append(int(metadata["tree_search_step"]))
+        if "tree_search_step" in metadata:
+            self._snapshot_steps[str(sandbox_id)].append(int(metadata["tree_search_step"]))
 
     def checkpoint_manual(self, sandbox: SandboxHandle, leave_running: bool = False):
         sandbox_id = str(sandbox.sandbox_id)
@@ -194,17 +214,20 @@ class _FakeHarness:
         sandbox_id: SandboxId,
         *,
         initial_steps: int,
+        require_complete: bool = True,
         timeout_s: float = 45.0,
     ) -> dict[int, TreeSearchCheckpointRecord]:
         _ = timeout_s
         sandbox_id_text = str(sandbox_id)
         self.wait_for_tree_search_calls.append((sandbox_id_text, initial_steps))
+        self.wait_for_tree_search_require_complete.append(require_complete)
+        steps = self.auto_checkpoint_steps.get(sandbox_id_text, list(range(1, initial_steps + 1)))
         return {
             step: TreeSearchCheckpointRecord(
                 CheckpointId(f"auto-{sandbox_id_text}-{step}"),
                 replay_actions=step,
             )
-            for step in range(1, initial_steps + 1)
+            for step in steps
         }
 
     def deactivate_sandbox_runtime(self, sandbox: SandboxHandle) -> None:
@@ -234,9 +257,10 @@ class _FakeHarness:
             last_status={"total_actions": 0},
             status_host="10.250.0.99",
             agent_type=source.agent_type,
+            llm_service_type=source.llm_service_type,
             task_description=source.task_description,
             task_config=source.task_config,
-            launch_metadata={"benchmark": {"task_id": fork_name}},
+            launch_metadata={"benchmark": dict(source.launch_metadata.get("benchmark", {}))},
         )
         self._next_port += 1
         self._statuses[str(fork.sandbox_id)] = {"total_actions": 0}
@@ -265,6 +289,14 @@ class _FakeHarness:
             self.events.append(("restore", str(sandbox.sandbox_id), step))
             if self.restore_delay_s > 0:
                 time.sleep(self.restore_delay_s)
+            if self.restore_should_fail:
+                now = datetime.now(timezone.utc)
+                return SimpleNamespace(
+                    status=SimpleNamespace(value="failed"),
+                    started_at=now,
+                    finished_at=now + timedelta(milliseconds=1),
+                    message="criu restore failed: inet: Can't bind inet socket (id 65): Cannot assign requested address",
+                )
             self._statuses[str(sandbox.sandbox_id)] = {"total_actions": max(0, step - 1)}
         finally:
             with self._restore_lock:
@@ -277,8 +309,36 @@ class _FakeHarness:
             message=None,
         )
 
+    def restore_tree_search_fork(self, sandbox: SandboxHandle, checkpoint_id: CheckpointId):
+        result = self.restore_once(sandbox, checkpoint_id)
+        if result.status.value == "succeeded":
+            return result
+        sandbox_id = str(sandbox.sandbox_id)
+        self.restore_fallbacks.append(sandbox_id)
+        step = self._checkpoint_to_step[str(checkpoint_id)]
+        self.events.append(("relaunch", sandbox_id, step))
+        self._statuses[sandbox_id] = {"total_actions": max(0, step - 1)}
+        now = datetime.now(timezone.utc)
+        return SimpleNamespace(
+            status=SimpleNamespace(value="succeeded"),
+            started_at=result.started_at,
+            finished_at=now + timedelta(milliseconds=1),
+            message="restore_failed_relaunch_fallback",
+        )
+
     def destroy_sandbox_dataset(self, sandbox: SandboxHandle) -> None:
         self.destroyed.append(str(sandbox.sandbox_id))
+
+    def wait_for_task_completion(self, sandbox: SandboxHandle, *, timeout_s: float | None = None) -> None:
+        _ = timeout_s
+        sandbox_id = str(sandbox.sandbox_id)
+        trace_response_count = sandbox.launch_metadata.get("benchmark", {}).get("trace_response_count")
+        if trace_response_count is not None:
+            payload = {"total_actions": int(trace_response_count), "replay_trace_cursor": int(trace_response_count)}
+            self._statuses[sandbox_id] = payload
+            sandbox.last_status = payload
+        if sandbox.task_future is not None and not sandbox.task_future.done():
+            sandbox.task_future.set_result(None)
 
 
 class TreeSearchScenarioTests(unittest.TestCase):
@@ -319,8 +379,136 @@ class TreeSearchScenarioTests(unittest.TestCase):
             sorted(harness.wait_for_tree_search_calls),
             [("tree-source-0", 3), ("tree-source-1", 3)],
         )
+        self.assertEqual(harness.wait_for_tree_search_require_complete, [True, True])
         self.assertEqual(sorted(row["source_index"] for row in rows), [0, 1])
         self.assertEqual([row["replay_actions"] for row in rows], [1, 1])
+
+    def test_auto_mode_can_reuse_latest_prior_checkpoint_when_sparse_steps_are_enabled(self) -> None:
+        harness = _FakeHarness()
+        harness.auto_checkpoint_steps["tree-source-0"] = [1, 3]
+        config = _config(
+            mode="auto",
+            scenario_options={
+                "source_steps": 4,
+                "branch_points": 2,
+                "fork_steps": 1,
+                "replay_mode": "sequential",
+                "skip_if_no_meaningful_delta": True,
+            },
+        )
+
+        rows = run_auto(config, harness)
+
+        self.assertEqual(harness.wait_for_tree_search_require_complete, [False])
+        self.assertEqual([row["replay_step"] for row in rows], [1, 2])
+        self.assertEqual([row["checkpoint_step"] for row in rows], [1, 1])
+        self.assertEqual([row["checkpoint_step_gap"] for row in rows], [0, 1])
+        self.assertEqual([row["replay_actions"] for row in rows], [1, 1])
+
+    def test_source_specs_use_trace_response_count_as_fallback_for_branchable_replay_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dataset_path = Path(tmpdir) / "tasks.jsonl"
+            rows = [
+                {
+                    "agent_type": "iflow",
+                    "task_description": "",
+                    "task_config": {},
+                    "task_id": "unbranchable-missing-progress",
+                    "llm_service_type": "iflow_trace_replay",
+                    "trace_response_count": 1,
+                },
+                {
+                    "agent_type": "iflow",
+                    "task_description": "",
+                    "task_config": {},
+                    "task_id": "long-enough-missing-progress",
+                    "llm_service_type": "iflow_trace_replay",
+                    "trace_response_count": 12,
+                },
+                {
+                    "agent_type": "iflow",
+                    "task_description": "",
+                    "task_config": {},
+                    "task_id": "long-enough-explicit-progress",
+                    "llm_service_type": "iflow_trace_replay",
+                    "trace_replay_progress_count": 15,
+                    "trace_response_count": 15,
+                },
+            ]
+            dataset_path.write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+            config = _config(
+                mode="auto",
+                agent="iflow",
+                llm_service="iflow_trace_replay",
+                task_dataset=dataset_path,
+                sandboxes=2,
+                scenario_options={
+                    "source_steps": 10,
+                    "branch_points": 1,
+                    "fork_steps": 1,
+                    "replay_mode": "sequential",
+                },
+            )
+
+            specs = _source_specs(config)
+
+        self.assertEqual([spec.task_record.task_id for spec in specs], [
+            "long-enough-missing-progress",
+            "long-enough-explicit-progress",
+        ])
+
+    def test_choose_random_replay_steps_is_stable(self) -> None:
+        first = choose_random_replay_steps(12, 3, seed_key="task-a")
+        second = choose_random_replay_steps(12, 3, seed_key="task-a")
+
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 3)
+        self.assertEqual(first, sorted(first))
+        self.assertTrue(all(1 <= step < 12 for step in first))
+
+    def test_replay_backed_auto_mode_runs_forks_to_completion(self) -> None:
+        harness = _FakeHarness()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dataset_path = Path(tmpdir) / "tasks.jsonl"
+            dataset_path.write_text(
+                json.dumps(
+                    {
+                        "agent_type": "iflow",
+                        "task_description": "",
+                        "task_config": {},
+                        "task_id": "task-replay",
+                        "llm_service_type": "iflow_trace_replay",
+                        "trace_response_count": 5,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config = _config(
+                mode="auto",
+                agent="iflow",
+                llm_service="iflow_trace_replay",
+                task_dataset=dataset_path,
+                sandboxes=1,
+                scenario_options={
+                    "source_steps": 2,
+                    "branch_points": 2,
+                    "fork_steps": 1,
+                    "replay_mode": "sequential",
+                },
+            )
+
+            rows = run_auto(config, harness)
+
+        self.assertEqual(harness.wait_for_tree_search_calls, [("tree-source-0", 5)])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([row["replay_step"] for row in rows], sorted(row["replay_step"] for row in rows))
+        self.assertTrue(all(1 <= int(row["replay_step"]) < 5 for row in rows))
+        self.assertIn("tree-source-0", harness.deactivated)
+        self.assertFalse(any(sandbox_id.startswith("tree-fork-") for sandbox_id in harness.stop_requests))
 
     def test_concurrent_mode_restores_forks_in_parallel(self) -> None:
         harness = _FakeHarness()
@@ -336,6 +524,46 @@ class TreeSearchScenarioTests(unittest.TestCase):
         self.assertIn("tree-fork-0-2", harness.stop_requests)
         self.assertGreaterEqual(harness.max_concurrent_restores, 2)
         self.assertEqual([row["replay_step"] for row in rows], [1, 2])
+
+    def test_replay_backed_restore_can_fallback_to_relaunch_for_forks(self) -> None:
+        harness = _FakeHarness()
+        harness.restore_should_fail = True
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dataset_path = Path(tmpdir) / "tasks.jsonl"
+            dataset_path.write_text(
+                json.dumps(
+                    {
+                        "agent_type": "iflow",
+                        "task_description": "",
+                        "task_config": {},
+                        "task_id": "task-replay-fallback",
+                        "llm_service_type": "iflow_trace_replay",
+                        "trace_response_count": 5,
+                        "docker_compose_file": "/tmp/compose.yaml",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config = _config(
+                mode="auto",
+                agent="iflow",
+                llm_service="iflow_trace_replay",
+                task_dataset=dataset_path,
+                sandboxes=1,
+                scenario_options={
+                    "source_steps": 2,
+                    "branch_points": 1,
+                    "fork_steps": 1,
+                    "replay_mode": "sequential",
+                },
+            )
+
+            rows = run_auto(config, harness)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(harness.restore_fallbacks, [rows[0]["fork_sandbox_id"]])
+        self.assertIn(("relaunch", rows[0]["fork_sandbox_id"], rows[0]["checkpoint_step"]), harness.events)
 
     def test_manual_mode_waits_for_source_task_stop_before_first_clone(self) -> None:
         harness = _FakeHarness()

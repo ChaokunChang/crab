@@ -75,6 +75,9 @@ def load_task_dataset(path: Path) -> list[BenchmarkTaskRecord]:
                 service_name=None if payload.get("service_name") is None else str(payload["service_name"]),
                 task_root=None if task_root is None else (dataset_root / str(task_root)).resolve(),
                 llm_service_config=_resolve_dataset_service_config(dataset_root, payload.get("llm_service_config")),
+                trace_replay_progress_count=None
+                if payload.get("trace_replay_progress_count") is None
+                else int(payload["trace_replay_progress_count"]),
                 trace_response_count=None
                 if payload.get("trace_response_count") is None
                 else int(payload["trace_response_count"]),
@@ -105,6 +108,7 @@ def select_task_record(
         task_config=default_task_config,
         llm_service_type=default_llm_service_type,
         task_id=None,
+        trace_replay_progress_count=None,
         trace_response_count=None,
         trace_malformed_line_count=None,
     )

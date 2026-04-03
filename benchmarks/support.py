@@ -286,6 +286,17 @@ def build_tree_search_checkpoint_index(
     return dict(sorted(indexed.items()))
 
 
+def resolve_tree_search_replay_checkpoint(
+    indexed: dict[int, TreeSearchCheckpointRecord],
+    replay_step: int,
+) -> tuple[int, TreeSearchCheckpointRecord]:
+    compatible_steps = [step for step in indexed if step <= replay_step]
+    if not compatible_steps:
+        raise ValueError(f"no tree-search checkpoint available at or before replay step {replay_step}")
+    checkpoint_step = max(compatible_steps)
+    return checkpoint_step, indexed[checkpoint_step]
+
+
 @dataclass(frozen=True)
 class BenchmarkTaskRecord:
     agent_type: str
@@ -298,8 +309,15 @@ class BenchmarkTaskRecord:
     service_name: str | None = None
     task_root: Path | None = None
     llm_service_config: dict[str, object] | None = None
+    trace_replay_progress_count: int | None = None
     trace_response_count: int | None = None
     trace_malformed_line_count: int | None = None
+
+
+def effective_trace_replay_progress_count(record: BenchmarkTaskRecord) -> int | None:
+    if record.trace_replay_progress_count is not None:
+        return record.trace_replay_progress_count
+    return record.trace_response_count
 
 
 def is_replay_llm_service_type(llm_service_type: str | None) -> bool:

@@ -25,6 +25,8 @@ _HOST_INSPECTOR_REGISTER_RETRY_DELAY_S = 0.2
 _RESILIENT_EXEC_RECOVERY_TIMEOUT_S = 300.0
 _DEFAULT_RUNTIME_COMMAND_TIMEOUT_SECONDS = 60.0
 _DEFAULT_ZFS_PREPARE_TIMEOUT_SECONDS = 300.0
+_DATASET_DESTROY_BUSY_RETRIES = 10
+_DATASET_DESTROY_BUSY_RETRY_DELAY_S = 0.5
 _LAUNCH_PREPARED_METADATA_KEY = "_agent_cr_runtime_prepared"
 _LAUNCH_REUSE_EXISTING_ROOTFS_METADATA_KEY = "_agent_cr_runtime_reuse_existing_rootfs"
 _SHARED_ROOTFS_KEY_METADATA_KEY = "shared_rootfs_key"
@@ -1086,18 +1088,37 @@ class RuncRuntime(Runtime):
         dataset = None if description is None else str(description.metadata.get("zfs_dataset", "")) or None
         if not dataset:
             dataset = f"{self._paths.zfs_dataset_prefix}/{sandbox_id}"
-        result = self._run_command(
-            [self._zfs_bin, "destroy", "-r", dataset],
-            operation="sandbox.zfs_destroy",
-            sandbox_id=sandbox_id,
-            check=False,
-            metadata={"dataset": dataset},
-        )
-        if result.returncode != 0 and "does not exist" not in result.stderr:
+        result: CommandResult | None = None
+        stderr = ""
+        for attempt in range(1, _DATASET_DESTROY_BUSY_RETRIES + 1):
+            result = self._run_command(
+                [self._zfs_bin, "destroy", "-r", dataset],
+                operation="sandbox.zfs_destroy",
+                sandbox_id=sandbox_id,
+                check=False,
+                metadata={"dataset": dataset, "attempt": attempt},
+            )
+            stderr = result.stderr.strip()
+            if result.returncode == 0 or "does not exist" in stderr:
+                return
+            if "dataset is busy" not in stderr:
+                break
+            if attempt < _DATASET_DESTROY_BUSY_RETRIES:
+                logger.warning(
+                    "ZFS dataset destroy reported busy; retrying sandbox=%s dataset=%s attempt=%d/%d stderr=%s",
+                    sandbox_id,
+                    dataset,
+                    attempt,
+                    _DATASET_DESTROY_BUSY_RETRIES,
+                    stderr,
+                )
+                time.sleep(_DATASET_DESTROY_BUSY_RETRY_DELAY_S)
+        assert result is not None
+        if result.returncode != 0 and "does not exist" not in stderr:
             raise RuntimeError(
                 f"command failed ({result.returncode}): {self._zfs_bin} destroy -r {dataset}"
                 f"\nstdout: {result.stdout.strip()}"
-                f"\nstderr: {result.stderr.strip()}"
+                f"\nstderr: {stderr}"
             )
 
     def clone_filesystem_snapshot(

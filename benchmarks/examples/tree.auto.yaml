@@ -17,3 +17,4 @@ scenario_options:
   branch_points: 3
   fork_steps: 7
   replay_mode: concurrent
+  skip_if_no_meaningful_delta: false

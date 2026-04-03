@@ -65,8 +65,9 @@ from agent_cr import (
     JobId,
     build_configured_telemetry_sink,
 )
-from agent_cr.models import ArtifactPayload, utc_now
+from agent_cr.models import ArtifactPayload, FailureCode, JobStatus, RestoreResult, utc_now
 from agent_cr.telemetry import start_operation
+from agent_cr.workers.composite import resolve_restore_manifest
 from agent_cr.host_inspector.fs_helper import LibbpfFilesystemMonitor
 from agent_cr.host_inspector.runtime_resolver import RuntimeResolver
 from agent_cr.host_inspector.server import HostInspectorDaemon, HostInspectorServer
@@ -2519,6 +2520,68 @@ PY
                 sandbox.task_run.on_restore_complete()
         return result
 
+    def restore_tree_search_fork(self, sandbox: SandboxHandle, checkpoint_id: CheckpointId):
+        result = self.restore_once(sandbox, checkpoint_id)
+        if result.status.value == "succeeded":
+            return result
+        if not self._should_fallback_tree_search_restore_to_relaunch(sandbox, result):
+            return result
+        manifest = self._resolve_tree_search_restore_manifest(sandbox.sandbox_id, checkpoint_id)
+        if manifest is None:
+            return result
+        logger.warning(
+            "Falling back to relaunch for tree-search fork restore sandbox=%s checkpoint=%s message=%s",
+            sandbox.sandbox_id,
+            checkpoint_id,
+            result.message,
+        )
+        self._restore_llm_service_state(sandbox.sandbox_id, manifest)
+        self.relaunch_sandbox(sandbox, preserve_filesystem_state=True)
+        self._repair_sandbox_network_after_recovery(sandbox)
+        return RestoreResult(
+            job_id=result.job_id,
+            sandbox_id=result.sandbox_id,
+            checkpoint_id=result.checkpoint_id,
+            status=JobStatus.SUCCEEDED,
+            started_at=result.started_at,
+            finished_at=utc_now(),
+            failure_code=FailureCode.NONE,
+            message="restore_failed_relaunch_fallback",
+            operation_statuses=result.operation_statuses,
+        )
+
+    def _should_fallback_tree_search_restore_to_relaunch(
+        self,
+        sandbox: SandboxHandle,
+        result: RestoreResult,
+    ) -> bool:
+        if sandbox.launch_source != "compose":
+            return False
+        if not benchmark_support.is_replay_llm_service_type(sandbox.llm_service_type):
+            return False
+        if sandbox.agent_type is None or not self._agent_requires_benchmark_network(sandbox.agent_type):
+            return False
+        message = (result.message or "").lower()
+        return "can't bind inet socket" in message or "cannot assign requested address" in message
+
+    def _resolve_tree_search_restore_manifest(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> CheckpointManifest | None:
+        if self.storage is None:
+            return None
+        try:
+            manifest = self.storage.get_manifest(sandbox_id, checkpoint_id)
+            return resolve_restore_manifest(self.storage, manifest)
+        except Exception:
+            logger.exception(
+                "Failed to resolve tree-search restore manifest sandbox=%s checkpoint=%s",
+                sandbox_id,
+                checkpoint_id,
+            )
+            return None
+
     def notify_fault(self, sandbox: SandboxHandle, *, reason: str = "fault") -> None:
         assert self.system is not None
         logger.info("Benchmark notifying fault sandbox=%s reason=%s", sandbox.sandbox_id, reason)
@@ -2617,10 +2680,25 @@ PY
         sandbox_id: SandboxId,
         *,
         initial_steps: int,
+        require_complete: bool = True,
         timeout_s: float = 45.0,
     ) -> dict[int, benchmark_support.TreeSearchCheckpointRecord]:
         collected: dict[int, benchmark_support.TreeSearchCheckpointRecord] = {}
         last_error = f"missing tree-search checkpoints for steps {list(range(1, initial_steps + 1))}"
+
+        if not require_complete:
+            self.wait_for_checkpoint_count_stable(sandbox_id, timeout_s=timeout_s)
+            collected = self.collect_tree_search_checkpoints(
+                sandbox_id,
+                initial_steps=initial_steps,
+                require_complete=False,
+            )
+            logger.info(
+                "Collected sparse tree-search checkpoints sandbox=%s steps=%s",
+                sandbox_id,
+                sorted(collected.keys()),
+            )
+            return collected
 
         def _ready() -> bool:
             nonlocal collected
@@ -3055,6 +3133,7 @@ PY
         )
         if target.task_run is not None and target.agent_type != "simulated":
             target.task_run.configure_bundle()
+        self._preserve_tree_search_restore_bundle_compatibility(source=source, target=target)
         target.status_host = "127.0.0.1" if network_lease is None else network_lease.guest_ip
         target.status_port = source.status_port
         if network_lease is not None:
@@ -3068,6 +3147,60 @@ PY
             checkpoint_id,
         )
         return target
+
+    def _preserve_tree_search_restore_bundle_compatibility(
+        self,
+        *,
+        source: SandboxHandle,
+        target: SandboxHandle,
+    ) -> None:
+        source_config_path = source.bundle_dir / "config.json"
+        target_config_path = target.bundle_dir / "config.json"
+        if not source_config_path.is_file() or not target_config_path.is_file():
+            return
+
+        source_cfg = json.loads(source_config_path.read_text(encoding="utf-8"))
+        target_cfg = json.loads(target_config_path.read_text(encoding="utf-8"))
+
+        source_mounts = source_cfg.get("mounts", [])
+        target_mounts = target_cfg.get("mounts", [])
+        if not isinstance(source_mounts, list) or not isinstance(target_mounts, list):
+            return
+
+        existing_destinations = {
+            str(mount.get("destination"))
+            for mount in target_mounts
+            if isinstance(mount, dict) and mount.get("destination")
+        }
+        preserved_destinations: list[str] = []
+        for mount in source_mounts:
+            if not isinstance(mount, dict):
+                continue
+            destination = mount.get("destination")
+            if not isinstance(destination, str) or not destination or destination in existing_destinations:
+                continue
+            target_mounts.append(dict(mount))
+            existing_destinations.add(destination)
+            preserved_destinations.append(destination)
+        if preserved_destinations:
+            logger.info(
+                "Preserved source-only mounts for tree-search restore compatibility "
+                "source=%s target=%s mounts=%s",
+                source.sandbox_id,
+                target.sandbox_id,
+                preserved_destinations,
+            )
+        target_cfg["mounts"] = target_mounts
+
+        source_process = source_cfg.get("process", {})
+        target_process = target_cfg.get("process", {})
+        if isinstance(source_process, dict) and isinstance(target_process, dict):
+            source_cwd = source_process.get("cwd")
+            if isinstance(source_cwd, str) and source_cwd:
+                target_process["cwd"] = source_cwd
+            target_cfg["process"] = target_process
+
+        target_config_path.write_text(json.dumps(target_cfg, indent=2), encoding="utf-8")
 
     def _sandbox_llm_service_config(self, sandbox: SandboxHandle) -> dict[str, object] | None:
         benchmark_metadata = sandbox.launch_metadata.get("benchmark")

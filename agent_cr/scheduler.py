@@ -17,6 +17,127 @@ logger = logging.getLogger(__name__)
 _PREEMPTION_NOTICE_KEY = "preemption_notice"
 _PREEMPTION_GRACE_SECONDS_KEY = "preemption_grace_remaining_seconds"
 _TREE_SEARCH_STEP_KEY = "tree_search_step"
+_TREE_SEARCH_IS_FORK_KEY = "tree_search_is_fork"
+
+
+def _evaluate_change_driven_checkpoint(
+    snapshot: SandboxSnapshot,
+    *,
+    config: SchedulerConfig,
+    policy_name: str,
+    leave_running: bool,
+) -> SchedulerCheckpointDecision:
+    changed = snapshot.process_changed or snapshot.filesystem_changed
+    checkpoint_process = snapshot.process_changed
+    checkpoint_filesystem = changed
+
+    if not snapshot.is_running:
+        return SchedulerCheckpointDecision(
+            should_checkpoint=False,
+            checkpoint_process=False,
+            checkpoint_filesystem=False,
+            leave_running=leave_running,
+            reason="sandbox_not_running",
+            policy_name=policy_name,
+        )
+
+    request_in_flight = bool(snapshot.metadata.get("llm_request_in_flight", False))
+
+    if config.checkpoint_full_baseline_on_first_checkpoint and snapshot.last_checkpoint_at is None:
+        return SchedulerCheckpointDecision(
+            should_checkpoint=True,
+            checkpoint_process=True,
+            checkpoint_filesystem=True,
+            leave_running=leave_running,
+            reason="no_previous_checkpoint",
+            policy_name=policy_name,
+            metadata={"llm_request_in_flight": request_in_flight},
+        )
+
+    if config.require_change_signal and not changed:
+        return SchedulerCheckpointDecision(
+            should_checkpoint=False,
+            checkpoint_process=False,
+            checkpoint_filesystem=False,
+            leave_running=leave_running,
+            reason="no_change_signal",
+            policy_name=policy_name,
+        )
+
+    if snapshot.last_checkpoint_at is None:
+        if config.require_llm_request_for_checkpoint and not request_in_flight:
+            return SchedulerCheckpointDecision(
+                should_checkpoint=False,
+                checkpoint_process=False,
+                checkpoint_filesystem=False,
+                leave_running=leave_running,
+                reason="llm_request_required",
+                policy_name=policy_name,
+                metadata={"llm_request_in_flight": request_in_flight},
+            )
+
+        reason = "change_signal_and_interval_elapsed"
+        if config.prefer_checkpoint_during_llm_request and request_in_flight:
+            reason = "llm_request_window_available"
+        return SchedulerCheckpointDecision(
+            should_checkpoint=True,
+            checkpoint_process=checkpoint_process,
+            checkpoint_filesystem=checkpoint_filesystem,
+            leave_running=leave_running,
+            reason=reason,
+            policy_name=policy_name,
+            metadata={"llm_request_in_flight": request_in_flight},
+        )
+
+    elapsed = (snapshot.observed_at - snapshot.last_checkpoint_at).total_seconds()
+    min_interval = config.min_checkpoint_interval_seconds
+    force_after = config.force_checkpoint_after_seconds
+
+    if force_after > 0 and elapsed >= force_after:
+        return SchedulerCheckpointDecision(
+            should_checkpoint=True,
+            checkpoint_process=checkpoint_process,
+            checkpoint_filesystem=checkpoint_filesystem,
+            leave_running=leave_running,
+            reason="force_interval_elapsed",
+            policy_name=policy_name,
+            metadata={"elapsed_seconds": elapsed, "llm_request_in_flight": request_in_flight},
+        )
+
+    if elapsed < min_interval:
+        return SchedulerCheckpointDecision(
+            should_checkpoint=False,
+            checkpoint_process=False,
+            checkpoint_filesystem=False,
+            leave_running=leave_running,
+            reason="minimum_interval_not_elapsed",
+            policy_name=policy_name,
+            metadata={"elapsed_seconds": elapsed, "llm_request_in_flight": request_in_flight},
+        )
+
+    if config.require_llm_request_for_checkpoint and not request_in_flight:
+        return SchedulerCheckpointDecision(
+            should_checkpoint=False,
+            checkpoint_process=False,
+            checkpoint_filesystem=False,
+            leave_running=leave_running,
+            reason="llm_request_required",
+            policy_name=policy_name,
+            metadata={"elapsed_seconds": elapsed, "llm_request_in_flight": request_in_flight},
+        )
+
+    reason = "change_signal_and_interval_elapsed"
+    if config.prefer_checkpoint_during_llm_request and request_in_flight:
+        reason = "llm_request_window_available"
+    return SchedulerCheckpointDecision(
+        should_checkpoint=True,
+        checkpoint_process=checkpoint_process,
+        checkpoint_filesystem=checkpoint_filesystem,
+        leave_running=leave_running,
+        reason=reason,
+        policy_name=policy_name,
+        metadata={"elapsed_seconds": elapsed, "llm_request_in_flight": request_in_flight},
+    )
 
 
 class SchedulerPolicy(Protocol):
@@ -62,121 +183,11 @@ class CheckpointingPolicy:
         return "default-checkpointing"
 
     def evaluate(self, snapshot: SandboxSnapshot) -> SchedulerCheckpointDecision:
-        changed = snapshot.process_changed or snapshot.filesystem_changed
-        checkpoint_process = snapshot.process_changed
-        checkpoint_filesystem = changed
-
-        if not snapshot.is_running:
-            return SchedulerCheckpointDecision(
-                should_checkpoint=False,
-                checkpoint_process=False,
-                checkpoint_filesystem=False,
-                leave_running=False,
-                reason="sandbox_not_running",
-                policy_name=self.name,
-            )
-
-        request_in_flight = bool(snapshot.metadata.get("llm_request_in_flight", False))
-
-        # Optionally force a full baseline checkpoint before applying the normal change-driven policy.
-        if (
-            self._config.checkpoint_full_baseline_on_first_checkpoint
-            and snapshot.last_checkpoint_at is None
-        ):
-            reason = "no_previous_checkpoint"
-            return SchedulerCheckpointDecision(
-                should_checkpoint=True,
-                checkpoint_process=True,
-                checkpoint_filesystem=True,
-                leave_running=False,
-                reason=reason,
-                policy_name=self.name,
-                metadata={"llm_request_in_flight": request_in_flight},
-            )
-
-        if self._config.require_change_signal and not changed:
-            return SchedulerCheckpointDecision(
-                should_checkpoint=False,
-                checkpoint_process=False,
-                checkpoint_filesystem=False,
-                leave_running=False,
-                reason="no_change_signal",
-                policy_name=self.name,
-            )
-
-        if snapshot.last_checkpoint_at is None:
-            if self._config.require_llm_request_for_checkpoint and not request_in_flight:
-                return SchedulerCheckpointDecision(
-                    should_checkpoint=False,
-                    checkpoint_process=False,
-                    checkpoint_filesystem=False,
-                    leave_running=False,
-                    reason="llm_request_required",
-                    policy_name=self.name,
-                    metadata={"llm_request_in_flight": request_in_flight},
-                )
-
-            reason = "change_signal_and_interval_elapsed"
-            if self._config.prefer_checkpoint_during_llm_request and request_in_flight:
-                reason = "llm_request_window_available"
-            return SchedulerCheckpointDecision(
-                should_checkpoint=True,
-                checkpoint_process=checkpoint_process,
-                checkpoint_filesystem=checkpoint_filesystem,
-                leave_running=False,
-                reason=reason,
-                policy_name=self.name,
-                metadata={"llm_request_in_flight": request_in_flight},
-            )
-
-        elapsed = (snapshot.observed_at - snapshot.last_checkpoint_at).total_seconds()
-        min_interval = self._config.min_checkpoint_interval_seconds
-        force_after = self._config.force_checkpoint_after_seconds
-
-        if force_after > 0 and elapsed >= force_after:
-            return SchedulerCheckpointDecision(
-                should_checkpoint=True,
-                checkpoint_process=checkpoint_process,
-                checkpoint_filesystem=checkpoint_filesystem,
-                leave_running=False,
-                reason="force_interval_elapsed",
-                policy_name=self.name,
-                metadata={"elapsed_seconds": elapsed, "llm_request_in_flight": request_in_flight},
-            )
-
-        if elapsed < min_interval:
-            return SchedulerCheckpointDecision(
-                should_checkpoint=False,
-                checkpoint_process=False,
-                checkpoint_filesystem=False,
-                leave_running=False,
-                reason="minimum_interval_not_elapsed",
-                policy_name=self.name,
-                metadata={"elapsed_seconds": elapsed, "llm_request_in_flight": request_in_flight},
-            )
-
-        if self._config.require_llm_request_for_checkpoint and not request_in_flight:
-            return SchedulerCheckpointDecision(
-                should_checkpoint=False,
-                checkpoint_process=False,
-                checkpoint_filesystem=False,
-                leave_running=False,
-                reason="llm_request_required",
-                policy_name=self.name,
-                metadata={"elapsed_seconds": elapsed, "llm_request_in_flight": request_in_flight},
-            )
-
-        reason = "change_signal_and_interval_elapsed"
-        if self._config.prefer_checkpoint_during_llm_request and request_in_flight:
-            reason = "llm_request_window_available"
-        return SchedulerCheckpointDecision(
-            should_checkpoint=True,
-            checkpoint_process=checkpoint_process,
-            checkpoint_filesystem=checkpoint_filesystem,
-            leave_running=False,
-            reason=reason,
+        return _evaluate_change_driven_checkpoint(
+            snapshot,
+            config=self._config,
             policy_name=self.name,
-            metadata={"elapsed_seconds": elapsed, "llm_request_in_flight": request_in_flight},
+            leave_running=False,
         )
 
 
@@ -186,10 +197,12 @@ class FaultToleranceCheckpointingPolicy(CheckpointingPolicy):
         return "fault-tolerance"
 
     def evaluate(self, snapshot: SandboxSnapshot) -> SchedulerCheckpointDecision:
-        decision = super().evaluate(snapshot)
-        if not decision.should_checkpoint:
-            return replace(decision, policy_name=self.name)
-        return replace(decision, leave_running=True, policy_name=self.name)
+        return _evaluate_change_driven_checkpoint(
+            snapshot,
+            config=self._config,
+            policy_name=self.name,
+            leave_running=True,
+        )
 
 
 class SpotPreemptionCheckpointingPolicy:
@@ -246,6 +259,17 @@ class SpotPreemptionCheckpointingPolicy:
 
 
 class TreeSearchCheckpointingPolicy:
+    def __init__(
+        self,
+        config: SchedulerConfig | None = None,
+        *,
+        skip_if_no_meaningful_delta: bool = False,
+        checkpoint_forks: bool = False,
+    ) -> None:
+        self._config = config or SchedulerConfig()
+        self._skip_if_no_meaningful_delta = bool(skip_if_no_meaningful_delta)
+        self._checkpoint_forks = bool(checkpoint_forks)
+
     @property
     def name(self) -> str:
         return "tree-search"
@@ -270,15 +294,43 @@ class TreeSearchCheckpointingPolicy:
                 reason="tree_search_step_missing",
                 policy_name=self.name,
             )
-        return SchedulerCheckpointDecision(
-            should_checkpoint=True,
-            checkpoint_process=True,
-            checkpoint_filesystem=True,
-            leave_running=True,
-            reason="tree_search_step",
+        is_fork = bool(snapshot.metadata.get(_TREE_SEARCH_IS_FORK_KEY, False))
+        if is_fork and not self._checkpoint_forks:
+            return SchedulerCheckpointDecision(
+                should_checkpoint=False,
+                checkpoint_process=False,
+                checkpoint_filesystem=False,
+                leave_running=False,
+                reason="tree_search_fork_disabled",
+                policy_name=self.name,
+                metadata={
+                    _TREE_SEARCH_STEP_KEY: step,
+                    _TREE_SEARCH_IS_FORK_KEY: True,
+                },
+            )
+        if not self._skip_if_no_meaningful_delta:
+            return SchedulerCheckpointDecision(
+                should_checkpoint=True,
+                checkpoint_process=True,
+                checkpoint_filesystem=True,
+                leave_running=True,
+                reason="tree_search_step",
+                policy_name=self.name,
+                metadata={
+                    _TREE_SEARCH_STEP_KEY: step,
+                    _TREE_SEARCH_IS_FORK_KEY: is_fork,
+                },
+            )
+        decision = _evaluate_change_driven_checkpoint(
+            snapshot,
+            config=self._config,
             policy_name=self.name,
-            metadata={_TREE_SEARCH_STEP_KEY: step},
+            leave_running=True,
         )
+        metadata = dict(decision.metadata)
+        metadata[_TREE_SEARCH_STEP_KEY] = step
+        metadata[_TREE_SEARCH_IS_FORK_KEY] = is_fork
+        return replace(decision, metadata=metadata)
 
 
 class CRScheduler:

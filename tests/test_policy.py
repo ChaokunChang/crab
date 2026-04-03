@@ -424,6 +424,98 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(decision.leave_running)
         self.assertEqual(decision.metadata["tree_search_step"], 7)
 
+    def test_tree_search_policy_can_skip_when_no_meaningful_delta(self) -> None:
+        policy = TreeSearchCheckpointingPolicy(
+            SchedulerConfig(
+                min_checkpoint_interval_seconds=0.0,
+                force_checkpoint_after_seconds=0.0,
+                require_change_signal=True,
+                checkpoint_full_baseline_on_first_checkpoint=False,
+            ),
+            skip_if_no_meaningful_delta=True,
+        )
+        snapshot = SandboxSnapshot(
+            sandbox_id=SandboxId("sbx-1"),
+            runtime_name="docker",
+            is_running=True,
+            process_changed=False,
+            filesystem_changed=False,
+            observed_at=utc_now(),
+            metadata={"tree_search_step": 3},
+        )
+
+        decision = policy.evaluate(snapshot)
+
+        self.assertFalse(decision.should_checkpoint)
+        self.assertEqual(decision.reason, "no_change_signal")
+        self.assertTrue(decision.leave_running)
+        self.assertEqual(decision.metadata["tree_search_step"], 3)
+
+    def test_tree_search_policy_can_keep_filesystem_only_scope_when_enabled(self) -> None:
+        policy = TreeSearchCheckpointingPolicy(
+            SchedulerConfig(
+                min_checkpoint_interval_seconds=0.0,
+                force_checkpoint_after_seconds=0.0,
+                require_change_signal=True,
+                checkpoint_full_baseline_on_first_checkpoint=False,
+            ),
+            skip_if_no_meaningful_delta=True,
+        )
+        snapshot = SandboxSnapshot(
+            sandbox_id=SandboxId("sbx-1"),
+            runtime_name="docker",
+            is_running=True,
+            process_changed=False,
+            filesystem_changed=True,
+            observed_at=utc_now(),
+            metadata={"tree_search_step": 4},
+        )
+
+        decision = policy.evaluate(snapshot)
+
+        self.assertTrue(decision.should_checkpoint)
+        self.assertFalse(decision.checkpoint_process)
+        self.assertTrue(decision.checkpoint_filesystem)
+        self.assertTrue(decision.leave_running)
+        self.assertEqual(decision.metadata["tree_search_step"], 4)
+
+    def test_tree_search_policy_skips_fork_checkpoints_by_default(self) -> None:
+        policy = TreeSearchCheckpointingPolicy()
+        snapshot = SandboxSnapshot(
+            sandbox_id=SandboxId("sbx-fork-1"),
+            runtime_name="docker",
+            is_running=True,
+            process_changed=True,
+            filesystem_changed=True,
+            observed_at=utc_now(),
+            metadata={"tree_search_step": 2, "tree_search_is_fork": True},
+        )
+
+        decision = policy.evaluate(snapshot)
+
+        self.assertFalse(decision.should_checkpoint)
+        self.assertEqual(decision.reason, "tree_search_fork_disabled")
+        self.assertEqual(decision.metadata["tree_search_step"], 2)
+        self.assertTrue(decision.metadata["tree_search_is_fork"])
+
+    def test_tree_search_policy_can_checkpoint_forks_when_enabled(self) -> None:
+        policy = TreeSearchCheckpointingPolicy(checkpoint_forks=True)
+        snapshot = SandboxSnapshot(
+            sandbox_id=SandboxId("sbx-fork-1"),
+            runtime_name="docker",
+            is_running=True,
+            process_changed=False,
+            filesystem_changed=False,
+            observed_at=utc_now(),
+            metadata={"tree_search_step": 5, "tree_search_is_fork": True},
+        )
+
+        decision = policy.evaluate(snapshot)
+
+        self.assertTrue(decision.should_checkpoint)
+        self.assertEqual(decision.reason, "tree_search_step")
+        self.assertTrue(decision.metadata["tree_search_is_fork"])
+
 
 if __name__ == "__main__":
     unittest.main()
