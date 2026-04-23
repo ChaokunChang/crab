@@ -531,6 +531,27 @@ class SchedulerTests(unittest.TestCase):
         self.assertTrue(decision.leave_running)
         self.assertEqual(self.sandbox_manager.calls, [])
 
+    def test_deactivate_sandbox_short_circuits_query_checkpoint_before_pause(self) -> None:
+        self.inspector.upsert_snapshot(
+            SandboxSnapshot(
+                sandbox_id=self.sandbox_id,
+                runtime_name="runc",
+                is_running=True,
+                process_changed=True,
+                filesystem_changed=True,
+                observed_at=utc_now(),
+            )
+        )
+
+        self.scheduler.deactivate_sandbox(self.sandbox_id)
+        decision = self.scheduler.query_checkpoint(self.sandbox_id)
+
+        self.assertFalse(decision.should_checkpoint)
+        self.assertEqual(decision.reason, "sandbox_deactivated")
+        self.assertTrue(decision.leave_running)
+        self.assertEqual(self.sandbox_manager.calls, [])
+        self.assertTrue(self.scheduler.is_sandbox_deactivated(self.sandbox_id))
+
 
 if __name__ == "__main__":
     unittest.main()

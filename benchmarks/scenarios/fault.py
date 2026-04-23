@@ -62,7 +62,7 @@ def parse_fault_options(config: BenchmarkConfig) -> FaultOptions:
     first = int(raw_first)
     if first < 0:
         raise ValueError("scenario_options.first_forced_event_chunk must be >= 0")
-    if first > config.iterations:
+    if config.iterations > 0 and first > config.iterations:
         raise ValueError("scenario_options.first_forced_event_chunk must be <= iterations")
     delete_filesystem_checkpoints = bool(config.scenario_options.get("delete_filesystem_checkpoints", False))
     return FaultOptions(
@@ -70,6 +70,17 @@ def parse_fault_options(config: BenchmarkConfig) -> FaultOptions:
         first_forced_event_chunk=first,
         delete_filesystem_checkpoints=delete_filesystem_checkpoints,
     )
+
+
+def _resolved_replay_iterations(config: BenchmarkConfig, sandbox: SandboxHandle) -> int:
+    if config.iterations != 0:
+        return config.iterations
+    return trace_response_count_for_sandbox(sandbox)
+
+
+def _validate_replay_fault_options(options: FaultOptions, *, iterations: int) -> None:
+    if options.first_forced_event_chunk > iterations:
+        raise ValueError("scenario_options.first_forced_event_chunk must be <= iterations")
 
 
 def build_harness_settings(config: BenchmarkConfig) -> HarnessSettings:
@@ -291,7 +302,9 @@ def _run_replay_manual_sandbox_run(
     sandbox: SandboxHandle,
     options: FaultOptions,
 ) -> dict[str, object]:
-    replay_chunk_targets = choose_replay_chunk_targets(sandbox, config.iterations)
+    replay_iterations = _resolved_replay_iterations(config, sandbox)
+    _validate_replay_fault_options(options, iterations=replay_iterations)
+    replay_chunk_targets = choose_replay_chunk_targets(sandbox, replay_iterations)
     emit_metric = getattr(harness, "emit_benchmark_metric", None)
     rng = random.Random(sandbox_index)
     trace_response_count = trace_response_count_for_sandbox(sandbox)
@@ -360,6 +373,8 @@ def _run_replay_manual_sandbox_run(
                 )
             if sandbox.agent_type == "mini_swe":
                 pre_event = _wait_for_mini_swe_command_window(sandbox)
+            elif config.iterations == 0:
+                pre_event = current
             else:
                 pre_event = sandbox.task_run.wait_for_action_delta(delta=1)
             event_started = time.perf_counter()
@@ -452,7 +467,9 @@ def _run_replay_auto_sandbox_run(
     sandbox: SandboxHandle,
     options: FaultOptions,
 ) -> dict[str, object]:
-    replay_chunk_targets = choose_replay_chunk_targets(sandbox, config.iterations)
+    replay_iterations = _resolved_replay_iterations(config, sandbox)
+    _validate_replay_fault_options(options, iterations=replay_iterations)
+    replay_chunk_targets = choose_replay_chunk_targets(sandbox, replay_iterations)
     emit_metric = getattr(harness, "emit_benchmark_metric", None)
     rng = random.Random(sandbox_index)
     trace_response_count = trace_response_count_for_sandbox(sandbox)

@@ -144,7 +144,15 @@ def cleanup_finished_replay_sandbox_after_run(
     *,
     task_error: str = "",
 ) -> str:
-    if config.verification_enabled or not config.phase_merging.setup_and_run:
+    # Bridges the run phase and the verification phase. When verification is
+    # enabled the next step will `runc exec` inside the sandbox, so we must
+    # enforce the handoff invariant: the agent's task_future has finished, no
+    # executor jobs are pending or running, the scheduler has stopped
+    # scheduling checkpoints, and the container is not paused. Violating any
+    # of these collides verify's exec with an in-flight scheduler pause and
+    # produces "cannot exec in a paused container" (seen in run
+    # 20260420_123846, sandbox spec-91-spec-81).
+    if not config.verification_enabled and not config.phase_merging.setup_and_run:
         return task_error
 
     completed = str(sandbox.last_status.get("state", "")) == "finished"
@@ -162,10 +170,23 @@ def cleanup_finished_replay_sandbox_after_run(
         else:
             completed = True
 
+    poll_sandbox_status(sandbox)
+
+    if config.verification_enabled:
+        system = getattr(harness, "system", None)
+        if system is not None:
+            try:
+                system.quiesce_for_verification(sandbox.sandbox_id)
+            except Exception:
+                logger.exception(
+                    "Failed to quiesce sandbox %s for verification handoff",
+                    sandbox.sandbox_id,
+                )
+        return task_error
+
     if not completed:
         return task_error
 
-    poll_sandbox_status(sandbox)
     deactivate_sandbox_runtime = getattr(harness, "deactivate_sandbox_runtime", None)
     if callable(deactivate_sandbox_runtime):
         deactivate_sandbox_runtime(sandbox)

@@ -56,6 +56,10 @@ _CAPTURED_REQUEST_ID = "captured_request_id"
 _CAPTURED_REQUEST_GENERATION = "captured_request_generation"
 _CAPTURED_REQUEST_PROVIDER = "captured_request_provider"
 _CAPTURED_REQUEST_STARTED_AT = "captured_request_started_at"
+_CAPTURED_REQUEST_GROUP_KIND = "captured_request_group_kind"
+_CAPTURED_REQUEST_GROUP_ID = "captured_request_group_id"
+_CAPTURED_REQUEST_IDS = "captured_request_ids"
+_CAPTURED_REQUEST_GROUP_STARTED_AT = "captured_request_group_started_at"
 _RESTORE_RUNTIME_READY_ATTEMPTS = 10
 _RESTORE_RUNTIME_READY_DELAY_S = 0.1
 
@@ -739,15 +743,6 @@ class AgentCRSystem:
                         checkpoint_id,
                         restore_result.message,
                     )
-                    if self.restore_metadata_handler is not None and restore_manifest is not None:
-                        try:
-                            self.restore_metadata_handler(event.sandbox_id, restore_manifest)
-                        except Exception:
-                            logger.exception(
-                                "Failed to restore replay metadata before relaunch sandbox=%s checkpoint=%s",
-                                event.sandbox_id,
-                                checkpoint_id,
-                            )
                     self.relaunch_handler(
                         event.sandbox_id,
                         event.event_type,
@@ -865,6 +860,7 @@ class AgentCRSystem:
             metadata={"policy": decision.policy_name, **decision.metadata, **checkpoint_metadata},
         )
         result: CheckpointResult | None = None
+        flow_exception: BaseException | None = None
         try:
             result = self.executor.submit_checkpoint(job).result()
             if result.status.value == "succeeded":
@@ -875,18 +871,36 @@ class AgentCRSystem:
                     filesystem=job.checkpoint_filesystem,
                     at=result.finished_at,
                 )
-            operation.finish(
-                status=result.status.value,
-                attributes={
-                    "checkpoint_id": str(result.checkpoint_id),
-                    "reason": decision.reason,
-                    "job_id": str(job.job_id),
-                    "checkpoint_scope": _checkpoint_scope(job),
-                    "failure_code": result.failure_code.value,
-                },
-            )
             return result
+        except BaseException as exc:
+            flow_exception = exc
+            raise
         finally:
+            # Telemetry must be symmetric: every flow.start needs a
+            # matching flow.finish, even if post-checkpoint bookkeeping
+            # (e.g. daemon-side reset) raised. An orphan flow.start is
+            # counted as a failure by the report tooling.
+            if result is not None:
+                operation.finish(
+                    status=result.status.value,
+                    attributes={
+                        "checkpoint_id": str(result.checkpoint_id),
+                        "reason": decision.reason,
+                        "job_id": str(job.job_id),
+                        "checkpoint_scope": _checkpoint_scope(job),
+                        "failure_code": result.failure_code.value,
+                    },
+                )
+            else:
+                operation.finish(
+                    status="failed",
+                    attributes={
+                        "reason": decision.reason,
+                        "job_id": str(job.job_id),
+                        "checkpoint_scope": _checkpoint_scope(job),
+                        "error": type(flow_exception).__name__ if flow_exception is not None else "unknown",
+                    },
+                )
             if self._should_resume_after_checkpoint(job, result):
                 self._resume_sandbox(sandbox_id)
 
@@ -931,11 +945,27 @@ class AgentCRSystem:
         if provider is not None:
             metadata[_CAPTURED_REQUEST_PROVIDER] = str(provider)
         metadata[_CAPTURED_REQUEST_STARTED_AT] = request_context.started_at.isoformat()
+        if pending.request_ids:
+            metadata[_CAPTURED_REQUEST_IDS] = list(pending.request_ids)
+        if pending.request_group_kind and pending.request_group_id:
+            metadata[_CAPTURED_REQUEST_GROUP_KIND] = pending.request_group_kind
+            metadata[_CAPTURED_REQUEST_GROUP_ID] = pending.request_group_id
+            contexts = self.request_state_store.get_request_contexts_for_group(
+                sandbox_id,
+                request_group_kind=pending.request_group_kind,
+                request_group_id=pending.request_group_id,
+            )
+            if contexts:
+                group_started_at = min(context.started_at for context in contexts)
+                metadata[_CAPTURED_REQUEST_GROUP_STARTED_AT] = group_started_at.isoformat()
+                metadata[_CAPTURED_REQUEST_IDS] = [context.request_id for context in contexts]
         logger.info(
-            "Checkpoint captured live request sandbox=%s request_id=%s generation=%s",
+            "Checkpoint captured live request sandbox=%s request_id=%s generation=%s group_kind=%s group_id=%s",
             sandbox_id,
             pending.request_id,
             pending.generation,
+            pending.request_group_kind,
+            pending.request_group_id,
         )
         self.telemetry.emit_event(
             "checkpoint.captured_live_request",
@@ -943,6 +973,8 @@ class AgentCRSystem:
                 "sandbox_id": str(sandbox_id),
                 "request_id": pending.request_id,
                 "request_generation": pending.generation,
+                "request_group_kind": pending.request_group_kind or "",
+                "request_group_id": pending.request_group_id or "",
             },
         )
         return metadata
@@ -952,6 +984,22 @@ class AgentCRSystem:
         if not bool(manifest.metadata.get(_CAPTURES_INFLIGHT_LLM, False)):
             return None
         captured_request_id = str(manifest.metadata.get(_CAPTURED_REQUEST_ID, "")).strip()
+        captured_group_kind = str(manifest.metadata.get(_CAPTURED_REQUEST_GROUP_KIND, "")).strip()
+        captured_group_id = str(manifest.metadata.get(_CAPTURED_REQUEST_GROUP_ID, "")).strip()
+        if captured_group_kind and captured_group_id:
+            pending = self._find_captured_pending_request(sandbox_id, manifest)
+            if pending is None:
+                return (
+                    f"checkpoint {checkpoint_id} captured live request group "
+                    f"{captured_group_kind}:{captured_group_id} but no matching interceptor-held group is pending"
+                )
+            if pending.request_group_kind != captured_group_kind or pending.request_group_id != captured_group_id:
+                return (
+                    f"checkpoint {checkpoint_id} captured live request group "
+                    f"{captured_group_kind}:{captured_group_id} but current pending group is "
+                    f"{pending.request_group_kind}:{pending.request_group_id}"
+                )
+            return None
         if not captured_request_id:
             return f"checkpoint {checkpoint_id} advertises live-request restore without captured_request_id"
         pending = self._find_captured_pending_request(sandbox_id, manifest)
@@ -1087,20 +1135,33 @@ class AgentCRSystem:
         if not bool(manifest.metadata.get(_CAPTURES_INFLIGHT_LLM, False)):
             release_operation.finish(status="skipped")
             return False
+        captured_group_kind = str(manifest.metadata.get(_CAPTURED_REQUEST_GROUP_KIND, "")).strip()
+        captured_group_id = str(manifest.metadata.get(_CAPTURED_REQUEST_GROUP_ID, "")).strip()
         captured_request_id = str(manifest.metadata.get(_CAPTURED_REQUEST_ID, "")).strip()
         if not captured_request_id:
             release_operation.finish(status="skipped")
             return False
-        self.executor.clear_live_response_ready(sandbox_id, captured_request_id)
+        request_ids = manifest.metadata.get(_CAPTURED_REQUEST_IDS, [])
+        if not isinstance(request_ids, list) or not request_ids:
+            request_ids = [captured_request_id]
+        for request_id in request_ids:
+            self.executor.clear_live_response_ready(sandbox_id, str(request_id))
         pending = self._find_captured_pending_request(sandbox_id, manifest)
         if pending is None:
             release_operation.finish(status="skipped")
             return False
-        released = self.response_gate_registry.release_pending(
-            sandbox_id,
-            request_id=captured_request_id,
-            generation=pending.generation,
-        )
+        if captured_group_kind and captured_group_id:
+            released = self.response_gate_registry.release_pending(
+                sandbox_id,
+                request_id=pending.request_id,
+                generation=pending.generation,
+            )
+        else:
+            released = self.response_gate_registry.release_pending(
+                sandbox_id,
+                request_id=captured_request_id,
+                generation=pending.generation,
+            )
         if released:
             logger.info(
                 "Released buffered response to restored sandbox=%s request_id=%s checkpoint=%s",
@@ -1196,6 +1257,31 @@ class AgentCRSystem:
             return
         self._mark_sandbox_running(sandbox_id)
 
+    def quiesce_for_verification(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        drain_timeout_seconds: float = 120.0,
+        poll_interval_seconds: float = 0.1,
+    ) -> None:
+        # Terminal transition from run phase to verification phase. Enforces:
+        #   1. scheduler no longer issues checkpoint decisions for this sandbox
+        #   2. no executor jobs remain pending or running
+        #   3. the container is not paused
+        # Any of these held at verify time produce the "cannot exec in a paused
+        # container" race we saw in 20260420_123846 spec-91-spec-81.
+        self.scheduler.deactivate_sandbox(sandbox_id)
+        deadline = time.monotonic() + max(0.0, float(drain_timeout_seconds))
+        while self.executor.has_active_job(sandbox_id):
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "quiesce_for_verification timed out draining executor for sandbox %s; proceeding",
+                    sandbox_id,
+                )
+                break
+            time.sleep(poll_interval_seconds)
+        self._resume_sandbox(sandbox_id)
+
     def _mark_sandbox_not_running(self, sandbox_id: SandboxId) -> None:
         upsert = getattr(self.inspector, "upsert_snapshot", None)
         if upsert is not None:
@@ -1241,10 +1327,14 @@ class AgentCRSystem:
         sandbox_id: SandboxId,
         pending_request: PendingSandboxResponse | None = None,
     ) -> None:
-        self.executor.clear_live_response_ready(
-            sandbox_id,
-            None if pending_request is None else pending_request.request_id,
-        )
+        if pending_request is None or not pending_request.request_ids:
+            self.executor.clear_live_response_ready(
+                sandbox_id,
+                None if pending_request is None else pending_request.request_id,
+            )
+        else:
+            for request_id in pending_request.request_ids:
+                self.executor.clear_live_response_ready(sandbox_id, request_id)
         if self.response_gate_registry is None:
             return
         if pending_request is None:
@@ -1295,6 +1385,14 @@ class AgentCRSystem:
     ) -> PendingSandboxResponse | None:
         if self.response_gate_registry is None:
             return None
+        captured_group_kind = str(manifest.metadata.get(_CAPTURED_REQUEST_GROUP_KIND, "")).strip()
+        captured_group_id = str(manifest.metadata.get(_CAPTURED_REQUEST_GROUP_ID, "")).strip()
+        if captured_group_kind and captured_group_id:
+            return self.response_gate_registry.find_pending_group(
+                sandbox_id,
+                request_group_kind=captured_group_kind,
+                request_group_id=captured_group_id,
+            )
         captured_request_id = str(manifest.metadata.get(_CAPTURED_REQUEST_ID, "")).strip()
         if not captured_request_id:
             return None

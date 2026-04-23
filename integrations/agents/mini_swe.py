@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 import json
 import logging
@@ -7,6 +8,7 @@ import re
 import threading
 import time
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -103,6 +105,10 @@ _OBSERVATION_MAX_CHARS = 10000
 _OBSERVATION_HEAD_CHARS = 5000
 _OBSERVATION_TAIL_CHARS = 5000
 _RESTORE_WAIT_TIMEOUT_S = 300.0
+_SPEC_FUTURE_DRAIN_TIMEOUT_S = 5.0
+_SPEC_REQUEST_GROUP_KIND = "spec_pair"
+_SPEC_ROLE_DRAFT = "draft"
+_SPEC_ROLE_ORACLE = "oracle"
 _RETRYABLE_EXEC_ERROR_FRAGMENTS = (
     "container does not exist",
     "container not running",
@@ -124,6 +130,21 @@ class _RecordedCommand:
     timeout_s: float
 
 
+@dataclass(frozen=True)
+class _AssistantTurn:
+    role: str
+    pair_id: str | None
+    content: str
+    command: str
+
+
+@dataclass(frozen=True)
+class _SpeculativeForkHandle:
+    handle: Any | None
+    created: bool = False
+    reused: bool = False
+
+
 class MiniSweAgent(BaseAgent):
     agent_type = "mini_swe"
 
@@ -139,6 +160,7 @@ class MiniSweAgent(BaseAgent):
         agent_host_dir: Path | None = None,
         llm_base_url: str | None = None,
         telemetry=None,
+        speculation_controller=None,
     ) -> None:
         super().__init__(
             sandbox,
@@ -150,6 +172,11 @@ class MiniSweAgent(BaseAgent):
             agent_host_dir=agent_host_dir,
             llm_base_url=llm_base_url,
             telemetry=telemetry,
+        )
+        self._speculation_controller = speculation_controller
+        self._spec_executor: ThreadPoolExecutor | None = ThreadPoolExecutor(
+            max_workers=4,
+            thread_name_prefix=f"mini-swe-spec-{self.sandbox.sandbox_id}",
         )
         self._lock = threading.Lock()
         self._state = "idle"
@@ -164,10 +191,22 @@ class MiniSweAgent(BaseAgent):
         self._pending_restore_generation = 0
         self._handled_restore_generation = 0
         self._restore_event = threading.Event()
+        self._spec_total_turns = 0
+        self._spec_accept_count = 0
+        self._spec_reject_count = 0
+        self._spec_saved_ms = 0.0
+        self._spec_penalty_ms = 0.0
+        self._spec_hidden_penalty_ms = 0.0
+        self._spec_fork_create_count = 0
+        self._spec_fork_reuse_count = 0
+        self._active_spec_futures: set[Future[Any]] = set()
 
     def prepare_sandbox(self) -> None:
-        if self.sandbox.llm_service_type != "mini_swe_trace_replay":
-            raise RuntimeError("MiniSweAgent currently only supports llm_service_type=mini_swe_trace_replay")
+        if self.sandbox.llm_service_type not in {"mini_swe_trace_replay", "mini_swe_spec_trace_replay"}:
+            raise RuntimeError(
+                "MiniSweAgent currently only supports llm_service_type in "
+                "{'mini_swe_trace_replay', 'mini_swe_spec_trace_replay'}"
+            )
         raw_instance_id = self.task_config.options.get("swebench_instance_id")
         if not isinstance(raw_instance_id, str) or not raw_instance_id:
             raise RuntimeError("MiniSweAgent requires task_config.options.swebench_instance_id")
@@ -237,7 +276,16 @@ class MiniSweAgent(BaseAgent):
             self._pending_restore_trace_cursor = None
             self._pending_restore_generation = 0
             self._handled_restore_generation = 0
+            self._spec_total_turns = 0
+            self._spec_accept_count = 0
+            self._spec_reject_count = 0
+            self._spec_saved_ms = 0.0
+            self._spec_penalty_ms = 0.0
+            self._spec_hidden_penalty_ms = 0.0
+            self._spec_fork_create_count = 0
+            self._spec_fork_reuse_count = 0
         self._set_status(self.poll_status())
+        turn_index = 0
         try:
             logger.info(
                 "Starting mini_swe task sandbox=%s timeout_s=%.1f",
@@ -252,12 +300,55 @@ class MiniSweAgent(BaseAgent):
                 len(self._messages),
             )
             while not self._stop_requested.is_set():
+                turn_index += 1
+                with self._lock:
+                    completed_actions = self._completed_actions
+                    message_count = len(self._messages)
+                    pending_restore_generation = self._pending_restore_generation
+                    handled_restore_generation = self._handled_restore_generation
+                logger.debug(
+                    (
+                        "Mini_swe turn start sandbox=%s turn=%d mode=%s completed_actions=%d "
+                        "messages=%d restore_generation=%d handled_restore_generation=%d"
+                    ),
+                    self.sandbox.sandbox_id,
+                    turn_index,
+                    "spec" if self._is_spec_replay_mode() else "serial",
+                    completed_actions,
+                    message_count,
+                    pending_restore_generation,
+                    handled_restore_generation,
+                )
                 self._drain_pending_restore_replays()
-                assistant_content = self._next_assistant_content()
-                command = self._parse_command(assistant_content)
-                result = self._exec_command(command)
+                if self._is_spec_replay_mode():
+                    result = self._spec_perform_step()
+                else:
+                    assistant_turn = self._request_assistant_turn()
+                    logger.debug(
+                        "Mini_swe turn assistant response sandbox=%s turn=%d role=%s command=%s",
+                        self.sandbox.sandbox_id,
+                        turn_index,
+                        assistant_turn.role,
+                        assistant_turn.command,
+                    )
+                    self._append_assistant_message(assistant_turn.content)
+                    result = self._exec_command(assistant_turn.command)
+                output = self._merged_exec_output(result)
+                logger.debug(
+                    "Mini_swe turn command completed sandbox=%s turn=%d returncode=%d output_chars=%d",
+                    self.sandbox.sandbox_id,
+                    turn_index,
+                    int(result.returncode),
+                    len(output),
+                )
                 if self._is_submission_result(result):
                     submission = self._submission_from_result(result)
+                    logger.debug(
+                        "Mini_swe submission detected sandbox=%s turn=%d submission_chars=%d",
+                        self.sandbox.sandbox_id,
+                        turn_index,
+                        len(submission),
+                    )
                     with self._lock:
                         self._submission = submission
                         self._state = "finished"
@@ -271,7 +362,7 @@ class MiniSweAgent(BaseAgent):
                     )
                     return
                 observation = self._format_observation(
-                    output=self._merged_exec_output(result),
+                    output=output,
                     returncode=result.returncode,
                     exception_info="",
                 )
@@ -279,9 +370,21 @@ class MiniSweAgent(BaseAgent):
                     self._messages.append({"role": "user", "content": observation})
                 payload = self.poll_status()
                 self._record_activity(payload)
+                logger.debug(
+                    "Mini_swe turn end sandbox=%s turn=%d total_actions=%d state=%s",
+                    self.sandbox.sandbox_id,
+                    turn_index,
+                    int(payload.get("total_actions", 0)),
+                    payload.get("state"),
+                )
             with self._lock:
                 if self._state == "running":
                     self._state = "finished"
+            logger.debug(
+                "Mini_swe task loop exited due to stop request sandbox=%s turns=%d",
+                self.sandbox.sandbox_id,
+                turn_index,
+            )
         except Exception as exc:
             with self._lock:
                 self._state = "failed"
@@ -293,6 +396,10 @@ class MiniSweAgent(BaseAgent):
             self.post_task_finish()
 
     def post_task_finish(self) -> None:
+        if self._spec_executor is not None:
+            self._wait_for_active_spec_futures(timeout_s=_SPEC_FUTURE_DRAIN_TIMEOUT_S)
+            self._spec_executor.shutdown(wait=False, cancel_futures=True)
+            self._spec_executor = None
         if self._is_compose_replay_mode():
             return
         super().post_task_finish()
@@ -307,11 +414,21 @@ class MiniSweAgent(BaseAgent):
             command_in_flight = self._command_in_flight
             submission = self._submission
             error = self._error
+            spec_total_turns = self._spec_total_turns
+            spec_accept_count = self._spec_accept_count
+            spec_reject_count = self._spec_reject_count
+            spec_saved_ms = self._spec_saved_ms
+            spec_penalty_ms = self._spec_penalty_ms
+            spec_hidden_penalty_ms = self._spec_hidden_penalty_ms
+            spec_fork_create_count = self._spec_fork_create_count
+            spec_fork_reuse_count = self._spec_fork_reuse_count
         replay_state = self._replay_router_state()
         total_responses = replay_state.get("total_responses")
         replay_is_complete = state == "finished"
         if isinstance(total_responses, int) and total_responses > 0:
             replay_is_complete = replay_is_complete or completed_actions >= total_responses
+        spec_net_gain_ms = spec_saved_ms - spec_penalty_ms
+        spec_total_decisions = spec_accept_count + spec_reject_count
         payload = {
             "agent_type": self.agent_type,
             "state": state,
@@ -324,6 +441,16 @@ class MiniSweAgent(BaseAgent):
             "replay_total_responses": total_responses,
             "replay_is_complete": replay_is_complete,
             "command_in_flight": command_in_flight,
+            "spec_total_turns": spec_total_turns,
+            "spec_accept_count": spec_accept_count,
+            "spec_reject_count": spec_reject_count,
+            "spec_accept_rate": 0.0 if spec_total_decisions <= 0 else spec_accept_count / spec_total_decisions,
+            "spec_saved_ms": spec_saved_ms,
+            "spec_penalty_ms": spec_penalty_ms,
+            "spec_hidden_penalty_ms": spec_hidden_penalty_ms,
+            "spec_net_gain_ms": spec_net_gain_ms,
+            "spec_fork_create_count": spec_fork_create_count,
+            "spec_fork_reuse_count": spec_fork_reuse_count,
         }
         if submission:
             payload["submission"] = submission
@@ -356,7 +483,13 @@ class MiniSweAgent(BaseAgent):
             self._pending_restore_generation += 1
 
     def _is_compose_replay_mode(self) -> bool:
-        return self.sandbox.launch_source == "compose" and self.sandbox.llm_service_type == "mini_swe_trace_replay"
+        return self.sandbox.launch_source == "compose" and self.sandbox.llm_service_type in {
+            "mini_swe_trace_replay",
+            "mini_swe_spec_trace_replay",
+        }
+
+    def _is_spec_replay_mode(self) -> bool:
+        return self.sandbox.llm_service_type == "mini_swe_spec_trace_replay"
 
     def _initial_messages(self) -> list[dict[str, str]]:
         return [
@@ -364,11 +497,28 @@ class MiniSweAgent(BaseAgent):
             {"role": "user", "content": _INSTANCE_TEMPLATE.format(task=self.task_description.prompt)},
         ]
 
-    def _next_assistant_content(self) -> str:
+    def _append_assistant_message(self, content: str) -> None:
+        with self._lock:
+            self._messages.append({"role": "assistant", "content": content})
+
+    def _request_assistant_turn(
+        self,
+        *,
+        role: str | None = None,
+        pair_id: str | None = None,
+    ) -> _AssistantTurn:
         if not self.llm_base_url:
             raise RuntimeError(f"missing llm base url for sandbox {self.sandbox.sandbox_id}")
         with self._lock:
             messages = list(self._messages)
+        logger.debug(
+            "Requesting assistant turn sandbox=%s role=%s pair_id=%s messages=%d timeout_s=%.1f",
+            self.sandbox.sandbox_id,
+            _SPEC_ROLE_ORACLE if role is None else role,
+            "" if pair_id is None else pair_id,
+            len(messages),
+            self._llm_request_timeout_seconds(),
+        )
         request_payload = {
             "model": "mini-swe-trace-replay",
             "messages": messages,
@@ -382,6 +532,10 @@ class MiniSweAgent(BaseAgent):
                 "X-Agent-Sandbox-Id": str(self.sandbox.sandbox_id),
             },
         )
+        if pair_id:
+            request.add_header("X-AgentCR-Spec-Pair-Id", pair_id)
+        if role:
+            request.add_header("X-AgentCR-Spec-Role", role)
         with urllib.request.urlopen(request, timeout=self._llm_request_timeout_seconds()) as response:
             payload = json.loads(response.read().decode("utf-8"))
         choices = payload.get("choices")
@@ -393,9 +547,680 @@ class MiniSweAgent(BaseAgent):
         content = message.get("content")
         if not isinstance(content, str) or not content.strip():
             raise RuntimeError("mini_swe llm replay returned empty assistant content")
+        parsed_command = self._parse_command(content)
+        resolved_role = _SPEC_ROLE_ORACLE if role is None else role
+        logger.debug(
+            "Received assistant turn sandbox=%s role=%s pair_id=%s content_chars=%d command=%s",
+            self.sandbox.sandbox_id,
+            resolved_role,
+            "" if pair_id is None else pair_id,
+            len(content),
+            parsed_command,
+        )
+        return _AssistantTurn(
+            role=resolved_role,
+            pair_id=pair_id,
+            content=content,
+            command=parsed_command,
+        )
+
+    def _submit_spec_future(self, fn, /, *args, **kwargs) -> Future[Any]:
+        if self._spec_executor is None:
+            raise RuntimeError("speculative executor is unavailable")
+        future = self._spec_executor.submit(fn, *args, **kwargs)
         with self._lock:
-            self._messages.append({"role": "assistant", "content": content})
-        return content
+            self._active_spec_futures.add(future)
+
+        def _discard(completed_future: Future[Any]) -> None:
+            with self._lock:
+                self._active_spec_futures.discard(completed_future)
+
+        future.add_done_callback(_discard)
+        return future
+
+    def _wait_for_active_spec_futures(self, *, timeout_s: float) -> None:
+        with self._lock:
+            active = list(self._active_spec_futures)
+        if not active:
+            return
+        done, not_done = wait(active, timeout=timeout_s)
+        for future in done:
+            try:
+                future.result()
+            except Exception as exc:
+                logger.debug(
+                    "Speculative future completed with error during task shutdown sandbox=%s error=%s",
+                    self.sandbox.sandbox_id,
+                    exc,
+                )
+        if not_done:
+            logger.warning(
+                "Timed out waiting for speculative futures during task shutdown sandbox=%s pending=%d timeout_s=%.1f",
+                self.sandbox.sandbox_id,
+                len(not_done),
+                timeout_s,
+            )
+
+    def _spec_perform_step(self):
+        step_started = time.perf_counter()
+        pair_id = uuid.uuid4().hex
+        logger.debug(
+            "Starting speculative step sandbox=%s pair_id=%s",
+            self.sandbox.sandbox_id,
+            pair_id,
+        )
+        draft_future = self._submit_spec_future(
+            self._request_assistant_turn,
+            role=_SPEC_ROLE_DRAFT,
+            pair_id=pair_id,
+        )
+        oracle_future = self._submit_spec_future(
+            self._request_assistant_turn,
+            role=_SPEC_ROLE_ORACLE,
+            pair_id=pair_id,
+        )
+        done, _ = wait([draft_future, oracle_future], return_when=FIRST_COMPLETED)
+        logger.debug(
+            "Speculative assistant race completed sandbox=%s pair_id=%s draft_done=%s oracle_done=%s",
+            self.sandbox.sandbox_id,
+            pair_id,
+            draft_future.done(),
+            oracle_future.done(),
+        )
+        if oracle_future in done:
+            try:
+                oracle_turn = oracle_future.result()
+            except Exception:
+                wait([draft_future], timeout=_SPEC_FUTURE_DRAIN_TIMEOUT_S)
+                raise
+            logger.debug(
+                "Oracle turn arrived first; falling back to non-spec command execution sandbox=%s pair_id=%s command=%s",
+                self.sandbox.sandbox_id,
+                pair_id,
+                oracle_turn.command,
+            )
+            self._invalidate_speculative_fork()
+            self._append_assistant_message(oracle_turn.content)
+            result = self._exec_command(oracle_turn.command)
+            self._record_spec_step_metrics(
+                pair_id=pair_id,
+                accepted=False,
+                draft_first=False,
+                fork_created=False,
+                fork_reused=False,
+                fork_restore_ms=0.0,
+                speculative_exec_ms=0.0,
+                saved_ms=0.0,
+                penalty_ms=0.0,
+                hidden_penalty_ms=0.0,
+                current_state_changed=False,
+                fork_state_changed=False,
+            )
+            return result
+
+        try:
+            draft_turn = draft_future.result()
+            logger.debug(
+                "Draft turn ready sandbox=%s pair_id=%s command=%s",
+                self.sandbox.sandbox_id,
+                pair_id,
+                draft_turn.command,
+            )
+        except Exception:
+            logger.debug(
+                "Draft turn failed; waiting for oracle and falling back sandbox=%s pair_id=%s",
+                self.sandbox.sandbox_id,
+                pair_id,
+                exc_info=True,
+            )
+            oracle_turn = oracle_future.result()
+            self._invalidate_speculative_fork()
+            self._append_assistant_message(oracle_turn.content)
+            result = self._exec_command(oracle_turn.command)
+            self._record_spec_step_metrics(
+                pair_id=pair_id,
+                accepted=False,
+                draft_first=False,
+                fork_created=False,
+                fork_reused=False,
+                fork_restore_ms=0.0,
+                speculative_exec_ms=0.0,
+                saved_ms=0.0,
+                penalty_ms=0.0,
+                hidden_penalty_ms=0.0,
+                current_state_changed=False,
+                fork_state_changed=False,
+            )
+            return result
+        fork_future: Future[_SpeculativeForkHandle] | None = None
+        if self._speculation_controller is not None and self._spec_executor is not None:
+            logger.debug(
+                "Submitting speculative fork preparation sandbox=%s pair_id=%s",
+                self.sandbox.sandbox_id,
+                pair_id,
+            )
+            fork_future = self._submit_spec_future(self._ensure_speculative_fork)
+
+        fork_handle = _SpeculativeForkHandle(handle=None)
+        fork_restore_ms = 0.0
+        if fork_future is not None:
+            fork_wait_started = time.perf_counter()
+            wait([fork_future, oracle_future], return_when=FIRST_COMPLETED)
+            fork_restore_ms = (time.perf_counter() - fork_wait_started) * 1000.0 if fork_future.done() else 0.0
+            logger.debug(
+                "Speculative fork/oracle race completed sandbox=%s pair_id=%s fork_done=%s oracle_done=%s fork_restore_ms=%.2f",
+                self.sandbox.sandbox_id,
+                pair_id,
+                fork_future.done(),
+                oracle_future.done(),
+                fork_restore_ms,
+            )
+            if oracle_future.done() and not fork_future.done():
+                oracle_turn = oracle_future.result()
+                logger.debug(
+                    "Oracle turn finished before fork restore; using non-spec execution sandbox=%s pair_id=%s command=%s",
+                    self.sandbox.sandbox_id,
+                    pair_id,
+                    oracle_turn.command,
+                )
+                self._invalidate_speculative_fork()
+                self._append_assistant_message(oracle_turn.content)
+                result = self._exec_command(oracle_turn.command)
+                self._record_spec_step_metrics(
+                    pair_id=pair_id,
+                    accepted=False,
+                    draft_first=True,
+                    fork_created=False,
+                    fork_reused=False,
+                    fork_restore_ms=0.0,
+                    speculative_exec_ms=0.0,
+                    saved_ms=0.0,
+                    penalty_ms=0.0,
+                    hidden_penalty_ms=0.0,
+                    current_state_changed=False,
+                    fork_state_changed=False,
+                )
+                return result
+            if fork_future.done():
+                fork_handle = fork_future.result()
+                logger.debug(
+                    "Speculative fork prepared sandbox=%s pair_id=%s has_handle=%s created=%s reused=%s",
+                    self.sandbox.sandbox_id,
+                    pair_id,
+                    fork_handle.handle is not None,
+                    fork_handle.created,
+                    fork_handle.reused,
+                )
+        
+        if fork_handle.handle is None:
+            oracle_turn = oracle_future.result()
+            logger.debug(
+                "No speculative fork available; executing oracle command directly sandbox=%s pair_id=%s command=%s",
+                self.sandbox.sandbox_id,
+                pair_id,
+                oracle_turn.command,
+            )
+            self._invalidate_speculative_fork()
+            self._append_assistant_message(oracle_turn.content)
+            result = self._exec_command(oracle_turn.command)
+            self._record_spec_step_metrics(
+                pair_id=pair_id,
+                accepted=False,
+                draft_first=True,
+                fork_created=False,
+                fork_reused=False,
+                fork_restore_ms=fork_restore_ms,
+                speculative_exec_ms=0.0,
+                saved_ms=0.0,
+                penalty_ms=0.0,
+                hidden_penalty_ms=0.0,
+                current_state_changed=False,
+                fork_state_changed=False,
+            )
+            return result
+
+        speculative_record = self._build_command_record(draft_turn.command)
+        speculative_started = time.perf_counter()
+        # Captured strictly inside the worker thread (via a wrapper whose
+        # finally runs before set_result), so saved_ms below can read an
+        # accurate draft-exec finish time without a callback race.
+        draft_exec_done_at: list[float] = []
+
+        def _run_draft_exec_timed() -> Any:
+            try:
+                return self._run_command_record_for_sandbox(
+                    speculative_record,
+                    fork_handle.handle.sandbox_id,
+                )
+            finally:
+                draft_exec_done_at.append(time.perf_counter())
+
+        speculative_exec_future = self._submit_spec_future(_run_draft_exec_timed)
+
+        oracle_turn = oracle_future.result()
+        oracle_ready_at = time.perf_counter()
+        commands_match = self._commands_match(draft_turn.command, oracle_turn.command)
+        logger.debug(
+            "Speculative command comparison sandbox=%s pair_id=%s commands_match=%s draft_command=%s oracle_command=%s",
+            self.sandbox.sandbox_id,
+            pair_id,
+            commands_match,
+            draft_turn.command,
+            oracle_turn.command,
+        )
+        accepted = False
+        current_state_changed = False
+        fork_state_changed = False
+        saved_ms = 0.0
+        penalty_ms = 0.0
+        hidden_penalty_ms = 0.0
+        reuse_candidate_value: bool | None = None
+        if commands_match:
+            speculative_result = speculative_exec_future.result()
+            speculative_exec_ms = (time.perf_counter() - speculative_started) * 1000.0
+            if self._is_retryable_exec_failure(speculative_result):
+                logger.warning(
+                    "Speculative command hit retryable sandbox interruption; falling back to active execution "
+                    "sandbox=%s pair_id=%s command=%s",
+                    self.sandbox.sandbox_id,
+                    pair_id,
+                    oracle_turn.command,
+                )
+                self._append_assistant_message(oracle_turn.content)
+                result = self._exec_command(oracle_turn.command)
+                # Retryable speculative failure: the fork was interrupted
+                # mid-exec so its post-action state is undefined. Never cache.
+                reuse_candidate_value = False
+                current_state_changed, fork_state_changed = self._finalize_speculative_fork(
+                    accepted=False,
+                    fork=fork_handle.handle,
+                    reuse_candidate=reuse_candidate_value,
+                )
+                penalty_ms = max(0.0, speculative_exec_ms)
+                hidden_penalty_ms = max(0.0, speculative_exec_ms)
+            else:
+                accepted = True
+                self._append_assistant_message(oracle_turn.content)
+                committed_record = self._build_command_record(
+                    oracle_turn.command,
+                    action_index=speculative_record.action_index,
+                )
+                self._record_completed_command(committed_record)
+                result = speculative_result
+                if self._speculation_controller is not None:
+                    self._promote_speculative_fork(fork_handle.handle)
+                # After promotion, `fork_handle.handle` points at the
+                # pre-command (old active) sandbox. Reuse is safe iff the
+                # executed command was a no-op on both sides (so both
+                # sandboxes still sit at the common pre-command state).
+                reuse_candidate_value = True
+                current_state_changed, fork_state_changed = self._finalize_speculative_fork(
+                    accepted=accepted,
+                    fork=fork_handle.handle,
+                    reuse_candidate=reuse_candidate_value,
+                )
+                # Honest wall-clock savings: the non-spec path would have
+                # started command execution only after the oracle reply
+                # arrived, so the overlap window we actually saved is
+                # bounded by both how long the draft exec took and how long
+                # the oracle made us wait for it.
+                draft_exec_done_time = (
+                    draft_exec_done_at[0] if draft_exec_done_at else time.perf_counter()
+                )
+                draft_exec_duration_ms = max(
+                    0.0, (draft_exec_done_time - speculative_started) * 1000.0
+                )
+                oracle_wait_ms = max(
+                    0.0, (oracle_ready_at - speculative_started) * 1000.0
+                )
+                saved_ms = max(0.0, min(draft_exec_duration_ms, oracle_wait_ms))
+                logger.debug(
+                    "Speculative command accepted sandbox=%s pair_id=%s speculative_exec_ms=%.2f "
+                    "draft_exec_duration_ms=%.2f oracle_wait_ms=%.2f saved_ms=%.2f",
+                    self.sandbox.sandbox_id,
+                    pair_id,
+                    speculative_exec_ms,
+                    draft_exec_duration_ms,
+                    oracle_wait_ms,
+                    saved_ms,
+                )
+        else:
+            result = self._exec_command(oracle_turn.command)
+            oracle_finished = time.perf_counter()
+            speculative_exec_ms = (oracle_finished - speculative_started) * 1000.0
+            eager_cleanup = bool(
+                self._speculation_controller is not None
+                and getattr(self._speculation_controller, "eager_cleanup_on_reject", False)
+            )
+            if eager_cleanup:
+                # Tear the fork down immediately so the draft exec
+                # subprocess fails and stops consuming host CPU. The
+                # fork's post-action state is undefined once destroyed,
+                # so reuse is never safe in this branch.
+                reuse_candidate_value = False
+                current_state_changed, fork_state_changed = self._finalize_speculative_fork(
+                    accepted=accepted,
+                    fork=fork_handle.handle,
+                    reuse_candidate=reuse_candidate_value,
+                )
+                drain_done, _ = wait(
+                    [speculative_exec_future], timeout=_SPEC_FUTURE_DRAIN_TIMEOUT_S
+                )
+                if drain_done:
+                    try:
+                        speculative_exec_future.result()
+                    except Exception as exc:
+                        logger.debug(
+                            "Rejected speculative command exited after eager cleanup sandbox=%s pair_id=%s error=%s",
+                            self.sandbox.sandbox_id,
+                            pair_id,
+                            exc,
+                        )
+                else:
+                    logger.debug(
+                        "Rejected speculative future still running after eager cleanup drain "
+                        "sandbox=%s pair_id=%s timeout_s=%.1f",
+                        self.sandbox.sandbox_id,
+                        pair_id,
+                        _SPEC_FUTURE_DRAIN_TIMEOUT_S,
+                    )
+                hidden_penalty_ms = max(
+                    0.0, (time.perf_counter() - speculative_started) * 1000.0
+                )
+            else:
+                # The fork's post-action state is only known once the draft
+                # exec finishes. If it's still running, we cannot decide
+                # reuse safely.
+                draft_done = speculative_exec_future.done()
+                if draft_done:
+                    hidden_penalty_ms = max(0.0, (time.perf_counter() - speculative_started) * 1000.0)
+                    try:
+                        speculative_exec_future.result()
+                    except Exception as exc:
+                        logger.debug(
+                            "Rejected speculative command completed with error sandbox=%s pair_id=%s error=%s",
+                            self.sandbox.sandbox_id,
+                            pair_id,
+                            exc,
+                        )
+                else:
+                    self._track_hidden_spec_penalty(
+                        future=speculative_exec_future,
+                        pair_id=pair_id,
+                        speculative_started=speculative_started,
+                    )
+                reuse_candidate_value = draft_done
+                current_state_changed, fork_state_changed = self._finalize_speculative_fork(
+                    accepted=accepted,
+                    fork=fork_handle.handle,
+                    reuse_candidate=reuse_candidate_value,
+                )
+            penalty_ms = max(0.0, (time.perf_counter() - oracle_finished) * 1000.0)
+            logger.debug(
+                "Speculative command rejected sandbox=%s pair_id=%s speculative_exec_ms=%.2f penalty_ms=%.2f "
+                "hidden_penalty_ms=%.2f",
+                self.sandbox.sandbox_id,
+                pair_id,
+                speculative_exec_ms,
+                penalty_ms,
+                hidden_penalty_ms,
+            )
+        self._record_spec_step_metrics(
+            pair_id=pair_id,
+            accepted=accepted,
+            draft_first=True,
+            fork_created=fork_handle.created,
+            fork_reused=fork_handle.reused,
+            fork_restore_ms=fork_restore_ms,
+            speculative_exec_ms=speculative_exec_ms,
+            saved_ms=saved_ms,
+            penalty_ms=penalty_ms,
+            hidden_penalty_ms=hidden_penalty_ms,
+            current_state_changed=current_state_changed,
+            fork_state_changed=fork_state_changed,
+            reuse_candidate=reuse_candidate_value,
+        )
+        logger.debug(
+            "Speculative step completed sandbox=%s pair_id=%s accepted=%s",
+            self.sandbox.sandbox_id,
+            pair_id,
+            accepted,
+        )
+        return result
+
+    def _ensure_speculative_fork(self) -> _SpeculativeForkHandle:
+        if self._speculation_controller is None:
+            logger.debug("Speculative fork skipped: controller unavailable sandbox=%s", self.sandbox.sandbox_id)
+            return _SpeculativeForkHandle(handle=None)
+        prepared = self._speculation_controller.ensure_fork()
+        if prepared is None:
+            logger.debug("Speculative fork controller returned no fork sandbox=%s", self.sandbox.sandbox_id)
+            return _SpeculativeForkHandle(handle=None)
+        if isinstance(prepared, _SpeculativeForkHandle):
+            logger.debug(
+                "Speculative fork prepared from handle wrapper sandbox=%s has_handle=%s created=%s reused=%s",
+                self.sandbox.sandbox_id,
+                prepared.handle is not None,
+                prepared.created,
+                prepared.reused,
+            )
+            return prepared
+        if isinstance(prepared, tuple) and len(prepared) >= 1:
+            handle = prepared[0]
+            created = bool(prepared[1]) if len(prepared) >= 2 else False
+            reused = bool(prepared[2]) if len(prepared) >= 3 else False
+            logger.debug(
+                "Speculative fork prepared from tuple sandbox=%s has_handle=%s created=%s reused=%s",
+                self.sandbox.sandbox_id,
+                handle is not None,
+                created,
+                reused,
+            )
+            return _SpeculativeForkHandle(handle=handle, created=created, reused=reused)
+        logger.debug(
+            "Speculative fork prepared from raw handle sandbox=%s has_handle=%s",
+            self.sandbox.sandbox_id,
+            prepared is not None,
+        )
+        return _SpeculativeForkHandle(handle=prepared)
+
+    def _promote_speculative_fork(self, fork) -> None:
+        if self._speculation_controller is None:
+            logger.debug("Skipping speculative fork promotion: controller unavailable sandbox=%s", self.sandbox.sandbox_id)
+            return
+        promoter = getattr(self._speculation_controller, "promote_fork", None)
+        if callable(promoter):
+            logger.debug("Promoting speculative fork sandbox=%s", self.sandbox.sandbox_id)
+            promoter(fork)
+
+    def _invalidate_speculative_fork(self) -> None:
+        if self._speculation_controller is None:
+            return
+        invalidator = getattr(self._speculation_controller, "invalidate_fork", None)
+        if callable(invalidator):
+            logger.debug("Invalidating speculative fork sandbox=%s", self.sandbox.sandbox_id)
+            invalidator()
+
+    def _finalize_speculative_fork(
+        self,
+        *,
+        accepted: bool,
+        fork,
+        reuse_candidate: bool,
+    ) -> tuple[bool, bool]:
+        if self._speculation_controller is None or fork is None:
+            logger.debug(
+                "Skipping speculative fork finalization sandbox=%s accepted=%s controller_available=%s fork_available=%s",
+                self.sandbox.sandbox_id,
+                accepted,
+                self._speculation_controller is not None,
+                fork is not None,
+            )
+            return False, False
+        current_state_changed = bool(self._speculation_controller.state_changed(self.sandbox))
+        fork_state_changed = bool(self._speculation_controller.state_changed(fork))
+        reusable = (
+            reuse_candidate
+            and not current_state_changed
+            and not fork_state_changed
+        )
+        logger.debug(
+            "Finalizing speculative fork sandbox=%s accepted=%s current_state_changed=%s "
+            "fork_state_changed=%s reuse_candidate=%s reusable=%s",
+            self.sandbox.sandbox_id,
+            accepted,
+            current_state_changed,
+            fork_state_changed,
+            reuse_candidate,
+            reusable,
+        )
+        releaser = getattr(self._speculation_controller, "release_fork", None)
+        if callable(releaser):
+            releaser(
+                fork,
+                reusable=reusable,
+                accepted=accepted,
+            )
+        return current_state_changed, fork_state_changed
+
+    def _record_spec_step_metrics(
+        self,
+        *,
+        pair_id: str,
+        accepted: bool,
+        draft_first: bool,
+        fork_created: bool,
+        fork_reused: bool,
+        fork_restore_ms: float,
+        speculative_exec_ms: float,
+        saved_ms: float,
+        penalty_ms: float,
+        hidden_penalty_ms: float,
+        current_state_changed: bool,
+        fork_state_changed: bool,
+        reuse_candidate: bool | None = None,
+    ) -> None:
+        with self._lock:
+            self._spec_total_turns += 1
+            if accepted:
+                self._spec_accept_count += 1
+            elif draft_first:
+                self._spec_reject_count += 1
+            self._spec_saved_ms += max(0.0, saved_ms)
+            self._spec_penalty_ms += max(0.0, penalty_ms)
+            self._spec_hidden_penalty_ms += max(0.0, hidden_penalty_ms)
+            if fork_created:
+                self._spec_fork_create_count += 1
+            if fork_reused:
+                self._spec_fork_reuse_count += 1
+            total_turns = self._spec_total_turns
+            accept_count = self._spec_accept_count
+            reject_count = self._spec_reject_count
+            saved_total_ms = self._spec_saved_ms
+            penalty_total_ms = self._spec_penalty_ms
+            hidden_penalty_total_ms = self._spec_hidden_penalty_ms
+        logger.debug(
+            (
+                "Recorded speculative step metrics sandbox=%s pair_id=%s accepted=%s draft_first=%s "
+                "saved_ms=%.2f penalty_ms=%.2f hidden_penalty_ms=%.2f fork_restore_ms=%.2f "
+                "speculative_exec_ms=%.2f totals(turns=%d accepted=%d rejected=%d saved_ms=%.2f "
+                "penalty_ms=%.2f hidden_penalty_ms=%.2f)"
+            ),
+            self.sandbox.sandbox_id,
+            pair_id,
+            accepted,
+            draft_first,
+            max(0.0, saved_ms),
+            max(0.0, penalty_ms),
+            max(0.0, hidden_penalty_ms),
+            max(0.0, fork_restore_ms),
+            max(0.0, speculative_exec_ms),
+            total_turns,
+            accept_count,
+            reject_count,
+            saved_total_ms,
+            penalty_total_ms,
+            hidden_penalty_total_ms,
+        )
+        if self.telemetry is not None:
+            task_run_id = self._benchmark_task_run_id()
+            attributes = {
+                "sandbox_id": str(self.sandbox.sandbox_id),
+                "task_run_id": task_run_id,
+                "pair_id": pair_id,
+                "accepted": 1 if accepted else 0,
+                "draft_first": 1 if draft_first else 0,
+                "oracle_first": 0 if draft_first else 1,
+                "fork_created": 1 if fork_created else 0,
+                "fork_reused": 1 if fork_reused else 0,
+                "current_state_changed": 1 if current_state_changed else 0,
+                "fork_state_changed": 1 if fork_state_changed else 0,
+                "fork_finalized": 1 if reuse_candidate is not None else 0,
+                "reuse_candidate": 1 if reuse_candidate else 0,
+            }
+            self.telemetry.emit_event("spec.turn.finish", attributes)
+            self.telemetry.emit_metric("benchmark.spec.saved_ms", max(0.0, saved_ms), attributes)
+            self.telemetry.emit_metric("benchmark.spec.penalty_ms", max(0.0, penalty_ms), attributes)
+            self.telemetry.emit_metric("benchmark.spec.hidden_penalty_ms", max(0.0, hidden_penalty_ms), attributes)
+            self.telemetry.emit_metric(
+                "benchmark.spec.net_gain_ms",
+                max(0.0, saved_ms) - max(0.0, penalty_ms),
+                attributes,
+            )
+            self.telemetry.emit_metric("benchmark.spec.fork_restore_ms", max(0.0, fork_restore_ms), attributes)
+            self.telemetry.emit_metric("benchmark.spec.speculative_exec_ms", max(0.0, speculative_exec_ms), attributes)
+            self.telemetry.emit_metric(
+                "benchmark.spec.accept_rate",
+                0.0 if accept_count + reject_count <= 0 else accept_count / (accept_count + reject_count),
+                attributes,
+            )
+
+    def _record_hidden_spec_penalty(self, *, pair_id: str, hidden_penalty_ms: float) -> None:
+        hidden_penalty_ms = max(0.0, hidden_penalty_ms)
+        if hidden_penalty_ms <= 0:
+            return
+        with self._lock:
+            self._spec_hidden_penalty_ms += hidden_penalty_ms
+        logger.debug(
+            "Recorded hidden speculative penalty sandbox=%s pair_id=%s hidden_penalty_ms=%.2f",
+            self.sandbox.sandbox_id,
+            pair_id,
+            hidden_penalty_ms,
+        )
+        if self.telemetry is not None:
+            task_run_id = self._benchmark_task_run_id()
+            attributes = {
+                "sandbox_id": str(self.sandbox.sandbox_id),
+                "task_run_id": task_run_id,
+                "pair_id": pair_id,
+                "accepted": 0,
+                "draft_first": 1,
+                "oracle_first": 0,
+            }
+            self.telemetry.emit_metric("benchmark.spec.hidden_penalty_ms", hidden_penalty_ms, attributes)
+
+    def _track_hidden_spec_penalty(
+        self,
+        *,
+        future: Future[Any],
+        pair_id: str,
+        speculative_started: float,
+    ) -> None:
+        def _finalize_hidden_penalty(completed_future: Future[Any]) -> None:
+            hidden_penalty_ms = (time.perf_counter() - speculative_started) * 1000.0
+            try:
+                completed_future.result()
+            except Exception as exc:
+                logger.debug(
+                    "Rejected speculative future finished with error after background cleanup "
+                    "sandbox=%s pair_id=%s error=%s",
+                    self.sandbox.sandbox_id,
+                    pair_id,
+                    exc,
+                )
+            self._record_hidden_spec_penalty(pair_id=pair_id, hidden_penalty_ms=hidden_penalty_ms)
+
+        future.add_done_callback(_finalize_hidden_penalty)
 
     def _llm_request_timeout_seconds(self) -> float:
         raw_timeout = self.task_config.options.get("max_agent_timeout_sec", 900.0)
@@ -405,11 +1230,23 @@ class MiniSweAgent(BaseAgent):
             timeout_s = 900.0
         return max(60.0, timeout_s)
 
+    def _benchmark_task_run_id(self) -> str:
+        metadata = self.sandbox.launch_metadata.get("benchmark", {})
+        if isinstance(metadata, dict):
+            raw_task_run_id = metadata.get("task_run_id")
+            if isinstance(raw_task_run_id, str) and raw_task_run_id:
+                return raw_task_run_id
+        return str(self.sandbox.sandbox_id)
+
     def _parse_command(self, assistant_content: str) -> str:
         commands = [item.strip() for item in _COMMAND_PATTERN.findall(assistant_content)]
         if len(commands) != 1 or not commands[0]:
             raise RuntimeError(f"MiniSweAgent expected exactly one mswea_bash_command tag, found {len(commands)}")
         return commands[0]
+
+    @staticmethod
+    def _commands_match(left: str, right: str) -> bool:
+        return " ".join(left.split()) == " ".join(right.split())
 
     def _bundle_process_config(self) -> dict[str, object]:
         config_path = self.sandbox.bundle_dir / "config.json"
@@ -455,15 +1292,14 @@ class MiniSweAgent(BaseAgent):
             return None
         return f"{uid}:{gid}" if gid is not None else str(uid)
 
-    def _exec_command(self, command: str):
-        assert self.runtime is not None
+    def _build_command_record(self, command: str, *, action_index: int | None = None) -> _RecordedCommand:
         raw_timeout = self.task_config.options.get("max_agent_timeout_sec", 900.0)
         try:
             timeout_s = max(1.0, float(raw_timeout))
         except (TypeError, ValueError):
             timeout_s = 900.0
-        command_record = _RecordedCommand(
-            action_index=self._next_action_index(),
+        return _RecordedCommand(
+            action_index=self._next_action_index() if action_index is None else int(action_index),
             command=command,
             argv=("bash", "-c", command),
             cwd=self._process_cwd(),
@@ -471,6 +1307,10 @@ class MiniSweAgent(BaseAgent):
             user=self._process_user(),
             timeout_s=timeout_s,
         )
+
+    def _exec_command(self, command: str):
+        assert self.runtime is not None
+        command_record = self._build_command_record(command)
         with self._lock:
             self._command_in_flight = True
             self._current_command = command_record
@@ -508,6 +1348,18 @@ class MiniSweAgent(BaseAgent):
                 self._command_in_flight = False
                 self._current_command = None
             self._set_status(self.poll_status())
+
+    def _run_command_record_for_sandbox(self, command_record: _RecordedCommand, sandbox_id) -> Any:
+        assert self.runtime is not None
+        return self.runtime.exec(
+            sandbox_id,
+            list(command_record.argv),
+            cwd=command_record.cwd,
+            env=dict(command_record.env),
+            user=command_record.user,
+            timeout_s=command_record.timeout_s,
+            capture_output=True,
+        )
 
     def _next_action_index(self) -> int:
         with self._lock:

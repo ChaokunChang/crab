@@ -26,6 +26,17 @@ logger = logging.getLogger(__name__)
 _JSON_CODEC = get_json_codec("auto")
 
 
+def _header_value(headers: dict[str, str], name: str, default: str = "") -> str:
+    value = headers.get(name)
+    if value is not None:
+        return value
+    lowered = name.lower()
+    for key, candidate in headers.items():
+        if key.lower() == lowered:
+            return candidate
+    return default
+
+
 def _maybe_requested_model(path: str, body: bytes) -> str | None:
     if path != "/v1/messages":
         return None
@@ -187,6 +198,25 @@ class InMemoryRequestStateStore:
                 return None
             return replace(context, metadata=dict(context.metadata))
 
+    def get_request_contexts_for_group(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        request_group_kind: str,
+        request_group_id: str,
+    ) -> list[RequestContext]:
+        with self._lock:
+            contexts = list(self._active_contexts.get(sandbox_id, {}).values())
+        matches: list[RequestContext] = []
+        for context in contexts:
+            metadata = dict(context.metadata)
+            if metadata.get("request_group_kind") != request_group_kind:
+                continue
+            if metadata.get("request_group_id") != request_group_id:
+                continue
+            matches.append(replace(context, metadata=metadata))
+        return matches
+
     def wait_for_change(self, timeout: float | None = None) -> RequestStateChange | None:
         with self._condition:
             if not self._changes:
@@ -205,13 +235,45 @@ class PendingSandboxResponse:
     sandbox_id: SandboxId
     request_id: str
     generation: int
+    request_ids: tuple[str, ...] = ()
+    request_group_kind: str | None = None
+    request_group_id: str | None = None
+
+
+@dataclass
+class _PendingResponseEntry:
+    generation: int
+    primary_request_id: str
+    request_ids: list[str]
+    request_group_kind: str | None = None
+    request_group_id: str | None = None
+
+    def as_pending(self, sandbox_id: SandboxId) -> PendingSandboxResponse:
+        return PendingSandboxResponse(
+            sandbox_id=sandbox_id,
+            request_id=self.primary_request_id,
+            generation=self.generation,
+            request_ids=tuple(self.request_ids),
+            request_group_kind=self.request_group_kind,
+            request_group_id=self.request_group_id,
+        )
 
 
 class SandboxResponseGateRegistry:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._enabled = False
-        self._states: dict[SandboxId, dict[str, int | dict[int, str] | threading.Condition]] = {}
+        self._states: dict[
+            SandboxId,
+            dict[
+                str,
+                int
+                | dict[int, _PendingResponseEntry]
+                | dict[tuple[str, str], int]
+                | set[tuple[str, str]]
+                | threading.Condition,
+            ],
+        ] = {}
 
     def enable(self) -> None:
         with self._lock:
@@ -232,7 +294,14 @@ class SandboxResponseGateRegistry:
             with condition:
                 condition.notify_all()
 
-    def arm(self, sandbox_id: SandboxId, request_id: str) -> int | None:
+    def arm(
+        self,
+        sandbox_id: SandboxId,
+        request_id: str,
+        *,
+        request_group_kind: str | None = None,
+        request_group_id: str | None = None,
+    ) -> int | None:
         with self._lock:
             if not self._enabled:
                 logger.debug(
@@ -247,20 +316,65 @@ class SandboxResponseGateRegistry:
                 state = {
                     "generation": 0,
                     "pending": {},
+                    "pending_groups": {},
+                    "satisfied_groups": set(),
                     "condition": condition,
                 }
                 self._states[sandbox_id] = state
+            group_key = None
+            if request_group_kind and request_group_id:
+                group_key = (request_group_kind, request_group_id)
+                satisfied_groups = state["satisfied_groups"]
+                assert isinstance(satisfied_groups, set)
+                if group_key in satisfied_groups:
+                    logger.debug(
+                        "Skipped arming response gate for already-satisfied request group: sandbox_id=%s request_id=%s group=%s",
+                        sandbox_id,
+                        request_id,
+                        group_key,
+                    )
+                    return None
+                pending_groups = state["pending_groups"]
+                assert isinstance(pending_groups, dict)
+                existing_generation = pending_groups.get(group_key)
+                if existing_generation is not None:
+                    pending = state["pending"]
+                    assert isinstance(pending, dict)
+                    entry = pending.get(existing_generation)
+                    if entry is not None:
+                        if request_id not in entry.request_ids:
+                            entry.request_ids.append(request_id)
+                        logger.debug(
+                            "Joined existing response gate group: sandbox_id=%s request_id=%s generation=%s group=%s",
+                            sandbox_id,
+                            request_id,
+                            existing_generation,
+                            group_key,
+                        )
+                        return existing_generation
             state["generation"] = int(state["generation"]) + 1
             pending = state["pending"]
             assert isinstance(pending, dict)
-            pending[int(state["generation"])] = request_id
+            generation = int(state["generation"])
+            entry = _PendingResponseEntry(
+                generation=generation,
+                primary_request_id=request_id,
+                request_ids=[request_id],
+                request_group_kind=request_group_kind,
+                request_group_id=request_group_id,
+            )
+            pending[generation] = entry
+            if group_key is not None:
+                pending_groups = state["pending_groups"]
+                assert isinstance(pending_groups, dict)
+                pending_groups[group_key] = generation
             logger.debug(
                 "Armed response gate: sandbox_id=%s request_id=%s generation=%s",
                 sandbox_id,
                 request_id,
-                state["generation"],
+                generation,
             )
-            return int(state["generation"])
+            return generation
 
     def wait_for_release(self, sandbox_id: SandboxId, generation: int | None, timeout: float | None = None) -> None:
         if generation is None:
@@ -299,12 +413,7 @@ class SandboxResponseGateRegistry:
             if not pending:
                 return None
             generation = max(pending)
-            request_id = pending[generation]
-            return PendingSandboxResponse(
-                sandbox_id=sandbox_id,
-                request_id=request_id,
-                generation=generation,
-            )
+            return pending[generation].as_pending(sandbox_id)
 
     def get_oldest_pending(self, sandbox_id: SandboxId) -> PendingSandboxResponse | None:
         with self._lock:
@@ -316,11 +425,7 @@ class SandboxResponseGateRegistry:
             if not pending:
                 return None
             generation = min(pending)
-            return PendingSandboxResponse(
-                sandbox_id=sandbox_id,
-                request_id=pending[generation],
-                generation=generation,
-            )
+            return pending[generation].as_pending(sandbox_id)
 
     def get_pending_generation(self, sandbox_id: SandboxId, generation: int) -> PendingSandboxResponse | None:
         with self._lock:
@@ -329,14 +434,10 @@ class SandboxResponseGateRegistry:
                 return None
             pending = state["pending"]
             assert isinstance(pending, dict)
-            request_id = pending.get(generation)
-            if request_id is None:
+            entry = pending.get(generation)
+            if entry is None:
                 return None
-            return PendingSandboxResponse(
-                sandbox_id=sandbox_id,
-                request_id=request_id,
-                generation=generation,
-            )
+            return entry.as_pending(sandbox_id)
 
     def find_pending_request(self, sandbox_id: SandboxId, request_id: str) -> PendingSandboxResponse | None:
         with self._lock:
@@ -346,13 +447,33 @@ class SandboxResponseGateRegistry:
             pending = state["pending"]
             assert isinstance(pending, dict)
             for generation in sorted(pending):
-                if pending[generation] == request_id:
-                    return PendingSandboxResponse(
-                        sandbox_id=sandbox_id,
-                        request_id=request_id,
-                        generation=generation,
-                    )
+                entry = pending[generation]
+                if request_id in entry.request_ids:
+                    return entry.as_pending(sandbox_id)
             return None
+
+    def find_pending_group(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        request_group_kind: str,
+        request_group_id: str,
+    ) -> PendingSandboxResponse | None:
+        with self._lock:
+            state = self._states.get(sandbox_id)
+            if state is None:
+                return None
+            pending_groups = state["pending_groups"]
+            assert isinstance(pending_groups, dict)
+            generation = pending_groups.get((request_group_kind, request_group_id))
+            if generation is None:
+                return None
+            pending = state["pending"]
+            assert isinstance(pending, dict)
+            entry = pending.get(generation)
+            if entry is None:
+                return None
+            return entry.as_pending(sandbox_id)
 
     def release_pending(self, sandbox_id: SandboxId, *, request_id: str, generation: int | None = None) -> bool:
         with self._lock:
@@ -370,7 +491,7 @@ class SandboxResponseGateRegistry:
             target_generation = generation
             if target_generation is None:
                 for candidate_generation in sorted(pending):
-                    if pending[candidate_generation] == request_id:
+                    if request_id in pending[candidate_generation].request_ids:
                         target_generation = candidate_generation
                         break
             if target_generation is None:
@@ -380,17 +501,25 @@ class SandboxResponseGateRegistry:
                     request_id,
                 )
                 return False
-            current_request_id = pending.get(target_generation)
-            if current_request_id != request_id:
+            entry = pending.get(target_generation)
+            if entry is None or request_id not in entry.request_ids:
                 logger.debug(
-                    "Skipped releasing response gate due to request_id mismatch: sandbox_id=%s expected=%s actual=%s generation=%s",
+                    "Skipped releasing response gate due to request_id mismatch: sandbox_id=%s actual=%s generation=%s",
                     sandbox_id,
-                    current_request_id,
                     request_id,
                     target_generation,
                 )
                 return False
             pending.pop(target_generation, None)
+            group_key = None
+            if entry.request_group_kind and entry.request_group_id:
+                group_key = (entry.request_group_kind, entry.request_group_id)
+                pending_groups = state["pending_groups"]
+                assert isinstance(pending_groups, dict)
+                pending_groups.pop(group_key, None)
+                satisfied_groups = state["satisfied_groups"]
+                assert isinstance(satisfied_groups, set)
+                satisfied_groups.add(group_key)
             condition = state["condition"]
             assert isinstance(condition, threading.Condition)
         with condition:
@@ -412,9 +541,24 @@ class SandboxResponseGateRegistry:
             pending = state["pending"]
             assert isinstance(pending, dict)
             if generation is None:
+                pending_groups = state["pending_groups"]
+                assert isinstance(pending_groups, dict)
+                satisfied_groups = state["satisfied_groups"]
+                assert isinstance(satisfied_groups, set)
+                for entry in pending.values():
+                    if entry.request_group_kind and entry.request_group_id:
+                        satisfied_groups.add((entry.request_group_kind, entry.request_group_id))
                 pending.clear()
+                pending_groups.clear()
             else:
-                pending.pop(generation, None)
+                entry = pending.pop(generation, None)
+                if entry is not None and entry.request_group_kind and entry.request_group_id:
+                    pending_groups = state["pending_groups"]
+                    assert isinstance(pending_groups, dict)
+                    pending_groups.pop((entry.request_group_kind, entry.request_group_id), None)
+                    satisfied_groups = state["satisfied_groups"]
+                    assert isinstance(satisfied_groups, set)
+                    satisfied_groups.add((entry.request_group_kind, entry.request_group_id))
             condition = state["condition"]
             assert isinstance(condition, threading.Condition)
         with condition:
@@ -513,6 +657,13 @@ class AgentCRRequestInterceptor:
         upstream_headers["X-Agent-Sandbox-Id"] = sandbox_id_raw
         provider = "openai" if path == "/v1/chat/completions" else "anthropic"
         request_kind, response_gate_enabled = _claude_request_gate_policy(path, body)
+        request_group_kind = None
+        request_group_id = None
+        request_group_role = None
+        spec_pair_id = _header_value(headers, "X-AgentCR-Spec-Pair-Id").strip()
+        if spec_pair_id:
+            request_group_kind = "spec_pair"
+            request_group_id = spec_pair_id
         metadata = {
             "provider": provider,
             "path": path,
@@ -520,6 +671,13 @@ class AgentCRRequestInterceptor:
         }
         if request_kind is not None:
             metadata["request_kind"] = request_kind
+        if request_group_kind is not None and request_group_id is not None:
+            metadata["request_group_kind"] = request_group_kind
+            metadata["request_group_id"] = request_group_id
+            spec_role = _header_value(headers, "X-AgentCR-Spec-Role").strip().lower()
+            if spec_role:
+                request_group_role = spec_role
+                metadata["request_group_role"] = spec_role
         context = RequestContext(
             request_id=upstream_headers.get("X-Request-Id", "").strip() or str(uuid.uuid4()),
             sandbox_id=SandboxId(sandbox_id_raw),
@@ -538,6 +696,11 @@ class AgentCRRequestInterceptor:
         }
         if request_kind is not None:
             request_attributes["request_kind"] = request_kind
+        if request_group_kind is not None and request_group_id is not None:
+            request_attributes["request_group_kind"] = request_group_kind
+            request_attributes["request_group_id"] = request_group_id
+            if request_group_role is not None:
+                request_attributes["request_group_role"] = request_group_role
         if self._telemetry is not None:
             self._telemetry.emit_event("interceptor.request.received", request_attributes)
         logger.debug(
@@ -555,7 +718,12 @@ class AgentCRRequestInterceptor:
         request_started = time.perf_counter()
         agentcr_delay_started_at: float | None = None
         if self._response_gate_registry is not None and response_gate_enabled:
-            gate_generation = self._response_gate_registry.arm(context.sandbox_id, context.request_id)
+            gate_generation = self._response_gate_registry.arm(
+                context.sandbox_id,
+                context.request_id,
+                request_group_kind=request_group_kind,
+                request_group_id=request_group_id,
+            )
         elif self._response_gate_registry is not None and request_kind is not None:
             logger.debug(
                 "Skipped response gate for auxiliary Claude request: sandbox_id=%s request_id=%s kind=%s path=%s",

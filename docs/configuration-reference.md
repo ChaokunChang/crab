@@ -244,28 +244,32 @@ Defined in `benchmarks/config.py`. Loaded from YAML via `load_config()`.
 
 | YAML Key | Type | Default | Description |
 |---|---|---|---|
-| `scenario` | `str` | *(required)* | Scenario type: `e2e`, `fault`, `spot`, `tree`. |
+| `scenario` | `str` | *(required)* | Scenario type: `e2e`, `fault`, `spot`, `tree`, `spec`. |
 | `mode` | `str` | *(required)* | Execution mode: `manual` or `auto`. |
 | `provider` | `str` | `"openai"` | LLM provider: `openai` or `anthropic`. |
-| `agent` | `str` | `"simulated"` | Agent type: `simulated` or `iflow`. |
-| `llm_service` | `str \| null` | `null` | LLM service type override: `simulated`, `manual`, `iflow_trace_replay`, `simulated_for_iflow`. |
+| `agent` | `str` | `"simulated"` | Agent type: `simulated`, `iflow`, `mini_swe`, or `claude_code`. |
+| `llm_service` | `str \| null` | `null` | LLM service type override: `simulated`, `manual`, `simulated_for_iflow`, `iflow_trace_replay`, `mini_swe_trace_replay`, `mini_swe_spec_trace_replay`, or `claude_code_trace_replay`. |
 | `task_dataset` | `path \| null` | `null` | Path to a task dataset file (relative to config file). |
 | `sandboxes` | `int` | `1` | Number of concurrent sandboxes. Must be > 0. |
 | `max_workers` | `int \| null` | `null` | Max worker threads. Defaults to `sandboxes` count. |
 | `phase_workers` | `mapping \| null` | `null` | Per-phase worker overrides for `setup`, `run`, and `verification`. Missing keys fall back to `max_workers`. |
 | `rootfs_reuse` | `mapping` | `{ enabled: true }` | Controls shared-rootfs reuse for benchmark sandbox provisioning. |
 | `phase_merging` | `mapping` | `{ setup_and_run: false, setup_and_run_executor_pool: separate }` | Controls whether eligible scenarios can pipeline setup directly into run and how merged setup/run work is scheduled. |
-| `iterations` | `int` | scenario-dependent | Number of iterations. Defaults: e2e=5, fault=3, spot=3, tree=1. |
+| `iterations` | `int` | scenario-dependent | Number of iterations. Defaults: e2e=5, fault=3, spot=3, tree=1, spec=0. `spec` is full-trace replay only and therefore requires `iterations: 0`. |
 | `output` | `path \| null` | `null` | Path for CSV output file. |
 | `log_file` | `path \| null` | `null` | Path for log file. |
 | `log_file_mode` | `str` | `"append"` | Log file open mode: `append` or `write`. |
 | `log_level` | `str` | `"info"` | Python log level: `debug`, `info`, `warning`, `error`, `critical`. |
-| `benchmark_root` | `path \| null` | `null` | Root directory for benchmark run data. Falls back to `AGENTCR_BENCH_DIR` env var, then a temp directory. |
+| `benchmark_root_home` | `path \| null` | `null` | Parent directory for benchmark run data. Falls back to `AGENTCR_BENCH_DIR` env var, then a temp directory. |
+| `benchmark_run_name` | `str \| null` | `null` | Directory name for this run under `benchmark_root_home`. Defaults to a timestamp such as `20260416_010203` when a benchmark root home is used. Requires `benchmark_root_home`, `benchmark_root`, or `AGENTCR_BENCH_DIR`. |
+| `benchmark_root` | `path \| null` | `null` | Deprecated alias for `benchmark_root_home`, kept for older configs. |
 | `clear_benchmark_root_after_run` | `bool` | `false` | Delete the resolved per-run benchmark directory after postprocessing completes. Tempdir-backed benchmark roots keep their existing automatic cleanup behavior. |
 | `storage_planes` | `mapping` | `{}` | Optional benchmark storage-plane overrides for runtime state, checkpoint storage, and agent host directories. |
 | `llm_service_options` | `mapping` | `{}` | Mapping merged into each task record's `llm_service_config`. Dataset-level values still take precedence. |
 | `max_agent_timeout_scale` | `float` | `1.0` | Multiplies dataset-provided `task_config.options.max_agent_timeout_sec` values before task launch. Missing dataset values stay unset. |
 | `max_test_timeout_scale` | `float` | `1.0` | Multiplies dataset-provided `task_config.options.max_test_timeout_sec` values before task launch. Missing dataset values stay unset. |
+
+When `output`, `log_file`, `telemetry.output`, or `telemetry.report.output_dir` are configured outside the resolved benchmark run root, the runner keeps writing those configured paths and also copies each existing artifact by basename into `<benchmark_root_home>/<benchmark_run_name>/` after the run.
 
 ---
 
@@ -333,6 +337,22 @@ Notes:
 - For non-compose or no-dataset runs, shared rootfs reuse is scoped to the current benchmark invocation.
 - Set `rootfs_reuse.enabled: false` to restore the older per-sandbox rootfs materialization path.
 
+### Sandbox Resource Limits YAML Block (`sandbox_resource_limits:`)
+
+Optional OCI `linux.resources` cgroup limits applied to every sandbox created by the harness. All fields are optional; omitting a field leaves that resource uncapped.
+
+| YAML Key | Type | Default | Description |
+|---|---|---|---|
+| `sandbox_resource_limits.cpus` | `int \| null` | `null` | CPU quota cap expressed as whole vCPUs. When set, the OCI spec receives `resources.cpu.quota = cpu_period_us * cpus` and `resources.cpu.period = cpu_period_us`. The launcher also injects `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `NUMEXPR_MAX_THREADS`, `LOKY_MAX_CPU_COUNT`, and `DJANGO_TEST_PROCESSES` into the sandbox environment (and the SWE-bench verify step) so pool sizing honors the cgroup quota rather than `os.cpu_count()`. |
+| `sandbox_resource_limits.memory_bytes` | `int \| null` | `null` | Maps to `resources.memory.limit` in bytes. Must be positive when set. |
+| `sandbox_resource_limits.pids_limit` | `int \| null` | `null` | Maps to `resources.pids.limit`. Must be positive when set. |
+| `sandbox_resource_limits.cpu_period_us` | `int` | `100000` | CFS period in microseconds used to translate `cpus` into a quota. Change only if you need a non-default CFS period. |
+
+Notes:
+
+- These fields are enforced through cgroups. The env-var injection is independent of the cgroup cap because the sandbox launcher drops the cgroup namespace; joblib/loky's `_cpu_count_cgroup` then sees the host root `cpu.max` and falls through to `os.cpu_count()` unless `LOKY_MAX_CPU_COUNT` is set.
+- The block is defined by `SandboxResourceLimitsConfig` in `benchmarks/config.py` and applied in `integrations/sandboxes/runtime/bundle.py` (`_apply_resource_limits`, `concurrency_env_for_cpu_limit`).
+
 ### Phase Merging YAML Block (`phase_merging:`)
 
 | YAML Key | Type | Default | Description |
@@ -352,7 +372,7 @@ These paths control the hottest host-side write locations used by the real-host 
 
 Notes:
 
-- `benchmark_root` remains the benchmark artifact root for CSV output, logs, and default telemetry/report artifacts.
+- The resolved benchmark run root remains the benchmark artifact root for CSV output, logs, and default telemetry/report artifacts.
 - `storage_planes` is opt-in. Omitting it preserves the pre-separation directory layout.
 - To reduce interference with file-backed ZFS pools, point `storage_planes.*` at a different filesystem or block device than `zpool_image`.
 - If you also use `work_dir_host_root`, that path is independent and may need the same treatment for very write-heavy tasks.
@@ -415,7 +435,7 @@ The `Overhead Analysis` section also includes a dedicated `llm.gate_wait` CDF so
 
 | YAML Key | Type | Default | Description |
 |---|---|---|---|
-| `telemetry.output` (or top-level `telemetry_output`) | `path \| null` | `null` | Path for telemetry JSONL output. Defaults to `<benchmark_root>/telemetry.jsonl`. |
+| `telemetry.output` (or top-level `telemetry_output`) | `path \| null` | `null` | Path for telemetry JSONL output. Defaults to `<benchmark_run_root>/telemetry.jsonl`. |
 | `telemetry.detail_level` | `str` | `"basic"` | `"basic"` or `"detailed"`. |
 | `telemetry.capture_command_output` | `bool` | `false` | Capture runtime command stdout/stderr in telemetry. |
 | `telemetry.max_text_attribute_bytes` | `int` | `2048` | Maximum byte length per text attribute in telemetry. Must be > 0. |
@@ -431,7 +451,7 @@ The `Overhead Analysis` section also includes a dedicated `llm.gate_wait` CDF so
 
 These keys are merged into each task record's `llm_service_config` before the benchmark launches. Dataset-provided `llm_service_config` values still win when both sides define the same key.
 
-For replay-backed LLM services such as `iflow_trace_replay`, `mini_swe_trace_replay`, and `claude_code_trace_replay`:
+For replay-backed LLM services such as `iflow_trace_replay`, `mini_swe_trace_replay`, `mini_swe_spec_trace_replay`, and `claude_code_trace_replay`:
 
 | YAML Key | Type | Default | Description |
 |---|---|---|---|
@@ -440,6 +460,14 @@ For replay-backed LLM services such as `iflow_trace_replay`, `mini_swe_trace_rep
 | `llm_service_options.response_delay_scaling_factor` | `float` | `1.0` | Multiplier applied to trace-derived delays when `response_delay_policy` is `trace_replay`. |
 | `llm_service_options.minimal_delay` | `float` | `0.0` | Lower clamp in milliseconds applied after the replay policy chooses a delay and after any scaling factor is applied. |
 | `llm_service_options.maximal_delay` | `float` | `1e9` | Upper clamp in milliseconds applied after the replay policy chooses a delay and after any scaling factor is applied. Must be greater than or equal to `minimal_delay`. |
+
+`mini_swe_spec_trace_replay` also understands additional speculative controls when they appear in the effective `llm_service_config`:
+
+| YAML Key | Type | Default | Description |
+|---|---|---|---|
+| `acceptance_rate` | `float` | `0.5` | Probability that the draft response matches the oracle command. Legacy alias: `accept_rate`. |
+| `draft_response_delay_scaling_factor` | `float` | `0.5` | Extra scaling factor applied only to draft replay latency after `response_delay_scaling_factor`. Legacy alias: `speculative_delay_scaling_factor`. |
+| `mismatch_policy` | `str` | `"preserve_command_class"` | Policy used when mutating rejected draft responses. Current supported value: `preserve_command_class`. |
 
 ### Scenario Options (`scenario_options:`)
 
@@ -467,6 +495,24 @@ For replay-backed LLM services such as `iflow_trace_replay`, `mini_swe_trace_rep
 | `branch_points` | `int` | `2` | Number of branch points to create. Must be ≥ 0. |
 | `fork_steps` | `int` | `3` | Number of steps to run on each forked branch. Must be ≥ 0. |
 | `replay_mode` | `str` | `"sequential"` | How to replay branches: `"sequential"` or `"concurrent"`. |
+
+#### Speculative Execution Scenario (`benchmarks/scenarios/spec.py`)
+
+These keys are merged into each task row's `llm_service_config` for `scenario: spec`.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `acceptance_rate` | `float` | `0.5` | Probability that the draft replay response matches the oracle command. Legacy alias: `accept_rate`. |
+| `draft_response_delay_scaling_factor` | `float` | `0.5` | Extra multiplier applied only to draft replay latency after the normal replay delay policy is resolved. Legacy alias: `speculative_delay_scaling_factor`. |
+| `mismatch_policy` | `str` | `"preserve_command_class"` | Draft-mismatch mutation policy. Current supported value: `preserve_command_class`. |
+| `enable_fork_reuse` | `bool` | `false` | When `true`, the speculative controller caches a finalized fork whose active and fork sandboxes both report `state_unchanged` and whose draft exec completed by oracle-finish time. The next turn consumes that cached fork instead of a fresh ZFS clone + CRIU restore. The cache is invalidated on any sandbox restore/recovery and is per-sandbox, so task boundaries always miss. Wired through `BenchmarkConfig.scenario_options["enable_fork_reuse"]` → `RealHostScenarioHarness(fork_reuse_enabled=...)` → `_SpeculativeSandboxController`. |
+| `eager_fork_cleanup_on_reject` | `bool` | `false` | When `true`, rejected speculative turns destroy the fork immediately (instead of letting the draft exec keep running on the fork until it finishes on its own). Destroying the fork terminates the `runc exec` subprocess, which bounds the hidden CPU penalty to the drain window (`_SPEC_FUTURE_DRAIN_TIMEOUT_S`, currently 5s) rather than the full draft-exec tail. The rejected fork is never cached for reuse in this mode; combining with `enable_fork_reuse=true` still caches forks on accepts. Wired through `BenchmarkConfig.scenario_options["eager_fork_cleanup_on_reject"]` → `RealHostScenarioHarness(eager_fork_cleanup_on_reject=...)` → `_SpeculativeSandboxController.eager_cleanup_on_reject`. |
+
+Additional `spec` scenario constraints:
+
+- `agent` must be `mini_swe`
+- `llm_service` must be `mini_swe_spec_trace_replay`
+- `iterations` must be exactly `0`
 
 ---
 

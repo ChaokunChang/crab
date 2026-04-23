@@ -69,7 +69,8 @@ provider: openai | anthropic
 agent: simulated | iflow
 llm_service: simulated | manual | iflow_trace_replay
 sandboxes: <count>
-benchmark_root: path/to/benchmark-runs
+benchmark_root_home: path/to/benchmark-runs
+benchmark_run_name: null  # optional; defaults to a timestamp
 reuse_zpool: bool   # keep ZFS pool across runs
 ```
 

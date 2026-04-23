@@ -1,4 +1,11 @@
-from integrations.sandboxes.runtime.bundle import merge_environment_defaults, resolve_process_user_from_rootfs, write_bundle_config
+from integrations.sandboxes.runtime.bundle import (
+    DEFAULT_CPU_PERIOD_US,
+    SandboxResourceLimits,
+    concurrency_env_for_cpu_limit,
+    merge_environment_defaults,
+    resolve_process_user_from_rootfs,
+    write_bundle_config,
+)
 from integrations.sandboxes.runtime.image import (
     ImageRuntimeDefaults,
     build_image,
@@ -17,9 +24,12 @@ from integrations.sandboxes.runtime.network import (
 __all__ = [
     "BenchmarkNetworkLease",
     "BenchmarkNetworkManager",
+    "DEFAULT_CPU_PERIOD_US",
     "ImageRuntimeDefaults",
     "PreparedBundleLaunch",
+    "SandboxResourceLimits",
     "build_image",
+    "concurrency_env_for_cpu_limit",
     "docker_tag_component",
     "export_image_rootfs",
     "find_free_port",

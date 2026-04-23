@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--out",
         type=Path,
-        default=ROOT / "results" / "datasets" / "swebench_sweagent_replay.jsonl",
+        default=ROOT / "results" / "datasets" / "swebench_miniswe_replay.jsonl",
     )
     parser.add_argument(
         "--tasks-root",

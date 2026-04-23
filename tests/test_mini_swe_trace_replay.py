@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from integrations.llm_services.mini_swe_trace_replay.service import TraceReplayLLMState, parse_replay_trace
+from integrations.llm_services.mini_swe_spec_trace_replay.service import TraceReplayLLMState as SpecTraceReplayLLMState
 
 
 def _trace_payload() -> dict[str, object]:
@@ -178,6 +179,176 @@ class MiniSWETraceReplayTests(unittest.TestCase):
                         "response_delay_policy": "nope",
                     }
                 )
+
+
+class MiniSWESpecTraceReplayTests(unittest.TestCase):
+    def test_oracle_and_draft_streams_advance_independently(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.traj.json"
+            trace_path.write_text(json.dumps(_trace_payload()), encoding="utf-8")
+            state = SpecTraceReplayLLMState(llm_service_config={"trace_path": str(trace_path), "acceptance_rate": 1.0})
+
+            draft = state.handle_request(
+                path="/v1/chat/completions",
+                headers={"X-AgentCR-Spec-Role": "draft", "X-AgentCR-Spec-Pair-Id": "pair-1"},
+                payload={},
+            )
+            oracle = state.handle_request(
+                path="/v1/chat/completions",
+                headers={"X-AgentCR-Spec-Role": "oracle", "X-AgentCR-Spec-Pair-Id": "pair-1"},
+                payload={},
+            )
+            snapshot = state.snapshot()
+
+        self.assertIn("echo first", draft["choices"][0]["message"]["content"])
+        self.assertIn("echo first", oracle["choices"][0]["message"]["content"])
+        self.assertEqual(snapshot["oracle_trace_cursor"], 1)
+        self.assertEqual(snapshot["draft_trace_cursor"], 1)
+        self.assertEqual(snapshot["accept_count"], 1)
+        self.assertEqual(snapshot["reject_count"], 0)
+
+    def test_draft_rejection_mutates_command_but_keeps_bucket(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.traj.json"
+            trace_path.write_text(json.dumps(_trace_payload()), encoding="utf-8")
+            state = SpecTraceReplayLLMState(llm_service_config={"trace_path": str(trace_path), "acceptance_rate": 0.0})
+
+            response = state.handle_request(
+                path="/v1/chat/completions",
+                headers={"X-AgentCR-Spec-Role": "draft", "X-AgentCR-Spec-Pair-Id": "pair-1"},
+                payload={},
+            )
+
+        content = response["choices"][0]["message"]["content"]
+        self.assertIn("<mswea_bash_command>", content)
+        self.assertNotIn("echo first", content)
+        self.assertEqual(state.snapshot()["reject_count"], 1)
+
+    def test_submission_turn_is_never_mutated_even_when_acceptance_rate_is_zero(self) -> None:
+        payload = _trace_payload()
+        payload["messages"] = [
+            payload["messages"][0],
+            payload["messages"][1],
+            {
+                "role": "assistant",
+                "content": (
+                    "THOUGHT: submit\n"
+                    "<mswea_bash_command>echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat patch.txt</mswea_bash_command>"
+                ),
+                "extra": {"timestamp": 10.0},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.traj.json"
+            trace_path.write_text(json.dumps(payload), encoding="utf-8")
+            state = SpecTraceReplayLLMState(llm_service_config={"trace_path": str(trace_path), "acceptance_rate": 0.0})
+
+            response = state.handle_request(
+                path="/v1/chat/completions",
+                headers={"X-AgentCR-Spec-Role": "draft", "X-AgentCR-Spec-Pair-Id": "pair-submit"},
+                payload={},
+            )
+
+        self.assertIn("COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT", response["choices"][0]["message"]["content"])
+        self.assertEqual(state.snapshot()["accept_count"], 1)
+        self.assertEqual(state.snapshot()["reject_count"], 0)
+
+    def test_draft_decision_is_deterministic_by_trace_index_not_pair_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.traj.json"
+            trace_path.write_text(json.dumps(_trace_payload()), encoding="utf-8")
+            first = SpecTraceReplayLLMState(llm_service_config={"trace_path": str(trace_path), "acceptance_rate": 0.5})
+            second = SpecTraceReplayLLMState(llm_service_config={"trace_path": str(trace_path), "acceptance_rate": 0.5})
+
+            first_response = first.handle_request(
+                path="/v1/chat/completions",
+                headers={"X-AgentCR-Spec-Role": "draft", "X-AgentCR-Spec-Pair-Id": "pair-alpha"},
+                payload={},
+            )
+            second_response = second.handle_request(
+                path="/v1/chat/completions",
+                headers={"X-AgentCR-Spec-Role": "draft", "X-AgentCR-Spec-Pair-Id": "pair-beta"},
+                payload={},
+            )
+
+        self.assertEqual(
+            first_response["choices"][0]["message"]["content"],
+            second_response["choices"][0]["message"]["content"],
+        )
+
+    def test_draft_delay_scaling_factor_applies_to_fixed_delay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.traj.json"
+            trace_path.write_text(json.dumps(_trace_payload()), encoding="utf-8")
+            state = SpecTraceReplayLLMState(
+                llm_service_config={
+                    "trace_path": str(trace_path),
+                    "response_delay_policy": "fixed",
+                    "response_delay_ms": 2000,
+                    "draft_response_delay_scaling_factor": 0.25,
+                    "acceptance_rate": 1.0,
+                }
+            )
+
+            with patch("integrations.llm_services.mini_swe_spec_trace_replay.service.time.sleep") as sleep:
+                state.handle_request(
+                    path="/v1/chat/completions",
+                    headers={"X-AgentCR-Spec-Role": "draft", "X-AgentCR-Spec-Pair-Id": "pair-1"},
+                    payload={},
+                )
+                state.handle_request(
+                    path="/v1/chat/completions",
+                    headers={"X-AgentCR-Spec-Role": "oracle", "X-AgentCR-Spec-Pair-Id": "pair-1"},
+                    payload={},
+                )
+
+        self.assertEqual(sleep.call_args_list[0].args, (0.5,))
+        self.assertEqual(sleep.call_args_list[1].args, (2.0,))
+
+    def test_exact_state_export_and_import_preserve_cursors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.traj.json"
+            trace_path.write_text(json.dumps(_trace_payload()), encoding="utf-8")
+            source = SpecTraceReplayLLMState(llm_service_config={"trace_path": str(trace_path), "acceptance_rate": 1.0})
+            target = SpecTraceReplayLLMState(llm_service_config={"trace_path": str(trace_path), "acceptance_rate": 1.0})
+
+            source.handle_request(
+                path="/v1/chat/completions",
+                headers={"X-AgentCR-Spec-Role": "draft", "X-AgentCR-Spec-Pair-Id": "pair-1"},
+                payload={},
+            )
+            source.handle_request(
+                path="/v1/chat/completions",
+                headers={"X-AgentCR-Spec-Role": "oracle", "X-AgentCR-Spec-Pair-Id": "pair-1"},
+                payload={},
+            )
+            target.import_state(source.export_state())
+
+        self.assertEqual(target.snapshot()["trace_cursor"], 1)
+        self.assertEqual(target.snapshot()["draft_trace_cursor"], 1)
+
+    def test_header_lookup_is_case_insensitive_for_spec_role_and_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.traj.json"
+            trace_path.write_text(json.dumps(_trace_payload()), encoding="utf-8")
+            state = SpecTraceReplayLLMState(llm_service_config={"trace_path": str(trace_path), "acceptance_rate": 1.0})
+
+            draft = state.handle_request(
+                path="/v1/chat/completions",
+                headers={"X-Agentcr-Spec-Role": "draft", "X-Agentcr-Spec-Pair-Id": "pair-1"},
+                payload={},
+            )
+            oracle = state.handle_request(
+                path="/v1/chat/completions",
+                headers={"X-Agentcr-Spec-Role": "oracle", "X-Agentcr-Spec-Pair-Id": "pair-1"},
+                payload={},
+            )
+            snapshot = state.snapshot()
+
+        self.assertIn("echo first", draft["choices"][0]["message"]["content"])
+        self.assertIn("echo first", oracle["choices"][0]["message"]["content"])
+        self.assertEqual(snapshot["oracle_trace_cursor"], 1)
+        self.assertEqual(snapshot["draft_trace_cursor"], 1)
 
 
 if __name__ == "__main__":

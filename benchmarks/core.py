@@ -252,6 +252,7 @@ def benchmark_phase_item_attributes(
         attributes = {
             "component": "benchmark",
             "sandbox_id": sandbox_name,
+            "task_run_id": sandbox_name,
             "task_id": task_id,
             "agent_type": agent_type,
             "llm_service_type": llm_service_type,
@@ -807,6 +808,14 @@ def task_id_for_sandbox(sandbox: SandboxHandle) -> str:
         raw_task_id = sandbox.task_config.options.get("task_id")
         if isinstance(raw_task_id, str) and raw_task_id:
             return raw_task_id
+    return str(sandbox.sandbox_id)
+
+
+def task_run_id_for_sandbox(sandbox: SandboxHandle) -> str:
+    metadata = sandbox_benchmark_metadata(sandbox)
+    raw_task_run_id = metadata.get("task_run_id")
+    if isinstance(raw_task_run_id, str) and raw_task_run_id:
+        return raw_task_run_id
     return str(sandbox.sandbox_id)
 
 

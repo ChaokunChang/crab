@@ -203,6 +203,8 @@ The benchmark runner now coordinates three phases across the whole run:
 
 By default, `run` does not begin until all sandboxes finish `setup`, and `verification` does not begin until all sandboxes finish `run`. When `phase_merging.setup_and_run` is enabled, eligible per-sandbox flows can pipeline setup directly into run so each sandbox starts run work immediately after its own setup completes. The verification barrier remains unchanged. By default, merged setup/run scheduling still uses separate setup and run executor pools. Setting `phase_merging.setup_and_run_executor_pool: shared` switches merged flows to a single executor pool that runs one combined `setup+run` task per sandbox.
 
+At the `run → verification` handoff, the harness calls `CRScheduler.deactivate_sandbox(sandbox_id)` before submitting the verify exec. `query_checkpoint(...)` short-circuits for deactivated sandboxes and returns a no-op `leave_running=True` decision, so a concurrent verifier cannot race a scheduler pause/checkpoint. This is a terminal flag — once a sandbox is deactivated for the run it does not reactivate.
+
 The main benchmark entrypoints and configuration surface are:
 
 - [benchmarks/run.py](/root/workspace/agent-cr/benchmarks/run.py)

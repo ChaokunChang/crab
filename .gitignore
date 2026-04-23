@@ -25,6 +25,7 @@ data/
 benchmarks/reports/
 integrations/sandboxes/iflow/cache/
 .codex
+.claude/
 benchmarks/evaluation
 logs.old
 test.png

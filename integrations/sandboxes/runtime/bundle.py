@@ -1,10 +1,91 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 from integrations.sandboxes.runtime.image import ImageRuntimeDefaults
+
+
+DEFAULT_CPU_PERIOD_US = 100_000
+
+
+@dataclass(frozen=True)
+class SandboxResourceLimits:
+    """Optional per-sandbox cgroup resource limits.
+
+    Unset fields leave the corresponding OCI spec section untouched so the
+    sandbox inherits host defaults (no limit).
+    """
+
+    cpus: int | None = None
+    memory_bytes: int | None = None
+    pids_limit: int | None = None
+    cpu_period_us: int = DEFAULT_CPU_PERIOD_US
+
+    def is_empty(self) -> bool:
+        return (
+            self.cpus is None
+            and self.memory_bytes is None
+            and self.pids_limit is None
+        )
+
+
+def _apply_resource_limits(linux_cfg: dict, limits: SandboxResourceLimits | None) -> None:
+    if limits is None or limits.is_empty():
+        return
+    resources = dict(linux_cfg.get("resources") or {})
+    if limits.cpus is not None:
+        cpus = int(limits.cpus)
+        if cpus <= 0:
+            raise ValueError(f"resource_limits.cpus must be positive, got {cpus}")
+        period = int(limits.cpu_period_us)
+        if period <= 0:
+            raise ValueError(f"resource_limits.cpu_period_us must be positive, got {period}")
+        cpu_cfg = dict(resources.get("cpu") or {})
+        cpu_cfg["period"] = period
+        cpu_cfg["quota"] = cpus * period
+        resources["cpu"] = cpu_cfg
+    if limits.memory_bytes is not None:
+        memory = int(limits.memory_bytes)
+        if memory <= 0:
+            raise ValueError(f"resource_limits.memory_bytes must be positive, got {memory}")
+        memory_cfg = dict(resources.get("memory") or {})
+        memory_cfg["limit"] = memory
+        resources["memory"] = memory_cfg
+    if limits.pids_limit is not None:
+        pids = int(limits.pids_limit)
+        if pids <= 0:
+            raise ValueError(f"resource_limits.pids_limit must be positive, got {pids}")
+        pids_cfg = dict(resources.get("pids") or {})
+        pids_cfg["limit"] = pids
+        resources["pids"] = pids_cfg
+    linux_cfg["resources"] = resources
+
+
+def concurrency_env_for_cpu_limit(cpus: int | None) -> dict[str, str]:
+    """Env vars that advertise the CPU limit to workloads whose process/thread
+    pool sizing is not affinity-aware. cgroup cpuset alone is insufficient
+    because Linux `sysconf(_SC_NPROCESSORS_ONLN)` — used by Python's
+    `multiprocessing.cpu_count()` and friends — reports the host count.
+    """
+    if cpus is None:
+        return {}
+    value = str(int(cpus))
+    return {
+        "DJANGO_TEST_PROCESSES": value,
+        "OMP_NUM_THREADS": value,
+        "OPENBLAS_NUM_THREADS": value,
+        "MKL_NUM_THREADS": value,
+        "NUMEXPR_MAX_THREADS": value,
+        # joblib/loky reads /sys/fs/cgroup/cpu.max to size Pools; because we
+        # drop the cgroup namespace (see write_bundle_config) the container
+        # sees the host root cgroup ("max") and falls through to
+        # os.cpu_count(), sizing Pools to host core count regardless of our
+        # cpu cgroup quota. Cap explicitly.
+        "LOKY_MAX_CPU_COUNT": value,
+    }
 
 
 def parse_env_assignments(values: Iterable[str]) -> dict[str, str]:
@@ -115,6 +196,7 @@ def write_bundle_config(
     network_namespace_path: Path | None = None,
     image_defaults: ImageRuntimeDefaults | None = None,
     image_rootfs_dir: Path | None = None,
+    resource_limits: SandboxResourceLimits | None = None,
 ) -> None:
     config_path = bundle_dir / "config.json"
     cfg = json.loads(config_path.read_text())
@@ -136,6 +218,7 @@ def write_bundle_config(
     linux_cfg["namespaces"] = namespaces
     linux_cfg["cgroupsPath"] = cgroup_path
     linux_cfg.pop("seccomp", None)
+    _apply_resource_limits(linux_cfg, resource_limits)
     cfg["linux"] = linux_cfg
     mounts = [mount for mount in cfg.get("mounts", []) if mount.get("destination") != "/work"]
     if work_dir_host_path is not None:
@@ -166,6 +249,10 @@ def write_bundle_config(
         f"AGENT_SANDBOX_ID={sandbox_name}",
         f"AGENT_PROVIDER={provider}",
     ]
+    concurrency_env = concurrency_env_for_cpu_limit(
+        resource_limits.cpus if resource_limits is not None else None
+    )
+    runtime_env.extend(f"{key}={value}" for key, value in concurrency_env.items())
     cfg["process"]["env"] = merge_environment_defaults(
         image_defaults.environment if image_defaults is not None else (),
         runtime_env,

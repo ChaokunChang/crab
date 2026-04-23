@@ -59,7 +59,15 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--agent-type", choices=["simulated", "iflow", "mini_swe", "claude_code"], default="simulated")
     parser.add_argument(
         "--llm-service-type",
-        choices=["simulated", "manual", "simulated_for_iflow", "iflow_trace_replay", "mini_swe_trace_replay", "claude_code_trace_replay"],
+        choices=[
+            "simulated",
+            "manual",
+            "simulated_for_iflow",
+            "iflow_trace_replay",
+            "mini_swe_trace_replay",
+            "mini_swe_spec_trace_replay",
+            "claude_code_trace_replay",
+        ],
         default=None,
     )
     parser.add_argument("--dataset", type=Path, default=None)
@@ -127,10 +135,13 @@ def compute_telemetry_summary(
     run_id: str | None = None,
     required_keys: Iterable[str] | None = None,
     attribute_filters: dict[str, dict[str, object]] | None = None,
+    last_value_keys: set[str] | None = None,
 ) -> dict[str, float]:
     if telemetry_path is None or not telemetry_path.exists():
         return {}
     rows_by_summary: dict[str, list[float]] = {key: [] for key in metric_aliases}
+    last_by_group: dict[str, dict[str, float]] = {}
+    _last_value_keys = last_value_keys or set()
     required = set(metric_aliases if required_keys is None else required_keys)
     filters = attribute_filters or {}
     with telemetry_path.open("r", encoding="utf-8") as handle:
@@ -160,10 +171,18 @@ def compute_telemetry_summary(
                 if not matches:
                     continue
                 try:
-                    rows_by_summary[summary_key].append(float(payload["value"]))
+                    value = float(payload["value"])
                 except (KeyError, TypeError, ValueError):
-                    pass
+                    break
+                if summary_key in _last_value_keys:
+                    group_id = str(attributes.get("task_run_id") or attributes.get("sandbox_id") or "")
+                    last_by_group.setdefault(summary_key, {})[group_id] = value
+                else:
+                    rows_by_summary[summary_key].append(value)
                 break
+    for key, group_values in last_by_group.items():
+        if group_values:
+            rows_by_summary[key] = list(group_values.values())
     summary = {
         key: sum(values) / len(values)
         for key, values in rows_by_summary.items()
@@ -321,7 +340,12 @@ def effective_trace_replay_progress_count(record: BenchmarkTaskRecord) -> int | 
 
 
 def is_replay_llm_service_type(llm_service_type: str | None) -> bool:
-    return llm_service_type in {"iflow_trace_replay", "mini_swe_trace_replay", "claude_code_trace_replay"}
+    return llm_service_type in {
+        "iflow_trace_replay",
+        "mini_swe_trace_replay",
+        "mini_swe_spec_trace_replay",
+        "claude_code_trace_replay",
+    }
 
 
 def choose_replay_points(total_responses: int, limit: int) -> list[int]:

@@ -4,6 +4,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -27,6 +28,7 @@ _DEFAULT_RUNTIME_COMMAND_TIMEOUT_SECONDS = 60.0
 _DEFAULT_ZFS_PREPARE_TIMEOUT_SECONDS = 300.0
 _DATASET_DESTROY_BUSY_RETRIES = 10
 _DATASET_DESTROY_BUSY_RETRY_DELAY_S = 0.5
+_DATASET_PROMOTE_CONFLICT_RETRIES = 8
 _LAUNCH_PREPARED_METADATA_KEY = "_agent_cr_runtime_prepared"
 _LAUNCH_REUSE_EXISTING_ROOTFS_METADATA_KEY = "_agent_cr_runtime_reuse_existing_rootfs"
 _SHARED_ROOTFS_KEY_METADATA_KEY = "shared_rootfs_key"
@@ -55,6 +57,7 @@ _POSTFIX_POSTDROP_DIRS = {
     "maildrop": 0o1730,
     "public": 0o2710,
 }
+_PROMOTE_CONFLICTING_SNAPSHOT_RE = re.compile(r"conflicting snapshot '([^']+)'")
 
 
 def _lookup_unix_id(path: Path, name: str, *, field_index: int) -> int | None:
@@ -994,19 +997,46 @@ class RuncRuntime(Runtime):
     ) -> RuntimeOperationStatus:
         dataset = self.dataset_name_for(sandbox_id)
         snapshot = f"{dataset}@{checkpoint_id}"
+        metadata: dict[str, object] = {
+            "phase": "filesystem_restore",
+            "runtime": self.name,
+            "dataset": dataset,
+            "snapshot": snapshot,
+            "mountpoint": str(self.rootfs_path_for(sandbox_id)),
+        }
+        origin = self._query_zfs_origin(dataset)
+        if origin is not None and origin.endswith(f"@{checkpoint_id}"):
+            # Dataset is a clone of the requested snapshot; its live state
+            # already matches, so rollback would be a no-op. Skipping avoids a
+            # same-name snapshot on the clone which would later collide with
+            # `zfs promote`.
+            return RuntimeOperationStatus(
+                executed=False,
+                reason="clone_origin_matches_checkpoint",
+                command=(self._zfs_bin, "rollback", "-r", snapshot),
+                metadata={**metadata, "origin": origin},
+            )
         return self._run_status(
             [self._zfs_bin, "rollback", "-r", snapshot],
             operation="sandbox.restore_filesystem",
             sandbox_id=sandbox_id,
             checkpoint_id=checkpoint_id,
-            metadata={
-                "phase": "filesystem_restore",
-                "runtime": self.name,
-                "dataset": dataset,
-                "snapshot": snapshot,
-                "mountpoint": str(self.rootfs_path_for(sandbox_id)),
-            },
+            metadata=metadata,
         )
+
+    def _query_zfs_origin(self, dataset: str) -> str | None:
+        result = self._run_command(
+            [self._zfs_bin, "get", "-H", "-o", "value", "origin", dataset],
+            operation="sandbox.zfs_get_origin",
+            check=False,
+            metadata={"dataset": dataset},
+        )
+        if result.returncode != 0:
+            return None
+        value = result.stdout.strip()
+        if not value or value == "-":
+            return None
+        return value
 
     def filesystem_checkpoint_metadata(
         self,
@@ -1121,6 +1151,52 @@ class RuncRuntime(Runtime):
                 f"\nstderr: {stderr}"
             )
 
+    def promote_filesystem_dataset(self, sandbox_id: SandboxId) -> None:
+        dataset = self.dataset_name_for(sandbox_id)
+        last_result: CommandResult | None = None
+        last_stderr = ""
+        for attempt in range(1, _DATASET_PROMOTE_CONFLICT_RETRIES + 1):
+            result = self._run_command(
+                [self._zfs_bin, "promote", dataset],
+                operation="sandbox.zfs_promote",
+                sandbox_id=sandbox_id,
+                check=False,
+                metadata={"dataset": dataset, "attempt": attempt},
+            )
+            stderr = result.stderr.strip()
+            if result.returncode == 0:
+                return
+            if "not a cloned filesystem" in stderr or "does not exist" in stderr:
+                return
+            conflict_match = _PROMOTE_CONFLICTING_SNAPSHOT_RE.search(stderr)
+            if conflict_match is None:
+                last_result = result
+                last_stderr = stderr
+                break
+            snapshot_name = conflict_match.group(1)
+            logger.warning(
+                "ZFS dataset promote reported conflicting snapshot; deleting child snapshot and retrying "
+                "sandbox=%s dataset=%s snapshot=%s attempt=%d/%d",
+                sandbox_id,
+                dataset,
+                snapshot_name,
+                attempt,
+                _DATASET_PROMOTE_CONFLICT_RETRIES,
+            )
+            self._destroy_dataset_snapshot(
+                dataset,
+                snapshot_name,
+                sandbox_id=sandbox_id,
+            )
+            last_result = result
+            last_stderr = stderr
+        assert last_result is not None
+        raise RuntimeError(
+            f"command failed ({last_result.returncode}): {self._zfs_bin} promote {dataset}"
+            f"\nstdout: {last_result.stdout.strip()}"
+            f"\nstderr: {last_stderr}"
+        )
+
     def clone_filesystem_snapshot(
         self,
         source_sandbox_id: SandboxId,
@@ -1146,13 +1222,6 @@ class RuncRuntime(Runtime):
             checkpoint_id=checkpoint_id,
             metadata={"source_dataset": source_dataset, "target_dataset": target_dataset, "mountpoint": str(target_rootfs_path)},
         )
-        self._run_command(
-            [self._zfs_bin, "snapshot", f"{target_dataset}@{checkpoint_id}"],
-            operation="sandbox.zfs_clone_snapshot",
-            sandbox_id=target_sandbox_id,
-            checkpoint_id=checkpoint_id,
-            metadata={"target_dataset": target_dataset},
-        )
         return target_dataset
 
     def bundle_path_for(self, sandbox_id: SandboxId) -> Path:
@@ -1172,6 +1241,30 @@ class RuncRuntime(Runtime):
         if description is None:
             return f"{self._paths.zfs_dataset_prefix}/{sandbox_id}"
         return str(description.metadata.get("zfs_dataset", f"{self._paths.zfs_dataset_prefix}/{sandbox_id}"))
+
+    def _destroy_dataset_snapshot(
+        self,
+        dataset: str,
+        snapshot_name: str,
+        *,
+        sandbox_id: SandboxId,
+    ) -> None:
+        snapshot = f"{dataset}@{snapshot_name}"
+        result = self._run_command(
+            [self._zfs_bin, "destroy", snapshot],
+            operation="sandbox.zfs_destroy_snapshot",
+            sandbox_id=sandbox_id,
+            check=False,
+            metadata={"dataset": dataset, "snapshot": snapshot},
+        )
+        stderr = result.stderr.strip()
+        if result.returncode == 0 or "does not exist" in stderr or "snapshot does not exist" in stderr:
+            return
+        raise RuntimeError(
+            f"command failed ({result.returncode}): {self._zfs_bin} destroy {snapshot}"
+            f"\nstdout: {result.stdout.strip()}"
+            f"\nstderr: {stderr}"
+        )
 
     def _zfs_dataset_exists(self, dataset: str) -> bool:
         result = self._run_command(

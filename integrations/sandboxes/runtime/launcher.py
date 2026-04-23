@@ -6,7 +6,7 @@ import shutil
 import socket
 from typing import Callable
 
-from integrations.sandboxes.runtime.bundle import write_bundle_config
+from integrations.sandboxes.runtime.bundle import SandboxResourceLimits, write_bundle_config
 from integrations.sandboxes.runtime.image import ImageRuntimeDefaults
 
 
@@ -40,6 +40,7 @@ def prepare_bundle_launch(
     image_defaults: ImageRuntimeDefaults | None = None,
     image_rootfs_dir: Path | None = None,
     bundle_spec_writer: Callable[[Path], None] | None = None,
+    resource_limits: SandboxResourceLimits | None = None,
 ) -> PreparedBundleLaunch:
     resolved_status_port = find_free_port() if status_port is None else status_port
     bundle_dir = bundle_root / sandbox_name
@@ -61,6 +62,7 @@ def prepare_bundle_launch(
         network_namespace_path=network_namespace_path,
         image_defaults=image_defaults,
         image_rootfs_dir=image_rootfs_dir,
+        resource_limits=resource_limits,
     )
     return PreparedBundleLaunch(
         bundle_dir=bundle_dir,

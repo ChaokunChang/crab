@@ -72,6 +72,7 @@ Not every record contains every key, but these are the standard correlation fiel
 | --- | --- |
 | `run_id` | Logical benchmark run identifier. Use this first when a file may contain multiple runs. |
 | `sandbox_id` | Sandbox/container identity. Primary join key for per-sandbox timelines. |
+| `task_run_id` | Stable logical benchmark task-run identity. In speculative runs, multiple promoted sandboxes can share one `task_run_id`. |
 | `task_id` | Logical benchmark task identity. Often attached by benchmark-level telemetry. |
 | `request_id` | Logical LLM request identity. Used to connect interceptor-side and service-side records. |
 | `request_generation` | Monotonic per-sandbox request generation used to distinguish overlapping gated requests from the same sandbox. |
@@ -80,6 +81,7 @@ Not every record contains every key, but these are the standard correlation fiel
 | `event_type` | Benchmark/recovery event type such as `fault` or `preemption`. |
 | `component` | Producing subsystem, such as `interceptor`, `llm_service`, `scheduler`, `runtime`, `checkpoint`, `restore`, `recovery`, `benchmark`, or `system`. |
 | `request_kind` | Optional classifier for request families such as Claude Code `main_loop`, `helper`, and `count_tokens`. |
+| `pair_id` | Speculative-execution pair identifier used to correlate draft and oracle work for one agent turn. |
 | `status` | Usually `succeeded`, `failed`, or `skipped` on finish/duration records. |
 | `operation` | Runtime command operation name for generic command telemetry. |
 
@@ -332,7 +334,7 @@ Examples include:
 - `sandbox.zfs_create.duration_ms`
 - `sandbox.zfs_destroy.duration_ms`
 - `sandbox.zfs_clone.duration_ms`
-- `sandbox.zfs_clone_snapshot.duration_ms`
+- `sandbox.zfs_get_origin.duration_ms`
 
 These are the preferred runtime cost signals.
 
@@ -408,6 +410,7 @@ These come from benchmark scenario logic and are benchmark-level outcome/breakdo
 These metrics often carry:
 
 - `task_id`
+- `task_run_id`
 - `sandbox_id`
 - `iteration`
 - `event_type`
@@ -415,6 +418,41 @@ These metrics often carry:
 - `recovery_status`
 
 That metadata is important for replay/fault/preemption analysis.
+
+### Speculative Execution Metrics
+
+The `spec` scenario emits additional per-turn metrics from the `mini_swe` agent:
+
+| Metric/Event | Meaning |
+| --- | --- |
+| `spec.turn.finish` | Per-turn speculative completion event. Carries `pair_id`, `accepted`, `draft_first`, `oracle_first`, `fork_created`, `fork_reused`, `current_state_changed`, `fork_state_changed`, `fork_finalized`, and `reuse_candidate`. `fork_finalized=1` indicates the turn reached `_finalize_speculative_fork` (turns that short-circuit on oracle-first, draft-failure, or no-fork-available emit `fork_finalized=0`). `reuse_candidate=1` indicates the reuse gate accepted the turn — i.e. the draft exec had completed by the time the oracle result arrived, so the fork's post-action state is well-defined and it is eligible for caching when `scenario_options.enable_fork_reuse` is `true`. |
+| `benchmark.spec.saved_ms` | Estimated time saved by an accepted speculative turn. |
+| `benchmark.spec.penalty_ms` | Agent-loop-visible delay from a rejected speculative turn. |
+| `benchmark.spec.hidden_penalty_ms` | Rejected speculative work that continued on the fork after the oracle path was already unblocked. |
+| `benchmark.spec.net_gain_ms` | `saved_ms - penalty_ms` for the turn. |
+| `benchmark.spec.fork_restore_ms` | Time spent waiting for a speculative fork restore to become usable. |
+| `benchmark.spec.speculative_exec_ms` | Time spent executing the speculative draft command on the fork. |
+| `benchmark.spec.accept_rate` | Running accepted/(accepted+rejected) ratio as observed by the agent. |
+
+At the scenario-row level, the benchmark also emits task summaries that may appear in `task_summary.csv` and the HTML report:
+
+- `spec_total_turns`
+- `spec_accept_count`
+- `spec_reject_count`
+- `spec_accept_rate`
+- `spec_saved_ms`
+- `spec_penalty_ms`
+- `spec_hidden_penalty_ms`
+- `spec_net_gain_ms`
+- `spec_fork_create_count`
+- `spec_fork_reuse_count`
+
+`spec_net_gain_ms` is computed as `spec_saved_ms - spec_penalty_ms`, so it reflects visible loop impact rather than hidden background fork cost.
+
+When these metrics are present, the telemetry report adds a `Speculative Execution Summary` section with saved-time, agent-loop-penalty, hidden-reject-cost, net-gain, and accept-rate charts.
+Task summary tables and task-level charts now group speculative promotions by `task_run_id`, so `spec-0`, `spec-0-spec-1`, and later accepted descendants appear as one logical task run in the report.
+
+When `spec.turn.finish` events carry `fork_finalized` and `reuse_candidate`, the report also renders a `Fork Reuse` subsection with a `total turns → finalized → state-unchanged → cache-eligible → reused` funnel, two gap rows (`state-unchanged → cache-eligible`, `cache-eligible → reused`), a fork-source / reuse-rate summary, and an accept/reject × state-unchanged/state-changed outcome matrix. The same 13 metrics are exported as `spec_fork_reuse.csv`. Under `scenario_options.enable_fork_reuse: false`, `forks_reused` is always `0` by design — every cache-eligible turn falls into the `cache-eligible → reused` gap. See [speculative-execution-benchmark.md](/root/workspace/agent-cr/docs/speculative-execution-benchmark.md#fork-reuse) for the full caching contract.
 
 ## 7. Image And Build Metrics
 

@@ -12,6 +12,7 @@ class HarnessSettings:
     scheduler_policy: object
     checkpoint_manager_factory: Callable[[object], object]
     max_workers: int
+    expected_sandboxes: int | None = None
 
 
 @dataclass(frozen=True)

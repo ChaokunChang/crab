@@ -342,6 +342,35 @@ class ExecutorTests(unittest.TestCase):
 
         self.assertEqual(worker.started_job_ids, ["job-a", "job-b", "job-c"])
 
+    def test_has_active_job_covers_running_checkpoint_and_restore(self) -> None:
+        worker = BlockingCheckpointWorker()
+        executor = CRExecutor(
+            ExecutorConfig(max_workers=2, checkpoint_workers=1, max_retries=0),
+            checkpoint_worker=worker,
+            restore_worker=PassThroughRestoreWorker(),
+        )
+        sandbox_id = SandboxId("sbx-active")
+        other_sandbox = SandboxId("sbx-other")
+        ckpt_job = CheckpointJob(
+            job_id=JobId("job-active-ckpt"),
+            sandbox_id=sandbox_id,
+            requested_at=utc_now(),
+        )
+
+        self.assertFalse(executor.has_active_job(sandbox_id))
+
+        future = executor.submit_checkpoint(ckpt_job)
+        self.assertTrue(worker.wait_started("job-active-ckpt"))
+
+        self.assertTrue(executor.has_active_job(sandbox_id))
+        self.assertFalse(executor.has_active_job(other_sandbox))
+
+        worker.release("job-active-ckpt")
+        future.result(timeout=2.0)
+
+        self.assertFalse(executor.has_active_job(sandbox_id))
+        executor.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

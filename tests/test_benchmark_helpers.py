@@ -68,6 +68,94 @@ ImageRuntimeDefaults = sandbox_image.ImageRuntimeDefaults
 
 
 class BenchmarkHelperTests(unittest.TestCase):
+    def test_llm_router_max_workers_scales_above_benchmark_workers(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(require_change_signal=False),
+            scheduler_policy=object(),
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=5,
+        )
+
+        self.assertEqual(harness._llm_router_max_workers(), 32)
+
+        harness.max_workers = 12
+
+        self.assertEqual(harness._llm_router_max_workers(), 48)
+
+    def test_resolve_benchmark_run_root_uses_configured_home_and_name(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(),
+            scheduler_policy=None,
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+            benchmark_root_home=Path("/bench-home"),
+            benchmark_run_name="run-a",
+        )
+
+        root, uses_temporary_root = harness._resolve_benchmark_run_root()
+
+        self.assertEqual(root, Path("/bench-home/run-a"))
+        self.assertFalse(uses_temporary_root)
+        self.assertEqual(harness.configured_benchmark_root, Path("/bench-home"))
+
+    def test_resolve_benchmark_run_root_generates_name_for_home_only(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(),
+            scheduler_policy=None,
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+            benchmark_root_home=Path("/bench-home"),
+        )
+
+        with patch.object(
+            RealHostScenarioHarness,
+            "_generated_benchmark_run_name",
+            return_value="20260416_010203",
+        ):
+            root, uses_temporary_root = harness._resolve_benchmark_run_root()
+
+        self.assertEqual(root, Path("/bench-home/20260416_010203"))
+        self.assertFalse(uses_temporary_root)
+
+    def test_resolve_benchmark_run_root_keeps_legacy_root_as_home_alias(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(),
+            scheduler_policy=None,
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+            benchmark_root=Path("/legacy-home"),
+            benchmark_run_name="run-a",
+        )
+
+        root, uses_temporary_root = harness._resolve_benchmark_run_root()
+
+        self.assertEqual(root, Path("/legacy-home/run-a"))
+        self.assertFalse(uses_temporary_root)
+        self.assertEqual(harness.configured_benchmark_root_home, Path("/legacy-home"))
+
+    def test_resolve_benchmark_run_root_rejects_name_without_home(self) -> None:
+        harness = RealHostScenarioHarness(
+            provider="openai",
+            transfer_delay_ms=0.0,
+            scheduler_config=SchedulerConfig(),
+            scheduler_policy=None,
+            checkpoint_manager_factory=lambda base: base,
+            max_workers=1,
+            benchmark_run_name="run-a",
+        )
+
+        with patch.dict(os.environ, {"AGENTCR_BENCH_DIR": "tmp"}):
+            with self.assertRaisesRegex(ValueError, "benchmark_run_name requires"):
+                harness._resolve_benchmark_run_root()
+
     def _load_verification_uv_shim_namespace(self) -> dict[str, object]:
         namespace: dict[str, object] = {}
         exec(RealHostScenarioHarness._verification_uv_python_shim_script(), namespace)
@@ -1333,6 +1421,82 @@ class BenchmarkHelperTests(unittest.TestCase):
             self.assertIn("PATH=/usr/local/bin:/usr/bin:/bin", payload["process"]["env"])
             self.assertEqual(payload["process"]["user"], {"uid": 1001, "gid": 1002})
 
+    def test_write_bundle_config_applies_resource_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = Path(tmp)
+            config_path = bundle_dir / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "linux": {"namespaces": [], "seccomp": {"defaultAction": "SCMP_ACT_ERRNO"}},
+                        "mounts": [],
+                        "process": {"terminal": True, "cwd": "/", "args": [], "env": []},
+                        "root": {"path": "rootfs", "readonly": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            sandbox_bundle.write_bundle_config(
+                bundle_dir=bundle_dir,
+                llm_base_url="http://127.0.0.1:9000/v1",
+                provider="openai",
+                sandbox_name="sandbox-rl",
+                status_port=9001,
+                cgroup_path="agent-cr/test/sandbox-rl",
+                resource_limits=sandbox_bundle.SandboxResourceLimits(
+                    cpus=4,
+                    memory_bytes=2 * 1024 * 1024 * 1024,
+                    pids_limit=512,
+                ),
+            )
+
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+            resources = payload["linux"]["resources"]
+            self.assertNotIn("cpus", resources["cpu"])
+            self.assertEqual(resources["cpu"]["period"], 100_000)
+            self.assertEqual(resources["cpu"]["quota"], 400_000)
+            self.assertEqual(resources["memory"]["limit"], 2 * 1024 * 1024 * 1024)
+            self.assertEqual(resources["pids"]["limit"], 512)
+            env = payload["process"]["env"]
+            self.assertIn("DJANGO_TEST_PROCESSES=4", env)
+            self.assertIn("OMP_NUM_THREADS=4", env)
+            self.assertIn("OPENBLAS_NUM_THREADS=4", env)
+            self.assertIn("MKL_NUM_THREADS=4", env)
+            self.assertIn("NUMEXPR_MAX_THREADS=4", env)
+            self.assertIn("LOKY_MAX_CPU_COUNT=4", env)
+
+    def test_write_bundle_config_without_resource_limits_leaves_resources_unset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = Path(tmp)
+            config_path = bundle_dir / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "linux": {"namespaces": [], "seccomp": {"defaultAction": "SCMP_ACT_ERRNO"}},
+                        "mounts": [],
+                        "process": {"terminal": True, "cwd": "/", "args": [], "env": []},
+                        "root": {"path": "rootfs", "readonly": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            sandbox_bundle.write_bundle_config(
+                bundle_dir=bundle_dir,
+                llm_base_url="http://127.0.0.1:9000/v1",
+                provider="openai",
+                sandbox_name="sandbox-no-rl",
+                status_port=9001,
+                cgroup_path="agent-cr/test/sandbox-no-rl",
+            )
+
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertNotIn("resources", payload["linux"])
+            env = payload["process"]["env"]
+            self.assertFalse(any(item.startswith("DJANGO_TEST_PROCESSES=") for item in env))
+            self.assertFalse(any(item.startswith("OMP_NUM_THREADS=") for item in env))
+
     def test_sandbox_handle_status_url_uses_status_host(self) -> None:
         handle = SandboxHandle(
             sandbox_id=SandboxId("sbx-status"),
@@ -1397,6 +1561,39 @@ class BenchmarkHelperTests(unittest.TestCase):
 
         self.assertIsNone(manager.resolve_sandbox_id(lease.guest_ip))
         self.assertIsNone(manager.lease_for(SandboxId("sbx-a")))
+
+    def test_release_benchmark_network_lease_returns_guest_ip_to_pool(self) -> None:
+        manager = sandbox_network.BenchmarkNetworkManager()
+
+        with patch("integrations.sandboxes.runtime.network.subprocess.run"):
+            first = manager.allocate_lease(SandboxId("sbx-a"))
+            second = manager.allocate_lease(SandboxId("sbx-b"))
+            manager.release_lease(SandboxId("sbx-a"))
+            reused = manager.allocate_lease(SandboxId("sbx-c"))
+
+        self.assertEqual(first.guest_ip, "10.250.0.2")
+        self.assertEqual(second.guest_ip, "10.250.0.3")
+        self.assertEqual(reused.guest_ip, first.guest_ip)
+
+    def test_repair_benchmark_network_lease_uses_configured_prefix_length(self) -> None:
+        manager = sandbox_network.BenchmarkNetworkManager()
+        manager._network_cidr = "10.250.8.0/22"
+        manager._bridge_ip = "10.250.8.1"
+
+        commands: list[list[str]] = []
+
+        def fake_run(cmd, *args, **kwargs):
+            commands.append(list(cmd))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch("integrations.sandboxes.runtime.network.subprocess.run", side_effect=fake_run):
+            lease = manager.allocate_lease(SandboxId("sbx-a"))
+            self.assertTrue(manager.repair_lease(SandboxId("sbx-a")))
+
+        self.assertIn(
+            ["ip", "netns", "exec", lease.namespace_name, "ip", "addr", "replace", f"{lease.guest_ip}/22", "dev", "eth0"],
+            commands,
+        )
 
     def test_resolve_interceptor_sandbox_id_uses_registered_guest_ip_for_any_benchmark(self) -> None:
         harness = RealHostScenarioHarness(

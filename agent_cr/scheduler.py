@@ -349,6 +349,20 @@ class CRScheduler:
         self._runtime = runtime
         self._state = state_store or InMemorySchedulerStateStore()
         self._telemetry = telemetry or NoopTelemetrySink()
+        self._deactivated_lock = Lock()
+        self._deactivated: set[SandboxId] = set()
+
+    def deactivate_sandbox(self, sandbox_id: SandboxId) -> None:
+        # Terminal deactivation (e.g. verification phase). query_checkpoint short-circuits
+        # before any runc pause can happen, so a concurrent verify exec doesn't race with
+        # scheduler pause/checkpoint.
+        with self._deactivated_lock:
+            self._deactivated.add(sandbox_id)
+        logger.info("Scheduler deactivated sandbox %s; no further checkpoints will be scheduled", sandbox_id)
+
+    def is_sandbox_deactivated(self, sandbox_id: SandboxId) -> bool:
+        with self._deactivated_lock:
+            return sandbox_id in self._deactivated
 
     def evaluate(self, sandbox: SandboxSnapshot) -> SchedulerCheckpointDecision:
         operation = start_operation(
@@ -413,6 +427,15 @@ class CRScheduler:
 
     def query_checkpoint(self, sandbox_id: SandboxId) -> SchedulerCheckpointDecision:
         logger.debug("Querying scheduler for sandbox %s", sandbox_id)
+        if self.is_sandbox_deactivated(sandbox_id):
+            return SchedulerCheckpointDecision(
+                should_checkpoint=False,
+                checkpoint_process=False,
+                checkpoint_filesystem=False,
+                leave_running=True,
+                reason="sandbox_deactivated",
+                policy_name=self._policy.name,
+            )
         if self._config.inspect_without_pause:
             return self._query_checkpoint_with_live_inspection(sandbox_id)
         return self._query_checkpoint_with_pause(sandbox_id)

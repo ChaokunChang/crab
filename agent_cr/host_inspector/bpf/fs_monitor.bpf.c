@@ -58,10 +58,17 @@ struct fs_event {
 
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
-  __uint(max_entries, 1024);
+  __uint(max_entries, 65536);
   __type(key, __u64);
   __type(value, __u8);
 } registered_cgroups SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 65536);
+  __type(key, __u32);
+  __type(value, __u8);
+} ignored_pids SEC(".maps");
 
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
@@ -78,6 +85,12 @@ struct {
 static __always_inline bool is_registered_cgroup(__u64 cgroup_id)
 {
   __u8 *value = bpf_map_lookup_elem(&registered_cgroups, &cgroup_id);
+  return value != 0;
+}
+
+static __always_inline bool is_ignored_pid(__u32 tgid)
+{
+  __u8 *value = bpf_map_lookup_elem(&ignored_pids, &tgid);
   return value != 0;
 }
 
@@ -337,7 +350,9 @@ SEC("tracepoint/raw_syscalls/sys_enter")
 int handle_sys_enter(struct trace_event_raw_sys_enter *ctx)
 {
   __u64 cgroup_id = bpf_get_current_cgroup_id();
-  __u32 tid = (__u32)bpf_get_current_pid_tgid();
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  __u32 tid = (__u32)pid_tgid;
+  __u32 tgid = (__u32)(pid_tgid >> 32);
   struct pending_op pending = {};
   unsigned long arg0 = ctx->args[0];
   unsigned long arg1 = ctx->args[1];
@@ -345,6 +360,8 @@ int handle_sys_enter(struct trace_event_raw_sys_enter *ctx)
   unsigned long arg3 = ctx->args[3];
 
   if (!is_registered_cgroup(cgroup_id))
+    return 0;
+  if (is_ignored_pid(tgid))
     return 0;
   if (!is_tracked_syscall(ctx->id))
     return 0;

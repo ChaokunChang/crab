@@ -26,6 +26,7 @@ from agent_cr.telemetry import (
 from integrations.llm_services.iflow_trace_replay.service import TraceReplayLLMState
 from integrations.llm_services.claude_code_trace_replay.service import TraceReplayLLMState as ClaudeCodeTraceReplayLLMState
 from integrations.llm_services.mini_swe_trace_replay.service import TraceReplayLLMState as MiniSWETraceReplayLLMState
+from integrations.llm_services.mini_swe_spec_trace_replay.service import TraceReplayLLMState as MiniSWESpecTraceReplayLLMState
 from integrations.llm_services.manual.service import ManualLLMState, handle_control_request
 from integrations.llm_services.simulated.service import SimulatedLLMState, handle_request as handle_simulated_request
 from integrations.llm_services.simulated_for_iflow.service import (
@@ -60,8 +61,22 @@ def default_llm_service_type_for_agent(agent_type: str) -> str:
 
 
 def validate_llm_service_type(*, provider: str, llm_service_type: str) -> None:
-    openai_only = {"manual", "simulated_for_iflow", "iflow_trace_replay", "mini_swe_trace_replay"}
-    supported = {"simulated", "manual", "simulated_for_iflow", "iflow_trace_replay", "mini_swe_trace_replay", "claude_code_trace_replay"}
+    openai_only = {
+        "manual",
+        "simulated_for_iflow",
+        "iflow_trace_replay",
+        "mini_swe_trace_replay",
+        "mini_swe_spec_trace_replay",
+    }
+    supported = {
+        "simulated",
+        "manual",
+        "simulated_for_iflow",
+        "iflow_trace_replay",
+        "mini_swe_trace_replay",
+        "mini_swe_spec_trace_replay",
+        "claude_code_trace_replay",
+    }
     if llm_service_type not in supported:
         raise ValueError(f"unsupported llm service type: {llm_service_type}")
     if provider == "anthropic" and llm_service_type in openai_only:
@@ -178,6 +193,29 @@ class MiniSWETraceReplayServiceState:
         self._state.restore(consumed_response_count=consumed_response_count)
 
 
+class MiniSWESpecTraceReplayServiceState:
+    def __init__(self, *, llm_service_config: dict[str, object] | None = None) -> None:
+        self._state = MiniSWESpecTraceReplayLLMState(llm_service_config=llm_service_config)
+
+    def handle_request(self, *, path: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
+        return self._state.handle_request(path=path, headers=headers, payload=payload)
+
+    def snapshot(self, *, include_events: bool = True) -> dict[str, Any]:
+        return self._state.snapshot(include_events=include_events)
+
+    def reset(self) -> None:
+        self._state.reset()
+
+    def restore(self, *, consumed_response_count: int) -> None:
+        self._state.restore(consumed_response_count=consumed_response_count)
+
+    def export_state(self) -> dict[str, Any]:
+        return self._state.export_state()
+
+    def import_state(self, state: dict[str, Any]) -> None:
+        self._state.import_state(state)
+
+
 class ClaudeCodeTraceReplayServiceState:
     def __init__(self, *, llm_service_config: dict[str, object] | None = None) -> None:
         self._state = ClaudeCodeTraceReplayLLMState(llm_service_config=llm_service_config)
@@ -202,6 +240,7 @@ def build_llm_service_registry() -> dict[str, type[LLMServiceState]]:
         "simulated_for_iflow": SimulatedForIFlowServiceState,
         "iflow_trace_replay": IFlowTraceReplayServiceState,
         "mini_swe_trace_replay": MiniSWETraceReplayServiceState,
+        "mini_swe_spec_trace_replay": MiniSWESpecTraceReplayServiceState,
         "claude_code_trace_replay": ClaudeCodeTraceReplayServiceState,
     }
 
@@ -330,6 +369,22 @@ class BenchmarkLLMRouter:
             consumed_response_count=consumed_response_count
         )
 
+    def copy_sandbox_state(self, *, source_sandbox_id: str, target_sandbox_id: str) -> None:
+        source_service = self.resolve_service(source_sandbox_id)
+        target_service = self.resolve_service(target_sandbox_id)
+        if source_service.llm_service_type != target_service.llm_service_type:
+            raise ValueError(
+                "cannot copy llm service state across different service types: "
+                f"{source_service.llm_service_type!r} != {target_service.llm_service_type!r}"
+            )
+        exporter = getattr(source_service.service_state, "export_state", None)
+        importer = getattr(target_service.service_state, "import_state", None)
+        if not callable(exporter) or not callable(importer):
+            raise ValueError(
+                f"llm service type {source_service.llm_service_type!r} does not support exact state copy"
+            )
+        importer(exporter())
+
 
 @dataclass(frozen=True)
 class BenchmarkLLMRouterClient:
@@ -381,6 +436,15 @@ class BenchmarkLLMRouterClient:
             {
                 "sandbox_id": sandbox_id,
                 "consumed_response_count": consumed_response_count,
+            },
+        )
+
+    def copy_sandbox_state(self, *, source_sandbox_id: str, target_sandbox_id: str) -> dict[str, Any]:
+        return self._post(
+            "/control/copy_state",
+            {
+                "source_sandbox_id": source_sandbox_id,
+                "target_sandbox_id": target_sandbox_id,
             },
         )
 
@@ -593,9 +657,29 @@ def serve_benchmark_llm_router(
                     )
                     self._write_json({"ok": True})
                     return
+                if self.path == "/control/copy_state":
+                    source_sandbox_id = str(payload.get("source_sandbox_id", "")).strip()
+                    target_sandbox_id = str(payload.get("target_sandbox_id", "")).strip()
+                    if not source_sandbox_id:
+                        raise ValueError("source_sandbox_id is required")
+                    if not target_sandbox_id:
+                        raise ValueError("target_sandbox_id is required")
+                    self.benchmark_llm_router.copy_sandbox_state(
+                        source_sandbox_id=source_sandbox_id,
+                        target_sandbox_id=target_sandbox_id,
+                    )
+                    self._write_json({"ok": True})
+                    return
                 self.send_error(404)
             except ValueError as exc:
                 self.send_error(400, str(exc))
+            except Exception:
+                logger.exception(
+                    "Benchmark LLM router request failed: path=%s client=%s",
+                    self.path,
+                    self.client_address[0] if self.client_address else "unknown",
+                )
+                self.send_error(500, "internal server error")
 
         def log_message(self, format: str, *args) -> None:
             _ = (format, args)

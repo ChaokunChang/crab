@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
 import sys
@@ -77,6 +78,26 @@ class _ExplodingSnapshotState:
         return
 
 
+class _ExplodingRequestState:
+    def __init__(self, *, llm_service_config: dict[str, object] | None = None) -> None:
+        _ = llm_service_config
+
+    def handle_request(self, *, path: str, headers: dict[str, str], payload: dict[str, object]) -> dict[str, object]:
+        _ = (path, headers, payload)
+        raise RuntimeError("boom from request handler")
+
+    def snapshot(self, *, include_events: bool = True) -> dict[str, object]:
+        _ = include_events
+        return {}
+
+    def reset(self) -> None:
+        return
+
+    def restore(self, *, consumed_response_count: int) -> None:
+        _ = consumed_response_count
+        return
+
+
 class BenchmarkLLMRouterTests(unittest.TestCase):
     def test_router_dispatches_to_simulated_service_for_registered_sandbox(self) -> None:
         router = BenchmarkLLMRouter()
@@ -132,6 +153,61 @@ class BenchmarkLLMRouterTests(unittest.TestCase):
             response["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
             "run_shell_command",
         )
+
+    def test_router_can_copy_exact_state_for_mini_swe_spec_replay(self) -> None:
+        payload = {
+            "trajectory_format": "mini-swe-agent-1.1",
+            "messages": [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "task"},
+                {
+                    "role": "assistant",
+                    "content": "THOUGHT: first\n<mswea_bash_command>echo first</mswea_bash_command>",
+                    "extra": {"timestamp": 10.0},
+                },
+                {
+                    "role": "assistant",
+                    "content": "THOUGHT: second\n<mswea_bash_command>echo second</mswea_bash_command>",
+                    "extra": {"timestamp": 12.0},
+                },
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.traj.json"
+            trace_path.write_text(json.dumps(payload), encoding="utf-8")
+            router = BenchmarkLLMRouter()
+            for sandbox_id in ("sbx-src", "sbx-dst"):
+                router.register_sandbox(
+                    sandbox_id=sandbox_id,
+                    llm_service_type="mini_swe_spec_trace_replay",
+                    llm_service_config={"trace_path": str(trace_path), "acceptance_rate": 1.0},
+                )
+
+            router.handle_request(
+                path="/v1/chat/completions",
+                headers={
+                    "X-Agent-Sandbox-Id": "sbx-src",
+                    "X-AgentCR-Spec-Role": "draft",
+                    "X-AgentCR-Spec-Pair-Id": "pair-1",
+                },
+                payload={"messages": []},
+            )
+            router.handle_request(
+                path="/v1/chat/completions",
+                headers={
+                    "X-Agent-Sandbox-Id": "sbx-src",
+                    "X-AgentCR-Spec-Role": "oracle",
+                    "X-AgentCR-Spec-Pair-Id": "pair-1",
+                },
+                payload={"messages": []},
+            )
+
+            router.copy_sandbox_state(source_sandbox_id="sbx-src", target_sandbox_id="sbx-dst")
+            snapshot = router.snapshot("sbx-dst")
+
+        assert snapshot is not None
+        self.assertEqual(snapshot["state"]["trace_cursor"], 1)
+        self.assertEqual(snapshot["state"]["draft_trace_cursor"], 1)
 
     def test_router_control_request_targets_registered_manual_service(self) -> None:
         router = BenchmarkLLMRouter()
@@ -484,6 +560,38 @@ class BenchmarkLLMRouterTests(unittest.TestCase):
         client.reset_sandbox("sbx-client")
         client.unregister_sandbox("sbx-client")
         self.assertIsNone(client.snapshot("sbx-client"))
+
+    def test_router_server_logs_unexpected_post_exceptions_and_returns_http_500(self) -> None:
+        server = serve_benchmark_llm_router(
+            host="127.0.0.1",
+            port=0,
+            registry={"explode": _ExplodingRequestState},
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join, 5.0)
+        base_url = f"http://127.0.0.1:{server.server_address[1]}"
+        _wait_for_json(f"{base_url}/healthz")
+
+        server.benchmark_llm_router.register_sandbox(
+            sandbox_id="sbx-explode",
+            llm_service_type="explode",
+        )
+        request = urllib.request.Request(
+            f"{base_url}/v1/chat/completions",
+            data=json.dumps({"messages": []}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-Agent-Sandbox-Id": "sbx-explode"},
+            method="POST",
+        )
+
+        with self.assertLogs("integrations.llm_services.router", level="ERROR") as captured:
+            with self.assertRaises(urllib.error.HTTPError) as error_context:
+                urllib.request.urlopen(request, timeout=2.0)
+
+        self.assertEqual(error_context.exception.code, 500)
+        self.assertIn("Benchmark LLM router request failed", "\n".join(captured.output))
 
     def test_router_server_handles_anthropic_count_tokens_requests(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

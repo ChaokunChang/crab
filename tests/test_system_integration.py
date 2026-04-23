@@ -24,6 +24,7 @@ from agent_cr import (
     ExecutorConfig,
     FailureCode,
     FaultToleranceCheckpointingPolicy,
+    CheckpointId,
     CheckpointJob,
     JobId,
     InMemoryEBPFEventCollector,
@@ -32,6 +33,7 @@ from agent_cr import (
     InMemoryTelemetrySink,
     LocalCheckpointManager,
     RequestContext,
+    SandboxResponseGateRegistry,
     RuncRuntime,
     RuncRuntimePaths,
     SandboxId,
@@ -40,7 +42,7 @@ from agent_cr import (
     SpotPreemptionCheckpointingPolicy,
     StorageConfig,
 )
-from agent_cr.models import JobStatus, RecoveryEvent, RecoveryRecord, utc_now
+from agent_cr.models import CheckpointManifest, JobStatus, RecoveryEvent, RecoveryRecord, utc_now
 from integrations.llm_services.simulated.service import SimulatedLLMState, handle_request
 from agent_cr.runtime import CommandRunner
 
@@ -132,6 +134,104 @@ class MinimalExecutor:
 
 
 class SystemIntegrationTests(unittest.TestCase):
+    def test_build_checkpoint_metadata_captures_spec_pair_group_once(self) -> None:
+        request_store = InMemoryRequestStateStore()
+        response_gate_registry = SandboxResponseGateRegistry()
+        response_gate_registry.enable()
+        sandbox_id = SandboxId("sbx-spec-group")
+        telemetry = InMemoryTelemetrySink()
+        system = AgentCRSystem.__new__(AgentCRSystem)
+        system.request_state_store = request_store
+        system.response_gate_registry = response_gate_registry
+        system.extra_checkpoint_metadata_provider = None
+        system.telemetry = telemetry
+
+        draft_context = RequestContext(
+            request_id="req-draft",
+            sandbox_id=sandbox_id,
+            started_at=utc_now(),
+            metadata={
+                "provider": "openai",
+                "path": "/v1/chat/completions",
+                "response_gate_enabled": True,
+                "request_group_kind": "spec_pair",
+                "request_group_id": "pair-1",
+            },
+        )
+        oracle_context = RequestContext(
+            request_id="req-oracle",
+            sandbox_id=sandbox_id,
+            started_at=utc_now(),
+            metadata={
+                "provider": "openai",
+                "path": "/v1/chat/completions",
+                "response_gate_enabled": True,
+                "request_group_kind": "spec_pair",
+                "request_group_id": "pair-1",
+            },
+        )
+        request_store.mark_request_start(draft_context)
+        request_store.mark_request_start(oracle_context)
+        response_gate_registry.arm(
+            sandbox_id,
+            "req-draft",
+            request_group_kind="spec_pair",
+            request_group_id="pair-1",
+        )
+        response_gate_registry.arm(
+            sandbox_id,
+            "req-oracle",
+            request_group_kind="spec_pair",
+            request_group_id="pair-1",
+        )
+
+        metadata = AgentCRSystem._build_checkpoint_metadata(system, sandbox_id)
+
+        self.assertTrue(metadata["captures_inflight_llm"])
+        self.assertEqual(metadata["captured_request_group_kind"], "spec_pair")
+        self.assertEqual(metadata["captured_request_group_id"], "pair-1")
+        self.assertEqual(set(metadata["captured_request_ids"]), {"req-draft", "req-oracle"})
+
+    def test_validate_restore_checkpoint_accepts_matching_spec_pair_group(self) -> None:
+        response_gate_registry = SandboxResponseGateRegistry()
+        response_gate_registry.enable()
+        sandbox_id = SandboxId("sbx-spec-group")
+        system = AgentCRSystem.__new__(AgentCRSystem)
+        system.response_gate_registry = response_gate_registry
+        response_gate_registry.arm(
+            sandbox_id,
+            "req-draft",
+            request_group_kind="spec_pair",
+            request_group_id="pair-1",
+        )
+        response_gate_registry.arm(
+            sandbox_id,
+            "req-oracle",
+            request_group_kind="spec_pair",
+            request_group_id="pair-1",
+        )
+        manifest = CheckpointManifest(
+            schema_version="1",
+            checkpoint_id=CheckpointId("ckpt-1"),
+            sandbox_id=sandbox_id,
+            created_at=utc_now(),
+            runtime_name="runc",
+            runtime_version="test",
+            process_artifacts=[],
+            filesystem_artifacts=[],
+            metadata={
+                "captures_inflight_llm": True,
+                "captured_request_id": "req-draft",
+                "captured_request_group_kind": "spec_pair",
+                "captured_request_group_id": "pair-1",
+            },
+        ).with_integrity()
+        system._resolve_restore_manifest = lambda _sandbox_id, _checkpoint_id: manifest
+
+        message = AgentCRSystem._validate_restore_checkpoint(system, sandbox_id, CheckpointId("ckpt-1"))
+
+        self.assertIsNone(message)
+
     def _wait_for_record(self, system: AgentCRSystem, sandbox_id: SandboxId, expected_event_type: str):
         import time
 
@@ -1624,6 +1724,91 @@ class SystemIntegrationTests(unittest.TestCase):
             self.assertEqual(record.status, "restored")
             self.assertEqual(storage.list_checkpoints(sandbox_id), [])
             self.assertTrue(any(command[3] == "restore" for command in runner.commands if len(command) > 3))
+
+
+class QuiesceForVerificationTests(unittest.TestCase):
+    def _build_system(self, *, paused: bool, active_job_counts: list[int]):
+        from agent_cr.models import SandboxDescription
+
+        sandbox_id = SandboxId("sbx-quiesce")
+
+        class FakeScheduler:
+            def __init__(self) -> None:
+                self.deactivated: list[SandboxId] = []
+
+            def deactivate_sandbox(self, sid: SandboxId) -> None:
+                self.deactivated.append(sid)
+
+            def is_sandbox_deactivated(self, sid: SandboxId) -> bool:
+                return sid in self.deactivated
+
+        class FakeExecutor:
+            def __init__(self, counts: list[int]) -> None:
+                self._counts = list(counts)
+                self.polls = 0
+
+            def has_active_job(self, sid: SandboxId) -> bool:
+                self.polls += 1
+                if not self._counts:
+                    return False
+                remaining = self._counts.pop(0)
+                return remaining > 0
+
+        class FakeRuntime:
+            def __init__(self, is_paused: bool) -> None:
+                self._status = "paused" if is_paused else "running"
+                self.describe_calls: list[SandboxId] = []
+                self.resume_calls: list[SandboxId] = []
+                self.sync_calls: list[tuple[SandboxId, bool]] = []
+
+            def describe(self, sid: SandboxId) -> SandboxDescription:
+                self.describe_calls.append(sid)
+                return SandboxDescription(sandbox_id=sid, runtime_name="runc", status=self._status)
+
+            def resume(self, sid: SandboxId) -> None:
+                self.resume_calls.append(sid)
+                self._status = "running"
+
+            def sync_runtime_state(self, sid: SandboxId, *, is_running: bool) -> None:
+                self.sync_calls.append((sid, is_running))
+
+        system = AgentCRSystem.__new__(AgentCRSystem)
+        system.scheduler = FakeScheduler()
+        system.executor = FakeExecutor(active_job_counts)
+        system.runtime = FakeRuntime(is_paused=paused)
+        system.inspector = object()
+        return system, sandbox_id
+
+    def test_quiesce_deactivates_drains_and_resumes_paused_sandbox(self) -> None:
+        system, sandbox_id = self._build_system(paused=True, active_job_counts=[2, 1, 0])
+
+        system.quiesce_for_verification(sandbox_id, poll_interval_seconds=0.0)
+
+        self.assertEqual(system.scheduler.deactivated, [sandbox_id])
+        self.assertGreaterEqual(system.executor.polls, 3)
+        self.assertEqual(system.runtime.resume_calls, [sandbox_id])
+        self.assertEqual(system.runtime.sync_calls, [(sandbox_id, True)])
+
+    def test_quiesce_skips_resume_when_not_paused(self) -> None:
+        system, sandbox_id = self._build_system(paused=False, active_job_counts=[0])
+
+        system.quiesce_for_verification(sandbox_id, poll_interval_seconds=0.0)
+
+        self.assertEqual(system.scheduler.deactivated, [sandbox_id])
+        self.assertEqual(system.runtime.resume_calls, [])
+        self.assertEqual(system.runtime.sync_calls, [])
+
+    def test_quiesce_times_out_when_executor_never_drains(self) -> None:
+        system, sandbox_id = self._build_system(paused=False, active_job_counts=[])
+        system.executor.has_active_job = lambda sid: True  # type: ignore[assignment]
+
+        system.quiesce_for_verification(
+            sandbox_id,
+            drain_timeout_seconds=0.0,
+            poll_interval_seconds=0.0,
+        )
+
+        self.assertEqual(system.scheduler.deactivated, [sandbox_id])
 
 
 if __name__ == "__main__":

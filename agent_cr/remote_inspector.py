@@ -5,10 +5,11 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from threading import Lock
 
-from .contracts import SandboxInspector
+from .contracts import SandboxInspector, TelemetrySink
 from .http_utils import HttpStatusError, ThreadLocalHttpClient
 from .ids import SandboxId
 from .models import SandboxSnapshot, utc_now
+from .telemetry import NoopTelemetrySink
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,11 @@ def _parse_ts(raw: str | None) -> datetime | None:
 @dataclass(frozen=True)
 class HostInspectorServiceClient:
     base_url: str
-    timeout_s: float = 5.0
+    # Must comfortably exceed the daemon's fs_sync timeout (5s in
+    # HostInspectorDaemon.status). If the client bound equals the sync
+    # bound, a sync that legitimately completes just under 5s still
+    # races the client into a TimeoutError.
+    timeout_s: float = 15.0
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -64,11 +69,24 @@ class HostInspectorServiceClient:
 
 
 class RemoteSandboxInspector(SandboxInspector):
-    def __init__(self, service_client: HostInspectorServiceClient) -> None:
+    def __init__(
+        self,
+        service_client: HostInspectorServiceClient,
+        *,
+        telemetry: TelemetrySink | None = None,
+    ) -> None:
         self._service_client = service_client
         self._lock = Lock()
         self._snapshots: dict[SandboxId, SandboxSnapshot] = {}
         self._pending_reset_at: dict[SandboxId, datetime] = {}
+        self._telemetry: TelemetrySink = telemetry or NoopTelemetrySink()
+        self._sync_timeout_count_lock = Lock()
+        self._sync_timeout_count = 0
+
+    @property
+    def sync_timeout_count(self) -> int:
+        with self._sync_timeout_count_lock:
+            return self._sync_timeout_count
 
     def upsert_snapshot(self, snapshot: SandboxSnapshot) -> None:
         with self._lock:
@@ -128,10 +146,34 @@ class RemoteSandboxInspector(SandboxInspector):
     ) -> None:
         if not process and not filesystem:
             return
-        self._service_client.reset_sandbox(sandbox_id, at)
+        # The checkpoint has already succeeded in storage; the daemon-side
+        # reset is a best-effort baseline refresh so the next inspect() can
+        # report a clean dirty signal. If the daemon call fails (unknown
+        # sandbox, transient timeout), fall back to pending_reset_at so the
+        # next inspect retries the reset — mirroring upsert_snapshot. A
+        # raised exception here would escape _execute_checkpoint_flow past
+        # operation.finish and create an orphan flow.start in telemetry.
+        try:
+            self._service_client.reset_sandbox(sandbox_id, at)
+        except Exception as exc:  # noqa: BLE001
+            with self._lock:
+                self._pending_reset_at[sandbox_id] = at
+            if self._is_unknown_sandbox_error(exc):
+                logger.debug(
+                    "Deferring mark_checkpoint_complete reset for unknown sandbox=%s",
+                    sandbox_id,
+                )
+            else:
+                logger.warning(
+                    "mark_checkpoint_complete daemon reset failed for sandbox=%s; deferring",
+                    sandbox_id,
+                    exc_info=True,
+                )
+        else:
+            with self._lock:
+                self._pending_reset_at.pop(sandbox_id, None)
         with self._lock:
             snapshot = self._snapshots.get(sandbox_id)
-            self._pending_reset_at.pop(sandbox_id, None)
             if snapshot is None:
                 return
             self._snapshots[sandbox_id] = replace(
@@ -167,6 +209,27 @@ class RemoteSandboxInspector(SandboxInspector):
         last_reset_at = _parse_ts(status.get("last_reset_at"))
         if last_reset_at is not None:
             metadata["host_last_reset_at"] = last_reset_at.isoformat()
+        if bool(metadata.get("fs_sync_timeout", False)):
+            with self._sync_timeout_count_lock:
+                self._sync_timeout_count += 1
+                total = self._sync_timeout_count
+            logger.warning(
+                "host-inspector fs sync timeout for sandbox=%s (cumulative=%d)",
+                sandbox_id,
+                total,
+            )
+            self._telemetry.emit_event(
+                "host_inspector.sync_timeout",
+                {
+                    "sandbox_id": str(sandbox_id),
+                    "cumulative_count": total,
+                },
+            )
+            self._telemetry.emit_metric(
+                "host_inspector.sync_timeout_count",
+                1.0,
+                {"sandbox_id": str(sandbox_id)},
+            )
         return SandboxSnapshot(
             sandbox_id=sandbox_id,
             runtime_name=str(status["runtime_name"]),

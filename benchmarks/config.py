@@ -6,6 +6,10 @@ from pathlib import Path
 import yaml
 
 from agent_cr import ExecutorConfig, SchedulerConfig
+from integrations.sandboxes.runtime.bundle import (
+    DEFAULT_CPU_PERIOD_US,
+    SandboxResourceLimits,
+)
 from agent_cr.telemetry import (
     DEFAULT_TELEMETRY_CAPTURE_COMMAND_OUTPUT,
     DEFAULT_TELEMETRY_BATCH_MAX_RECORDS,
@@ -19,7 +23,7 @@ from agent_cr.telemetry import (
 )
 
 
-_SCENARIOS = {"e2e", "fault", "spot", "tree"}
+_SCENARIOS = {"e2e", "fault", "spot", "tree", "spec"}
 _MODES = {"manual", "auto"}
 _PROVIDERS = {"openai", "anthropic"}
 _LOG_LEVELS = {"debug", "info", "warning", "error", "critical"}
@@ -28,6 +32,7 @@ _TELEMETRY_DETAIL_LEVELS = {"basic", "detailed"}
 _BENCHMARK_PHASES = ("setup", "run", "verification")
 _LLM_SERVER_LAUNCH_MODES = {"process", "thread"}
 _HOST_INSPECTOR_LAUNCH_MODES = {"process", "thread"}
+_HOST_INSPECTOR_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 _TELEMETRY_WRITER_MODES = {"sync", "async"}
 _TELEMETRY_OVERFLOW_POLICIES = {"drop_new", "block"}
 _TELEMETRY_SERIALIZERS = {"auto", "stdlib", "orjson"}
@@ -39,12 +44,14 @@ _SUPPORTED_MODES = {
     "fault": {"manual", "auto"},
     "spot": {"manual", "auto"},
     "tree": {"manual", "auto"},
+    "spec": {"manual", "auto"},
 }
 _DEFAULT_ITERATIONS = {
     "e2e": 5,
     "fault": 3,
     "spot": 3,
     "tree": 1,
+    "spec": 0,
 }
 
 
@@ -218,12 +225,19 @@ class BenchmarkLLMServerConfig:
 @dataclass(frozen=True)
 class BenchmarkHostInspectorConfig:
     launch_mode: str = "process"
+    log_level: str = "INFO"
+    log_file: bool = False
 
     def __post_init__(self) -> None:
         if self.launch_mode not in _HOST_INSPECTOR_LAUNCH_MODES:
             raise ValueError(
                 f"host_inspector.launch_mode must be one of {sorted(_HOST_INSPECTOR_LAUNCH_MODES)}, "
                 f"got {self.launch_mode!r}"
+            )
+        if self.log_level not in _HOST_INSPECTOR_LOG_LEVELS:
+            raise ValueError(
+                f"host_inspector.log_level must be one of {sorted(_HOST_INSPECTOR_LOG_LEVELS)}, "
+                f"got {self.log_level!r}"
             )
 
 
@@ -237,6 +251,24 @@ class BenchmarkStoragePlanesConfig:
 @dataclass(frozen=True)
 class BenchmarkRootfsReuseConfig:
     enabled: bool = True
+
+
+@dataclass(frozen=True)
+class SandboxResourceLimitsConfig:
+    cpus: int | None = None
+    memory_bytes: int | None = None
+    pids_limit: int | None = None
+    cpu_period_us: int = DEFAULT_CPU_PERIOD_US
+
+    def to_runtime_limits(self) -> SandboxResourceLimits | None:
+        if self.cpus is None and self.memory_bytes is None and self.pids_limit is None:
+            return None
+        return SandboxResourceLimits(
+            cpus=self.cpus,
+            memory_bytes=self.memory_bytes,
+            pids_limit=self.pids_limit,
+            cpu_period_us=self.cpu_period_us,
+        )
 
 
 @dataclass(frozen=True)
@@ -306,6 +338,30 @@ class BenchmarkConfig:
     storage_planes: BenchmarkStoragePlanesConfig = field(default_factory=BenchmarkStoragePlanesConfig)
     rootfs_reuse: BenchmarkRootfsReuseConfig = field(default_factory=BenchmarkRootfsReuseConfig)
     phase_merging: BenchmarkPhaseMergingConfig = field(default_factory=BenchmarkPhaseMergingConfig)
+    sandbox_resource_limits: SandboxResourceLimitsConfig = field(default_factory=SandboxResourceLimitsConfig)
+    benchmark_root_home: Path | None = None
+    benchmark_run_name: str | None = None
+
+    def __post_init__(self) -> None:
+        benchmark_root = _coerce_optional_path(self.benchmark_root)
+        benchmark_root_home = _coerce_optional_path(self.benchmark_root_home)
+        if (
+            benchmark_root is not None
+            and benchmark_root_home is not None
+            and benchmark_root != benchmark_root_home
+        ):
+            raise ValueError(
+                "benchmark_root and benchmark_root_home are aliases; specify only one "
+                "or give them the same value"
+            )
+        resolved_home = benchmark_root_home or benchmark_root
+        object.__setattr__(self, "benchmark_root", resolved_home)
+        object.__setattr__(self, "benchmark_root_home", resolved_home)
+        object.__setattr__(
+            self,
+            "benchmark_run_name",
+            _normalize_benchmark_run_name(self.benchmark_run_name),
+        )
 
     @property
     def config_dir(self) -> Path:
@@ -331,6 +387,24 @@ def _resolve_optional_path(base_dir: Path, raw_value: object) -> Path | None:
     else:
         path = path.resolve()
     return path
+
+
+def _coerce_optional_path(raw_value: object) -> Path | None:
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, Path):
+        return raw_value
+    return Path(str(raw_value))
+
+
+def _normalize_benchmark_run_name(raw_value: object) -> str | None:
+    if raw_value is None:
+        return None
+    value = str(raw_value).strip()
+    path = Path(value)
+    if not value or path.is_absolute() or len(path.parts) != 1 or value in {".", ".."}:
+        raise ValueError("benchmark_run_name must be a single non-empty directory name")
+    return value
 
 
 def _require_object(payload: object, *, label: str) -> dict[str, object]:
@@ -445,6 +519,8 @@ def _load_host_inspector_config(payload: object) -> BenchmarkHostInspectorConfig
     data = _require_object(payload, label="host_inspector")
     return BenchmarkHostInspectorConfig(
         launch_mode=str(data.get("launch_mode", "process")).strip().lower(),
+        log_level=str(data.get("log_level", "INFO")).strip().upper(),
+        log_file=bool(data.get("log_file", False)),
     )
 
 
@@ -475,6 +551,37 @@ def _load_phase_merging_config(payload: object) -> BenchmarkPhaseMergingConfig:
     return BenchmarkPhaseMergingConfig(
         setup_and_run=bool(data.get("setup_and_run", False)),
         setup_and_run_executor_pool=str(data.get("setup_and_run_executor_pool", "separate")).strip().lower(),
+    )
+
+
+def _optional_positive_int(value: object, *, label: str) -> int | None:
+    if value is None:
+        return None
+    result = int(value)
+    if result <= 0:
+        raise ValueError(f"{label} must be positive when set, got {result}")
+    return result
+
+
+def _load_sandbox_resource_limits_config(payload: object) -> SandboxResourceLimitsConfig:
+    if payload is None:
+        return SandboxResourceLimitsConfig()
+    data = _require_object(payload, label="sandbox_resource_limits")
+    known = {"cpus", "memory_bytes", "pids_limit", "cpu_period_us"}
+    unknown = sorted(set(data) - known)
+    if unknown:
+        raise ValueError(
+            f"sandbox_resource_limits contains unknown keys {unknown}; expected subset of {sorted(known)}"
+        )
+    return SandboxResourceLimitsConfig(
+        cpus=_optional_positive_int(data.get("cpus"), label="sandbox_resource_limits.cpus"),
+        memory_bytes=_optional_positive_int(
+            data.get("memory_bytes"), label="sandbox_resource_limits.memory_bytes"
+        ),
+        pids_limit=_optional_positive_int(
+            data.get("pids_limit"), label="sandbox_resource_limits.pids_limit"
+        ),
+        cpu_period_us=int(data.get("cpu_period_us", DEFAULT_CPU_PERIOD_US)),
     )
 
 
@@ -515,8 +622,20 @@ def load_config(path: Path) -> BenchmarkConfig:
     phase_workers = _load_phase_workers(data.get("phase_workers"))
 
     iterations = int(data.get("iterations", _DEFAULT_ITERATIONS[scenario]))
-    if iterations <= 0:
-        raise ValueError(f"iterations must be positive, got {iterations}")
+    if iterations < 0:
+        raise ValueError(f"iterations must be non-negative, got {iterations}")
+    if iterations == 0 and scenario not in {"fault", "spec"}:
+        raise ValueError(f"iterations must be positive for scenario {scenario!r}, got {iterations}")
+    if scenario == "spec" and iterations != 0:
+        raise ValueError("iterations must be exactly 0 for scenario 'spec' because it replays full traces")
+
+    agent = str(data.get("agent", "simulated"))
+    llm_service = None if data.get("llm_service") is None else str(data["llm_service"])
+    if scenario == "spec":
+        if agent != "mini_swe":
+            raise ValueError("scenario='spec' requires agent='mini_swe'")
+        if llm_service != "mini_swe_spec_trace_replay":
+            raise ValueError("scenario='spec' requires llm_service='mini_swe_spec_trace_replay'")
 
     scenario_options = data.get("scenario_options", {})
     if scenario_options is None:
@@ -646,6 +765,9 @@ def load_config(path: Path) -> BenchmarkConfig:
     storage_planes = _load_storage_planes_config(base_dir, data.get("storage_planes"))
     rootfs_reuse = _load_rootfs_reuse_config(data.get("rootfs_reuse"))
     phase_merging = _load_phase_merging_config(data.get("phase_merging"))
+    sandbox_resource_limits = _load_sandbox_resource_limits_config(
+        data.get("sandbox_resource_limits")
+    )
     verification_options = data.get("verification", {})
     if verification_options is None:
         verification_options = {}
@@ -656,14 +778,17 @@ def load_config(path: Path) -> BenchmarkConfig:
             data.get("verification_enabled", True),
         )
     )
+    benchmark_root = _resolve_optional_path(base_dir, data.get("benchmark_root"))
+    benchmark_root_home = _resolve_optional_path(base_dir, data.get("benchmark_root_home"))
+    benchmark_run_name = _normalize_benchmark_run_name(data.get("benchmark_run_name"))
 
     return BenchmarkConfig(
         config_path=config_path,
         scenario=scenario,
         mode=mode,
         provider=provider,
-        agent=str(data.get("agent", "simulated")),
-        llm_service=None if data.get("llm_service") is None else str(data["llm_service"]),
+        agent=agent,
+        llm_service=llm_service,
         task_dataset=_resolve_optional_path(base_dir, data.get("task_dataset")),
         sandboxes=sandboxes,
         max_workers=max_workers,
@@ -685,7 +810,7 @@ def load_config(path: Path) -> BenchmarkConfig:
         log_file=_resolve_optional_path(base_dir, data.get("log_file")),
         log_file_mode=log_file_mode,
         verification_enabled=verification_enabled,
-        benchmark_root=_resolve_optional_path(base_dir, data.get("benchmark_root")),
+        benchmark_root=benchmark_root,
         clear_benchmark_root_after_run=bool(data.get("clear_benchmark_root_after_run", False)),
         zpool_size=str(data.get("zpool_size", "10G")),
         zpool_name=None if data.get("zpool_name") is None else str(data.get("zpool_name")),
@@ -710,4 +835,7 @@ def load_config(path: Path) -> BenchmarkConfig:
         storage_planes=storage_planes,
         rootfs_reuse=rootfs_reuse,
         phase_merging=phase_merging,
+        sandbox_resource_limits=sandbox_resource_limits,
+        benchmark_root_home=benchmark_root_home,
+        benchmark_run_name=benchmark_run_name,
     )

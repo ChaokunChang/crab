@@ -29,6 +29,14 @@ class SandboxRecord:
     fs_event_count_since_reset: int = 0
     recent_fs_events: list[dict[str, object]] = field(default_factory=list)
     live_dirty_entries: dict[str, dict[str, object]] = field(default_factory=dict)
+    # Reverse indexes into live_dirty_entries, kept in sync by _dirty_put /
+    # _dirty_pop under sandbox_lock. Without them _lookup_entry_key had to
+    # scan the full dirty set on every event whose preferred key (by inode)
+    # wasn't yet registered — O(N) per event, O(N*M) over a burst of new
+    # file creations (tar/make install), enough to blow fs_monitor.sync
+    # barriers at N~10k.
+    dirty_by_path: dict[str, str] = field(default_factory=dict)
+    dirty_by_inode: dict[tuple[int, int], str] = field(default_factory=dict)
     unreconciled_fs_events: list[dict[str, object]] = field(default_factory=list)
     last_error: str | None = None
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+import heapq
 import logging
 import os
 from dataclasses import dataclass
@@ -111,6 +112,7 @@ class BenchmarkNetworkManager:
         self._bridge_ip = "10.250.0.1"
         self._network_cidr = _DEFAULT_BENCHMARK_NETWORK_CIDR
         self._ip_cursor = 2
+        self._free_ip_indices: list[int] = []
         self._leases: dict[SandboxId, BenchmarkNetworkLease] = {}
         self._ip_to_sandbox: dict[str, SandboxId] = {}
         self._lock = threading.Lock()
@@ -224,17 +226,27 @@ class BenchmarkNetworkManager:
         with self._lock:
             assert self._bridge_name is not None
             network = ipaddress.ip_network(self._network_cidr, strict=False)
-            if self._ip_cursor >= network.num_addresses - 1:
-                raise RuntimeError(
-                    f"benchmark network exhausted guest IP capacity "
-                    f"cidr={self._network_cidr} max_guests={benchmark_network_guest_capacity(network)}"
-                )
-            guest_ip = str(network[self._ip_cursor])
-            self._ip_cursor += 1
+            if self._free_ip_indices:
+                guest_index = heapq.heappop(self._free_ip_indices)
+            else:
+                if self._ip_cursor >= network.num_addresses - 1:
+                    raise RuntimeError(
+                        f"benchmark network exhausted guest IP capacity "
+                        f"cidr={self._network_cidr} max_guests={benchmark_network_guest_capacity(network)}"
+                    )
+                guest_index = self._ip_cursor
+                self._ip_cursor += 1
+            guest_ip = str(network[guest_index])
             suffix = uuid.uuid4().hex[:8]
             namespace_name = f"ts-{suffix}"
-            host_veth_name = f"vh{suffix[:6]}"
-            guest_veth_name = f"vg{suffix[:6]}"
+            # Use the full 8-char suffix (not suffix[:6]) so the veth-name keyspace
+            # matches the namespace keyspace. Truncating to 6 hex chars collapsed
+            # the keyspace to ~16.7M, and at ~5k concurrent leases birthday
+            # collisions became >50% likely, triggering spurious
+            # `ip link add … File exists` failures. vh+8 = 10 chars, well within
+            # IFNAMSIZ-1 (15).
+            host_veth_name = f"vh{suffix}"
+            guest_veth_name = f"vg{suffix}"
             subprocess.run(["ip", "netns", "add", namespace_name], check=True)
             subprocess.run(
                 ["ip", "link", "add", host_veth_name, "type", "veth", "peer", "name", guest_veth_name],
@@ -303,6 +315,7 @@ class BenchmarkNetworkManager:
         with self._lock:
             lease = self._leases.get(sandbox_id)
             bridge_name = self._bridge_name
+            network_prefixlen = ipaddress.ip_network(self._network_cidr, strict=False).prefixlen
         if lease is None or bridge_name is None:
             return False
         try:
@@ -312,7 +325,18 @@ class BenchmarkNetworkManager:
             subprocess.run(["ip", "netns", "exec", lease.namespace_name, "ip", "link", "set", "lo", "up"], check=True)
             subprocess.run(["ip", "netns", "exec", lease.namespace_name, "ip", "link", "set", "eth0", "up"], check=True)
             subprocess.run(
-                ["ip", "netns", "exec", lease.namespace_name, "ip", "addr", "replace", f"{lease.guest_ip}/24", "dev", "eth0"],
+                [
+                    "ip",
+                    "netns",
+                    "exec",
+                    lease.namespace_name,
+                    "ip",
+                    "addr",
+                    "replace",
+                    f"{lease.guest_ip}/{network_prefixlen}",
+                    "dev",
+                    "eth0",
+                ],
                 check=True,
             )
             subprocess.run(
@@ -341,6 +365,13 @@ class BenchmarkNetworkManager:
             lease = self._leases.pop(sandbox_id, None)
             if lease is not None:
                 self._ip_to_sandbox.pop(lease.guest_ip, None)
+                network = ipaddress.ip_network(self._network_cidr, strict=False)
+                try:
+                    guest_index = int(ipaddress.ip_address(lease.guest_ip)) - int(network.network_address)
+                except ValueError:
+                    guest_index = -1
+                if 2 <= guest_index < network.num_addresses - 1:
+                    heapq.heappush(self._free_ip_indices, guest_index)
         if lease is None:
             return
         subprocess.run(["ip", "netns", "del", lease.namespace_name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

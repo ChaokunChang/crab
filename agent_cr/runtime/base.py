@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import subprocess
-import tempfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 import logging
@@ -44,21 +43,22 @@ class SubprocessCommandRunner(CommandRunner):
         timeout = self._timeout_seconds if timeout_seconds is None else float(timeout_seconds)
         detached = self._should_use_file_stdio(command)
         if detached:
-            with tempfile.TemporaryFile(mode="w+") as stdout_file, tempfile.TemporaryFile(mode="w+") as stderr_file:
-                completed = subprocess.run(
-                    command,
-                    cwd=None if cwd is None else str(cwd),
-                    check=False,
-                    stdin=subprocess.DEVNULL,
-                    stdout=stdout_file,
-                    stderr=stderr_file,
-                    text=True,
-                    timeout=timeout,
-                )
-                stdout_file.seek(0)
-                stderr_file.seek(0)
-                stdout = stdout_file.read()
-                stderr = stderr_file.read()
+            # Container init inherits these fds from runc. A tempfile here uses O_TMPFILE, so
+            # the inherited fd points into the host's mount ns and CRIU can't dump it
+            # ("Can't lookup mount=N for fd=1 path=/tmp/#<inode> (deleted)"). /dev/null resolves
+            # identically across mount namespaces.
+            completed = subprocess.run(
+                command,
+                cwd=None if cwd is None else str(cwd),
+                check=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=timeout,
+            )
+            stdout = ""
+            stderr = ""
         else:
             completed = subprocess.run(
                 command,

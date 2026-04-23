@@ -22,31 +22,12 @@ class RuntimeBaseTests(unittest.TestCase):
             result = runner.run(["runc", "run", "-d", "sbx-test"])
 
         self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
         kwargs = run_mock.call_args.kwargs
         self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
-        self.assertTrue(hasattr(kwargs["stdout"], "read"))
-        self.assertTrue(hasattr(kwargs["stderr"], "read"))
-
-    def test_detached_commands_read_back_captured_stdio(self) -> None:
-        runner = SubprocessCommandRunner(timeout_seconds=1.0)
-
-        def fake_run(*args, **kwargs):
-            kwargs["stdout"].write("detached-out\n")
-            kwargs["stderr"].write("detached-err\n")
-            kwargs["stdout"].flush()
-            kwargs["stderr"].flush()
-            return subprocess.CompletedProcess(
-                args=args[0],
-                returncode=0,
-                stdout="",
-                stderr="",
-            )
-
-        with patch("agent_cr.runtime.base.subprocess.run", side_effect=fake_run):
-            result = runner.run(["runc", "run", "-d", "sbx-test"])
-
-        self.assertEqual(result.stdout, "detached-out\n")
-        self.assertEqual(result.stderr, "detached-err\n")
+        self.assertIs(kwargs["stdout"], subprocess.DEVNULL)
+        self.assertIs(kwargs["stderr"], subprocess.DEVNULL)
 
     def test_attached_commands_capture_stdout_and_stderr(self) -> None:
         runner = SubprocessCommandRunner(timeout_seconds=1.0)

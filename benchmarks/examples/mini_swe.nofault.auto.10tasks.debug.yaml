@@ -4,26 +4,26 @@ provider: openai
 agent: mini_swe
 llm_service: mini_swe_trace_replay
 task_dataset: /root/workspace/agent-cr/results/datasets/swebench_miniswe_replay.jsonl
-sandboxes: 32
-max_workers: 32
+sandboxes: 10
+max_workers: 5
 phase_workers:
-  setup: 32
-  run: 32
+  setup: 5
+  run: 5
   verification: 16
 rootfs_reuse:
   enabled: true
 phase_merging:
   setup_and_run: true
 verification:
-  enabled: false
+  enabled: true
 executor:
-  checkpoint_workers: 32
-  restore_workers: 32
+  checkpoint_workers: 5
+  restore_workers: 5
   checkpoint_queue_size: 10000
   max_retries: 0
   retry_backoff_seconds: 0.05
-  coordination_workers: 32
-  composite_step_workers: 32
+  coordination_workers: 5
+  composite_step_workers: 5
 scheduler:
   min_checkpoint_interval_seconds: 0.0
   force_checkpoint_after_seconds: 0.0
@@ -37,11 +37,11 @@ llm_server:
 host_inspector:
   launch_mode: process
 iterations: 10
-output: /root/workspace/agent-cr/logs/mini_swe.nofault.auto.32tasks.debug.csv
-log_file: /root/workspace/agent-cr/logs/mini_swe.nofault.auto.32tasks.debug.log
+output: /root/workspace/agent-cr/logs/mini_swe.nofault.auto.10tasks.debug.csv
+log_file: /root/workspace/agent-cr/logs/mini_swe.nofault.auto.10tasks.debug.log
 log_file_mode: write
 telemetry:
-  output: /root/workspace/agent-cr/logs/mini_swe.nofault.auto.32tasks.debug.telemetry.jsonl
+  output: /root/workspace/agent-cr/logs/mini_swe.nofault.auto.10tasks.debug.telemetry.jsonl
   file_mode: write
   detail_level: detailed
   capture_command_output: false
@@ -55,7 +55,7 @@ telemetry:
   serializer: auto
   report:
     enabled: true
-    output_dir: /root/workspace/agent-cr/logs/mini_swe.nofault.auto.32tasks.debug.report
+    output_dir: /root/workspace/agent-cr/logs/mini_swe.nofault.auto.10tasks.debug.report
     top_k: 50
     log_scale_charts: false
     export_svg: true
@@ -64,10 +64,14 @@ monitoring:
   sample_interval_ms: 1000
   include_host: true
   include_sandboxes: true
-zpool_name: zfspool
 reuse_zpool: true
 benchmark_root: /root/workspace/agent-cr/data/agent_cr/results
-log_level: info
+zpool_size: 20G
+zpool_name: agentcrbench-20
+zpool_image: /root/workspace/agent-cr/data/agent_cr/results/zpool/agentcrbench-20G.zpool.img
+runtime_command_timeout_seconds: 300
+runtime_zfs_prepare_timeout_seconds: 900
+log_level: debug
 scenario_options:
   injection_rate: 0.0
   first_forced_event_chunk: 0

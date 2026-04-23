@@ -37,6 +37,9 @@ class FakeFilesystemMonitor:
         self.on_event = None
         self.upserts: list[tuple[str, int]] = []
         self.removals: list[str] = []
+        self.sync_calls = 0
+        self.ignored_pid_adds: list[int] = []
+        self.ignored_pid_removes: list[int] = []
 
     def start(self, on_event) -> None:
         self.started = True
@@ -50,6 +53,16 @@ class FakeFilesystemMonitor:
 
     def remove_sandbox(self, sandbox_id: str) -> None:
         self.removals.append(sandbox_id)
+
+    def sync(self, timeout_s: float = 2.0) -> bool:
+        self.sync_calls += 1
+        return True
+
+    def add_ignored_pid(self, pid: int) -> None:
+        self.ignored_pid_adds.append(int(pid))
+
+    def remove_ignored_pid(self, pid: int) -> None:
+        self.ignored_pid_removes.append(int(pid))
 
 
 def _event(
@@ -260,6 +273,68 @@ class HostInspectorServerTests(unittest.TestCase):
         status = daemon.status("sbx-1")
         self.assertFalse(status["filesystem_changed"])
 
+    def test_mutating_open_on_real_path_survives_racy_fd_kind(self) -> None:
+        """`cat > file << 'EOF'` opens the real file then dup2/close/pipe-reuses
+        the fd before the helper can stat /proc/<pid>/fd/<fd>. The helper then
+        reports fd_kind=fifo (or socket) even though the syscall actually hit a
+        regular file — the path in the BPF event is authoritative, so the
+        mutating open must still latch filesystem_changed."""
+        for racy_kind in ("fifo", "socket"):
+            with self.subTest(racy_kind=racy_kind):
+                resolver = FakeResolver()
+                fs_monitor = FakeFilesystemMonitor()
+                daemon = HostInspectorDaemon(resolver=resolver, fs_monitor=fs_monitor, process_poll_interval_s=60.0)
+                daemon.register("sbx-1", "docker", "container-1")
+
+                with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+                    "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+                    return_value={111},
+                ):
+                    daemon.reset("sbx-1")
+
+                daemon._handle_fs_event(
+                    _event(
+                        syscall="openat",
+                        pid=222,
+                        fd=3,
+                        fd_kind=racy_kind,
+                        flags=os.O_CREAT | os.O_WRONLY | os.O_TRUNC,
+                        path="/testbed/django/db/backends/postgresql/client.py",
+                        inode=4242,
+                        device=64,
+                    )
+                )
+                status = daemon.status("sbx-1")
+                self.assertTrue(status["filesystem_changed"])
+
+    def test_mutating_open_on_dev_null_still_dropped(self) -> None:
+        """The racy-fd_kind bypass must not accept writes into pseudo
+        filesystems. /dev/null is the common shell-redirection sink and must
+        keep being ignored."""
+        resolver = FakeResolver()
+        fs_monitor = FakeFilesystemMonitor()
+        daemon = HostInspectorDaemon(resolver=resolver, fs_monitor=fs_monitor, process_poll_interval_s=60.0)
+        daemon.register("sbx-1", "docker", "container-1")
+
+        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+            return_value={111},
+        ):
+            daemon.reset("sbx-1")
+
+        daemon._handle_fs_event(
+            _event(
+                syscall="openat",
+                pid=222,
+                fd=3,
+                fd_kind="char",
+                flags=os.O_CREAT | os.O_WRONLY | os.O_TRUNC,
+                path="/dev/null",
+            )
+        )
+        status = daemon.status("sbx-1")
+        self.assertFalse(status["filesystem_changed"])
+
     def test_write_to_non_regular_fd_does_not_latch_filesystem(self) -> None:
         resolver = FakeResolver()
         fs_monitor = FakeFilesystemMonitor()
@@ -431,7 +506,12 @@ class HostInspectorServerTests(unittest.TestCase):
         self.assertTrue(status["filesystem_changed"])
         self.assertTrue(status["metadata"]["live_dirty_entries"][0]["deleted"])
 
-    def test_created_file_missing_at_status_is_reconciled_away(self) -> None:
+    def test_created_file_missing_at_status_still_counts_as_change(self) -> None:
+        # A file that was created after reset and then disappeared (e.g., a
+        # temp file that was unlinked but whose delete event was lost) is still
+        # evidence that the sandbox mutated its filesystem.  Kernel tracepoint
+        # events are authoritative — we should not second-guess them with a
+        # host-side lstat that may fail for multiple valid reasons.
         resolver = FakeResolver()
         fs_monitor = FakeFilesystemMonitor()
         daemon = HostInspectorDaemon(resolver=resolver, fs_monitor=fs_monitor, process_poll_interval_s=60.0)
@@ -453,16 +533,13 @@ class HostInspectorServerTests(unittest.TestCase):
                 path="/tmp/short-lived.tmp",
             )
         )
-        with patch("agent_cr.host_inspector.server.os.lstat", side_effect=FileNotFoundError), patch(
-            "agent_cr.host_inspector.server.list_cgroup_pids",
-            return_value={111},
-        ), patch(
+        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
             "agent_cr.host_inspector.server.dirty_pids",
             return_value=set(),
         ):
             status = daemon.status("sbx-1")
-        self.assertFalse(status["filesystem_changed"])
-        self.assertEqual(status["metadata"]["live_dirty_entries"], [])
+        self.assertTrue(status["filesystem_changed"])
+        self.assertEqual(len(status["metadata"]["live_dirty_entries"]), 1)
 
     def test_ignored_pid_does_not_contribute_to_process_changed(self) -> None:
         resolver = FakeResolver()
@@ -473,6 +550,8 @@ class HostInspectorServerTests(unittest.TestCase):
         with patch(
             "agent_cr.host_inspector.process_filter.read_process_identity",
             side_effect=[
+                ProcessIdentity(pid=111, executable_path="/opt/iflow-runtime/node/bin/node", executable_basename="node", cmdline=("node", "iflow")),
+                ProcessIdentity(pid=222, executable_path="/bin/sh", executable_basename="sh", cmdline=("sh", "-lc", "sleep 1")),
                 ProcessIdentity(pid=111, executable_path="/opt/iflow-runtime/node/bin/node", executable_basename="node", cmdline=("node", "iflow")),
                 ProcessIdentity(pid=222, executable_path="/bin/sh", executable_basename="sh", cmdline=("sh", "-lc", "sleep 1")),
                 ProcessIdentity(pid=111, executable_path="/opt/iflow-runtime/node/bin/node", executable_basename="node", cmdline=("node", "iflow")),
@@ -548,6 +627,8 @@ class HostInspectorServerTests(unittest.TestCase):
         with patch(
             "agent_cr.host_inspector.process_filter.read_process_identity",
             side_effect=[
+                ProcessIdentity(pid=111, executable_path="/opt/iflow-runtime/node/bin/node", executable_basename="node", cmdline=("node", "iflow")),
+                ProcessIdentity(pid=222, executable_path="/bin/sh", executable_basename="sh", cmdline=("sh", "-lc", "echo hi")),
                 ProcessIdentity(pid=111, executable_path="/opt/iflow-runtime/node/bin/node", executable_basename="node", cmdline=("node", "iflow")),
                 ProcessIdentity(pid=222, executable_path="/bin/sh", executable_basename="sh", cmdline=("sh", "-lc", "echo hi")),
                 ProcessIdentity(pid=111, executable_path="/opt/iflow-runtime/node/bin/node", executable_basename="node", cmdline=("node", "iflow")),

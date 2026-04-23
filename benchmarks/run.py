@@ -12,6 +12,7 @@ from benchmarks.core import emit_benchmark_phase_progress
 from benchmarks.real_host_scenario_base import RealHostScenarioHarness
 from benchmarks.scenarios.e2e import SCENARIO as E2E_SCENARIO
 from benchmarks.scenarios.fault import SCENARIO as FAULT_SCENARIO
+from benchmarks.scenarios.spec import SCENARIO as SPEC_SCENARIO
 from benchmarks.scenarios.spot import SCENARIO as SPOT_SCENARIO
 from benchmarks.scenarios.tree import SCENARIO as TREE_SCENARIO
 from benchmarks.support import (
@@ -26,6 +27,7 @@ from benchmarks.support import (
 SCENARIOS = {
     E2E_SCENARIO.name: E2E_SCENARIO,
     FAULT_SCENARIO.name: FAULT_SCENARIO,
+    SPEC_SCENARIO.name: SPEC_SCENARIO,
     SPOT_SCENARIO.name: SPOT_SCENARIO,
     TREE_SCENARIO.name: TREE_SCENARIO,
 }
@@ -91,7 +93,7 @@ def _failed_sandbox_lines(rows: list[dict[str, object]]) -> list[str]:
     return lines
 
 
-def _telemetry_metric_aliases(config: BenchmarkConfig, rows: list[dict[str, object]]) -> tuple[dict[str, str | tuple[str, ...]], dict[str, dict[str, object]]]:
+def _telemetry_metric_aliases(config: BenchmarkConfig, rows: list[dict[str, object]]) -> tuple[dict[str, str | tuple[str, ...]], dict[str, dict[str, object]], set[str]]:
     """Map summary keys to telemetry metric names for post-run aggregation.
 
     The telemetry summary intentionally *overrides* the row-based summary
@@ -103,6 +105,7 @@ def _telemetry_metric_aliases(config: BenchmarkConfig, rows: list[dict[str, obje
     """
     aliases: dict[str, str | tuple[str, ...]] = {}
     attribute_filters: dict[str, dict[str, object]] = {}
+    last_value_keys: set[str] = set()
     if config.scenario == "fault":
         aliases.update(
             {
@@ -144,6 +147,19 @@ def _telemetry_metric_aliases(config: BenchmarkConfig, rows: list[dict[str, obje
                     "restore_batch_ms": "benchmark.restore_batch_ms",
                 }
             )
+    elif config.scenario == "spec":
+        aliases.update(
+            {
+                "task_completion_ms": "benchmark.task.duration_ms",
+                "verification_ms": "benchmark.task.verify.duration_ms",
+                "spec_saved_ms": "benchmark.spec.saved_ms",
+                "spec_penalty_ms": "benchmark.spec.penalty_ms",
+                "spec_hidden_penalty_ms": "benchmark.spec.hidden_penalty_ms",
+                "spec_net_gain_ms": "benchmark.spec.net_gain_ms",
+                "spec_accept_rate": "benchmark.spec.accept_rate",
+            }
+        )
+        last_value_keys.add("spec_accept_rate")
     elif config.scenario == "tree":
         aliases.update(
             {
@@ -156,7 +172,7 @@ def _telemetry_metric_aliases(config: BenchmarkConfig, rows: list[dict[str, obje
                 "fanout_ms": "benchmark.fanout_ms",
             }
         )
-    return aliases, attribute_filters
+    return aliases, attribute_filters, last_value_keys
 
 
 def _artifact_lines(*, log_file: Path | None, output: Path | None, telemetry_output: Path | None) -> list[str]:
@@ -170,6 +186,69 @@ def _artifact_lines(*, log_file: Path | None, output: Path | None, telemetry_out
             lines.append(f"{label}: {path.resolve()}")
     return lines
 
+
+def _flush_logging_handlers() -> None:
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+
+
+def _copy_artifact_replica(source: Path, benchmark_run_root: Path) -> Path | None:
+    source_path = source.expanduser().resolve()
+    if not source_path.exists():
+        return None
+    replica_path = (benchmark_run_root / source_path.name).expanduser().resolve()
+    if source_path == replica_path:
+        return replica_path
+    replica_path.parent.mkdir(parents=True, exist_ok=True)
+    if source_path.is_dir():
+        if replica_path.exists():
+            if replica_path.is_dir():
+                shutil.rmtree(replica_path)
+            else:
+                replica_path.unlink()
+        shutil.copytree(source_path, replica_path)
+    else:
+        if replica_path.exists() and replica_path.is_dir():
+            shutil.rmtree(replica_path)
+        shutil.copy2(source_path, replica_path)
+    return replica_path
+
+
+def _replicate_artifacts_to_benchmark_run_root(
+    *,
+    harness_context: object | None,
+    log_file: Path | None,
+    output: Path | None,
+    telemetry_output: Path | None,
+    telemetry_report_output_dir: Path | None,
+) -> None:
+    if harness_context is None or bool(getattr(harness_context, "uses_temporary_root", False)):
+        return
+    root = getattr(harness_context, "root", None)
+    if root is None:
+        return
+    benchmark_run_root = Path(root).expanduser().resolve()
+    _flush_logging_handlers()
+    for label, path in (
+        ("log_file", log_file),
+        ("output", output),
+        ("telemetry_output", telemetry_output),
+        ("telemetry_report", telemetry_report_output_dir),
+    ):
+        if path is None:
+            continue
+        try:
+            _copy_artifact_replica(Path(path), benchmark_run_root)
+        except Exception:
+            logger.exception(
+                "Failed to replicate benchmark artifact label=%s source=%s benchmark_run_root=%s",
+                label,
+                path,
+                benchmark_run_root,
+            )
+            continue
+    logger.info("artificats replicated to %s", benchmark_run_root)
+    print("artificats replicated to %s", benchmark_run_root, flush=True)
 
 def _emit_lines(lines: list[str]) -> None:
     for line in lines:
@@ -211,6 +290,7 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
     executor_default_workers = max(settings.max_workers, config.effective_phase_workers.run)
     executor_config = config.executor.resolve(default_workers=executor_default_workers)
     harness_context: object | None = None
+    report_dir: Path | None = None
     try:
         teardown_started_at: float | None = None
         harness_context = RealHostScenarioHarness(
@@ -234,7 +314,8 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
             telemetry_flush_interval_ms=config.telemetry_flush_interval_ms,
             telemetry_overflow_policy=config.telemetry_overflow_policy,
             telemetry_serializer=config.telemetry_serializer,
-            benchmark_root=config.benchmark_root,
+            benchmark_root_home=config.benchmark_root_home,
+            benchmark_run_name=config.benchmark_run_name,
             zpool_size=config.zpool_size,
             zpool_name=config.zpool_name,
             zpool_image=config.zpool_image,
@@ -249,11 +330,18 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
             monitoring_include_sandboxes=config.monitoring.include_sandboxes,
             llm_server_launch_mode=config.llm_server.launch_mode,
             host_inspector_launch_mode=config.host_inspector.launch_mode,
+            host_inspector_log_level=config.host_inspector.log_level,
+            host_inspector_log_file=config.host_inspector.log_file,
             runtime_root=config.storage_planes.runtime_root,
             storage_root=config.storage_planes.storage_root,
             agent_host_root=config.storage_planes.agent_host_root,
-            expected_sandboxes=config.sandboxes,
+            expected_sandboxes=settings.expected_sandboxes or config.sandboxes,
             rootfs_reuse_enabled=config.rootfs_reuse.enabled,
+            sandbox_resource_limits=config.sandbox_resource_limits.to_runtime_limits(),
+            fork_reuse_enabled=bool(config.scenario_options.get("enable_fork_reuse", False)),
+            eager_fork_cleanup_on_reject=bool(
+                config.scenario_options.get("eager_fork_cleanup_on_reject", False)
+            ),
         )
         with harness_context as harness:
             if scenario.prepare_harness is not None:
@@ -287,17 +375,17 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
                 config.output.parent.mkdir(parents=True, exist_ok=True)
                 write_rows(str(config.output), rows)
             summary = scenario.summarize(config, rows)
-            telemetry_aliases, telemetry_filters = _telemetry_metric_aliases(config, rows)
+            telemetry_aliases, telemetry_filters, telemetry_last_value_keys = _telemetry_metric_aliases(config, rows)
             if telemetry_aliases:
                 telemetry_summary = compute_telemetry_summary(
                     telemetry_output,
                     telemetry_aliases,
                     run_id=str(run_context["run_id"]),
                     attribute_filters=telemetry_filters,
+                    last_value_keys=telemetry_last_value_keys,
                 )
                 if telemetry_summary:
                     summary = {**summary, **telemetry_summary}
-            report_dir: Path | None = None
             if config.telemetry_report.enabled and telemetry_output.exists():
                 report_dir = config.telemetry_report.output_dir or _default_report_output_dir(telemetry_output)
                 try:
@@ -342,12 +430,26 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
             config.config_path.resolve(),
             benchmark_run_duration_seconds(run_context),
         )
+        _replicate_artifacts_to_benchmark_run_root(
+            harness_context=harness_context,
+            log_file=config.log_file,
+            output=config.output,
+            telemetry_output=telemetry_output,
+            telemetry_report_output_dir=report_dir,
+        )
         return rows
     except Exception:
         logger.exception(
             "========== benchmark.run end status=failed config=%s duration_s=%.3f ==========",
             config.config_path.resolve(),
             benchmark_run_duration_seconds(run_context),
+        )
+        _replicate_artifacts_to_benchmark_run_root(
+            harness_context=harness_context,
+            log_file=config.log_file,
+            output=config.output,
+            telemetry_output=telemetry_output,
+            telemetry_report_output_dir=report_dir,
         )
         raise
     finally:

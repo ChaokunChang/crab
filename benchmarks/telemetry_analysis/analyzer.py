@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import json
 import math
 from pathlib import Path
+import re
 from typing import Any, Callable, Iterable
 
 
@@ -36,6 +37,11 @@ _DEFAULT_BREAKDOWN_METRICS = (
     "benchmark.task.run.duration_ms",
     "benchmark.task.duration_ms",
     "benchmark.task.verify.duration_ms",
+    "benchmark.spec.saved_ms",
+    "benchmark.spec.penalty_ms",
+    "benchmark.spec.hidden_penalty_ms",
+    "benchmark.spec.net_gain_ms",
+    "benchmark.spec.accept_rate",
     "benchmark.checkpoint_ms",
     "benchmark.restore_ms",
     "benchmark.recovery_ms",
@@ -56,8 +62,16 @@ _LLM_BREAKDOWN_METRICS = (
 
 _OVERHEAD_ANALYSIS_METRICS = (
     "llm.gate_wait_ms",
+    "interceptor.response_gate.wait.duration_ms",
     "llm.agentcr_delay_ms",
 )
+
+_SPEC_DRAFT_REPORT_FILTERED_METRICS = frozenset(_OVERHEAD_ANALYSIS_METRICS)
+_SPEC_REQUEST_ROLE_DRAFT = "draft"
+
+_LAST_VALUE_METRICS = frozenset({
+    "benchmark.spec.accept_rate",
+})
 
 _TURN_ANALYSIS_RESPONSE_METRIC_SOURCES = (
     "llm.interceptor_total_ms",
@@ -126,6 +140,17 @@ def _maybe_str(value: object) -> str:
     return str(value)
 
 
+def _normalized_request_group_role(attributes: dict[str, Any]) -> str:
+    return _maybe_str(attributes.get("request_group_role")).strip().lower()
+
+
+def _is_spec_draft_report_filtered_metric(metric_name: str, attributes: dict[str, Any]) -> bool:
+    return (
+        metric_name in _SPEC_DRAFT_REPORT_FILTERED_METRICS
+        and _normalized_request_group_role(attributes) == _SPEC_REQUEST_ROLE_DRAFT
+    )
+
+
 def _safe_float(value: object) -> float | None:
     try:
         return float(value)
@@ -138,6 +163,13 @@ def _safe_int(value: object) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _infer_task_run_id_from_sandbox_id(sandbox_id: str) -> str:
+    if not sandbox_id:
+        return ""
+    inferred = re.sub(r"(?:-spec-\d+)+$", "", sandbox_id)
+    return inferred or sandbox_id
 
 
 def _percentile(sorted_values: list[float], q: float) -> float:
@@ -269,7 +301,9 @@ class MetricSummary:
 
 @dataclass(frozen=True)
 class TaskSummary:
+    task_run_id: str
     sandbox_id: str
+    sandbox_ids: list[str]
     task_id: str
     agent_type: str
     llm_service_type: str
@@ -343,6 +377,8 @@ class CheckpointAnalysisSummary:
     per_task: list[OperationTaskAnalysis]
     load_over_time: list[LoadSeriesPoint]
     latency_over_time: dict[str, list[TimeSeriesPoint]]
+    fs_sync_timeout_count: int = 0
+    fs_sync_timeout_sandbox_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -434,6 +470,34 @@ class PhaseSummary:
 
 
 @dataclass(frozen=True)
+class SpecTurnBreakdown:
+    total: int
+    accepted: int
+    rejected_no_fork: int
+    rejected_oracle_first: int
+    rejected_command_mismatch: int
+
+    @property
+    def total_rejected(self) -> int:
+        return self.total - self.accepted
+
+
+@dataclass(frozen=True)
+class SpecForkReuseStats:
+    total_turns: int
+    finalized_turns: int
+    forks_created: int
+    forks_reused: int
+    state_unchanged: int
+    cache_eligible: int
+    accepted_state_unchanged: int
+    accepted_state_changed: int
+    rejected_state_unchanged: int
+    rejected_state_changed: int
+    rejected_state_unchanged_draft_incomplete: int
+
+
+@dataclass(frozen=True)
 class TelemetryAnalysis:
     input_path: str
     run_id: str
@@ -471,6 +535,9 @@ class TelemetryAnalysis:
     turn_analysis: TurnAnalysisSummary | None = None
     restore_analysis: RestoreAnalysisSummary | None = None
     resource_analysis: ResourceAnalysisSummary | None = None
+    spec_turn_breakdown: SpecTurnBreakdown | None = None
+    spec_fork_reuse_stats: SpecForkReuseStats | None = None
+    spec_draft_overhead_analysis: OverheadAnalysisSummary | None = None
     exclude_failed_tasks: bool = False
     excluded_sandbox_task_pairs: list[tuple[str, str]] = field(default_factory=list)
 
@@ -512,6 +579,11 @@ class TelemetryAnalysis:
             "turn_analysis": None if self.turn_analysis is None else asdict(self.turn_analysis),
             "restore_analysis": None if self.restore_analysis is None else asdict(self.restore_analysis),
             "resource_analysis": None if self.resource_analysis is None else asdict(self.resource_analysis),
+            "spec_turn_breakdown": None if self.spec_turn_breakdown is None else asdict(self.spec_turn_breakdown),
+            "spec_fork_reuse_stats": None if self.spec_fork_reuse_stats is None else asdict(self.spec_fork_reuse_stats),
+            "spec_draft_overhead_analysis": (
+                None if self.spec_draft_overhead_analysis is None else asdict(self.spec_draft_overhead_analysis)
+            ),
             "exclude_failed_tasks": self.exclude_failed_tasks,
             "excluded_sandbox_task_pairs": [
                 {"sandbox_id": sid, "task_id": tid}
@@ -638,13 +710,26 @@ class _LifecycleAccumulator:
 
 @dataclass
 class _TaskAccumulator:
+    task_run_id: str
     sandbox_id: str
     task_id: str
+    sandbox_ids: set[str] = field(default_factory=set)
     agent_types: Counter[str] = field(default_factory=Counter)
     llm_service_types: Counter[str] = field(default_factory=Counter)
     metrics: dict[str, list[float]] = field(default_factory=lambda: defaultdict(list))
 
-    def add(self, *, metric_name: str, value: float, task_id: str, agent_type: str, llm_service_type: str) -> None:
+    def add(
+        self,
+        *,
+        sandbox_id: str,
+        metric_name: str,
+        value: float,
+        task_id: str,
+        agent_type: str,
+        llm_service_type: str,
+    ) -> None:
+        if sandbox_id:
+            self.sandbox_ids.add(sandbox_id)
         if task_id:
             self.task_id = task_id
         if agent_type:
@@ -654,13 +739,18 @@ class _TaskAccumulator:
         self.metrics[metric_name].append(value)
 
     def build_summary(self) -> TaskSummary:
-        averaged_metrics = {
-            metric_name: (sum(values) / len(values))
-            for metric_name, values in sorted(self.metrics.items())
-            if values
-        }
+        averaged_metrics = {}
+        for metric_name, values in sorted(self.metrics.items()):
+            if not values:
+                continue
+            if metric_name in _LAST_VALUE_METRICS:
+                averaged_metrics[metric_name] = values[-1]
+            else:
+                averaged_metrics[metric_name] = sum(values) / len(values)
         return TaskSummary(
+            task_run_id=self.task_run_id,
             sandbox_id=self.sandbox_id,
+            sandbox_ids=sorted(self.sandbox_ids) if self.sandbox_ids else ([self.sandbox_id] if self.sandbox_id else []),
             task_id=self.task_id,
             agent_type=self.agent_types.most_common(1)[0][0] if self.agent_types else "",
             llm_service_type=self.llm_service_types.most_common(1)[0][0] if self.llm_service_types else "",
@@ -790,6 +880,44 @@ def _build_cdf_points(values: list[float]) -> list[CDFPoint]:
         CDFPoint(value=value, cumulative_probability=(index + 1) / total)
         for index, value in enumerate(sorted_values)
     ]
+
+
+def _build_overhead_analysis_view(
+    *,
+    summary_by_name: dict[str, MetricSummary],
+    series_raw: dict[str, list[tuple[datetime, float]]],
+    metric_names: Iterable[str],
+    started_at: datetime | None,
+) -> OverheadAnalysisSummary | None:
+    overhead_metrics = [
+        summary_by_name[metric_name]
+        for metric_name in metric_names
+        if metric_name in summary_by_name
+    ]
+    overhead_time_series = {
+        metric_name: [
+            TimeSeriesPoint(
+                timestamp=timestamp.isoformat(),
+                offset_seconds=_offset_seconds(timestamp, started_at),
+                value=value,
+            )
+            for timestamp, value in sorted(series_raw.get(metric_name, []))
+        ]
+        for metric_name in metric_names
+        if series_raw.get(metric_name)
+    }
+    overhead_cdf_series = {
+        metric_name: _build_cdf_points([value for _, value in sorted(series_raw.get(metric_name, []))])
+        for metric_name in metric_names
+        if series_raw.get(metric_name)
+    }
+    if not overhead_metrics and not overhead_time_series:
+        return None
+    return OverheadAnalysisSummary(
+        metrics=overhead_metrics,
+        time_series=overhead_time_series,
+        cdf_series=overhead_cdf_series,
+    )
 
 
 def _build_turn_analysis(
@@ -1129,6 +1257,8 @@ def _build_checkpoint_analysis(
     process_intervals: list[dict[str, Any]],
     filesystem_intervals: list[dict[str, Any]],
     checkpoint_metrics: dict[tuple[str, str, str], dict[str, Any]],
+    fs_sync_timeout_event_count: int = 0,
+    fs_sync_timeout_sandbox_ids: set[str] | None = None,
 ) -> CheckpointAnalysisSummary:
     duration_minutes = _duration_minutes(started_at, finished_at)
     per_task: dict[str, dict[str, list[float] | int | str]] = defaultdict(lambda: {
@@ -1254,6 +1384,8 @@ def _build_checkpoint_analysis(
             "checkpoint.process.duration_ms": _build_latency_series(started_at=started_at, intervals=process_intervals),
             "checkpoint.filesystem.duration_ms": _build_latency_series(started_at=started_at, intervals=filesystem_intervals),
         },
+        fs_sync_timeout_count=fs_sync_timeout_event_count,
+        fs_sync_timeout_sandbox_count=len(fs_sync_timeout_sandbox_ids or set()),
     )
 
 
@@ -1557,6 +1689,7 @@ def analyze_telemetry_file(
     lifecycle_accumulators: dict[str, _LifecycleAccumulator] = {}
     task_accumulators: dict[str, _TaskAccumulator] = {}
     sandbox_to_task: dict[str, str] = {}
+    sandbox_to_task_run: dict[str, str] = {}
     excluded_sandbox_to_task: dict[str, str] = {}
     event_name_counts: Counter[str] = Counter()
     metric_name_counts: Counter[str] = Counter()
@@ -1580,9 +1713,15 @@ def analyze_telemetry_file(
     checkpoint_metrics: dict[tuple[str, str, str], dict[str, Any]] = defaultdict(dict)
     restore_metrics: dict[tuple[str, str, str], dict[str, Any]] = defaultdict(dict)
     overhead_series_raw: dict[str, list[tuple[datetime, float]]] = defaultdict(list)
+    spec_draft_overhead_accumulators: dict[str, _MetricAccumulator] = {}
+    spec_draft_overhead_series_raw: dict[str, list[tuple[datetime, float]]] = defaultdict(list)
     host_series_raw: dict[str, list[tuple[datetime, float]]] = defaultdict(list)
     sandbox_series_raw: dict[str, dict[str, list[tuple[datetime, float]]]] = defaultdict(lambda: defaultdict(list))
     request_metric_records: dict[tuple[str, str], _RequestMetricAccumulator] = {}
+    spec_turn_counts: Counter[str] = Counter()
+    spec_fork_reuse_counts: Counter[str] = Counter()
+    fs_sync_timeout_event_count = 0
+    fs_sync_timeout_sandbox_ids: set[str] = set()
 
     interval_operations = {
         "checkpoint.flow",
@@ -1630,6 +1769,7 @@ def analyze_telemetry_file(
 
         sandbox_id = _maybe_str(attributes.get("sandbox_id"))
         task_id = _maybe_str(attributes.get("task_id"))
+        task_run_id = _maybe_str(attributes.get("task_run_id"))
         if sandbox_id:
             sandbox_ids.add(sandbox_id)
         if task_id:
@@ -1637,6 +1777,12 @@ def analyze_telemetry_file(
             task_ids.add(task_id)
         elif sandbox_id and sandbox_id in sandbox_to_task:
             task_id = sandbox_to_task[sandbox_id]
+        if not task_run_id and sandbox_id and sandbox_id in sandbox_to_task_run:
+            task_run_id = sandbox_to_task_run[sandbox_id]
+        if not task_run_id and sandbox_id:
+            task_run_id = _infer_task_run_id_from_sandbox_id(sandbox_id)
+        if sandbox_id and task_run_id:
+            sandbox_to_task_run[sandbox_id] = task_run_id
         request_id = _maybe_str(attributes.get("request_id"))
         checkpoint_id = _maybe_str(attributes.get("checkpoint_id"))
         job_id = _maybe_str(attributes.get("job_id"))
@@ -1650,6 +1796,8 @@ def analyze_telemetry_file(
         enriched_attributes = dict(attributes)
         if task_id and not enriched_attributes.get("task_id"):
             enriched_attributes["task_id"] = task_id
+        if task_run_id and not enriched_attributes.get("task_run_id"):
+            enriched_attributes["task_run_id"] = task_run_id
 
         if kind == "event":
             detail_total_events += 1
@@ -1664,6 +1812,49 @@ def analyze_telemetry_file(
                 status = _maybe_str(enriched_attributes.get("status"))
                 if status:
                     accumulator.finish_status_counts[status] += 1
+
+            if name == "host_inspector.sync_timeout":
+                fs_sync_timeout_event_count += 1
+                sid = _maybe_str(enriched_attributes.get("sandbox_id"))
+                if sid:
+                    fs_sync_timeout_sandbox_ids.add(sid)
+
+            if name == "spec.turn.finish":
+                accepted = _safe_int(enriched_attributes.get("accepted"))
+                if accepted:
+                    spec_turn_counts["accepted"] += 1
+                elif not _safe_int(enriched_attributes.get("draft_first")):
+                    spec_turn_counts["rejected_oracle_first"] += 1
+                elif not (_safe_int(enriched_attributes.get("fork_created")) or _safe_int(enriched_attributes.get("fork_reused"))):
+                    spec_turn_counts["rejected_no_fork"] += 1
+                else:
+                    spec_turn_counts["rejected_command_mismatch"] += 1
+
+                spec_fork_reuse_counts["total"] += 1
+                if _safe_int(enriched_attributes.get("fork_created")):
+                    spec_fork_reuse_counts["forks_created"] += 1
+                if _safe_int(enriched_attributes.get("fork_reused")):
+                    spec_fork_reuse_counts["forks_reused"] += 1
+                if _safe_int(enriched_attributes.get("fork_finalized")):
+                    spec_fork_reuse_counts["finalized"] += 1
+                    state_changed = bool(
+                        _safe_int(enriched_attributes.get("current_state_changed"))
+                        or _safe_int(enriched_attributes.get("fork_state_changed"))
+                    )
+                    reuse_candidate = bool(_safe_int(enriched_attributes.get("reuse_candidate")))
+                    if not state_changed:
+                        spec_fork_reuse_counts["state_unchanged"] += 1
+                        if reuse_candidate:
+                            spec_fork_reuse_counts["cache_eligible"] += 1
+                        elif not accepted:
+                            # Reject branch where draft_exec hadn't finished when oracle returned:
+                            # state snapshot looks clean but reuse gate refuses to cache.
+                            spec_fork_reuse_counts["rejected_state_unchanged_draft_incomplete"] += 1
+                    if accepted:
+                        key = "accepted_state_changed" if state_changed else "accepted_state_unchanged"
+                    else:
+                        key = "rejected_state_changed" if state_changed else "rejected_state_unchanged"
+                    spec_fork_reuse_counts[key] += 1
 
             base_name = ""
             if name.endswith(".start"):
@@ -1689,10 +1880,18 @@ def analyze_telemetry_file(
         value = _safe_float(payload.get("value"))
         if value is None:
             continue
-        accumulator = metric_accumulators.setdefault(name, _MetricAccumulator(name=name))
-        accumulator.add(value, payload=payload, attributes=enriched_attributes, top_k=top_k)
+        is_spec_draft_filtered_metric = _is_spec_draft_report_filtered_metric(name, enriched_attributes)
+        if is_spec_draft_filtered_metric:
+            draft_accumulator = spec_draft_overhead_accumulators.setdefault(name, _MetricAccumulator(name=name))
+            draft_accumulator.add(value, payload=payload, attributes=enriched_attributes, top_k=top_k)
+            if timestamp is not None:
+                spec_draft_overhead_series_raw[name].append((timestamp, value))
+        else:
+            accumulator = metric_accumulators.setdefault(name, _MetricAccumulator(name=name))
+            accumulator.add(value, payload=payload, attributes=enriched_attributes, top_k=top_k)
         if (
-            timestamp is not None
+            not is_spec_draft_filtered_metric
+            and timestamp is not None
             and sandbox_id
             and request_id
             and (name in _TURN_ANALYSIS_RESPONSE_METRIC_SOURCES or name == _TURN_ANALYSIS_PURE_LLM_METRIC)
@@ -1711,20 +1910,26 @@ def analyze_telemetry_file(
                 task_id=task_id,
                 request_kind=_maybe_str(enriched_attributes.get("request_kind")),
             )
-        if timestamp is not None and name in _OVERHEAD_ANALYSIS_METRICS:
+        if not is_spec_draft_filtered_metric and timestamp is not None and name in _OVERHEAD_ANALYSIS_METRICS:
             overhead_series_raw[name].append((timestamp, value))
 
         metric_task_id = task_id
-        if sandbox_id and (
+        if not is_spec_draft_filtered_metric and sandbox_id and (
             name in _DEFAULT_BREAKDOWN_METRICS
             or name in _LLM_BREAKDOWN_METRICS
             or name in _CHECKPOINT_BREAKDOWN_METRICS
         ):
+            task_summary_key = task_run_id or sandbox_id
             task_accumulator = task_accumulators.setdefault(
-                sandbox_id,
-                _TaskAccumulator(sandbox_id=sandbox_id, task_id=metric_task_id),
+                task_summary_key,
+                _TaskAccumulator(
+                    task_run_id=task_summary_key,
+                    sandbox_id=task_summary_key,
+                    task_id=metric_task_id,
+                ),
             )
             task_accumulator.add(
+                sandbox_id=sandbox_id,
                 metric_name=name,
                 value=value,
                 task_id=metric_task_id,
@@ -1835,35 +2040,20 @@ def analyze_telemetry_file(
         if metric_name in summary_by_name
     }
     overhead_started_at = detail_started_at or started_at
-    overhead_metrics = [
-        summary_by_name[metric_name]
-        for metric_name in _OVERHEAD_ANALYSIS_METRICS
-        if metric_name in summary_by_name
-    ]
-    overhead_time_series = {
-        metric_name: [
-            TimeSeriesPoint(
-                timestamp=timestamp.isoformat(),
-                offset_seconds=_offset_seconds(timestamp, overhead_started_at),
-                value=value,
-            )
-            for timestamp, value in sorted(overhead_series_raw.get(metric_name, []))
-        ]
-        for metric_name in _OVERHEAD_ANALYSIS_METRICS
-        if overhead_series_raw.get(metric_name)
-    }
-    overhead_cdf_series = {
-        metric_name: _build_cdf_points([value for _, value in sorted(overhead_series_raw.get(metric_name, []))])
-        for metric_name in _OVERHEAD_ANALYSIS_METRICS
-        if overhead_series_raw.get(metric_name)
-    }
-    overhead_analysis = None
-    if overhead_metrics or overhead_time_series:
-        overhead_analysis = OverheadAnalysisSummary(
-            metrics=overhead_metrics,
-            time_series=overhead_time_series,
-            cdf_series=overhead_cdf_series,
-        )
+    overhead_analysis = _build_overhead_analysis_view(
+        summary_by_name=summary_by_name,
+        series_raw=overhead_series_raw,
+        metric_names=_OVERHEAD_ANALYSIS_METRICS,
+        started_at=overhead_started_at,
+    )
+    spec_draft_operation_summaries = _select_operation_summaries(spec_draft_overhead_accumulators)
+    spec_draft_summary_by_name = _summary_lookup(spec_draft_operation_summaries)
+    spec_draft_overhead_analysis = _build_overhead_analysis_view(
+        summary_by_name=spec_draft_summary_by_name,
+        series_raw=spec_draft_overhead_series_raw,
+        metric_names=_OVERHEAD_ANALYSIS_METRICS,
+        started_at=overhead_started_at,
+    )
     turn_analysis = _build_turn_analysis(
         started_at=detail_started_at or started_at,
         request_metric_records=request_metric_records,
@@ -1883,6 +2073,8 @@ def analyze_telemetry_file(
         process_intervals=checkpoint_process_intervals,
         filesystem_intervals=checkpoint_filesystem_intervals,
         checkpoint_metrics=checkpoint_metrics,
+        fs_sync_timeout_event_count=fs_sync_timeout_event_count,
+        fs_sync_timeout_sandbox_ids=fs_sync_timeout_sandbox_ids,
     )
     restore_analysis = _build_restore_analysis(
         started_at=started_at,
@@ -1902,6 +2094,33 @@ def analyze_telemetry_file(
         (sid, excluded_sandbox_to_task.get(sid, ""))
         for sid in failed_sandbox_ids
     )
+
+    spec_total = sum(spec_turn_counts.values())
+    spec_breakdown: SpecTurnBreakdown | None = None
+    if spec_total > 0:
+        spec_breakdown = SpecTurnBreakdown(
+            total=spec_total,
+            accepted=spec_turn_counts["accepted"],
+            rejected_no_fork=spec_turn_counts["rejected_no_fork"],
+            rejected_oracle_first=spec_turn_counts["rejected_oracle_first"],
+            rejected_command_mismatch=spec_turn_counts["rejected_command_mismatch"],
+        )
+
+    spec_reuse_stats: SpecForkReuseStats | None = None
+    if spec_fork_reuse_counts["total"] > 0:
+        spec_reuse_stats = SpecForkReuseStats(
+            total_turns=spec_fork_reuse_counts["total"],
+            finalized_turns=spec_fork_reuse_counts["finalized"],
+            forks_created=spec_fork_reuse_counts["forks_created"],
+            forks_reused=spec_fork_reuse_counts["forks_reused"],
+            state_unchanged=spec_fork_reuse_counts["state_unchanged"],
+            cache_eligible=spec_fork_reuse_counts["cache_eligible"],
+            accepted_state_unchanged=spec_fork_reuse_counts["accepted_state_unchanged"],
+            accepted_state_changed=spec_fork_reuse_counts["accepted_state_changed"],
+            rejected_state_unchanged=spec_fork_reuse_counts["rejected_state_unchanged"],
+            rejected_state_changed=spec_fork_reuse_counts["rejected_state_changed"],
+            rejected_state_unchanged_draft_incomplete=spec_fork_reuse_counts["rejected_state_unchanged_draft_incomplete"],
+        )
 
     return TelemetryAnalysis(
         input_path=str(path),
@@ -1940,6 +2159,9 @@ def analyze_telemetry_file(
         turn_analysis=turn_analysis,
         restore_analysis=restore_analysis,
         resource_analysis=resource_analysis,
+        spec_turn_breakdown=spec_breakdown,
+        spec_fork_reuse_stats=spec_reuse_stats,
+        spec_draft_overhead_analysis=spec_draft_overhead_analysis,
         exclude_failed_tasks=exclude_failed_tasks,
         excluded_sandbox_task_pairs=excluded_pairs,
     )

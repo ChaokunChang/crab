@@ -87,7 +87,7 @@ Telemetry stays JSONL-based and is designed to be lightweight by default.
   - executor queueing and job execution
   - checkpoint/restore flows and process/filesystem sub-steps
   - `runc` and ZFS command execution
-- Correlation attributes are attached where available, including `run_id`, `sandbox_id`, `task_id`, `request_id`, `job_id`, `checkpoint_id`, `event_type`, and `component`.
+- Correlation attributes are attached where available, including `run_id`, `sandbox_id`, `task_run_id`, `task_id`, `request_id`, `job_id`, `checkpoint_id`, `event_type`, and `component`.
 
 `TelemetryConfig` now supports a few knobs:
 
@@ -228,16 +228,17 @@ python3 -m benchmarks.run --config benchmarks/examples/fault.manual.yaml
 python3 -m benchmarks.run --config benchmarks/examples/fault.auto.yaml
 python3 -m benchmarks.run --config benchmarks/examples/spot.auto.yaml
 python3 -m benchmarks.run --config benchmarks/examples/tree.auto.yaml
+python3 -m benchmarks.run --config benchmarks/examples/mini_swe.spec.auto.10tasks.debug.yaml
 ```
 
 Each benchmark run is now driven by a YAML config. The top-level fields are:
 
 ```yaml
-scenario: fault | spot | tree | e2e
+scenario: fault | spot | tree | e2e | spec
 mode: manual | auto
 provider: openai | anthropic
 agent: simulated | iflow | mini_swe | claude_code
-llm_service: simulated | manual | simulated_for_iflow | iflow_trace_replay | mini_swe_trace_replay | claude_code_trace_replay
+llm_service: simulated | manual | simulated_for_iflow | iflow_trace_replay | mini_swe_trace_replay | mini_swe_spec_trace_replay | claude_code_trace_replay
 task_dataset: path/to/tasks.jsonl
 sandboxes: 1
 max_workers: 32  # legacy fallback for all phases when phase_workers is omitted
@@ -250,6 +251,11 @@ rootfs_reuse:
 phase_merging:
   setup_and_run: false
   setup_and_run_executor_pool: separate | shared
+sandbox_resource_limits:
+  cpus: null           # int OCI CPU-quota cap (enforced via cgroup cpu.max)
+  memory_bytes: null   # int cgroup memory.limit
+  pids_limit: null     # int cgroup pids.limit
+  cpu_period_us: 100000
 executor:
   checkpoint_workers: 32
   restore_workers: 32
@@ -273,13 +279,16 @@ llm_server:
   launch_mode: process
 host_inspector:
   launch_mode: process
-iterations: 5
+  log_level: INFO       # DEBUG | INFO | WARNING | ERROR | CRITICAL
+  log_file: false       # when true, writes to <benchmark_run_root>/host-inspector.log
+iterations: 5  # spec requires exactly 0 because it replays full traces
 output: logs/tmp/out.csv
 log_file: logs/tmp/out.log
 log_file_mode: append | write
 verification:
   enabled: true
-benchmark_root: logs/tmp/benchmark-runs
+benchmark_root_home: logs/tmp/benchmark-runs
+benchmark_run_name: null  # defaults to a timestamp such as 20260416_010203
 clear_benchmark_root_after_run: false
 storage_planes:
   runtime_root: /mnt/agent-cr-runtime
@@ -331,6 +340,18 @@ For the fault scenario, `scenario_options` also supports:
 - `delete_filesystem_checkpoints: false` by default. Keeping filesystem checkpoints avoids synchronous old-snapshot deletion in the run-phase checkpoint hot path. Set it to `true` only when you explicitly want more aggressive retention cleanup.
 - Latest-only retention cleanup now runs asynchronously in the background. Checkpoint completion only schedules the cleanup work instead of waiting for old-snapshot deletion inline.
 
+For the speculative-execution scenario (`scenario: spec`):
+
+- `agent` must be `mini_swe`
+- `llm_service` must be `mini_swe_spec_trace_replay`
+- `iterations` must be exactly `0`
+- `scenario_options.acceptance_rate` controls how often the draft command is accepted. Legacy alias: `accept_rate`.
+- `scenario_options.draft_response_delay_scaling_factor` controls how much faster the draft replay stream is than the oracle replay stream. Legacy alias: `speculative_delay_scaling_factor`.
+- `scenario_options.mismatch_policy` currently supports only `preserve_command_class`.
+- `scenario_options.enable_fork_reuse` defaults to `false`. When enabled, a finalized fork whose active and fork sandboxes both report `state_unchanged` and whose draft exec had completed by oracle-finish time is cached for the next turn, so the next speculative step skips a ZFS clone + CRIU restore. The cache is invalidated on any sandbox restore/recovery and is per-sandbox, so task boundaries always miss.
+- `scenario_options.eager_fork_cleanup_on_reject` defaults to `false`. When enabled, rejected speculative turns tear the fork down immediately rather than letting the draft exec finish in the background — bounding the hidden CPU penalty to a short drain window instead of the full draft-exec tail. Forks are never reused after a reject in this mode.
+- [docs/speculative-execution-benchmark.md](/root/workspace/agent-cr/docs/speculative-execution-benchmark.md) documents the execution model, telemetry, and tracked example/evaluation configs.
+
 Benchmark runs now use a three-phase pipeline:
 
 - `setup`: shared image/materialization work, bundle/rootfs/workdir/network setup, sandbox launch, and any readiness that must complete before the benchmark task starts
@@ -376,6 +397,8 @@ The benchmark YAML also exposes run-phase tuning for the core Agent-CR system:
 - `scheduler.inspect_without_pause` is opt-in and defaults to `false`. Turning it on allows the scheduler to inspect before pausing, but that is intentionally not the default because live inspection of a running sandbox can be risky depending on the inspector.
 - `llm_server.launch_mode` defaults to `process`, which runs the benchmark LLM router in a separate process to reduce thread pressure in the main benchmark process. `thread` remains available for tests and debugging.
 - `host_inspector.launch_mode` also defaults to `process`, which keeps the host inspector and its filesystem-monitor threads out of the main benchmark process.
+- `host_inspector.log_level` defaults to `INFO`. Set to `DEBUG` to log every eBPF filesystem event and every register/status/reset call — useful for diagnosing missed filesystem-change signals.
+- `host_inspector.log_file` defaults to `false`. Set to `true` to write host-inspector logs to `<benchmark_run_root>/host-inspector.log` in addition to stderr. Enable both `log_level: DEBUG` and `log_file: true` when diagnosing checkpoint-related bugs such as stale forks or missed writes.
 - The benchmark request path still goes through HTTP on `localhost`; only the router launch mode changed. Benchmark timings therefore still include interceptor-to-router transport overhead.
 - `storage_planes` lets you move run-phase host writes off the benchmark artifact root. This is especially important when `zpool_image` is a file vdev: keeping CRIU checkpoint images, storage manifests/artifacts, exported rootfs state, and agent host directories on a different filesystem/device avoids sibling host writes contending with the ZFS backing file.
 - `storage_planes` is fully opt-in. If you omit it, the harness preserves the legacy layout under the benchmark run root.
@@ -416,6 +439,8 @@ The analyzer is streaming-oriented and is intended for large JSONL files. It doe
 - `restore_analysis.csv`, `restore_per_task.csv`, `restore_load.csv`
 - `resource_summary.csv`, `resource_samples.csv`
 - standalone SVG figure files for hotspot, checkpoint, restore, and resource charts
+- when speculative-execution metrics are present, extra SVGs and an HTML section for saved time, agent-loop penalty, hidden reject cost, net gain, and accept rate
+- when speculative runs emit fork-reuse attributes, an additional `spec_fork_reuse.csv` and a `Fork Reuse` subsection inside the speculative report, including a funnel (total → finalized → state-unchanged → cache-eligible → reused), gap attributions (state-unchanged → cache-eligible, cache-eligible → reused), and an accept/reject × state-unchanged/changed outcome matrix
 
 Report CLI notes:
 
@@ -429,9 +454,10 @@ Logging notes:
 - Default `log_file_mode: append` preserves existing log history.
 - Use `log_file_mode: write` when you want each benchmark run to start with a fresh log file.
 - `verification.enabled` defaults to `true`. Set it to `false` to skip the benchmark verification phase and omit verification fields from output rows.
-- `benchmark_root` places each run under a timestamped subdirectory rooted at the configured path. If omitted, benchmarks use a temporary directory. `AGENTCR_BENCH_DIR` is still accepted as a fallback for older workflows.
+- `benchmark_root_home` is the parent directory for benchmark runs. `benchmark_run_name` is the run directory under that parent; when omitted, it defaults to a timestamp such as `20260416_010203`. The stale `benchmark_root` key is still accepted as an alias for `benchmark_root_home`. If no home is configured, benchmarks use a temporary directory; an explicit `benchmark_run_name` requires a home from config or `AGENTCR_BENCH_DIR`. `AGENTCR_BENCH_DIR` is still accepted as a fallback for older workflows.
 - `clear_benchmark_root_after_run` defaults to `false`. When enabled, the runner deletes the resolved per-run benchmark directory after postprocessing completes. Tempdir-backed runs keep their existing automatic cleanup behavior.
-- `benchmark_root` is still the benchmark artifact root and the default home for runtime bundles, runtime checkpoint images, sandbox metadata, checkpoint storage, exported image rootfs, and agent host state. Use `storage_planes` only when you want to move some of that hot write traffic elsewhere.
+- The resolved benchmark run root is still the benchmark artifact root and the default home for runtime bundles, runtime checkpoint images, sandbox metadata, checkpoint storage, exported image rootfs, and agent host state. Use `storage_planes` only when you want to move some of that hot write traffic elsewhere.
+- `output`, `log_file`, `telemetry.output`, and `telemetry.report.output_dir` still write to their configured paths. After the run, existing files/directories are also copied by basename into the resolved benchmark run root.
 - `benchmark.run` now logs an explicit start marker and end marker for each run, and the final summary/artifact paths are logged as well as printed.
 - Benchmark YAML supports a nested `telemetry:` block for telemetry output and detail controls.
 - `telemetry.output` sets the JSONL artifact path. If omitted, the runner defaults to `<output>.telemetry.jsonl` or `<config>.telemetry.jsonl`.
@@ -453,11 +479,13 @@ Logging notes:
 - `phase_workers` overrides concurrency per benchmark phase. Missing phase keys fall back to `max_workers`.
 - `max_agent_timeout_scale` and `max_test_timeout_scale` scale per-task `task_config.options.max_agent_timeout_sec` and `task_config.options.max_test_timeout_sec` when those values are present in the dataset. Both default to `1.0`.
 - `rootfs_reuse.enabled` defaults to `true`. Set it to `false` to restore the older per-sandbox rootfs materialization path.
+- `sandbox_resource_limits` applies OCI `linux.resources` cgroup limits to every launched sandbox. `cpus` maps to a CPU quota (`cpu_period_us * cpus`), `memory_bytes` maps to `memory.limit`, and `pids_limit` maps to `pids.limit`. When `cpus` is set, the launcher also injects `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `NUMEXPR_MAX_THREADS`, `LOKY_MAX_CPU_COUNT`, and `DJANGO_TEST_PROCESSES` into the container (and the SWE-bench verify step) so process/thread-pool sizing follows the cgroup quota rather than `os.cpu_count()`. Omitting the block preserves the pre-limit behavior.
 - `phase_merging.setup_and_run` defaults to `false`. Set it to `true` to pipeline setup directly into run for eligible per-sandbox scenarios.
 - `phase_merging.setup_and_run_executor_pool` defaults to `separate`. Set it to `shared` to use one executor pool for merged `setup+run` work.
 - Phase telemetry now emits distinct phase-qualified records such as `benchmark.phase.setup.*`, `benchmark.phase.run.*`, `benchmark.phase.verification.*`, and `benchmark.phase.<phase>.item.*` so JSONL output shows phase timing and configured concurrency.
 - The telemetry HTML report now includes a `Turn Analysis` section with stats, CDFs, and over-time charts for `llm_response_time`, `pure_llm_time`, `action_time`, and `turn_time`.
 - `Turn Analysis` keeps the aggregate `all` view and now also breaks those same metrics out by `request_kind` when telemetry includes it, so Claude runs can separate `main_loop`, `helper`, and `count_tokens` behavior.
+- For speculative-execution runs, the telemetry HTML report distinguishes visible `penalty` from `hidden reject cost`: `penalty` is the delay that still blocks the agent loop, while hidden cost is fork-side work that continued after the oracle path advanced.
 - `Overhead Analysis` now includes a dedicated `llm.gate_wait` CDF figure in addition to the existing summary tables and latency charts.
 - `llm_response_time` is the observed interceptor-side latency for a request, while `pure_llm_time` is the underlying `llm.service.request` duration from the LLM service itself.
 - `zpool_size` controls the backing file size for ephemeral benchmark zpools.
@@ -468,7 +496,7 @@ Logging notes:
 
 `llm_service_options` is a top-level YAML block whose keys are merged into each task's `llm_service_config` (dataset-level values take precedence). This is useful for controlling replay behavior globally without editing the dataset JSONL.
 
-For replay-backed services such as `iflow_trace_replay`, `mini_swe_trace_replay`, and `claude_code_trace_replay`, the following options control how response delays are simulated:
+For replay-backed services such as `iflow_trace_replay`, `mini_swe_trace_replay`, `mini_swe_spec_trace_replay`, and `claude_code_trace_replay`, the following options control how response delays are simulated:
 
 - `response_delay_policy`: selects how the replay service simulates LLM response latency.
   - `fixed` (default): uses a constant delay of `response_delay_ms` milliseconds.
@@ -477,6 +505,12 @@ For replay-backed services such as `iflow_trace_replay`, `mini_swe_trace_replay`
 - `response_delay_scaling_factor`: multiplier applied to trace-derived delays when `response_delay_policy` is `trace_replay` (default 1.0). A value of 0.5 replays at 2× speed; 2.0 replays at half speed.
 - `minimal_delay`: lower clamp in milliseconds applied after the policy-specific delay and `response_delay_scaling_factor` are resolved (default `0`).
 - `maximal_delay`: upper clamp in milliseconds applied after the policy-specific delay and `response_delay_scaling_factor` are resolved (default `1e9`).
+
+`mini_swe_spec_trace_replay` also supports speculative controls in its effective `llm_service_config`:
+
+- `acceptance_rate` or legacy `accept_rate`: probability that the draft replay response keeps the oracle command
+- `draft_response_delay_scaling_factor` or legacy `speculative_delay_scaling_factor`: extra multiplier applied only to draft replay latency after the base replay delay is computed
+- `mismatch_policy`: currently `preserve_command_class`
 
 Example YAML:
 
@@ -498,6 +532,7 @@ The per-scenario knobs live under `scenario_options`:
 python3 -m benchmarks.run --config benchmarks/examples/fault.auto.yaml
 python3 -m benchmarks.run --config benchmarks/examples/spot.auto.yaml
 python3 -m benchmarks.run --config benchmarks/examples/tree.auto.yaml
+python3 -m benchmarks.run --config benchmarks/examples/mini_swe.spec.auto.10tasks.debug.yaml
 ```
 
 The real-host benchmarks allocate temporary runtime state, create a ZFS pool, build the simulated agent image, and launch `runc` sandboxes through the shared harness in [benchmarks/real_host_scenario_base.py](/root/workspace/agent-cr/benchmarks/real_host_scenario_base.py).

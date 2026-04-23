@@ -13,6 +13,7 @@ from unittest import mock
 
 from agent_cr import (
     CheckpointId,
+    FaultToleranceCheckpointingPolicy,
     JobStatus,
     LatestOnlyCheckpointManager,
     LocalCheckpointManager,
@@ -38,6 +39,12 @@ from benchmarks.scenarios.fault import (
     run_replay_auto_sandbox,
     run_replay_manual_sandbox,
     summarize as summarize_fault,
+)
+from benchmarks.scenarios.spec import (
+    build_harness_settings as build_spec_harness_settings,
+    run_auto as run_spec_auto,
+    run_manual as run_spec_manual,
+    summary_metrics as summarize_spec,
 )
 from benchmarks.scenarios.spot import run_auto as run_spot_auto, run_manual as run_spot_manual
 from benchmarks.support import BenchmarkTaskRecord
@@ -156,13 +163,16 @@ class _BaseScenarioHarness:
         }
 
     def _record_for_config(self, config: BenchmarkConfig, sandbox_index: int) -> BenchmarkTaskRecord:
+        trace_response_count = None
+        if config.llm_service in {"iflow_trace_replay", "mini_swe_trace_replay", "mini_swe_spec_trace_replay"}:
+            trace_response_count = 10
         return BenchmarkTaskRecord(
             agent_type=config.agent,
             task_description=SimpleNamespace(prompt=""),
             task_config=SimpleNamespace(options={}),
             llm_service_type=config.llm_service,
             task_id=f"task-{sandbox_index}",
-            trace_response_count=10 if config.llm_service == "iflow_trace_replay" else None,
+            trace_response_count=trace_response_count,
         )
 
     def setup_task_record(self, sandbox_name: str, record: BenchmarkTaskRecord):
@@ -329,6 +339,18 @@ class _BaseScenarioHarness:
         self.phase_events.append(("deactivate", sandbox_id))
 
 
+class _RecordingSpecHarness(_BaseScenarioHarness):
+    def __init__(self) -> None:
+        super().__init__()
+        self.recorded_service_configs: list[dict[str, object] | None] = []
+        self.recorded_llm_service_types: list[str | None] = []
+
+    def setup_task_record(self, sandbox_name: str, record: BenchmarkTaskRecord):
+        self.recorded_service_configs.append(None if record.llm_service_config is None else dict(record.llm_service_config))
+        self.recorded_llm_service_types.append(record.llm_service_type)
+        return super().setup_task_record(sandbox_name, record)
+
+
 class FaultScenarioTests(unittest.TestCase):
     def test_choose_replay_chunk_targets_uses_chunk_endpoints(self) -> None:
         sandbox = SandboxHandle(
@@ -344,6 +366,77 @@ class FaultScenarioTests(unittest.TestCase):
         targets = choose_replay_chunk_targets(sandbox, 5)
 
         self.assertEqual(targets, [5, 10, 15, 20, 24])
+
+    def test_replay_auto_mode_infers_iterations_from_trace_when_configured_as_zero(self) -> None:
+        harness = _BaseScenarioHarness()
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("fault-0"),
+            bundle_dir=Path("/tmp/fault-0"),
+            status_port=20000,
+            last_status={"total_actions": 0},
+            agent_type="iflow",
+            llm_service_type="iflow_trace_replay",
+            launch_metadata={"benchmark": {"task_id": "amuse-install", "trace_response_count": 4}},
+        )
+        sandbox.task_run = _FakeTaskRun(harness, sandbox)
+        harness._statuses[str(sandbox.sandbox_id)] = {"total_actions": 0}
+        harness._progress_actions[str(sandbox.sandbox_id)] = 0
+        config = _config(
+            "fault",
+            "auto",
+            sandboxes=1,
+            iterations=0,
+            agent="iflow",
+            llm_service="iflow_trace_replay",
+            scenario_options={"injection_rate": 0.0},
+        )
+
+        row = run_replay_auto_sandbox(
+            config,
+            harness,
+            sandbox_index=0,
+            sandbox=sandbox,
+            options=parse_fault_options(config),
+        )
+
+        self.assertEqual(row["chunks_planned"], 4)
+        self.assertEqual(row["iterations_planned"], 4)
+
+    def test_replay_manual_mode_with_zero_iterations_uses_current_turn_without_extra_delta(self) -> None:
+        harness = _BaseScenarioHarness()
+        sandbox = SandboxHandle(
+            sandbox_id=SandboxId("fault-0"),
+            bundle_dir=Path("/tmp/fault-0"),
+            status_port=20000,
+            last_status={"total_actions": 0},
+            agent_type="iflow",
+            llm_service_type="iflow_trace_replay",
+            launch_metadata={"benchmark": {"task_id": "catch-me-if-you-can", "trace_response_count": 3}},
+        )
+        sandbox.task_run = _FakeTaskRun(harness, sandbox)
+        harness._statuses[str(sandbox.sandbox_id)] = {"total_actions": 0}
+        harness._progress_actions[str(sandbox.sandbox_id)] = 0
+        config = _config(
+            "fault",
+            "manual",
+            sandboxes=1,
+            iterations=0,
+            agent="iflow",
+            llm_service="iflow_trace_replay",
+            scenario_options={"injection_rate": 1.0, "first_injection_iteration": 1},
+        )
+
+        row = run_replay_manual_sandbox(
+            config,
+            harness,
+            sandbox_index=0,
+            sandbox=sandbox,
+            options=parse_fault_options(config),
+        )
+
+        self.assertEqual(row["chunks_planned"], 3)
+        self.assertEqual(row["events_injected"], 3)
+        self.assertEqual(harness.wait_for_action_delta_calls, [])
 
     def test_manual_mode_runs_sandboxes_independently_and_sorts_rows(self) -> None:
         harness = _BaseScenarioHarness()
@@ -1255,6 +1348,105 @@ class E2EScenarioTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(harness.wait_for_task_completion_calls, ["sandbox-0"])
         self.assertEqual(harness.deactivate_sandbox_runtime_calls, ["sandbox-0"])
+
+
+class SpecScenarioTests(unittest.TestCase):
+    def test_build_harness_settings_uses_leave_running_policy_by_default(self) -> None:
+        config = _config(
+            "spec",
+            "auto",
+            agent="mini_swe",
+            llm_service="mini_swe_spec_trace_replay",
+            iterations=0,
+        )
+
+        settings = build_spec_harness_settings(config)
+
+        self.assertIsInstance(settings.scheduler_policy, FaultToleranceCheckpointingPolicy)
+        self.assertEqual(settings.max_workers, config.effective_max_workers)
+        self.assertEqual(settings.expected_sandboxes, config.sandboxes * 2)
+
+    def test_spec_manual_runs_single_full_trace_replay_and_emits_spec_metrics(self) -> None:
+        harness = _BaseScenarioHarness()
+        config = _config(
+            "spec",
+            "manual",
+            sandboxes=1,
+            iterations=0,
+            agent="mini_swe",
+            llm_service="mini_swe_spec_trace_replay",
+            verification_enabled=False,
+        )
+
+        rows = run_spec_manual(config, harness)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["iteration"], 1)
+        self.assertEqual(harness.wait_for_task_completion_calls, ["spec-0"])
+        self.assertIn("task_completion_ms", rows[0])
+        self.assertIn("spec_accept_rate", rows[0])
+        self.assertIn("spec_net_gain_ms", rows[0])
+        self.assertEqual(summarize_spec(config, rows)["success_ratio"], 1.0)
+
+    def test_spec_auto_matches_manual_behavior_in_v1(self) -> None:
+        harness = _BaseScenarioHarness()
+        config = _config(
+            "spec",
+            "auto",
+            sandboxes=1,
+            iterations=0,
+            agent="mini_swe",
+            llm_service="mini_swe_spec_trace_replay",
+            verification_enabled=False,
+        )
+
+        rows = run_spec_auto(config, harness)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(harness.wait_for_task_completion_calls, ["spec-0"])
+
+    def test_spec_scenario_options_are_forwarded_into_llm_service_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = root / "tasks.jsonl"
+            dataset.write_text(
+                "\n".join(
+                    [
+                        (
+                            '{"agent_type":"mini_swe","llm_service_type":"mini_swe_trace_replay",'
+                            '"task_description":"","task_config":{},'
+                            '"llm_service_config":{"trace_path":"trace.log"}}'
+                        )
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            harness = _RecordingSpecHarness()
+            config = _config(
+                "spec",
+                "manual",
+                sandboxes=1,
+                iterations=0,
+                agent="mini_swe",
+                llm_service="mini_swe_spec_trace_replay",
+                task_dataset=dataset,
+                verification_enabled=False,
+                scenario_options={
+                    "acceptance_rate": 0.25,
+                    "draft_response_delay_scaling_factor": 0.4,
+                    "mismatch_policy": "preserve_command_class",
+                },
+            )
+
+            run_spec_manual(config, harness)
+
+        self.assertEqual(len(harness.recorded_service_configs), 1)
+        self.assertIsNotNone(harness.recorded_service_configs[0])
+        self.assertEqual(harness.recorded_llm_service_types, ["mini_swe_spec_trace_replay"])
+        self.assertEqual(harness.recorded_service_configs[0]["acceptance_rate"], 0.25)
+        self.assertEqual(harness.recorded_service_configs[0]["draft_response_delay_scaling_factor"], 0.4)
+        self.assertEqual(harness.recorded_service_configs[0]["mismatch_policy"], "preserve_command_class")
+        self.assertTrue(str(harness.recorded_service_configs[0]["trace_path"]).endswith("trace.log"))
 
 if __name__ == "__main__":
     unittest.main()

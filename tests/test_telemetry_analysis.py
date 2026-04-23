@@ -217,6 +217,86 @@ class TelemetryAnalysisTests(unittest.TestCase):
                         ),
                         json.dumps(
                             {
+                                "timestamp": "2026-03-23T01:00:01.100000+08:00",
+                                "kind": "metric",
+                                "name": "benchmark.spec.saved_ms",
+                                "value": 12.0,
+                                "attributes": {
+                                    "run_id": "run-a",
+                                    "sandbox_id": "sbx-1",
+                                    "task_id": "task-1",
+                                    "component": "benchmark",
+                                    "agent_type": "mini_swe",
+                                    "llm_service_type": "mini_swe_spec_trace_replay",
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-03-23T01:00:01.200000+08:00",
+                                "kind": "metric",
+                                "name": "benchmark.spec.penalty_ms",
+                                "value": 3.0,
+                                "attributes": {
+                                    "run_id": "run-a",
+                                    "sandbox_id": "sbx-1",
+                                    "task_id": "task-1",
+                                    "component": "benchmark",
+                                    "agent_type": "mini_swe",
+                                    "llm_service_type": "mini_swe_spec_trace_replay",
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-03-23T01:00:01.300000+08:00",
+                                "kind": "metric",
+                                "name": "benchmark.spec.hidden_penalty_ms",
+                                "value": 40.0,
+                                "attributes": {
+                                    "run_id": "run-a",
+                                    "sandbox_id": "sbx-1",
+                                    "task_id": "task-1",
+                                    "component": "benchmark",
+                                    "agent_type": "mini_swe",
+                                    "llm_service_type": "mini_swe_spec_trace_replay",
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-03-23T01:00:01.400000+08:00",
+                                "kind": "metric",
+                                "name": "benchmark.spec.net_gain_ms",
+                                "value": 9.0,
+                                "attributes": {
+                                    "run_id": "run-a",
+                                    "sandbox_id": "sbx-1",
+                                    "task_id": "task-1",
+                                    "component": "benchmark",
+                                    "agent_type": "mini_swe",
+                                    "llm_service_type": "mini_swe_spec_trace_replay",
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-03-23T01:00:01.500000+08:00",
+                                "kind": "metric",
+                                "name": "benchmark.spec.accept_rate",
+                                "value": 0.5,
+                                "attributes": {
+                                    "run_id": "run-a",
+                                    "sandbox_id": "sbx-1",
+                                    "task_id": "task-1",
+                                    "component": "benchmark",
+                                    "agent_type": "mini_swe",
+                                    "llm_service_type": "mini_swe_spec_trace_replay",
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
                                 "timestamp": "2026-03-23T01:00:02+08:00",
                                 "kind": "metric",
                                 "name": "llm.interceptor_total_ms",
@@ -252,11 +332,254 @@ class TelemetryAnalysisTests(unittest.TestCase):
             self.assertTrue((root / "report" / "turn_cdf.csv").exists())
             self.assertTrue((root / "report" / "task_run_latency.svg").exists())
             self.assertTrue((root / "report" / "task_queue_wait.svg").exists())
+            self.assertTrue((root / "report" / "spec_hidden_penalty.svg").exists())
 
             html = (root / "report" / "report.html").read_text(encoding="utf-8")
             self.assertIn("Task Timing Analysis", html)
-            self.assertIn("Sandbox Pure Task Run Time", html)
-            self.assertIn("Sandbox Task Queue Wait", html)
+            self.assertIn("Task-Run Pure Task Run Time", html)
+            self.assertIn("Task-Run Task Queue Wait", html)
+            self.assertIn("Speculative Execution Summary", html)
+            self.assertIn("Agent-Loop Penalty", html)
+            self.assertIn("Hidden Reject Cost", html)
+
+    def test_spec_draft_gate_waits_are_split_from_primary_overhead_report(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_telemetry_spec_draft_overhead_") as tmp:
+            root = Path(tmp)
+            path = root / "telemetry.jsonl"
+
+            def _metric(ts: str, name: str, value: float, request_id: str, role: str | None) -> dict[str, object]:
+                attributes: dict[str, object] = {
+                    "run_id": "run-a",
+                    "sandbox_id": "spec-1",
+                    "task_id": "task-1",
+                    "component": "interceptor",
+                    "request_id": request_id,
+                }
+                if role is not None:
+                    attributes.update(
+                        {
+                            "request_group_kind": "spec_pair",
+                            "request_group_id": "pair-1",
+                            "request_group_role": role,
+                        }
+                    )
+                return {
+                    "timestamp": ts,
+                    "kind": "metric",
+                    "name": name,
+                    "value": value,
+                    "attributes": attributes,
+                }
+
+            records = [
+                _metric("2026-03-23T01:00:01+08:00", "llm.gate_wait_ms", 10.0, "req-oracle", "oracle"),
+                _metric("2026-03-23T01:00:02+08:00", "llm.gate_wait_ms", 100.0, "req-draft", "draft"),
+                _metric("2026-03-23T01:00:03+08:00", "llm.gate_wait_ms", 20.0, "req-plain", None),
+                _metric(
+                    "2026-03-23T01:00:04+08:00",
+                    "interceptor.response_gate.wait.duration_ms",
+                    11.0,
+                    "req-oracle",
+                    "oracle",
+                ),
+                _metric(
+                    "2026-03-23T01:00:05+08:00",
+                    "interceptor.response_gate.wait.duration_ms",
+                    110.0,
+                    "req-draft",
+                    "draft",
+                ),
+                _metric(
+                    "2026-03-23T01:00:06+08:00",
+                    "interceptor.response_gate.wait.duration_ms",
+                    21.0,
+                    "req-plain",
+                    None,
+                ),
+                _metric("2026-03-23T01:00:07+08:00", "llm.agentcr_delay_ms", 30.0, "req-oracle", "oracle"),
+                _metric("2026-03-23T01:00:08+08:00", "llm.agentcr_delay_ms", 300.0, "req-draft", "draft"),
+                _metric("2026-03-23T01:00:09+08:00", "llm.agentcr_delay_ms", 40.0, "req-plain", None),
+            ]
+            path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+            analysis = generate_report_bundle(path, output_dir=root / "report", window_size_seconds=30.0)
+
+            self.assertIsNotNone(analysis.overhead_analysis)
+            assert analysis.overhead_analysis is not None
+            overhead_by_name = {item.metric_name: item for item in analysis.overhead_analysis.metrics}
+            self.assertEqual(overhead_by_name["llm.gate_wait_ms"].count, 2)
+            self.assertAlmostEqual(overhead_by_name["llm.gate_wait_ms"].mean_ms, 15.0)
+            self.assertEqual(overhead_by_name["interceptor.response_gate.wait.duration_ms"].count, 2)
+            self.assertAlmostEqual(overhead_by_name["interceptor.response_gate.wait.duration_ms"].mean_ms, 16.0)
+            self.assertEqual(overhead_by_name["llm.agentcr_delay_ms"].count, 2)
+            self.assertAlmostEqual(overhead_by_name["llm.agentcr_delay_ms"].mean_ms, 35.0)
+            self.assertEqual(len(analysis.overhead_analysis.time_series["llm.gate_wait_ms"]), 2)
+
+            self.assertIsNotNone(analysis.spec_draft_overhead_analysis)
+            assert analysis.spec_draft_overhead_analysis is not None
+            draft_by_name = {item.metric_name: item for item in analysis.spec_draft_overhead_analysis.metrics}
+            self.assertEqual(draft_by_name["llm.gate_wait_ms"].count, 1)
+            self.assertAlmostEqual(draft_by_name["llm.gate_wait_ms"].mean_ms, 100.0)
+            self.assertEqual(draft_by_name["interceptor.response_gate.wait.duration_ms"].count, 1)
+            self.assertAlmostEqual(draft_by_name["interceptor.response_gate.wait.duration_ms"].mean_ms, 110.0)
+            self.assertEqual(draft_by_name["llm.agentcr_delay_ms"].count, 1)
+            self.assertAlmostEqual(draft_by_name["llm.agentcr_delay_ms"].mean_ms, 300.0)
+            self.assertEqual(len(analysis.spec_draft_overhead_analysis.time_series["llm.gate_wait_ms"]), 1)
+
+            operation_by_name = {item.metric_name: item for item in analysis.operation_summaries}
+            self.assertEqual(operation_by_name["llm.gate_wait_ms"].count, 2)
+            self.assertEqual(operation_by_name["interceptor.response_gate.wait.duration_ms"].count, 2)
+
+            html = (root / "report" / "report.html").read_text(encoding="utf-8")
+            self.assertIn("Draft Model Gate Delay", html)
+            self.assertIn("Draft llm.gate_wait CDF", html)
+            self.assertIn("Draft interceptor.response_gate.wait CDF", html)
+            self.assertTrue((root / "report" / "spec_draft_llm.gate_wait_ms_cdf.svg").exists())
+            self.assertTrue((root / "report" / "spec_draft_interceptor.response_gate.wait.duration_ms_cdf.svg").exists())
+            spec_csv = (root / "report" / "spec_draft_overhead_analysis.csv").read_text(encoding="utf-8")
+            self.assertIn("llm.gate_wait_ms", spec_csv)
+            self.assertIn("100.000000", spec_csv)
+
+    def test_task_summaries_merge_speculative_sandboxes_by_inferred_task_run_id(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_telemetry_spec_merge_") as tmp:
+            path = Path(tmp) / "telemetry.jsonl"
+            records = [
+                {
+                    "timestamp": "2026-03-23T01:00:00+08:00",
+                    "kind": "metric",
+                    "name": "benchmark.spec.saved_ms",
+                    "value": 10.0,
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "spec-0",
+                        "task_id": "astropy__astropy-13453",
+                        "component": "benchmark",
+                        "agent_type": "mini_swe",
+                        "llm_service_type": "mini_swe_spec_trace_replay",
+                    },
+                },
+                {
+                    "timestamp": "2026-03-23T01:00:01+08:00",
+                    "kind": "metric",
+                    "name": "benchmark.spec.saved_ms",
+                    "value": 30.0,
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "spec-0-spec-1",
+                        "task_id": "astropy__astropy-13453",
+                        "component": "benchmark",
+                        "agent_type": "mini_swe",
+                        "llm_service_type": "mini_swe_spec_trace_replay",
+                    },
+                },
+                {
+                    "timestamp": "2026-03-23T01:00:02+08:00",
+                    "kind": "metric",
+                    "name": "benchmark.task.duration_ms",
+                    "value": 120.0,
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "spec-0-spec-1",
+                        "task_id": "astropy__astropy-13453",
+                        "component": "benchmark",
+                        "agent_type": "mini_swe",
+                        "llm_service_type": "mini_swe_spec_trace_replay",
+                    },
+                },
+            ]
+            path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+            analysis = analyze_telemetry_file(path)
+
+            self.assertEqual(len(analysis.task_summaries), 1)
+            summary = analysis.task_summaries[0]
+            self.assertEqual(summary.task_run_id, "spec-0")
+            self.assertEqual(summary.sandbox_id, "spec-0")
+            self.assertEqual(summary.sandbox_ids, ["spec-0", "spec-0-spec-1"])
+            self.assertAlmostEqual(summary.metrics["benchmark.spec.saved_ms"], 20.0)
+            self.assertAlmostEqual(summary.metrics["benchmark.task.duration_ms"], 120.0)
+
+    def test_task_summaries_prefer_explicit_task_run_id_when_present(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_telemetry_task_run_id_") as tmp:
+            path = Path(tmp) / "telemetry.jsonl"
+            records = [
+                {
+                    "timestamp": "2026-03-23T01:00:00+08:00",
+                    "kind": "metric",
+                    "name": "benchmark.spec.saved_ms",
+                    "value": 8.0,
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "fork-a",
+                        "task_run_id": "task-run-7",
+                        "task_id": "shared-task",
+                        "component": "benchmark",
+                        "agent_type": "mini_swe",
+                        "llm_service_type": "mini_swe_spec_trace_replay",
+                    },
+                },
+                {
+                    "timestamp": "2026-03-23T01:00:01+08:00",
+                    "kind": "metric",
+                    "name": "benchmark.spec.saved_ms",
+                    "value": 12.0,
+                    "attributes": {
+                        "run_id": "run-a",
+                        "sandbox_id": "fork-b",
+                        "task_run_id": "task-run-7",
+                        "task_id": "shared-task",
+                        "component": "benchmark",
+                        "agent_type": "mini_swe",
+                        "llm_service_type": "mini_swe_spec_trace_replay",
+                    },
+                },
+            ]
+            path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+            analysis = analyze_telemetry_file(path)
+
+            self.assertEqual(len(analysis.task_summaries), 1)
+            summary = analysis.task_summaries[0]
+            self.assertEqual(summary.task_run_id, "task-run-7")
+            self.assertEqual(summary.sandbox_ids, ["fork-a", "fork-b"])
+            self.assertAlmostEqual(summary.metrics["benchmark.spec.saved_ms"], 10.0)
+
+    def test_render_report_shortens_long_sandbox_membership_but_keeps_lineage_section(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_telemetry_task_run_lineage_") as tmp:
+            root = Path(tmp)
+            path = root / "telemetry.jsonl"
+            records = []
+            sandbox_ids = ["spec-0"] + [f"spec-0-spec-{index}" for index in range(1, 20)]
+            for index, sandbox_id in enumerate(sandbox_ids):
+                records.append(
+                    {
+                        "timestamp": f"2026-03-23T01:00:{index:02d}+08:00",
+                        "kind": "metric",
+                        "name": "benchmark.spec.saved_ms",
+                        "value": float(index + 1),
+                        "attributes": {
+                            "run_id": "run-a",
+                            "sandbox_id": sandbox_id,
+                            "task_id": "astropy__astropy-13453",
+                            "component": "benchmark",
+                            "agent_type": "mini_swe",
+                            "llm_service_type": "mini_swe_spec_trace_replay",
+                        },
+                    }
+                )
+            path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+            generate_report_bundle(path, output_dir=root / "report")
+
+            html = (root / "report" / "report.html").read_text(encoding="utf-8")
+            self.assertIn("Per-Task-Run Summary", html)
+            self.assertIn("Task-Run Sandboxes", html)
+            self.assertIn("spec-0, etc (20 sandboxes)", html)
+            self.assertIn("spec-0-spec-19", html)
+
+            lineage_csv = (root / "report" / "task_run_lineage.csv").read_text(encoding="utf-8")
+            self.assertIn("task_run_id,task_id,sandbox_count,sandbox_ids", lineage_csv)
+            self.assertIn("spec-0,astropy__astropy-13453,20,", lineage_csv)
 
     def test_turn_analysis_reconstructs_request_response_and_action_timings(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_telemetry_turn_analysis_") as tmp:
@@ -962,19 +1285,20 @@ class TelemetryAnalysisTests(unittest.TestCase):
             self.assertIn("sbx-2,shared-task", summary_csv)
 
             checkpoint_csv = (root / "report" / "checkpoint_per_task.csv").read_text(encoding="utf-8")
-            self.assertIn("sandbox_id,task_id,total_count", checkpoint_csv)
-            self.assertIn("sbx-1,shared-task,1", checkpoint_csv)
-            self.assertIn("sbx-2,shared-task,1", checkpoint_csv)
+            self.assertIn("sandbox_id,task_id,task_run_id,sandbox_ids,total_count", checkpoint_csv.splitlines()[0])
+            self.assertIn("sbx-1,shared-task,sbx-1,sbx-1,1", checkpoint_csv)
+            self.assertIn("sbx-2,shared-task,sbx-2,sbx-2,1", checkpoint_csv)
 
             restore_csv = (root / "report" / "restore_per_task.csv").read_text(encoding="utf-8")
-            self.assertIn("sandbox_id,task_id,total_count", restore_csv)
-            self.assertIn("sbx-1,shared-task,1", restore_csv)
-            self.assertIn("sbx-2,shared-task,1", restore_csv)
+            self.assertIn("sandbox_id,task_id,task_run_id,sandbox_ids,total_count", restore_csv.splitlines()[0])
+            self.assertIn("sbx-1,shared-task,sbx-1,sbx-1,1", restore_csv)
+            self.assertIn("sbx-2,shared-task,sbx-2,sbx-2,1", restore_csv)
 
             html = (root / "report" / "report.html").read_text(encoding="utf-8")
-            self.assertIn("Per-Sandbox Summary", html)
-            self.assertIn("Checkpoint Per Sandbox", html)
-            self.assertIn("Restore Per Sandbox", html)
+            self.assertIn("Per-Task-Run Summary", html)
+            self.assertIn("Checkpoint Per Task Run", html)
+            self.assertIn("Restore Per Task Run", html)
+            self.assertIn("Task-Run Sandboxes", html)
 
     def test_checkpoint_restore_and_resource_analysis_are_reported(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_telemetry_deep_report_") as tmp:
@@ -1393,10 +1717,13 @@ class TelemetryAnalysisTests(unittest.TestCase):
             self.assertTrue((root / "report" / "restore_filesystem_latency.svg").exists())
             self.assertTrue((root / "report" / "resource_host_cpu.svg").exists())
             self.assertTrue((root / "report" / "resource_summary.csv").exists())
+            self.assertTrue((root / "report" / "task_run_lineage.csv").exists())
             self.assertTrue((root / "report" / "overhead_analysis.csv").exists())
             self.assertTrue((root / "report" / "overhead_timeseries.csv").exists())
             operation_csv = (root / "report" / "operation_summary.csv").read_text(encoding="utf-8")
             self.assertIn("p25_ms", operation_csv.splitlines()[0])
+            resource_csv = (root / "report" / "resource_summary.csv").read_text(encoding="utf-8")
+            self.assertIn("metric_name,sandbox_id,task_run_id,sandbox_ids,sample_count,mean_value,max_value", resource_csv.splitlines()[0])
             checkpoint_load_svg = (root / "report" / "checkpoint_load_jobs.svg").read_text(encoding="utf-8")
             self.assertIn("legend-bg", checkpoint_load_svg)
             self.assertIn("active filesystem jobs", checkpoint_load_svg)

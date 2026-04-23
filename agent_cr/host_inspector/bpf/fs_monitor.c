@@ -36,10 +36,23 @@ struct registration {
   struct registration *next;
 };
 
+#define PENDING_SYNC_CAPACITY 1024
+
 struct helper_state {
   int registered_cgroups_fd;
+  int ignored_pids_fd;
   struct registration *registrations;
   pthread_mutex_t lock;
+  uint64_t pending_sync_ids[PENDING_SYNC_CAPACITY];
+  size_t pending_sync_count;
+  size_t pending_sync_overflow;
+  /* Instrumentation: accumulated wall time (microseconds) spent inside
+   * ring_buffer__poll + ring_buffer__consume between two sync_ack
+   * emissions, and the number of events processed in that window. Both
+   * are reset after emit_sync_ack so Python can attribute "helper CPU
+   * time" and "event backlog drained" to each sync() round-trip. */
+  uint64_t drain_us_since_prev_sync;
+  uint64_t events_since_prev_sync;
 };
 
 static volatile sig_atomic_t stop_flag;
@@ -205,6 +218,21 @@ static int remove_registration_map(struct helper_state *state, const char *sandb
   return rc;
 }
 
+static int add_ignored_pid_map(struct helper_state *state, uint32_t pid)
+{
+  uint8_t present = 1;
+  if (pid == 0)
+    return -EINVAL;
+  return bpf_map_update_elem(state->ignored_pids_fd, &pid, &present, BPF_ANY);
+}
+
+static int remove_ignored_pid_map(struct helper_state *state, uint32_t pid)
+{
+  if (pid == 0)
+    return -EINVAL;
+  return bpf_map_delete_elem(state->ignored_pids_fd, &pid);
+}
+
 static int find_sandbox_id(struct helper_state *state, uint64_t cgroup_id, char *output, size_t output_len)
 {
   struct registration *item;
@@ -274,6 +302,38 @@ static void *stdin_loop(void *arg)
 
     if (extract_string_field(line, "op", op, sizeof(op)) != 0)
       continue;
+
+    if (strcmp(op, "sync") == 0) {
+      uint64_t sync_id = 0;
+      if (extract_u64_field(line, "sync_id", &sync_id) != 0 || sync_id == 0)
+        continue;
+      pthread_mutex_lock(&state->lock);
+      if (state->pending_sync_count < PENDING_SYNC_CAPACITY) {
+        state->pending_sync_ids[state->pending_sync_count++] = sync_id;
+      } else {
+        state->pending_sync_overflow++;
+      }
+      pthread_mutex_unlock(&state->lock);
+      continue;
+    }
+
+    if (strcmp(op, "add_ignored_pid") == 0) {
+      uint64_t pid = 0;
+      if (extract_u64_field(line, "pid", &pid) != 0 || pid == 0)
+        continue;
+      if (add_ignored_pid_map(state, (uint32_t)pid) != 0)
+        fprintf(stderr, "failed to add ignored pid %llu\n", (unsigned long long)pid);
+      continue;
+    }
+
+    if (strcmp(op, "remove_ignored_pid") == 0) {
+      uint64_t pid = 0;
+      if (extract_u64_field(line, "pid", &pid) != 0 || pid == 0)
+        continue;
+      remove_ignored_pid_map(state, (uint32_t)pid);
+      continue;
+    }
+
     if (extract_string_field(line, "sandbox_id", sandbox_id, sizeof(sandbox_id)) != 0)
       continue;
 
@@ -501,6 +561,11 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
   if (find_sandbox_id(state, event->cgroup_id, sandbox_id, sizeof(sandbox_id)) != 0)
     return 0;
 
+  /* Count only events that belong to a registered sandbox (the path
+   * that actually performs /proc syscalls + stdout write). Events for
+   * unregistered cgroups return above and cost ~zero. */
+  state->events_since_prev_sync++;
+
   resolve_event_path(event->pid, event->dirfd_primary, event->path, primary_path, sizeof(primary_path));
   resolve_event_path(
     event->pid,
@@ -575,6 +640,29 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
   return 0;
 }
 
+static void emit_sync_ack(struct helper_state *state, uint64_t sync_id)
+{
+  /* Attach per-round-trip instrumentation so Python can log a latency
+   * breakdown (helper drain vs worker drain) without extra syscalls. */
+  printf(
+    "{\"kind\":\"sync_ack\",\"sync_id\":%llu,\"drain_us\":%llu,\"events\":%llu}\n",
+    (unsigned long long)sync_id,
+    (unsigned long long)state->drain_us_since_prev_sync,
+    (unsigned long long)state->events_since_prev_sync
+  );
+  fflush(stdout);
+  state->drain_us_since_prev_sync = 0;
+  state->events_since_prev_sync = 0;
+}
+
+static uint64_t monotonic_us(void)
+{
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+    return 0;
+  return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
+
 int main(void)
 {
   struct helper_state state = {};
@@ -621,6 +709,13 @@ int main(void)
     goto cleanup;
   }
 
+  state.ignored_pids_fd = bpf_object__find_map_fd_by_name(obj, "ignored_pids");
+  if (state.ignored_pids_fd < 0) {
+    err = state.ignored_pids_fd;
+    fprintf(stderr, "failed to find ignored_pids map: %d\n", err);
+    goto cleanup;
+  }
+
   bpf_object__for_each_program(prog, obj) {
     struct bpf_link *link = bpf_program__attach(prog);
     if (libbpf_get_error(link)) {
@@ -645,12 +740,55 @@ int main(void)
   }
 
   while (!stop_flag) {
-    err = ring_buffer__poll(rb, 250);
+    uint64_t sync_batch[PENDING_SYNC_CAPACITY];
+    size_t sync_batch_count = 0;
+    size_t sync_overflow = 0;
+    uint64_t poll_start_us = monotonic_us();
+
+    err = ring_buffer__poll(rb, 50);
     if (err == -EINTR)
       continue;
     if (err < 0) {
       fprintf(stderr, "ring buffer poll failed: %d\n", err);
       break;
+    }
+    /* Only count wall-clock time as "drain work" when poll actually
+     * returned events — an idle poll (returned 0) just burned the 50ms
+     * timeout and isn't interesting for the bottleneck analysis. */
+    if (err > 0)
+      state.drain_us_since_prev_sync += monotonic_us() - poll_start_us;
+
+    pthread_mutex_lock(&state.lock);
+    sync_batch_count = state.pending_sync_count;
+    if (sync_batch_count > 0) {
+      memcpy(sync_batch, state.pending_sync_ids, sync_batch_count * sizeof(sync_batch[0]));
+      state.pending_sync_count = 0;
+    }
+    sync_overflow = state.pending_sync_overflow;
+    state.pending_sync_overflow = 0;
+    pthread_mutex_unlock(&state.lock);
+
+    if (sync_overflow > 0)
+      fprintf(stderr, "sync queue overflow: %zu syncs dropped\n", sync_overflow);
+
+    if (sync_batch_count > 0) {
+      /* Drain any events that landed between the poll return and the
+       * sync request so the ack truly means "all in-flight events are
+       * processed". ring_buffer__consume is non-blocking and runs the
+       * callback for each ready event. One drain satisfies every queued
+       * sync because each ack only promises "events up to this point
+       * have been processed" — and the latest drain covers all earlier
+       * ones. */
+      uint64_t consume_start_us = monotonic_us();
+      int consumed = ring_buffer__consume(rb);
+      if (consumed < 0) {
+        fprintf(stderr, "ring buffer consume failed: %d\n", consumed);
+        break;
+      }
+      if (consumed > 0)
+        state.drain_us_since_prev_sync += monotonic_us() - consume_start_us;
+      for (size_t i = 0; i < sync_batch_count; i++)
+        emit_sync_ack(&state, sync_batch[i]);
     }
   }
 

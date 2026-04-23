@@ -71,6 +71,8 @@ class BenchmarkConfigTests(unittest.TestCase):
             self.assertEqual(config.effective_phase_workers.as_dict(), {"setup": 3, "run": 3, "verification": 3})
             self.assertEqual(config.log_file_mode, "write")
             self.assertEqual(config.benchmark_root, (root / "benchmark-runs").resolve())
+            self.assertEqual(config.benchmark_root_home, (root / "benchmark-runs").resolve())
+            self.assertIsNone(config.benchmark_run_name)
             self.assertFalse(config.clear_benchmark_root_after_run)
             self.assertEqual(config.zpool_size, "32G")
             self.assertEqual(config.zpool_name, "benchcache")
@@ -85,6 +87,65 @@ class BenchmarkConfigTests(unittest.TestCase):
             self.assertEqual(config.image_cache_root, (root / "cache" / "images").resolve())
             self.assertEqual(config.work_dir_host_root, (root / "workdirs").resolve())
             self.assertEqual(config.scenario_options["injection_rate"], 0.25)
+
+    def test_load_config_resolves_benchmark_root_home_and_run_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "bench.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "scenario: fault",
+                        "mode: auto",
+                        "benchmark_root_home: benchmark-runs",
+                        "benchmark_run_name: named-run",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+            self.assertEqual(config.benchmark_root_home, (root / "benchmark-runs").resolve())
+            self.assertEqual(config.benchmark_root, (root / "benchmark-runs").resolve())
+            self.assertEqual(config.benchmark_run_name, "named-run")
+
+    def test_load_config_rejects_conflicting_benchmark_root_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "bench.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "scenario: fault",
+                        "mode: auto",
+                        "benchmark_root: old-root",
+                        "benchmark_root_home: new-root",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "aliases"):
+                load_config(config_path)
+
+    def test_load_config_rejects_invalid_benchmark_run_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "bench.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "scenario: fault",
+                        "mode: auto",
+                        "benchmark_root_home: benchmark-runs",
+                        "benchmark_run_name: nested/run",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "benchmark_run_name"):
+                load_config(config_path)
 
     def test_load_config_supports_nested_telemetry_block(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -132,6 +193,121 @@ class BenchmarkConfigTests(unittest.TestCase):
             self.assertTrue(config.telemetry_report.enabled)
             self.assertIsNone(config.telemetry_report.output_dir)
             self.assertEqual(config.monitoring.sample_interval_ms, 1000)
+
+    def test_load_config_allows_zero_iterations_for_fault(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "bench.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "scenario: fault",
+                        "mode: auto",
+                        "iterations: 0",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+        self.assertEqual(config.iterations, 0)
+
+    def test_load_config_defaults_spec_iterations_to_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "bench.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "scenario: spec",
+                        "mode: auto",
+                        "agent: mini_swe",
+                        "llm_service: mini_swe_spec_trace_replay",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+        self.assertEqual(config.iterations, 0)
+
+    def test_load_config_allows_zero_iterations_for_spec(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "bench.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "scenario: spec",
+                        "mode: manual",
+                        "agent: mini_swe",
+                        "llm_service: mini_swe_spec_trace_replay",
+                        "iterations: 0",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+        self.assertEqual(config.iterations, 0)
+
+    def test_load_config_rejects_positive_iterations_for_spec(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "bench.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "scenario: spec",
+                        "mode: auto",
+                        "agent: mini_swe",
+                        "llm_service: mini_swe_spec_trace_replay",
+                        "iterations: 1",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "iterations must be exactly 0 for scenario 'spec'"):
+                load_config(config_path)
+
+    def test_load_config_rejects_non_mini_swe_agent_for_spec(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "bench.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "scenario: spec",
+                        "mode: auto",
+                        "agent: iflow",
+                        "llm_service: mini_swe_spec_trace_replay",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "scenario='spec' requires agent='mini_swe'"):
+                load_config(config_path)
+
+    def test_load_config_requires_spec_llm_service_for_spec(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "bench.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "scenario: spec",
+                        "mode: manual",
+                        "agent: mini_swe",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "scenario='spec' requires llm_service='mini_swe_spec_trace_replay'",
+            ):
+                load_config(config_path)
 
     def test_load_config_supports_verification_and_telemetry_file_modes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -816,7 +992,8 @@ class BenchmarkRunDispatchTests(unittest.TestCase):
             telemetry_output=None,
             log_file=Path("/tmp/out.log"),
             log_file_mode="append",
-            benchmark_root=Path("/tmp/bench-root"),
+            benchmark_root_home=Path("/tmp/bench-root"),
+            benchmark_run_name="named-run",
             zpool_size="10G",
             zpool_name=None,
             zpool_image=None,
@@ -835,7 +1012,8 @@ class BenchmarkRunDispatchTests(unittest.TestCase):
         self.assertEqual(calls[0]["telemetry_detail_level"], "basic")
         self.assertFalse(calls[0]["telemetry_capture_command_output"])
         self.assertEqual(calls[0]["telemetry_max_text_attribute_bytes"], 2048)
-        self.assertEqual(calls[0]["benchmark_root"], Path("/tmp/bench-root"))
+        self.assertEqual(calls[0]["benchmark_root_home"], Path("/tmp/bench-root"))
+        self.assertEqual(calls[0]["benchmark_run_name"], "named-run")
 
     def test_run_benchmark_config_clears_explicit_benchmark_run_root_when_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1042,6 +1220,52 @@ class BenchmarkRunDispatchTests(unittest.TestCase):
             run_benchmark_config(config)
 
         self.assertEqual(calls[0]["expected_sandboxes"], 640)
+
+    def test_run_benchmark_config_uses_scenario_expected_sandboxes_override(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        class _HarnessContext:
+            def __init__(self, **kwargs) -> None:
+                calls.append(kwargs)
+
+            def __enter__(self):
+                return {"kind": "fake-harness"}
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                _ = (exc_type, exc, tb)
+
+        scenario = ScenarioDefinition(
+            name="fake",
+            supported_modes=frozenset({"manual"}),
+            build_harness_settings=lambda config: HarnessSettings(
+                scheduler_config={"mode": config.mode},
+                scheduler_policy=None,
+                checkpoint_manager_factory=lambda base: base,
+                max_workers=1,
+                expected_sandboxes=config.sandboxes * 2,
+            ),
+            run_manual=lambda config, harness: [],
+            run_auto=None,
+            summarize=lambda config, rows: {},
+        )
+        config = BenchmarkConfig(
+            config_path=Path("/tmp/bench.yaml"),
+            scenario="fake",
+            mode="manual",
+            provider="openai",
+            agent="simulated",
+            llm_service="simulated",
+            sandboxes=128,
+        )
+
+        with patch("benchmarks.run.RealHostScenarioHarness", _HarnessContext), patch.dict(
+            "benchmarks.run.SCENARIOS",
+            {"fake": scenario},
+            clear=True,
+        ):
+            run_benchmark_config(config)
+
+        self.assertEqual(calls[0]["expected_sandboxes"], 256)
 
     def test_run_benchmark_config_passes_rootfs_reuse_setting_to_harness(self) -> None:
         calls: list[dict[str, object]] = []
@@ -1301,6 +1525,102 @@ class BenchmarkRunDispatchTests(unittest.TestCase):
         self.assertEqual(len(report_calls), 1)
         self.assertEqual(report_calls[0]["args"][0], Path("/tmp/auto.telemetry.jsonl"))
         self.assertEqual(report_calls[0]["kwargs"]["output_dir"], Path("/tmp/auto.telemetry.report"))
+
+    def test_run_benchmark_config_replicates_configured_artifacts_to_benchmark_run_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "results" / "out.csv"
+            log_file = root / "results" / "out.log"
+            telemetry_output = root / "results" / "out.telemetry.jsonl"
+            report_output_dir = root / "results" / "out.report"
+            benchmark_run_root = root / "benchmark-runs" / "run-a"
+
+            class _HarnessContext:
+                def __init__(self, **kwargs) -> None:
+                    self.kwargs = kwargs
+                    self.root = benchmark_run_root
+                    self.uses_temporary_root = False
+
+                def __enter__(self):
+                    telemetry_path = self.kwargs["telemetry_output"]
+                    assert isinstance(telemetry_path, Path)
+                    telemetry_path.parent.mkdir(parents=True, exist_ok=True)
+                    telemetry_path.write_text(
+                        json.dumps(
+                            {
+                                "timestamp": "2026-03-24T00:00:00+08:00",
+                                "kind": "metric",
+                                "name": "benchmark.task.duration_ms",
+                                "value": 10.0,
+                                "attributes": {"run_id": "run-x"},
+                            }
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                    return {"kind": "fake-harness"}
+
+                def __exit__(self, exc_type, exc, tb) -> None:
+                    _ = (exc_type, exc, tb)
+
+            scenario = ScenarioDefinition(
+                name="fake",
+                supported_modes=frozenset({"manual"}),
+                build_harness_settings=lambda config: HarnessSettings(
+                    scheduler_config={"mode": config.mode},
+                    scheduler_policy=None,
+                    checkpoint_manager_factory=lambda base: base,
+                    max_workers=1,
+                ),
+                run_manual=lambda config, harness: [{"success_ratio": 1.0, "task_id": "task-1"}],
+                run_auto=None,
+                summarize=lambda config, rows: {"success_ratio": 1.0},
+            )
+            config = BenchmarkConfig(
+                config_path=root / "bench.yaml",
+                scenario="fake",
+                mode="manual",
+                provider="openai",
+                agent="simulated",
+                llm_service="simulated",
+                output=output,
+                telemetry_output=telemetry_output,
+                telemetry_report=TelemetryReportConfig(enabled=True, output_dir=report_output_dir),
+                log_file=log_file,
+                log_file_mode="write",
+                benchmark_root_home=root / "benchmark-runs",
+                benchmark_run_name="run-a",
+            )
+
+            def _fake_report_bundle(*args, **kwargs):
+                _ = args
+                report_dir = kwargs["output_dir"]
+                assert isinstance(report_dir, Path)
+                report_dir.mkdir(parents=True, exist_ok=True)
+                (report_dir / "index.html").write_text("report\n", encoding="utf-8")
+
+            with patch("benchmarks.run.RealHostScenarioHarness", _HarnessContext), patch.dict(
+                "benchmarks.run.SCENARIOS",
+                {"fake": scenario},
+                clear=True,
+            ), patch("benchmarks.telemetry_analysis.generate_report_bundle", side_effect=_fake_report_bundle):
+                run_benchmark_config(config)
+
+            self.assertEqual(
+                (benchmark_run_root / "out.csv").read_text(encoding="utf-8"),
+                output.read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                (benchmark_run_root / "out.telemetry.jsonl").read_text(encoding="utf-8"),
+                telemetry_output.read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                (benchmark_run_root / "out.report" / "index.html").read_text(encoding="utf-8"),
+                "report\n",
+            )
+            replica_log = (benchmark_run_root / "out.log").read_text(encoding="utf-8")
+            self.assertIn("benchmark.run start", replica_log)
+            self.assertIn("benchmark.run end status=completed", replica_log)
 
     def test_run_benchmark_config_logs_run_markers_and_summary_to_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

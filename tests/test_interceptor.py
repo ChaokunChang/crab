@@ -96,6 +96,62 @@ class InterceptorTests(unittest.TestCase):
         )
         self.assertIsNone(registry.get_pending(sandbox_id))
 
+    def test_response_gate_registry_groups_spec_pair_requests_into_one_generation(self) -> None:
+        registry = SandboxResponseGateRegistry()
+        sandbox_id = SandboxId("sbx-spec-group")
+        registry.enable()
+
+        first_generation = registry.arm(
+            sandbox_id,
+            "req-draft",
+            request_group_kind="spec_pair",
+            request_group_id="pair-1",
+        )
+        second_generation = registry.arm(
+            sandbox_id,
+            "req-oracle",
+            request_group_kind="spec_pair",
+            request_group_id="pair-1",
+        )
+
+        self.assertEqual(first_generation, second_generation)
+        pending = registry.get_oldest_pending(sandbox_id)
+        self.assertIsNotNone(pending)
+        assert pending is not None
+        self.assertEqual(pending.request_group_kind, "spec_pair")
+        self.assertEqual(pending.request_group_id, "pair-1")
+        self.assertEqual(set(pending.request_ids), {"req-draft", "req-oracle"})
+
+    def test_response_gate_registry_does_not_rearm_late_sibling_after_group_release(self) -> None:
+        registry = SandboxResponseGateRegistry()
+        sandbox_id = SandboxId("sbx-spec-group")
+        registry.enable()
+
+        generation = registry.arm(
+            sandbox_id,
+            "req-draft",
+            request_group_kind="spec_pair",
+            request_group_id="pair-1",
+        )
+        self.assertIsNotNone(generation)
+        assert generation is not None
+        self.assertTrue(
+            registry.release_pending(
+                sandbox_id,
+                request_id="req-draft",
+                generation=generation,
+            )
+        )
+
+        self.assertIsNone(
+            registry.arm(
+                sandbox_id,
+                "req-oracle",
+                request_group_kind="spec_pair",
+                request_group_id="pair-1",
+            )
+        )
+
     def test_interceptor_tracks_request_state_and_emits_telemetry(self) -> None:
         request_state_store = InMemoryRequestStateStore()
         telemetry = InMemoryTelemetrySink()
@@ -596,7 +652,13 @@ class InterceptorTests(unittest.TestCase):
         releaser.start()
         interceptor.intercept(
             path="/v1/chat/completions",
-            headers={"Content-Type": "application/json", "X-Agent-Sandbox-Id": "sbx-metrics", "X-Request-Id": "req-metrics"},
+            headers={
+                "Content-Type": "application/json",
+                "X-Agent-Sandbox-Id": "sbx-metrics",
+                "X-Request-Id": "req-metrics",
+                "X-Agentcr-Spec-Pair-Id": "pair-metrics",
+                "X-Agentcr-Spec-Role": "oracle",
+            },
             body=b"{}",
         )
         releaser.join(timeout=2.0)
@@ -612,6 +674,14 @@ class InterceptorTests(unittest.TestCase):
 
         self.assertLess(abs(gate_operation - gate_wait), 25.0)
         self.assertLess(abs(agentcr_delay - gate_wait), 25.0)
+        metric_attrs = {
+            name: attributes
+            for name, _value, attributes in telemetry.metrics
+            if attributes.get("request_id") == "req-metrics"
+        }
+        self.assertEqual(metric_attrs["llm.gate_wait_ms"]["request_group_role"], "oracle")
+        self.assertEqual(metric_attrs["llm.agentcr_delay_ms"]["request_group_role"], "oracle")
+        self.assertEqual(metric_attrs["interceptor.response_gate.wait.duration_ms"]["request_group_role"], "oracle")
 
     def test_anthropic_count_tokens_request_bypasses_response_gate(self) -> None:
         request_state_store = InMemoryRequestStateStore()

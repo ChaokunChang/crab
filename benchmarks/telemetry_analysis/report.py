@@ -6,6 +6,7 @@ from html import escape
 import json
 import math
 from pathlib import Path
+import re
 from typing import Iterable
 
 from .analyzer import (
@@ -59,8 +60,13 @@ def _format_request_kind_label(request_kind: str) -> str:
     return request_kind.replace("_", " ")
 
 
+def _metric_figure_key(metric_name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", metric_name)
+
+
 _OVERHEAD_METRIC_LABELS = {
     "llm.gate_wait_ms": "llm.gate_wait",
+    "interceptor.response_gate.wait.duration_ms": "interceptor.response_gate.wait",
     "llm.agentcr_delay_ms": "llm.agentcr_delay",
 }
 
@@ -385,11 +391,160 @@ def _operation_tail_rows(items: list[MetricSummary]) -> list[tuple[str, float]]:
 
 def _task_metric_rows(tasks: list[TaskSummary], metric_name: str) -> list[tuple[str, float]]:
     rows = [
-        (task.sandbox_id, task.metrics.get(metric_name, 0.0))
+        (task.task_run_id, task.metrics.get(metric_name, 0.0))
         for task in tasks
         if metric_name in task.metrics
     ]
     rows.sort(key=lambda item: item[1], reverse=True)
+    return rows
+
+
+def _infer_task_run_id_from_sandbox_id(sandbox_id: str) -> str:
+    if not sandbox_id:
+        return ""
+    inferred = re.sub(r"(?:-spec-\d+)+$", "", sandbox_id)
+    return inferred or sandbox_id
+
+
+def _task_run_lookup(tasks: list[TaskSummary]) -> tuple[dict[str, TaskSummary], dict[str, str]]:
+    by_task_run: dict[str, TaskSummary] = {}
+    sandbox_to_task_run: dict[str, str] = {}
+    for task in tasks:
+        by_task_run[task.task_run_id] = task
+        sandbox_to_task_run[task.sandbox_id] = task.task_run_id
+        for sandbox_id in task.sandbox_ids:
+            sandbox_to_task_run[sandbox_id] = task.task_run_id
+    return by_task_run, sandbox_to_task_run
+
+
+def _task_run_for_sandbox_id(sandbox_id: str, sandbox_to_task_run: dict[str, str]) -> str:
+    if sandbox_id in sandbox_to_task_run:
+        return sandbox_to_task_run[sandbox_id]
+    return _infer_task_run_id_from_sandbox_id(sandbox_id)
+
+
+def _format_sandbox_membership(sandbox_ids: list[str], *, shorten: bool) -> str:
+    if not sandbox_ids:
+        return ""
+    if not shorten or len(sandbox_ids) <= 4:
+        return ", ".join(sandbox_ids)
+    return f"{sandbox_ids[0]}, etc ({len(sandbox_ids)} sandboxes)"
+
+
+def _task_run_lineage_rows(tasks: list[TaskSummary]) -> list[tuple[str, str, int, str]]:
+    return [
+        (
+            task.task_run_id,
+            task.task_id,
+            len(task.sandbox_ids),
+            ", ".join(task.sandbox_ids),
+        )
+        for task in tasks
+    ]
+
+
+def _aggregate_operation_task_rows(items, tasks: list[TaskSummary]) -> list[dict[str, object]]:
+    by_task_run, sandbox_to_task_run = _task_run_lookup(tasks)
+    grouped: dict[str, dict[str, object]] = {}
+    for item in items:
+        task_run_id = _task_run_for_sandbox_id(item.sandbox_id, sandbox_to_task_run)
+        group = grouped.setdefault(
+            task_run_id,
+            {
+                "task_run_id": task_run_id,
+                "sandbox_id": task_run_id,
+                "sandbox_ids": set(),
+                "task_id": "",
+                "total_count": 0,
+                "success_count": 0,
+                "skip_count": 0,
+                "fail_count": 0,
+                "per_minute_rate": 0.0,
+                "estimated_io_sum": 0.0,
+                "gap_turn_sum": 0.0,
+                "gap_ms_sum": 0.0,
+            },
+        )
+        sandbox_ids = group["sandbox_ids"]
+        assert isinstance(sandbox_ids, set)
+        sandbox_ids.add(item.sandbox_id)
+        group["task_id"] = str(group["task_id"] or item.task_id)
+        group["total_count"] = int(group["total_count"]) + int(item.total_count)
+        group["success_count"] = int(group["success_count"]) + int(item.success_count)
+        group["skip_count"] = int(group["skip_count"]) + int(item.skip_count)
+        group["fail_count"] = int(group["fail_count"]) + int(item.fail_count)
+        group["per_minute_rate"] = float(group["per_minute_rate"]) + float(item.per_minute_rate)
+        group["estimated_io_sum"] = float(group["estimated_io_sum"]) + float(item.mean_estimated_io_bytes) * int(item.total_count)
+        group["gap_turn_sum"] = float(group["gap_turn_sum"]) + float(item.mean_source_gap_turns) * int(item.total_count)
+        group["gap_ms_sum"] = float(group["gap_ms_sum"]) + float(item.mean_source_gap_ms) * int(item.total_count)
+    rows: list[dict[str, object]] = []
+    for task_run_id, group in grouped.items():
+        task_summary = by_task_run.get(task_run_id)
+        sandbox_ids = sorted(set(task_summary.sandbox_ids if task_summary is not None else []) | set(group["sandbox_ids"]))
+        total_count = int(group["total_count"])
+        success_count = int(group["success_count"])
+        rows.append(
+            {
+                "task_run_id": task_run_id,
+                "sandbox_id": task_summary.sandbox_id if task_summary is not None else str(group["sandbox_id"]),
+                "sandbox_ids": sandbox_ids,
+                "task_id": str(group["task_id"] or (task_summary.task_id if task_summary is not None else task_run_id)),
+                "total_count": total_count,
+                "success_count": success_count,
+                "skip_count": int(group["skip_count"]),
+                "fail_count": int(group["fail_count"]),
+                "success_rate": (success_count / total_count) if total_count else 0.0,
+                "per_minute_rate": float(group["per_minute_rate"]),
+                "mean_estimated_io_bytes": (float(group["estimated_io_sum"]) / total_count) if total_count else 0.0,
+                "mean_source_gap_turns": (float(group["gap_turn_sum"]) / total_count) if total_count else 0.0,
+                "mean_source_gap_ms": (float(group["gap_ms_sum"]) / total_count) if total_count else 0.0,
+            }
+        )
+    rows.sort(key=lambda item: (int(item["total_count"]), str(item["task_run_id"])), reverse=True)
+    return rows
+
+
+def _aggregate_resource_rows(resource: ResourceAnalysisSummary, tasks: list[TaskSummary]) -> list[dict[str, object]]:
+    by_task_run, sandbox_to_task_run = _task_run_lookup(tasks)
+    grouped: dict[tuple[str, str], dict[str, object]] = {}
+    for item in resource.sandbox_metrics:
+        task_run_id = _task_run_for_sandbox_id(item.sandbox_id, sandbox_to_task_run)
+        key = (item.metric_name, task_run_id)
+        group = grouped.setdefault(
+            key,
+            {
+                "metric_name": item.metric_name,
+                "task_run_id": task_run_id,
+                "sandbox_id": task_run_id,
+                "sandbox_ids": set(),
+                "sample_count": 0,
+                "weighted_mean_sum": 0.0,
+                "max_value": 0.0,
+            },
+        )
+        sandbox_ids = group["sandbox_ids"]
+        assert isinstance(sandbox_ids, set)
+        sandbox_ids.add(item.sandbox_id)
+        group["sample_count"] = int(group["sample_count"]) + int(item.sample_count)
+        group["weighted_mean_sum"] = float(group["weighted_mean_sum"]) + float(item.mean_value) * int(item.sample_count)
+        group["max_value"] = max(float(group["max_value"]), float(item.max_value))
+    rows: list[dict[str, object]] = []
+    for (_metric_name, task_run_id), group in grouped.items():
+        task_summary = by_task_run.get(task_run_id)
+        sandbox_ids = sorted(set(task_summary.sandbox_ids if task_summary is not None else []) | set(group["sandbox_ids"]))
+        sample_count = int(group["sample_count"])
+        rows.append(
+            {
+                "metric_name": str(group["metric_name"]),
+                "task_run_id": task_run_id,
+                "sandbox_id": task_summary.sandbox_id if task_summary is not None else str(group["sandbox_id"]),
+                "sandbox_ids": sandbox_ids,
+                "sample_count": sample_count,
+                "mean_value": (float(group["weighted_mean_sum"]) / sample_count) if sample_count else 0.0,
+                "max_value": float(group["max_value"]),
+            }
+        )
+    rows.sort(key=lambda item: (str(item["metric_name"]), str(item["task_run_id"])))
     return rows
 
 
@@ -594,11 +749,12 @@ def _resource_host_figures(resource: ResourceAnalysisSummary) -> dict[str, str]:
     return figures
 
 
-def _sandbox_peak_rows(resource: ResourceAnalysisSummary, metric_name: str) -> list[tuple[str, float]]:
+def _task_run_peak_rows(resource: ResourceAnalysisSummary, tasks: list[TaskSummary], metric_name: str) -> list[tuple[str, float]]:
+    aggregated_rows = _aggregate_resource_rows(resource, tasks)
     rows = [
-        (summary.sandbox_id, summary.max_value)
-        for summary in resource.sandbox_metrics
-        if summary.metric_name == metric_name
+        (str(summary["task_run_id"]), float(summary["max_value"]))
+        for summary in aggregated_rows
+        if str(summary["metric_name"]) == metric_name
     ]
     rows.sort(key=lambda item: item[1], reverse=True)
     return rows[:12]
@@ -627,19 +783,19 @@ def build_figure_svgs(
             log_scale=log_scale,
         ),
         "task_latency.svg": _svg_bar_chart(
-            "Sandbox End-To-End Latency (ms)",
+            "Task-Run End-To-End Latency (ms)",
             _task_metric_rows(analysis.task_summaries, "benchmark.task.duration_ms")[:20],
             width=980,
             log_scale=log_scale,
         ),
         "task_run_latency.svg": _svg_bar_chart(
-            "Sandbox Pure Task Run Time (ms)",
+            "Task-Run Pure Task Run Time (ms)",
             _task_metric_rows(analysis.task_summaries, "benchmark.task.run.duration_ms")[:20],
             width=980,
             log_scale=log_scale,
         ),
         "task_queue_wait.svg": _svg_bar_chart(
-            "Sandbox Task Queue Wait (ms)",
+            "Task-Run Task Queue Wait (ms)",
             _task_metric_rows(analysis.task_summaries, "benchmark.task.queue_wait_ms")[:20],
             width=980,
             log_scale=log_scale,
@@ -656,6 +812,38 @@ def build_figure_svgs(
             log_scale=log_scale,
         ),
     }
+    if any("benchmark.spec.saved_ms" in task.metrics for task in analysis.task_summaries):
+        figures["spec_saved.svg"] = _svg_bar_chart(
+            "Task-Run Speculation Saved Time (ms)",
+            _task_metric_rows(analysis.task_summaries, "benchmark.spec.saved_ms")[:20],
+            width=980,
+            log_scale=log_scale,
+        )
+        figures["spec_penalty.svg"] = _svg_bar_chart(
+            "Task-Run Speculation Agent-Loop Penalty (ms)",
+            _task_metric_rows(analysis.task_summaries, "benchmark.spec.penalty_ms")[:20],
+            width=980,
+            log_scale=log_scale,
+        )
+        figures["spec_hidden_penalty.svg"] = _svg_bar_chart(
+            "Task-Run Speculation Hidden Reject Cost (ms)",
+            _task_metric_rows(analysis.task_summaries, "benchmark.spec.hidden_penalty_ms")[:20],
+            width=980,
+            log_scale=log_scale,
+        )
+        figures["spec_net_gain.svg"] = _svg_bar_chart(
+            "Task-Run Speculation Net Gain (ms)",
+            _task_metric_rows(analysis.task_summaries, "benchmark.spec.net_gain_ms")[:20],
+            width=980,
+            log_scale=log_scale,
+        )
+        figures["spec_accept_rate.svg"] = _svg_bar_chart(
+            "Task-Run Speculation Accept Rate",
+            _task_metric_rows(analysis.task_summaries, "benchmark.spec.accept_rate")[:20],
+            width=980,
+            log_scale=log_scale,
+            formatter=_format_percent,
+        )
     if analysis.checkpoint_analysis is not None:
         figures["checkpoint_load_jobs.svg"] = _svg_line_chart(
             "Checkpoint Load Over Time (Jobs)",
@@ -683,11 +871,24 @@ def build_figure_svgs(
             _overhead_series(analysis.overhead_analysis, window_size_seconds=window_size_seconds),
             formatter=_format_ms,
         )
-        gate_wait_cdf = analysis.overhead_analysis.cdf_series.get("llm.gate_wait_ms", [])
-        if gate_wait_cdf:
-            figures["overhead_llm.gate_wait_cdf.svg"] = _svg_cdf_chart(
-                "llm.gate_wait CDF",
-                gate_wait_cdf,
+        for metric_name, cdf_points in analysis.overhead_analysis.cdf_series.items():
+            if not cdf_points:
+                continue
+            figure_name = f"overhead_{_metric_figure_key(metric_name)}_cdf.svg"
+            figures[figure_name] = _svg_cdf_chart(
+                f"{_format_overhead_metric_label(metric_name)} CDF",
+                cdf_points,
+                formatter=_format_ms,
+            )
+            if metric_name == "llm.gate_wait_ms":
+                figures["overhead_llm.gate_wait_cdf.svg"] = figures[figure_name]
+    if analysis.spec_draft_overhead_analysis is not None:
+        for metric_name, cdf_points in analysis.spec_draft_overhead_analysis.cdf_series.items():
+            if not cdf_points:
+                continue
+            figures[f"spec_draft_{_metric_figure_key(metric_name)}_cdf.svg"] = _svg_cdf_chart(
+                f"Draft {_format_overhead_metric_label(metric_name)} CDF",
+                cdf_points,
                 formatter=_format_ms,
             )
     if analysis.turn_analysis is not None:
@@ -755,13 +956,13 @@ def build_figure_svgs(
                     "<p>No data.</p>",
                 ),
                 "resource_sandbox_cpu_peaks.svg": _svg_bar_chart(
-                    "Sandbox CPU Peak Usage",
-                    _sandbox_peak_rows(analysis.resource_analysis, "resource.sandbox.cpu.usage_percent"),
+                    "Task-Run CPU Peak Usage",
+                    _task_run_peak_rows(analysis.resource_analysis, analysis.task_summaries, "resource.sandbox.cpu.usage_percent"),
                     formatter=_format_number,
                 ),
                 "resource_sandbox_memory_peaks.svg": _svg_bar_chart(
-                    "Sandbox Memory Peak Usage",
-                    _sandbox_peak_rows(analysis.resource_analysis, "resource.sandbox.memory.peak_bytes"),
+                    "Task-Run Memory Peak Usage",
+                    _task_run_peak_rows(analysis.resource_analysis, analysis.task_summaries, "resource.sandbox.memory.peak_bytes"),
                     formatter=_format_bytes,
                 ),
             }
@@ -873,10 +1074,20 @@ def render_report_html(
     )
 
     task_metric_names = sorted({metric_name for task in analysis.task_summaries for metric_name in task.metrics})
+    task_run_lineage_table = _html_table(
+        ["Task Run", "Task", "Sandbox Count", "Sandboxes"],
+        _task_run_lineage_rows(analysis.task_summaries),
+    )
     task_table = _html_table(
-        ["Sandbox", "Task", "Agent", "LLM Service"] + task_metric_names,
+        ["Task Run", "Sandboxes", "Task", "Agent", "LLM Service"] + task_metric_names,
         [
-            [task.sandbox_id, task.task_id, task.agent_type, task.llm_service_type]
+            [
+                task.task_run_id,
+                _format_sandbox_membership(task.sandbox_ids, shorten=True),
+                task.task_id,
+                task.agent_type,
+                task.llm_service_type,
+            ]
             + [f"{task.metrics.get(metric_name, 0.0):.2f}" for metric_name in task_metric_names]
             for task in analysis.task_summaries
         ],
@@ -937,23 +1148,27 @@ def render_report_html(
                 ("Total Process Size", _format_bytes(checkpoint.total_process_size_bytes)),
                 ("Total Filesystem Written", _format_bytes(checkpoint.total_filesystem_written_bytes)),
                 ("Total Estimated I/O", _format_bytes(checkpoint.total_estimated_io_bytes)),
+                ("FS Sync Timeout Events", checkpoint.fs_sync_timeout_count),
+                ("FS Sync Timeout Sandboxes", checkpoint.fs_sync_timeout_sandbox_count),
             ],
         )
+        checkpoint_task_rows = _aggregate_operation_task_rows(checkpoint.per_task, analysis.task_summaries)
         checkpoint_task_table = _html_table(
-            ["Sandbox", "Task", "Count", "Succeeded", "Skipped", "Failed", "Success Rate", "Rate/Min", "Mean Estimated I/O"],
+            ["Task Run", "Sandboxes", "Task", "Count", "Succeeded", "Skipped", "Failed", "Success Rate", "Rate/Min", "Mean Estimated I/O"],
             [
                 (
-                    item.sandbox_id,
-                    item.task_id,
-                    item.total_count,
-                    item.success_count,
-                    item.skip_count,
-                    item.fail_count,
-                    f"{item.success_rate:.2%}",
-                    f"{item.per_minute_rate:.2f}",
-                    _format_bytes(item.mean_estimated_io_bytes),
+                    str(item["task_run_id"]),
+                    _format_sandbox_membership(list(item["sandbox_ids"]), shorten=True),
+                    str(item["task_id"]),
+                    int(item["total_count"]),
+                    int(item["success_count"]),
+                    int(item["skip_count"]),
+                    int(item["fail_count"]),
+                    f"{float(item['success_rate']):.2%}",
+                    f"{float(item['per_minute_rate']):.2f}",
+                    _format_bytes(float(item["mean_estimated_io_bytes"])),
                 )
-                for item in checkpoint.per_task
+                for item in checkpoint_task_rows
             ],
         )
         checkpoint_section = (
@@ -969,7 +1184,7 @@ def render_report_html(
             f"<section><h3>Process Checkpoint Latency Over Time</h3>{figures.get('checkpoint_process_latency.svg', '<p>No data.</p>')}</section>"
             f"<section><h3>Filesystem Checkpoint Latency Over Time</h3>{figures.get('checkpoint_filesystem_latency.svg', '<p>No data.</p>')}</section>"
             "</div>"
-            "<section><h3>Checkpoint Per Sandbox</h3>"
+            "<section><h3>Checkpoint Per Task Run</h3>"
             f"{checkpoint_task_table}"
             "</section>"
             "</section>"
@@ -994,6 +1209,12 @@ def render_report_html(
                 for item in overhead.metrics
             ],
         )
+        overhead_cdf_blocks = "".join(
+            f"<section><h3>{escape(_format_overhead_metric_label(metric_name))} CDF</h3>"
+            f"{figures.get(f'overhead_{_metric_figure_key(metric_name)}_cdf.svg', '<p>No data.</p>')}"
+            "</section>"
+            for metric_name in overhead.cdf_series
+        )
         overhead_section = (
             "<section><h2>Overhead Analysis</h2>"
             f"{overhead_note}"
@@ -1001,9 +1222,9 @@ def render_report_html(
             "<section><h3>Window-Aggregated Overhead Over Time</h3>"
             f"{figures.get('overhead_latency.svg', '<p>No data.</p>')}"
             "</section>"
-            "<section><h3>llm.gate_wait CDF</h3>"
-            f"{figures.get('overhead_llm.gate_wait_cdf.svg', '<p>No data.</p>')}"
-            "</section>"
+            "<div class='grid'>"
+            f"{overhead_cdf_blocks}"
+            "</div>"
             "</section>"
         )
 
@@ -1101,22 +1322,24 @@ def render_report_html(
                 ("Max Source Gap (ms)", _format_ms(restore.max_source_gap_ms)),
             ],
         )
+        restore_task_rows = _aggregate_operation_task_rows(restore.per_task, analysis.task_summaries)
         restore_task_table = _html_table(
-            ["Sandbox", "Task", "Count", "Succeeded", "Skipped", "Failed", "Success Rate", "Rate/Min", "Mean Gap Turns", "Mean Gap Ms"],
+            ["Task Run", "Sandboxes", "Task", "Count", "Succeeded", "Skipped", "Failed", "Success Rate", "Rate/Min", "Mean Gap Turns", "Mean Gap Ms"],
             [
                 (
-                    item.sandbox_id,
-                    item.task_id,
-                    item.total_count,
-                    item.success_count,
-                    item.skip_count,
-                    item.fail_count,
-                    f"{item.success_rate:.2%}",
-                    f"{item.per_minute_rate:.2f}",
-                    f"{item.mean_source_gap_turns:.2f}",
-                    _format_ms(item.mean_source_gap_ms),
+                    str(item["task_run_id"]),
+                    _format_sandbox_membership(list(item["sandbox_ids"]), shorten=True),
+                    str(item["task_id"]),
+                    int(item["total_count"]),
+                    int(item["success_count"]),
+                    int(item["skip_count"]),
+                    int(item["fail_count"]),
+                    f"{float(item['success_rate']):.2%}",
+                    f"{float(item['per_minute_rate']):.2f}",
+                    f"{float(item['mean_source_gap_turns']):.2f}",
+                    _format_ms(float(item["mean_source_gap_ms"])),
                 )
-                for item in restore.per_task
+                for item in restore_task_rows
             ],
         )
         restore_section = (
@@ -1132,7 +1355,7 @@ def render_report_html(
             f"<section><h3>Process Restore Latency Over Time</h3>{figures.get('restore_process_latency.svg', '<p>No data.</p>')}</section>"
             f"<section><h3>Filesystem Restore Latency Over Time</h3>{figures.get('restore_filesystem_latency.svg', '<p>No data.</p>')}</section>"
             "</div>"
-            "<section><h3>Restore Per Sandbox</h3>"
+            "<section><h3>Restore Per Task Run</h3>"
             f"{restore_task_table}"
             "</section>"
             "</section>"
@@ -1163,21 +1386,23 @@ def render_report_html(
                 for item in resource.host_metrics
             ],
         )
+        aggregated_resource_rows = _aggregate_resource_rows(resource, analysis.task_summaries)
         sandbox_metric_table = (
             _html_table(
-                ["Metric", "Sandbox", "Samples", "Mean", "Max"],
+                ["Metric", "Task Run", "Sandboxes", "Samples", "Mean", "Max"],
                 [
                     (
-                        item.metric_name,
-                        item.sandbox_id,
-                        item.sample_count,
-                        _format_number(item.mean_value) if "usage_percent" in item.metric_name else _format_bytes(item.mean_value),
-                        _format_number(item.max_value) if "usage_percent" in item.metric_name else _format_bytes(item.max_value),
+                        str(item["metric_name"]),
+                        str(item["task_run_id"]),
+                        _format_sandbox_membership(list(item["sandbox_ids"]), shorten=True),
+                        int(item["sample_count"]),
+                        _format_number(float(item["mean_value"])) if "usage_percent" in str(item["metric_name"]) else _format_bytes(float(item["mean_value"])),
+                        _format_number(float(item["max_value"])) if "usage_percent" in str(item["metric_name"]) else _format_bytes(float(item["max_value"])),
                     )
-                    for item in resource.sandbox_metrics[:50]
+                    for item in aggregated_resource_rows[:50]
                 ],
             )
-            if resource.sandbox_metrics
+            if aggregated_resource_rows
             else "<p>No sandbox resource metrics were captured in this telemetry input.</p>"
         )
         resource_section = (
@@ -1195,12 +1420,166 @@ def render_report_html(
             f"<section><h3>Host Network I/O</h3>{figures.get('resource_host_network.svg', '<p>No data.</p>')}</section>"
             "</div>"
             "<div class='grid'>"
-            f"<section><h3>Sandbox CPU Peaks</h3>{sandbox_cpu_block}</section>"
-            f"<section><h3>Sandbox Memory Peaks</h3>{sandbox_memory_block}</section>"
+            f"<section><h3>Task-Run CPU Peaks</h3>{sandbox_cpu_block}</section>"
+            f"<section><h3>Task-Run Memory Peaks</h3>{sandbox_memory_block}</section>"
             "</div>"
-            "<section><h3>Sandbox Breakdown</h3>"
+            "<section><h3>Task-Run Breakdown</h3>"
             f"{sandbox_metric_table}"
             "</section>"
+            "</section>"
+        )
+
+    spec_section = ""
+    if "spec_saved.svg" in figures or analysis.spec_draft_overhead_analysis is not None:
+        breakdown_html = ""
+        stb = analysis.spec_turn_breakdown
+        if stb is not None and stb.total > 0:
+            def _pct(n: int) -> str:
+                return f"{n / stb.total * 100:.1f}%"
+            breakdown_html = (
+                "<section><h3>Turn Outcome Breakdown</h3>"
+                "<table><thead><tr>"
+                "<th>Outcome</th><th>Count</th><th>%</th>"
+                "</tr></thead><tbody>"
+                f"<tr><td>Accepted</td><td>{stb.accepted}</td><td>{_pct(stb.accepted)}</td></tr>"
+                f"<tr><td>Rejected — command mismatch</td><td>{stb.rejected_command_mismatch}</td><td>{_pct(stb.rejected_command_mismatch)}</td></tr>"
+                f"<tr><td>Rejected — no fork available</td><td>{stb.rejected_no_fork}</td><td>{_pct(stb.rejected_no_fork)}</td></tr>"
+                f"<tr><td>Rejected — oracle won race</td><td>{stb.rejected_oracle_first}</td><td>{_pct(stb.rejected_oracle_first)}</td></tr>"
+                f"<tr style='font-weight:600'><td>Total turns</td><td>{stb.total}</td><td>100%</td></tr>"
+                "</tbody></table></section>"
+            )
+        reuse_html = ""
+        frs = analysis.spec_fork_reuse_stats
+        if frs is not None and frs.total_turns > 0:
+            total = frs.total_turns
+            finalized = frs.finalized_turns
+            def _tpct(n: int) -> str:
+                return f"{n / total * 100:.1f}%" if total > 0 else "—"
+            def _fpct(n: int) -> str:
+                return f"{n / finalized * 100:.1f}%" if finalized > 0 else "—"
+            fork_decisions = frs.forks_created + frs.forks_reused
+            reuse_rate = (
+                f"{frs.forks_reused / fork_decisions * 100:.1f}%"
+                if fork_decisions > 0
+                else "—"
+            )
+            gap_state_to_eligible = frs.state_unchanged - frs.cache_eligible
+            gap_eligible_to_reused = frs.cache_eligible - frs.forks_reused
+            reuse_html = (
+                "<section><h3>Fork Reuse</h3>"
+                "<p><strong>Reused</strong> turns skipped fork creation for the next speculative step by "
+                "consuming a fork cached from the prior turn. A fork is cached only when three conditions "
+                "hold: the prior turn was finalized (draft/oracle raced to completion), both sandboxes "
+                "finished at an unchanged state, and the reuse gate allowed it "
+                "(the draft exec had completed by the time the oracle finished, so the fork's "
+                "post-action state is well-defined).</p>"
+                "<table><thead><tr>"
+                "<th>Stage</th><th>Count</th><th>% of total turns</th>"
+                "</tr></thead><tbody>"
+                f"<tr><td>Total turns (all <code>spec.turn.finish</code>)</td>"
+                f"<td>{total}</td><td>100.0%</td></tr>"
+                f"<tr><td>&nbsp;&nbsp;Finalized turns (reached fork finalize)</td>"
+                f"<td>{finalized}</td><td>{_tpct(finalized)}</td></tr>"
+                f"<tr><td>&nbsp;&nbsp;&nbsp;&nbsp;State-unchanged</td>"
+                f"<td>{frs.state_unchanged}</td><td>{_tpct(frs.state_unchanged)}</td></tr>"
+                f"<tr><td>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Cache-eligible (state-unchanged ∧ reuse_candidate)</td>"
+                f"<td>{frs.cache_eligible}</td><td>{_tpct(frs.cache_eligible)}</td></tr>"
+                f"<tr><td>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Reused by next turn</td>"
+                f"<td>{frs.forks_reused}</td><td>{_tpct(frs.forks_reused)}</td></tr>"
+                "</tbody></table>"
+                "<table style='margin-top:0.75rem'><thead><tr>"
+                "<th>Funnel gap</th><th>Count</th><th>Explanation</th>"
+                "</tr></thead><tbody>"
+                "<tr><td>state-unchanged → cache-eligible</td>"
+                f"<td>{gap_state_to_eligible}</td>"
+                "<td>Rejected turns where the draft exec hadn't finished by oracle-finish "
+                "time. State snapshot looks clean, but the reuse gate refuses to cache because the "
+                f"draft's post-action state isn't yet defined ({frs.rejected_state_unchanged_draft_incomplete} "
+                "observed). Also includes retryable-failure finalize paths.</td></tr>"
+                "<tr><td>cache-eligible → reused</td>"
+                f"<td>{gap_eligible_to_reused}</td>"
+                "<td>Cached forks that the next turn never consumed — dominated by task boundaries "
+                "(the last turn of each task caches a fork no one reads) and cache invalidations "
+                "triggered by sandbox restore / recovery.</td></tr>"
+                "</tbody></table>"
+                "<table style='margin-top:0.75rem'><thead><tr>"
+                "<th>Fork source</th><th>Count</th><th>% of total turns</th>"
+                "</tr></thead><tbody>"
+                f"<tr><td>Forks created (fresh ZFS clone + checkpoint restore)</td>"
+                f"<td>{frs.forks_created}</td><td>{_tpct(frs.forks_created)}</td></tr>"
+                f"<tr><td>Forks reused (cache hit)</td>"
+                f"<td>{frs.forks_reused}</td><td>{_tpct(frs.forks_reused)}</td></tr>"
+                f"<tr><td>Reuse rate (reused / fork decisions)</td>"
+                f"<td colspan='2'>{reuse_rate}</td></tr>"
+                "</tbody></table>"
+                "<table style='margin-top:0.75rem'><thead><tr>"
+                "<th>Outcome (finalized turns only)</th><th>State unchanged</th><th>State changed</th>"
+                "</tr></thead><tbody>"
+                f"<tr><td>Accepted</td><td>{frs.accepted_state_unchanged} ({_fpct(frs.accepted_state_unchanged)})</td>"
+                f"<td>{frs.accepted_state_changed} ({_fpct(frs.accepted_state_changed)})</td></tr>"
+                f"<tr><td>Rejected</td><td>{frs.rejected_state_unchanged} ({_fpct(frs.rejected_state_unchanged)})</td>"
+                f"<td>{frs.rejected_state_changed} ({_fpct(frs.rejected_state_changed)})</td></tr>"
+                "</tbody></table>"
+                "<p style='margin-top:0.5rem;font-size:0.9em;color:#555'>"
+                "Reuse is disabled when <code>scenario_options.enable_fork_reuse</code> is off, "
+                "so <em>Forks reused</em> will be 0 even if cache-eligible turns are present. "
+                "Non-finalized turns (oracle-first, draft-failure, no-fork-available) bypass the "
+                "state check entirely and are excluded from the funnel below the first row.</p>"
+                "</section>"
+            )
+        draft_overhead_html = ""
+        if analysis.spec_draft_overhead_analysis is not None and analysis.spec_draft_overhead_analysis.metrics:
+            draft_overhead = analysis.spec_draft_overhead_analysis
+            draft_overhead_summary = _html_table(
+                ["Metric", "Count", "Mean (ms)", "Median (ms)", "Min (ms)", "Max (ms)", "P95 (ms)", "P99 (ms)"],
+                [
+                    (
+                        _format_overhead_metric_label(item.metric_name),
+                        item.count,
+                        f"{item.mean_ms:.2f}",
+                        f"{item.p50_ms:.2f}",
+                        f"{item.min_ms:.2f}",
+                        f"{item.max_ms:.2f}",
+                        f"{item.p95_ms:.2f}",
+                        f"{item.p99_ms:.2f}",
+                    )
+                    for item in draft_overhead.metrics
+                ],
+            )
+            draft_cdf_blocks = "".join(
+                f"<section><h3>Draft {escape(_format_overhead_metric_label(metric_name))} CDF</h3>"
+                f"{figures.get(f'spec_draft_{_metric_figure_key(metric_name)}_cdf.svg', '<p>No data.</p>')}"
+                "</section>"
+                for metric_name in draft_overhead.cdf_series
+            )
+            draft_overhead_html = (
+                "<section><h3>Draft Model Gate Delay</h3>"
+                "<p>Draft request gate-delay samples are excluded from the normal Overhead Analysis and summarized here.</p>"
+                f"{draft_overhead_summary}"
+                "<div class='grid'>"
+                f"{draft_cdf_blocks}"
+                "</div>"
+                "</section>"
+            )
+        spec_section = (
+            "<section><h2>Speculative Execution Summary</h2>"
+            "<p><strong>Penalty</strong> here means agent-loop-visible delay after a rejected draft. "
+            "<strong>Hidden reject cost</strong> captures rejected fork work that continued in the background "
+            "after the oracle path was already unblocked.</p>"
+            "<div class='grid'>"
+            f"<section><h3>Saved Time</h3>{figures.get('spec_saved.svg', '<p>No data.</p>')}</section>"
+            f"<section><h3>Agent-Loop Penalty</h3>{figures.get('spec_penalty.svg', '<p>No data.</p>')}</section>"
+            "</div>"
+            "<div class='grid'>"
+            f"<section><h3>Hidden Reject Cost</h3>{figures.get('spec_hidden_penalty.svg', '<p>No data.</p>')}</section>"
+            f"<section><h3>Net Gain</h3>{figures.get('spec_net_gain.svg', '<p>No data.</p>')}</section>"
+            "</div>"
+            "<div class='grid'>"
+            f"<section><h3>Accept Rate</h3>{figures.get('spec_accept_rate.svg', '<p>No data.</p>')}</section>"
+            f"{breakdown_html}"
+            "</div>"
+            f"{reuse_html}"
+            f"{draft_overhead_html}"
             "</section>"
         )
 
@@ -1288,15 +1667,15 @@ def render_report_html(
     </div>
     <div class="grid">
       <section><h2>Top Operations By P95 Latency</h2>{figures['top_tail_latency.svg']}</section>
-      <section><h2>Sandbox End-To-End Latency</h2>{figures['task_latency.svg']}</section>
+      <section><h2>Task-Run End-To-End Latency</h2>{figures['task_latency.svg']}</section>
     </div>
     <section>
       <h2>Task Timing Analysis</h2>
       {task_timing_table}
     </section>
     <div class="grid">
-      <section><h2>Sandbox Pure Task Run Time</h2>{figures['task_run_latency.svg']}</section>
-      <section><h2>Sandbox Task Queue Wait</h2>{figures['task_queue_wait.svg']}</section>
+      <section><h2>Task-Run Pure Task Run Time</h2>{figures['task_run_latency.svg']}</section>
+      <section><h2>Task-Run Task Queue Wait</h2>{figures['task_queue_wait.svg']}</section>
     </div>
     <div class="grid">
       <section><h2>Average LLM Path Breakdown</h2>{figures['llm_breakdown.svg']}</section>
@@ -1306,14 +1685,20 @@ def render_report_html(
     {overhead_section}
     {turn_section}
     {restore_section}
+    {spec_section}
     {resource_section}
     <section>
       <h2>Top Runtime Hotspots</h2>
       {operation_table}
     </section>
     <section>
-      <h2>Per-Sandbox Summary</h2>
+      <h2>Per-Task-Run Summary</h2>
       {task_table}
+    </section>
+    <section>
+      <h2>Task-Run Sandboxes</h2>
+      <p>This lineage view keeps the full sandbox membership list for each logical task run, even when the summary tables shorten the display.</p>
+      {task_run_lineage_table}
     </section>
     <section>
       <h2>Slowest Recorded Operations</h2>
@@ -1366,7 +1751,7 @@ def _operation_rows_for_csv(items: list[MetricSummary]) -> list[dict[str, object
 
 def _task_rows_for_csv(items: list[TaskSummary]) -> tuple[list[str], list[dict[str, object]]]:
     metric_names = sorted({metric_name for item in items for metric_name in item.metrics})
-    headers = ["sandbox_id", "task_id", "agent_type", "llm_service_type"] + metric_names
+    headers = ["sandbox_id", "task_id", "agent_type", "llm_service_type", "task_run_id", "sandbox_ids"] + metric_names
     rows = []
     for item in items:
         row = {
@@ -1374,6 +1759,8 @@ def _task_rows_for_csv(items: list[TaskSummary]) -> tuple[list[str], list[dict[s
             "task_id": item.task_id,
             "agent_type": item.agent_type,
             "llm_service_type": item.llm_service_type,
+            "task_run_id": item.task_run_id,
+            "sandbox_ids": ",".join(item.sandbox_ids),
         }
         for metric_name in metric_names:
             row[metric_name] = f"{item.metrics.get(metric_name, 0.0):.6f}"
@@ -1400,6 +1787,8 @@ def _checkpoint_rows_for_csv(checkpoint: CheckpointAnalysisSummary | None) -> tu
         {"metric": "total_process_size_bytes", "value": f"{checkpoint.total_process_size_bytes:.6f}"},
         {"metric": "total_filesystem_written_bytes", "value": f"{checkpoint.total_filesystem_written_bytes:.6f}"},
         {"metric": "total_estimated_io_bytes", "value": f"{checkpoint.total_estimated_io_bytes:.6f}"},
+        {"metric": "fs_sync_timeout_count", "value": checkpoint.fs_sync_timeout_count},
+        {"metric": "fs_sync_timeout_sandbox_count", "value": checkpoint.fs_sync_timeout_sandbox_count},
     ]
     for scope, count in sorted(checkpoint.scope_counts.items()):
         rows.append({"metric": f"scope_count.{scope}", "value": count})
@@ -1489,18 +1878,139 @@ def _turn_rows_for_csv(turn: TurnAnalysisSummary | None) -> tuple[list[str], lis
         )
     return headers, rows
 def _resource_rows_for_csv(resource: ResourceAnalysisSummary | None) -> tuple[list[str], list[dict[str, object]]]:
-    headers = ["metric_name", "sandbox_id", "sample_count", "mean_value", "max_value"]
+    headers = ["metric_name", "sandbox_id", "task_run_id", "sandbox_ids", "sample_count", "mean_value", "max_value"]
     if resource is None:
         return headers, []
     rows = [
         {
             "metric_name": item.metric_name,
-            "sandbox_id": item.sandbox_id,
+            "sandbox_id": "",
+            "task_run_id": "",
+            "sandbox_ids": "",
             "sample_count": item.sample_count,
             "mean_value": f"{item.mean_value:.6f}",
             "max_value": f"{item.max_value:.6f}",
         }
-        for item in [*resource.host_metrics, *resource.sandbox_metrics]
+        for item in resource.host_metrics
+    ]
+    return headers, rows
+
+
+def _checkpoint_task_rows_for_csv(
+    checkpoint: CheckpointAnalysisSummary | None,
+    tasks: list[TaskSummary],
+) -> tuple[list[str], list[dict[str, object]]]:
+    headers = [
+        "sandbox_id",
+        "task_id",
+        "task_run_id",
+        "sandbox_ids",
+        "total_count",
+        "success_count",
+        "skip_count",
+        "fail_count",
+        "success_rate",
+        "per_minute_rate",
+        "mean_estimated_io_bytes",
+    ]
+    if checkpoint is None:
+        return headers, []
+    rows = []
+    for item in _aggregate_operation_task_rows(checkpoint.per_task, tasks):
+        rows.append(
+            {
+                "sandbox_id": item["sandbox_id"],
+                "task_id": item["task_id"],
+                "task_run_id": item["task_run_id"],
+                "sandbox_ids": ",".join(item["sandbox_ids"]),
+                "total_count": item["total_count"],
+                "success_count": item["success_count"],
+                "skip_count": item["skip_count"],
+                "fail_count": item["fail_count"],
+                "success_rate": f"{float(item['success_rate']):.6f}",
+                "per_minute_rate": f"{float(item['per_minute_rate']):.6f}",
+                "mean_estimated_io_bytes": f"{float(item['mean_estimated_io_bytes']):.6f}",
+            }
+        )
+    return headers, rows
+
+
+def _restore_task_rows_for_csv(
+    restore: RestoreAnalysisSummary | None,
+    tasks: list[TaskSummary],
+) -> tuple[list[str], list[dict[str, object]]]:
+    headers = [
+        "sandbox_id",
+        "task_id",
+        "task_run_id",
+        "sandbox_ids",
+        "total_count",
+        "success_count",
+        "skip_count",
+        "fail_count",
+        "success_rate",
+        "per_minute_rate",
+        "mean_source_gap_turns",
+        "mean_source_gap_ms",
+        "mean_estimated_io_bytes",
+    ]
+    if restore is None:
+        return headers, []
+    rows = []
+    for item in _aggregate_operation_task_rows(restore.per_task, tasks):
+        rows.append(
+            {
+                "sandbox_id": item["sandbox_id"],
+                "task_id": item["task_id"],
+                "task_run_id": item["task_run_id"],
+                "sandbox_ids": ",".join(item["sandbox_ids"]),
+                "total_count": item["total_count"],
+                "success_count": item["success_count"],
+                "skip_count": item["skip_count"],
+                "fail_count": item["fail_count"],
+                "success_rate": f"{float(item['success_rate']):.6f}",
+                "per_minute_rate": f"{float(item['per_minute_rate']):.6f}",
+                "mean_source_gap_turns": f"{float(item['mean_source_gap_turns']):.6f}",
+                "mean_source_gap_ms": f"{float(item['mean_source_gap_ms']):.6f}",
+                "mean_estimated_io_bytes": f"{float(item['mean_estimated_io_bytes']):.6f}",
+            }
+        )
+    return headers, rows
+
+
+def _resource_task_run_rows_for_csv(
+    resource: ResourceAnalysisSummary | None,
+    tasks: list[TaskSummary],
+) -> tuple[list[str], list[dict[str, object]]]:
+    headers = ["metric_name", "sandbox_id", "task_run_id", "sandbox_ids", "sample_count", "mean_value", "max_value"]
+    if resource is None:
+        return headers, []
+    rows = _resource_rows_for_csv(resource)[1]
+    rows.extend(
+        {
+            "metric_name": str(item["metric_name"]),
+            "sandbox_id": str(item["sandbox_id"]),
+            "task_run_id": str(item["task_run_id"]),
+            "sandbox_ids": ",".join(item["sandbox_ids"]),
+            "sample_count": int(item["sample_count"]),
+            "mean_value": f"{float(item['mean_value']):.6f}",
+            "max_value": f"{float(item['max_value']):.6f}",
+        }
+        for item in _aggregate_resource_rows(resource, tasks)
+    )
+    return headers, rows
+
+
+def _task_run_lineage_rows_for_csv(tasks: list[TaskSummary]) -> tuple[list[str], list[dict[str, object]]]:
+    headers = ["task_run_id", "task_id", "sandbox_count", "sandbox_ids"]
+    rows = [
+        {
+            "task_run_id": task.task_run_id,
+            "task_id": task.task_id,
+            "sandbox_count": len(task.sandbox_ids),
+            "sandbox_ids": ",".join(task.sandbox_ids),
+        }
+        for task in tasks
     ]
     return headers, rows
 
@@ -1632,24 +2142,8 @@ def generate_report_bundle(
 
     headers, rows = _checkpoint_rows_for_csv(analysis.checkpoint_analysis)
     _write_csv(target_dir / "checkpoint_analysis.csv", headers, rows)
-    _write_csv(
-        target_dir / "checkpoint_per_task.csv",
-        ["sandbox_id", "task_id", "total_count", "success_count", "skip_count", "fail_count", "success_rate", "per_minute_rate", "mean_estimated_io_bytes"],
-        [
-            {
-                "sandbox_id": item.sandbox_id,
-                "task_id": item.task_id,
-                "total_count": item.total_count,
-                "success_count": item.success_count,
-                "skip_count": item.skip_count,
-                "fail_count": item.fail_count,
-                "success_rate": f"{item.success_rate:.6f}",
-                "per_minute_rate": f"{item.per_minute_rate:.6f}",
-                "mean_estimated_io_bytes": f"{item.mean_estimated_io_bytes:.6f}",
-            }
-            for item in ([] if analysis.checkpoint_analysis is None else analysis.checkpoint_analysis.per_task)
-        ],
-    )
+    headers, rows = _checkpoint_task_rows_for_csv(analysis.checkpoint_analysis, analysis.task_summaries)
+    _write_csv(target_dir / "checkpoint_per_task.csv", headers, rows)
     _write_csv(
         target_dir / "checkpoint_load.csv",
         ["timestamp", "offset_seconds", "active_jobs", "active_process_jobs", "active_filesystem_jobs", "active_estimated_io_bytes"],
@@ -1695,6 +2189,61 @@ def generate_report_bundle(
             for point in points
         ],
     )
+    headers, rows = _overhead_rows_for_csv(analysis.spec_draft_overhead_analysis)
+    _write_csv(target_dir / "spec_draft_overhead_analysis.csv", headers, rows)
+    _write_csv(
+        target_dir / "spec_draft_overhead_timeseries.csv",
+        ["metric_name", "timestamp", "offset_seconds", "value_ms"],
+        [
+            {
+                "metric_name": metric_name,
+                "timestamp": point.timestamp,
+                "offset_seconds": f"{point.offset_seconds:.6f}",
+                "value_ms": f"{point.value:.6f}",
+            }
+            for metric_name, points in (
+                [] if analysis.spec_draft_overhead_analysis is None else analysis.spec_draft_overhead_analysis.time_series.items()
+            )
+            for point in points
+        ],
+    )
+    _write_csv(
+        target_dir / "spec_draft_overhead_cdf.csv",
+        ["metric_name", "value_ms", "cumulative_probability"],
+        [
+            {
+                "metric_name": metric_name,
+                "value_ms": f"{point.value:.6f}",
+                "cumulative_probability": f"{point.cumulative_probability:.6f}",
+            }
+            for metric_name, points in (
+                [] if analysis.spec_draft_overhead_analysis is None else analysis.spec_draft_overhead_analysis.cdf_series.items()
+            )
+            for point in points
+        ],
+    )
+
+    frs = analysis.spec_fork_reuse_stats
+    if frs is not None:
+        _write_csv(
+            target_dir / "spec_fork_reuse.csv",
+            ["metric", "value"],
+            [
+                {"metric": "total_turns", "value": frs.total_turns},
+                {"metric": "finalized_turns", "value": frs.finalized_turns},
+                {"metric": "state_unchanged", "value": frs.state_unchanged},
+                {"metric": "cache_eligible", "value": frs.cache_eligible},
+                {"metric": "forks_created", "value": frs.forks_created},
+                {"metric": "forks_reused", "value": frs.forks_reused},
+                {"metric": "accepted_state_unchanged", "value": frs.accepted_state_unchanged},
+                {"metric": "accepted_state_changed", "value": frs.accepted_state_changed},
+                {"metric": "rejected_state_unchanged", "value": frs.rejected_state_unchanged},
+                {"metric": "rejected_state_changed", "value": frs.rejected_state_changed},
+                {"metric": "rejected_state_unchanged_draft_incomplete", "value": frs.rejected_state_unchanged_draft_incomplete},
+                {"metric": "gap_state_unchanged_to_cache_eligible", "value": frs.state_unchanged - frs.cache_eligible},
+                {"metric": "gap_cache_eligible_to_reused", "value": frs.cache_eligible - frs.forks_reused},
+            ],
+        )
 
     headers, rows = _turn_rows_for_csv(analysis.turn_analysis)
     _write_csv(target_dir / "turn_analysis.csv", headers, rows)
@@ -1752,26 +2301,8 @@ def generate_report_bundle(
     )
     headers, rows = _restore_rows_for_csv(analysis.restore_analysis)
     _write_csv(target_dir / "restore_analysis.csv", headers, rows)
-    _write_csv(
-        target_dir / "restore_per_task.csv",
-        ["sandbox_id", "task_id", "total_count", "success_count", "skip_count", "fail_count", "success_rate", "per_minute_rate", "mean_source_gap_turns", "mean_source_gap_ms", "mean_estimated_io_bytes"],
-        [
-            {
-                "sandbox_id": item.sandbox_id,
-                "task_id": item.task_id,
-                "total_count": item.total_count,
-                "success_count": item.success_count,
-                "skip_count": item.skip_count,
-                "fail_count": item.fail_count,
-                "success_rate": f"{item.success_rate:.6f}",
-                "per_minute_rate": f"{item.per_minute_rate:.6f}",
-                "mean_source_gap_turns": f"{item.mean_source_gap_turns:.6f}",
-                "mean_source_gap_ms": f"{item.mean_source_gap_ms:.6f}",
-                "mean_estimated_io_bytes": f"{item.mean_estimated_io_bytes:.6f}",
-            }
-            for item in ([] if analysis.restore_analysis is None else analysis.restore_analysis.per_task)
-        ],
-    )
+    headers, rows = _restore_task_rows_for_csv(analysis.restore_analysis, analysis.task_summaries)
+    _write_csv(target_dir / "restore_per_task.csv", headers, rows)
     _write_csv(
         target_dir / "restore_load.csv",
         ["timestamp", "offset_seconds", "active_jobs", "active_process_jobs", "active_filesystem_jobs", "active_estimated_io_bytes"],
@@ -1788,8 +2319,10 @@ def generate_report_bundle(
         ],
     )
 
-    headers, rows = _resource_rows_for_csv(analysis.resource_analysis)
+    headers, rows = _resource_task_run_rows_for_csv(analysis.resource_analysis, analysis.task_summaries)
     _write_csv(target_dir / "resource_summary.csv", headers, rows)
+    headers, rows = _task_run_lineage_rows_for_csv(analysis.task_summaries)
+    _write_csv(target_dir / "task_run_lineage.csv", headers, rows)
     resource_sample_rows: list[dict[str, object]] = []
     if analysis.resource_analysis is not None:
         for metric_name, points in analysis.resource_analysis.host_series.items():

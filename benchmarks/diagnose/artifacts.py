@@ -67,8 +67,8 @@ def load_artifacts(config_path: Path) -> LoadedArtifacts:
         csv_path=csv_path,
         telemetry_path=telemetry_path,
         configured_benchmark_root=None
-        if config.benchmark_root is None
-        else config.benchmark_root.resolve(),
+        if config.benchmark_root_home is None
+        else config.benchmark_root_home.resolve(),
         actual_benchmark_root=actual_root,
         inferred_run_roots=inferred_roots,
     )

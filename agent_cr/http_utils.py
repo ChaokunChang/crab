@@ -3,6 +3,8 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import http.client
 from http.server import HTTPServer
+import socket
+import time
 from threading import Lock, local
 from typing import Any
 from urllib.parse import urlsplit
@@ -11,6 +13,7 @@ from .json_codec import JsonCodec, get_json_codec
 
 
 DEFAULT_HTTP_SERVER_MAX_WORKERS = 32
+DEFAULT_HTTP_SERVER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 
 class HttpStatusError(RuntimeError):
@@ -31,27 +34,58 @@ class PooledHTTPServer(HTTPServer):
         RequestHandlerClass,
         *,
         max_workers: int | None = None,
+        shutdown_timeout_seconds: float | None = DEFAULT_HTTP_SERVER_SHUTDOWN_TIMEOUT_SECONDS,
     ) -> None:
         super().__init__(server_address, RequestHandlerClass)
         workers = DEFAULT_HTTP_SERVER_MAX_WORKERS if max_workers is None else max(1, int(max_workers))
         self._executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="agent-cr-http")
+        self._active_sockets_lock = Lock()
+        self._active_sockets: set[socket.socket] = set()
+        self._shutdown_timeout_seconds = shutdown_timeout_seconds
 
     def process_request(self, request, client_address) -> None:
+        with self._active_sockets_lock:
+            self._active_sockets.add(request)
         self._executor.submit(self._process_request_worker, request, client_address)
 
     def _process_request_worker(self, request, client_address) -> None:
         try:
-            self.finish_request(request, client_address)
-            self.shutdown_request(request)
-        except Exception:
-            self.handle_error(request, client_address)
-            self.shutdown_request(request)
+            try:
+                self.finish_request(request, client_address)
+            except Exception:
+                self.handle_error(request, client_address)
+            finally:
+                self.shutdown_request(request)
+        finally:
+            with self._active_sockets_lock:
+                self._active_sockets.discard(request)
 
     def server_close(self) -> None:
         try:
             super().server_close()
         finally:
-            self._executor.shutdown(wait=True, cancel_futures=True)
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            timeout = self._shutdown_timeout_seconds
+            workers = list(self._executor._threads) if hasattr(self._executor, "_threads") else []
+            deadline = None if timeout is None else (time.monotonic() + float(timeout))
+            for worker in workers:
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                worker.join(timeout=remaining)
+                if worker.is_alive():
+                    break
+            if any(worker.is_alive() for worker in workers):
+                with self._active_sockets_lock:
+                    active = list(self._active_sockets)
+                    self._active_sockets.clear()
+                for sock in active:
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
 
 
 class ThreadLocalHttpClient:
@@ -142,6 +176,12 @@ class ThreadLocalHttpClient:
             connections = list(self._connections)
             self._connections.clear()
         for connection in connections:
+            sock = getattr(connection, "sock", None)
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
             try:
                 connection.close()
             except Exception:

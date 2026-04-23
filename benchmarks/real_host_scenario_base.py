@@ -81,6 +81,7 @@ from integrations.llm_services import (
 from integrations.sandboxes.runtime import launcher as sandbox_launcher
 from integrations.sandboxes.runtime import network as sandbox_network
 from integrations.sandboxes.runtime import bundle as sandbox_bundle
+from integrations.sandboxes.runtime.bundle import SandboxResourceLimits
 from integrations.sandboxes.runtime import compose as sandbox_compose
 from integrations.sandboxes.runtime import image as sandbox_image
 from integrations.sandboxes import swebench as swebench_support
@@ -192,6 +193,16 @@ def _merge_runtime_launch_metadata(*parts: dict[str, object] | None) -> dict[str
     return merged
 
 
+def _normalize_benchmark_run_name(raw_value: object) -> str | None:
+    if raw_value is None:
+        return None
+    value = str(raw_value).strip()
+    path = Path(value)
+    if not value or path.is_absolute() or len(path.parts) != 1 or value in {".", ".."}:
+        raise ValueError("benchmark_run_name must be a single non-empty directory name")
+    return value
+
+
 def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -237,6 +248,130 @@ class PreparedBenchmarkSandbox:
     wait_for_ready_after_task_start: bool = False
     emit_ready_event: bool = True
     runtime_launched: bool = False
+
+
+class _SpeculativeSandboxController:
+    def __init__(
+        self,
+        harness: "RealHostScenarioHarness",
+        active_sandbox: SandboxHandle,
+        *,
+        fork_reuse_enabled: bool = False,
+        eager_cleanup_on_reject: bool = False,
+    ) -> None:
+        self._harness = harness
+        self._active_sandbox = active_sandbox
+        self._fork_name_root = str(active_sandbox.sandbox_id)
+        self._lock = threading.Lock()
+        self._cached_fork: SandboxHandle | None = None
+        self._fork_counter = 0
+        self._fork_epoch = 0
+        self._fork_reuse_enabled = bool(fork_reuse_enabled)
+        self.eager_cleanup_on_reject = bool(eager_cleanup_on_reject)
+
+    def ensure_fork(self):
+        with self._lock:
+            cached_fork = self._cached_fork
+            if cached_fork is not None:
+                return cached_fork, False, True
+            storage = self._harness.storage
+            if storage is None:
+                return None
+            checkpoints = storage.list_checkpoints(self._active_sandbox.sandbox_id)
+            if not checkpoints:
+                return None
+            checkpoint_id = checkpoints[-1]
+            self._fork_counter += 1
+            fork_epoch = self._fork_epoch
+            fork_name = f"{self._fork_name_root}-spec-{self._fork_counter}"
+        fork = self._harness.clone_checkpoint_to_fork(
+            self._active_sandbox,
+            checkpoint_id,
+            fork_name,
+        )
+        if fork.task_run is not None:
+            fork.task_run.configure_bundle()
+        try:
+            restore_result = self._harness.restore_once(fork, checkpoint_id)
+        except Exception:
+            logger.exception(
+                "Failed to restore speculative fork source=%s target=%s checkpoint=%s",
+                self._active_sandbox.sandbox_id,
+                fork.sandbox_id,
+                checkpoint_id,
+            )
+            self._harness.destroy_sandbox_dataset(fork)
+            return None
+        if restore_result.status.value != "succeeded":
+            logger.warning(
+                "Speculative fork restore did not succeed source=%s target=%s checkpoint=%s status=%s message=%s",
+                self._active_sandbox.sandbox_id,
+                fork.sandbox_id,
+                checkpoint_id,
+                restore_result.status.value,
+                restore_result.message,
+            )
+            self._harness.destroy_sandbox_dataset(fork)
+            return None
+        invalidate_stale_fork = False
+        with self._lock:
+            if fork_epoch != self._fork_epoch:
+                invalidate_stale_fork = True
+            else:
+                self._cached_fork = fork
+        if invalidate_stale_fork:
+            logger.debug(
+                "Discarding stale speculative fork after cache invalidation source=%s target=%s checkpoint=%s",
+                self._active_sandbox.sandbox_id,
+                fork.sandbox_id,
+                checkpoint_id,
+            )
+            self._harness.destroy_sandbox_dataset(fork)
+            return None
+        return fork, True, False
+
+    def promote_fork(self, fork: SandboxHandle) -> None:
+        with self._lock:
+            self._harness._copy_llm_router_state(
+                source_sandbox_id=self._active_sandbox.sandbox_id,
+                target_sandbox_id=fork.sandbox_id,
+            )
+            # Accepted speculative forks are ZFS clones of the current active
+            # sandbox. Promote the clone before we swap handles so releasing the
+            # old sandbox can delete its dataset without cascading into the new
+            # active sandbox.
+            self._harness._promote_filesystem_dataset(fork.sandbox_id)
+            self._harness._swap_speculative_sandbox_state(self._active_sandbox, fork)
+            if self._fork_reuse_enabled:
+                self._cached_fork = fork
+
+    def state_changed(self, sandbox: SandboxHandle) -> bool:
+        return self._harness.sandbox_state_changed(sandbox)
+
+    def invalidate_fork(self) -> None:
+        with self._lock:
+            fork = self._cached_fork
+            self._cached_fork = None
+            self._fork_epoch += 1
+        if fork is None:
+            return
+        try:
+            self._harness.destroy_sandbox_dataset(fork)
+        except Exception:
+            logger.exception("Failed to invalidate speculative fork sandbox=%s", fork.sandbox_id)
+
+    def release_fork(self, fork: SandboxHandle, *, reusable: bool, accepted: bool) -> None:
+        _ = accepted
+        with self._lock:
+            if reusable and self._fork_reuse_enabled:
+                self._cached_fork = fork
+                return
+            if self._cached_fork is fork:
+                self._cached_fork = None
+        try:
+            self._harness.destroy_sandbox_dataset(fork)
+        except Exception:
+            logger.exception("Failed to delete speculative fork sandbox=%s", fork.sandbox_id)
 
 
 class RealHostScenarioHarness:
@@ -668,6 +803,8 @@ PY
         telemetry_overflow_policy: str = "drop_new",
         telemetry_serializer: str = "auto",
         benchmark_root: Path | None = None,
+        benchmark_root_home: Path | None = None,
+        benchmark_run_name: str | None = None,
         zpool_size: str = "10G",
         zpool_name: str | None = None,
         zpool_image: Path | None = None,
@@ -682,11 +819,16 @@ PY
         monitoring_include_sandboxes: bool = True,
         llm_server_launch_mode: str = "process",
         host_inspector_launch_mode: str = "process",
+        host_inspector_log_level: str = "INFO",
+        host_inspector_log_file: bool = False,
         runtime_root: Path | None = None,
         storage_root: Path | None = None,
         agent_host_root: Path | None = None,
         expected_sandboxes: int | None = None,
         rootfs_reuse_enabled: bool = True,
+        sandbox_resource_limits: SandboxResourceLimits | None = None,
+        fork_reuse_enabled: bool = False,
+        eager_fork_cleanup_on_reject: bool = False,
     ) -> None:
         self.provider = provider
         self.transfer_delay_ms = transfer_delay_ms
@@ -708,7 +850,24 @@ PY
         self.telemetry_flush_interval_ms = telemetry_flush_interval_ms
         self.telemetry_overflow_policy = telemetry_overflow_policy
         self.telemetry_serializer = telemetry_serializer
-        self.configured_benchmark_root = None if benchmark_root is None else benchmark_root.expanduser().resolve()
+        configured_benchmark_root = (
+            None if benchmark_root is None else Path(benchmark_root).expanduser().resolve()
+        )
+        configured_benchmark_root_home = (
+            None if benchmark_root_home is None else Path(benchmark_root_home).expanduser().resolve()
+        )
+        if (
+            configured_benchmark_root is not None
+            and configured_benchmark_root_home is not None
+            and configured_benchmark_root != configured_benchmark_root_home
+        ):
+            raise ValueError(
+                "benchmark_root and benchmark_root_home are aliases; specify only one "
+                "or give them the same value"
+        )
+        self.configured_benchmark_root_home = configured_benchmark_root_home or configured_benchmark_root
+        self.configured_benchmark_root = self.configured_benchmark_root_home
+        self.configured_benchmark_run_name = _normalize_benchmark_run_name(benchmark_run_name)
         self.configured_runtime_root = None if runtime_root is None else runtime_root.expanduser().resolve()
         self.configured_storage_root = None if storage_root is None else storage_root.expanduser().resolve()
         self.configured_agent_host_root = None if agent_host_root is None else agent_host_root.expanduser().resolve()
@@ -726,8 +885,13 @@ PY
         self.monitoring_include_sandboxes = monitoring_include_sandboxes
         self.llm_server_launch_mode = llm_server_launch_mode
         self.host_inspector_launch_mode = host_inspector_launch_mode
+        self.host_inspector_log_level = host_inspector_log_level
+        self.host_inspector_log_file = host_inspector_log_file
         self.expected_sandboxes = expected_sandboxes
         self.rootfs_reuse_enabled = bool(rootfs_reuse_enabled)
+        self.sandbox_resource_limits = sandbox_resource_limits
+        self.fork_reuse_enabled = bool(fork_reuse_enabled)
+        self.eager_fork_cleanup_on_reject = bool(eager_fork_cleanup_on_reject)
         self._tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self.uses_temporary_root = False
         self.root: Path | None = None
@@ -742,6 +906,7 @@ PY
         self.host_inspector_url: str = ""
         self._host_inspector_server: HostInspectorServer | None = None
         self._host_inspector_process: subprocess.Popen[str] | None = None
+        self._host_inspector_process_log_path: Path | None = None
         self.host_inspector_client: HostInspectorServiceClient = None
         self.telemetry: TelemetrySink | None = None
         self.telemetry_path: Path | None = None
@@ -757,6 +922,7 @@ PY
         self.llm_server = None
         self.llm_thread: threading.Thread | None = None
         self.llm_process: subprocess.Popen[str] | None = None
+        self._llm_process_log_path: Path | None = None
         self.llm_server_base_url: str = ""
         self.llm_router_client: BenchmarkLLMRouterClient | None = None
         self.sandboxes: list[SandboxHandle] = []
@@ -819,21 +985,27 @@ PY
         self.runtime_state_root.mkdir(parents=True, exist_ok=True)
         if self.host_inspector_launch_mode == "process":
             port = _find_free_port()
-            self._host_inspector_process = subprocess.Popen(
-                self._host_inspector_subprocess_command(port=port),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
+            log_dir = self.root if self.root is not None else Path(tempfile.gettempdir())
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / "host-inspector.stderr.log"
+            self._host_inspector_process_log_path = log_path
+            log_fh = open(log_path, "w")
+            try:
+                self._host_inspector_process = subprocess.Popen(
+                    self._host_inspector_subprocess_command(port=port),
+                    stdout=log_fh,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            finally:
+                log_fh.close()
             url = f"http://{_HOST_INSPECTOR_HOST}:{port}"
             try:
                 wait_for_http_json(f"{url}/healthz")
             except Exception as exc:
                 if self._host_inspector_process is not None and self._host_inspector_process.poll() is not None:
                     returncode = self._host_inspector_process.returncode
-                    stderr_output = (
-                        "" if self._host_inspector_process.stderr is None else self._host_inspector_process.stderr.read()
-                    )
+                    stderr_output = self._read_subprocess_log_tail(self._host_inspector_process_log_path)
                     self._stop_host_inspector_server()
                     raise RuntimeError(
                         f"host inspector failed to start exit_code={returncode} stderr={stderr_output.strip()}"
@@ -895,6 +1067,41 @@ PY
                 self._host_inspector_process.wait(timeout=5.0)
             self._host_inspector_process = None
 
+    @staticmethod
+    def _generated_benchmark_run_name() -> str:
+        return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    @staticmethod
+    def _read_subprocess_log_tail(path: Path | None, *, max_bytes: int = 8192) -> str:
+        if path is None:
+            return ""
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(0, size - max_bytes))
+                return fh.read().decode("utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    def _resolve_benchmark_run_root(self) -> tuple[Path, bool]:
+        benchmark_root_home = self.configured_benchmark_root_home
+        if benchmark_root_home is None:
+            bench_dir = os.environ.get("AGENTCR_BENCH_DIR", None)
+            if bench_dir and bench_dir.lower() not in ["tmpdir", "tmp"]:
+                benchmark_root_home = Path(bench_dir).expanduser().resolve()
+        if benchmark_root_home is None:
+            if self.configured_benchmark_run_name is not None:
+                raise ValueError(
+                    "benchmark_run_name requires benchmark_root_home, benchmark_root, "
+                    "or AGENTCR_BENCH_DIR"
+                )
+            if self._tmpdir is None:
+                raise RuntimeError("temporary benchmark root has not been initialized")
+            return Path(self._tmpdir.name), True
+        run_name = self.configured_benchmark_run_name or self._generated_benchmark_run_name()
+        return benchmark_root_home / run_name, False
+
     def __enter__(self) -> "RealHostScenarioHarness":
         require_binaries()
         self.network_manager.configure(expected_sandboxes=self.expected_sandboxes)
@@ -904,18 +1111,7 @@ PY
             self.network_manager.bridge_ip,
         )
         self._tmpdir = tempfile.TemporaryDirectory(prefix="agent_cr_scenario_bench_")
-        benchmark_root = self.configured_benchmark_root
-        if benchmark_root is None:
-            bench_dir = os.environ.get("AGENTCR_BENCH_DIR", None)
-            if bench_dir and bench_dir.lower() not in ["tmpdir", "tmp"]:
-                benchmark_root = Path(bench_dir).expanduser().resolve()
-        if benchmark_root is not None:
-            suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.root = benchmark_root / suffix
-            self.uses_temporary_root = False
-        else:
-            self.root = Path(self._tmpdir.name)
-            self.uses_temporary_root = True
+        self.root, self.uses_temporary_root = self._resolve_benchmark_run_root()
         unique_suffix = uuid.uuid4().hex[:10]
         self.pool_name = self.configured_zpool_name or f"agentcrbench{unique_suffix}"
         zpool_image_path = self.configured_zpool_image or (self.root / "zpool.img")
@@ -952,7 +1148,7 @@ PY
         self._ensure_zpool()
 
         self.host_inspector_client = HostInspectorServiceClient(self.host_inspector_url)
-        self.base_inspector = RemoteSandboxInspector(self.host_inspector_client)
+        self.base_inspector = RemoteSandboxInspector(self.host_inspector_client, telemetry=self.telemetry)
         self.inspector = RequestAwareSandboxInspector(self.base_inspector, self.request_state_store)
         self.runtime = RuncRuntime(
             paths=RuncRuntimePaths(
@@ -1163,6 +1359,7 @@ PY
         )
 
     def _llm_router_subprocess_command(self, *, port: int) -> list[str]:
+        router_workers = self._llm_router_max_workers()
         command = [
             sys.executable,
             "-m",
@@ -1188,7 +1385,7 @@ PY
             "--telemetry-serializer",
             self.telemetry_serializer,
             "--max-workers",
-            str(max(1, self.max_workers)),
+            str(router_workers),
         ]
         if self.telemetry_path is not None:
             command.extend(["--telemetry-jsonl", str(self.telemetry_path)])
@@ -1202,7 +1399,7 @@ PY
 
     def _host_inspector_subprocess_command(self, *, port: int) -> list[str]:
         assert self.runtime_state_root is not None
-        return [
+        command = [
             sys.executable,
             "-m",
             "agent_cr.host_inspector.server",
@@ -1214,7 +1411,21 @@ PY
             str(self.runtime_state_root),
             "--max-workers",
             str(max(1, self.max_workers)),
+            "--log-level",
+            self.host_inspector_log_level,
         ]
+        if self.host_inspector_log_file and self.root is not None:
+            log_file = self.root / "host-inspector.log"
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            command.extend(["--log-file", str(log_file)])
+        return command
+
+    def _llm_router_max_workers(self) -> int:
+        # Speculative replay can issue both draft and oracle requests per active
+        # sandbox while agents also poll the control plane for router state.
+        # Keep the router pool comfortably above benchmark concurrency so
+        # control endpoints are not starved by delayed replay responses.
+        return max(32, max(1, self.max_workers) * 4)
 
     def _start_llm_server(self) -> None:
         if self.llm_server_launch_mode not in {"process", "thread"}:
@@ -1226,19 +1437,27 @@ PY
                 host="127.0.0.1",
                 port=0,
                 telemetry=self.telemetry,
-                max_workers=max(1, self.max_workers),
+                max_workers=self._llm_router_max_workers(),
             )
             self.llm_thread = threading.Thread(target=self.llm_server.serve_forever, daemon=True)
             self.llm_thread.start()
             port = int(self.llm_server.server_address[1])
         else:
             port = _find_free_port()
-            self.llm_process = subprocess.Popen(
-                self._llm_router_subprocess_command(port=port),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
+            log_dir = self.root if self.root is not None else Path(tempfile.gettempdir())
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / "llm-router.log"
+            self._llm_process_log_path = log_path
+            log_fh = open(log_path, "w")
+            try:
+                self.llm_process = subprocess.Popen(
+                    self._llm_router_subprocess_command(port=port),
+                    stdout=log_fh,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            finally:
+                log_fh.close()
         self.llm_server_base_url = f"http://127.0.0.1:{port}"
         self.llm_router_client = BenchmarkLLMRouterClient(self.llm_server_base_url)
         try:
@@ -1246,7 +1465,7 @@ PY
         except Exception as exc:
             if self.llm_process is not None and self.llm_process.poll() is not None:
                 returncode = self.llm_process.returncode
-                stderr_output = "" if self.llm_process.stderr is None else self.llm_process.stderr.read()
+                stderr_output = self._read_subprocess_log_tail(self._llm_process_log_path)
                 self._stop_llm_server()
                 raise RuntimeError(
                     f"benchmark llm router failed to start exit_code={returncode} stderr={stderr_output.strip()}"
@@ -1350,6 +1569,63 @@ PY
             return
         raise RuntimeError("llm router is not initialized")
 
+    def _copy_llm_router_state(self, *, source_sandbox_id: SandboxId, target_sandbox_id: SandboxId) -> None:
+        if self.llm_router_client is not None:
+            self.llm_router_client.copy_sandbox_state(
+                source_sandbox_id=str(source_sandbox_id),
+                target_sandbox_id=str(target_sandbox_id),
+            )
+            return
+        if self.llm_server is not None:
+            self.llm_server.benchmark_llm_router.copy_sandbox_state(  # type: ignore[attr-defined]
+                source_sandbox_id=str(source_sandbox_id),
+                target_sandbox_id=str(target_sandbox_id),
+            )
+            return
+        raise RuntimeError("llm router is not initialized")
+
+    def sandbox_state_changed(self, sandbox: SandboxHandle) -> bool:
+        assert self.base_inspector is not None
+        snapshot = self.base_inspector.inspect(sandbox.sandbox_id)
+        return bool(snapshot.process_changed or snapshot.filesystem_changed)
+
+    def _swap_speculative_sandbox_state(self, active: SandboxHandle, fork: SandboxHandle) -> None:
+        active_id = active.sandbox_id
+        fork_id = fork.sandbox_id
+        active_bundle_dir = active.bundle_dir
+        active_status_port = active.status_port
+        active_status_host = active.status_host
+        active_llm_base_url = active.llm_base_url
+        active_llm_control_base_url = active.llm_control_base_url
+        active_last_status = dict(active.last_status)
+        active_launch_source = active.launch_source
+        active_launch_metadata = dict(active.launch_metadata)
+
+        active.sandbox_id = fork_id
+        active.bundle_dir = fork.bundle_dir
+        active.status_port = fork.status_port
+        active.status_host = fork.status_host
+        active.llm_base_url = fork.llm_base_url
+        active.llm_control_base_url = fork.llm_control_base_url
+        active.last_status = dict(fork.last_status)
+        active.launch_source = fork.launch_source
+        active.launch_metadata = dict(fork.launch_metadata)
+
+        fork.sandbox_id = active_id
+        fork.bundle_dir = active_bundle_dir
+        fork.status_port = active_status_port
+        fork.status_host = active_status_host
+        fork.llm_base_url = active_llm_base_url
+        fork.llm_control_base_url = active_llm_control_base_url
+        fork.last_status = active_last_status
+        fork.launch_source = active_launch_source
+        fork.launch_metadata = active_launch_metadata
+        fork.task_run = None
+        fork.task_future = None
+
+        self._sandbox_by_id[active.sandbox_id] = active
+        self._sandbox_by_id[fork.sandbox_id] = fork
+
     def _ensure_zpool(self) -> None:
         assert self.root is not None
         dataset = f"{self.pool_name}/agent-cr"
@@ -1402,6 +1678,14 @@ PY
         task_description: TaskDescription,
         task_config: TaskConfig,
     ) -> BaseAgent:
+        extra_kwargs: dict[str, object] = {}
+        if agent_type == "mini_swe" and sandbox.llm_service_type == "mini_swe_spec_trace_replay":
+            extra_kwargs["speculation_controller"] = _SpeculativeSandboxController(
+                self,
+                sandbox,
+                fork_reuse_enabled=self.fork_reuse_enabled,
+                eager_cleanup_on_reject=self.eager_fork_cleanup_on_reject,
+            )
         return self.get_agent_class(agent_type)(
             sandbox,
             task_description,
@@ -1411,10 +1695,34 @@ PY
             agent_host_dir=self._effective_agent_host_root() / agent_type / str(sandbox.sandbox_id),
             llm_base_url=sandbox.llm_base_url,
             telemetry=self.telemetry,
+            **extra_kwargs,
         )
 
     def _agent_requires_benchmark_network(self, agent_type: str) -> bool:
         return bool(self.get_agent_class(agent_type).requires_network_namespace)
+
+    def _sandbox_requires_benchmark_network(self, sandbox: SandboxHandle) -> bool:
+        if self._agent_requires_benchmark_network(sandbox.agent_type):
+            return True
+        lease_for = getattr(self.network_manager, "lease_for", None)
+        if callable(lease_for) and lease_for(sandbox.sandbox_id) is not None:
+            return True
+        config_path = sandbox.bundle_dir / "config.json"
+        if not config_path.is_file():
+            return False
+        try:
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.debug(
+                "Failed to inspect sandbox bundle for network namespace usage sandbox=%s",
+                sandbox.sandbox_id,
+                exc_info=True,
+            )
+            return False
+        namespaces = payload.get("linux", {}).get("namespaces", [])
+        if not isinstance(namespaces, list):
+            return False
+        return any(isinstance(namespace, dict) and namespace.get("type") == "network" for namespace in namespaces)
 
     def resolve_llm_service_type(self, *, agent_type: str, llm_service_type: str | None) -> str:
         resolved = llm_service_type or default_llm_service_type_for_agent(agent_type)
@@ -1622,6 +1930,7 @@ PY
             "component": "benchmark",
             "sandbox_id": str(sandbox.sandbox_id),
             "task_id": benchmark_core.task_id_for_sandbox(sandbox),
+            "task_run_id": benchmark_core.task_run_id_for_sandbox(sandbox),
             "agent_type": sandbox.agent_type,
             "llm_service_type": sandbox.llm_service_type,
             "task_attempt": self._task_attempts.get(str(sandbox.sandbox_id), 0),
@@ -1850,6 +2159,7 @@ PY
     ) -> None:
         handle.launch_metadata["benchmark"] = {
             "task_id": task_record.task_id or (task_record.task_root.name if task_record.task_root is not None else sandbox_name),
+            "task_run_id": sandbox_name,
             "trace_response_count": task_record.trace_response_count,
             "trace_malformed_line_count": task_record.trace_malformed_line_count,
             "llm_service_config": None if task_record.llm_service_config is None else dict(task_record.llm_service_config),
@@ -2847,14 +3157,24 @@ PY
         try:
             self.runtime.describe(sandbox.sandbox_id)
         except KeyError:
+            self._unregister_host_inspector(sandbox.sandbox_id)
             self._unregister_llm_service(sandbox.sandbox_id)
             self.network_manager.release_lease(sandbox.sandbox_id)
             self._sandbox_by_id.pop(sandbox.sandbox_id, None)
+            self._drop_sandbox_from_registry(sandbox)
             return
         self._destroy_filesystem_dataset(sandbox.sandbox_id)
+        self._unregister_host_inspector(sandbox.sandbox_id)
         self._unregister_llm_service(sandbox.sandbox_id)
         self.network_manager.release_lease(sandbox.sandbox_id)
         self._sandbox_by_id.pop(sandbox.sandbox_id, None)
+        self._drop_sandbox_from_registry(sandbox)
+
+    def _drop_sandbox_from_registry(self, sandbox: SandboxHandle) -> None:
+        try:
+            self.sandboxes.remove(sandbox)
+        except ValueError:
+            pass
 
     def _relaunch_sandbox(
         self,
@@ -2940,7 +3260,7 @@ PY
 
         network_lease = (
             self.network_manager.allocate_lease(SandboxId(fork_name))
-            if self._agent_requires_benchmark_network(source.agent_type)
+            if self._sandbox_requires_benchmark_network(source)
             else None
         )
         target, work_dir_host_path = self._prepare_sandbox_handle(
@@ -3048,6 +3368,7 @@ PY
         )
         self.runtime._items[target.sandbox_id] = description
         self.runtime._persist(description)
+        inherited_checkpoint_at = manifests[checkpoint_id].created_at
         self.base_inspector.upsert_snapshot(
             SandboxSnapshot(
                 sandbox_id=target.sandbox_id,
@@ -3056,8 +3377,14 @@ PY
                 process_changed=False,
                 filesystem_changed=False,
                 observed_at=utc_now(),
+                last_checkpoint_at=inherited_checkpoint_at,
             )
         )
+        if self.system is not None:
+            self.system.scheduler.mark_checkpoint_complete(
+                target.sandbox_id,
+                inherited_checkpoint_at,
+            )
         target.agent_type = source.agent_type
         target.llm_service_type = source.llm_service_type
         target.llm_base_url = source.llm_base_url
@@ -3130,6 +3457,7 @@ PY
             network_namespace_path=None if network_lease is None else network_lease.namespace_path,
             image_defaults=None if sandbox_image is None else sandbox_image.image_defaults,
             image_rootfs_dir=None if sandbox_image is None else sandbox_image.exported_rootfs,
+            resource_limits=self.sandbox_resource_limits,
         )
         if target.task_run is not None and target.agent_type != "simulated":
             target.task_run.configure_bundle()
@@ -3230,6 +3558,20 @@ PY
         if self.runtime is None or not hasattr(self.runtime, "destroy_filesystem_dataset"):
             return
         self.runtime.destroy_filesystem_dataset(sandbox_id)
+
+    def _unregister_host_inspector(self, sandbox_id: SandboxId) -> None:
+        client = self.host_inspector_client
+        if client is None:
+            return
+        try:
+            client.unregister_sandbox(sandbox_id)
+        except Exception:
+            logger.exception("Failed to unregister sandbox %s from host inspector", sandbox_id)
+
+    def _promote_filesystem_dataset(self, sandbox_id: SandboxId) -> None:
+        if self.runtime is None or not hasattr(self.runtime, "promote_filesystem_dataset"):
+            return
+        self.runtime.promote_filesystem_dataset(sandbox_id)
 
     def _dataset_name_for(self, sandbox_id: SandboxId) -> str:
         if self.runtime is not None and hasattr(self.runtime, "dataset_name_for"):
@@ -3576,6 +3918,203 @@ PY
             f"stderr={last_result.stderr.rstrip()}"
         )
 
+    @staticmethod
+    def _legacy_cython_pin_script() -> str:
+        # swebench sklearn testbeds for commits ~0.20–0.22 ship a Python 3.6
+        # conda env. The replay agent's trajectory for tasks like
+        # scikit-learn-14710 runs `pip install cython` without a version
+        # pin, which upgrades the testbed env to Cython 3.x. A subsequent
+        # `pip install -e .` then regenerates .pyx→.c with Cython 3.x,
+        # producing sources that start with `#error Cython requires
+        # Python 3.8+.` swebench's verification `pip install -e .` then
+        # fails to compile against the testbed's Python 3.6. We fix this
+        # surgically before verification by (1) forcing Cython<3 into the
+        # testbed env and (2) deleting any .c files that carry the
+        # Cython-3.x Python-3.8 marker so setup.py's build_src
+        # regenerates them via the pinned Cython.
+        return r"""
+set -uo pipefail
+_run() {
+  local TESTBED_PY=/opt/miniconda3/envs/testbed/bin/python
+  local TESTBED_PIP=/opt/miniconda3/envs/testbed/bin/pip
+  if [ ! -x "$TESTBED_PY" ]; then echo "SKIP: no testbed python at $TESTBED_PY"; return 0; fi
+  local py
+  py=$("$TESTBED_PY" -c 'import sys; print(sys.version_info[0]*100 + sys.version_info[1])' 2>&1) || { echo "SKIP: python version probe failed: $py"; return 0; }
+  echo "testbed_python_version_code=$py"
+  if [ "$py" -ge 308 ]; then echo "SKIP: python >= 3.8"; return 0; fi
+  local cur
+  cur=$("$TESTBED_PY" -c 'import Cython; print(Cython.__version__)' 2>&1) || cur=absent
+  echo "current_cython=$cur"
+  local need_pin=0
+  case "$cur" in
+    0.*) echo "cython already 0.x, skip pip install" ;;
+    *) need_pin=1 ;;
+  esac
+  if [ $need_pin -eq 1 ]; then
+    echo "INSTALL: pip install cython<3"
+    local pip_out rc
+    pip_out=$("$TESTBED_PIP" install --no-input --disable-pip-version-check 'cython<3' 2>&1)
+    rc=$?
+    echo "pip_rc=$rc"
+    echo "$pip_out" | tail -5
+    local after
+    after=$("$TESTBED_PY" -c 'import Cython; print(Cython.__version__)' 2>&1) || after=?
+    echo "cython_after_install=$after"
+  fi
+  # Scrub poisoned Cython outputs left by the agent's Cython 3.x build.
+  # These begin with `#error Cython requires Python 3.8+.` and appear in
+  # both .c and .cpp form depending on whether the .pyx targets C or
+  # C++. Deleting them forces numpy.distutils.build_src to re-cythonize
+  # from .pyx using the pinned testbed Cython.
+  local src=/testbed
+  if [ -d "$src" ]; then
+    local scrubbed=0 gen_file
+    while IFS= read -r -d '' gen_file; do
+      if head -n 80 "$gen_file" 2>/dev/null | grep -q "Cython requires Python 3.8+"; then
+        rm -f "$gen_file"
+        scrubbed=$((scrubbed + 1))
+      fi
+    done < <(find "$src" \( -name '*.c' -o -name '*.cpp' -o -name '*.cxx' \) -print0 2>/dev/null)
+    echo "scrubbed_poisoned_sources=$scrubbed"
+  fi
+}
+_run
+""".strip()
+
+    def _ensure_legacy_cython_pin(
+        self, sandbox: SandboxHandle, *, timeout_s: float | None = None
+    ) -> None:
+        budget = 180.0 if timeout_s is None else max(30.0, min(float(timeout_s), 240.0))
+        result = self.exec_in_sandbox(
+            sandbox,
+            ["/bin/bash", "-lc", self._legacy_cython_pin_script()],
+            cwd=self.sandbox_process_cwd(sandbox),
+            timeout_s=budget,
+        )
+        logger.info(
+            "legacy cython pin prelude sandbox=%s exit_code=%s log=%s",
+            sandbox.sandbox_id,
+            result.returncode,
+            result.stdout.rstrip().replace("\n", " | "),
+        )
+
+    @staticmethod
+    def _psf_requests_local_httpbin_wrapper(inner_command: str) -> str:
+        # psf/requests tests read HTTPBIN from
+        # `os.environ.get('HTTPBIN_URL', 'http://httpbin.org/')`, defaulting
+        # to public httpbin.org. At high benchmark concurrency that service
+        # rate-limits and returns 502, flaking PASS_TO_PASS tests like
+        # test_unicode_multipart_post and test_mixed_case_scheme_acceptable.
+        # Swap in a per-sandbox loopback httpbin. test_mixed_case_scheme_acceptable
+        # probes both http:// and HTTPS:// schemes against the same netloc, so
+        # we bind one process listening on 127.0.0.1:80 (HTTP) and 127.0.0.1:443
+        # (HTTPS via self-signed cert) — matching how public httpbin.org exposes
+        # both schemes on the same hostname. The testbed env's requests CA
+        # bundle is extended with our self-signed cert so HTTPS verifies cleanly.
+        # The sandbox has CAP_NET_BIND_SERVICE so privileged ports are bindable
+        # as root. Install + cert are no-ops after the first run because the
+        # base env and /tmp state persist inside the rootfs.
+        return rf"""
+set -uo pipefail
+BASE_PY=/opt/miniconda3/bin/python
+BASE_PIP=/opt/miniconda3/bin/pip
+HTTPBIN_PID=""
+HTTPBIN_ACTIVE=0
+if [ ! -x "$BASE_PY" ]; then
+  echo "psf_requests_httpbin: SKIP no base python"
+else
+  if ! "$BASE_PY" -c 'import httpbin, flask, cryptography' >/dev/null 2>&1; then
+    echo "psf_requests_httpbin: installing httpbin+flask+cryptography"
+    "$BASE_PIP" install --no-input --disable-pip-version-check --quiet \
+      'httpbin' 'Flask<3' 'Werkzeug<3' 'brotli' 'cryptography' 'pyOpenSSL' 2>&1 | tail -5 || true
+  fi
+  # v2 cert path: older urllib3 vendored in psf/requests only checks DNS SANs
+  # (ignores IP SANs) and never falls back to CN when any DNS SAN is present.
+  # To satisfy both old and new stacks we omit DNS SAN entries entirely so old
+  # urllib3 falls back to CN="127.0.0.1" while modern stacks match IP SAN.
+  CERT=/tmp/agent-cr-httpbin-v2.crt
+  KEY=/tmp/agent-cr-httpbin-v2.key
+  if [ ! -s "$CERT" ] || [ ! -s "$KEY" ]; then
+    "$BASE_PY" - <<'PYCERT' >/tmp/agent-cr-httpbin-cert.log 2>&1 || true
+import datetime, ipaddress
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+now = datetime.datetime.utcnow()
+subj = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
+cert = (x509.CertificateBuilder()
+    .subject_name(subj).issuer_name(subj)
+    .public_key(key.public_key())
+    .serial_number(x509.random_serial_number())
+    .not_valid_before(now - datetime.timedelta(days=1))
+    .not_valid_after(now + datetime.timedelta(days=3650))
+    .add_extension(x509.SubjectAlternativeName([
+        x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+    ]), critical=False)
+    .sign(key, hashes.SHA256()))
+open("/tmp/agent-cr-httpbin-v2.key","wb").write(key.private_bytes(
+    serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL,
+    serialization.NoEncryption()))
+open("/tmp/agent-cr-httpbin-v2.crt","wb").write(cert.public_bytes(serialization.Encoding.PEM))
+PYCERT
+  fi
+  if [ -s "$CERT" ] && [ -s "$KEY" ]; then
+    setsid "$BASE_PY" - >/tmp/agent-cr-httpbin.log 2>&1 <<PYRUN &
+import threading, ssl
+from httpbin import app
+from werkzeug.serving import make_server
+ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+ctx.load_cert_chain("$CERT", "$KEY")
+http_srv = make_server("127.0.0.1", 80, app, threaded=True)
+https_srv = make_server("127.0.0.1", 443, app, threaded=True, ssl_context=ctx)
+t1 = threading.Thread(target=http_srv.serve_forever, daemon=True)
+t2 = threading.Thread(target=https_srv.serve_forever, daemon=True)
+t1.start(); t2.start()
+t1.join(); t2.join()
+PYRUN
+    HTTPBIN_PID=$!
+    up_http=0; up_https=0
+    for i in $(seq 1 150); do
+      if [ "$up_http" -eq 0 ] && curl -s -f -o /dev/null "http://127.0.0.1/get"; then up_http=1; fi
+      if [ "$up_https" -eq 0 ] && curl -s -f -k -o /dev/null "https://127.0.0.1/get"; then up_https=1; fi
+      if [ "$up_http" -eq 1 ] && [ "$up_https" -eq 1 ]; then break; fi
+      sleep 0.1
+    done
+    if [ "$up_http" -eq 1 ] && [ "$up_https" -eq 1 ]; then
+      echo "psf_requests_httpbin: ready http+https pid=$HTTPBIN_PID"
+      export HTTPBIN_URL="http://127.0.0.1/"
+      TESTBED_PY=/opt/miniconda3/envs/testbed/bin/python
+      if [ -x "$TESTBED_PY" ]; then
+        CA_BUNDLE=$("$TESTBED_PY" -c 'import requests; print(requests.certs.where())' 2>/dev/null || echo "")
+        if [ -n "$CA_BUNDLE" ] && [ -f "$CA_BUNDLE" ]; then
+          if ! grep -q "agent-cr-httpbin" "$CA_BUNDLE" 2>/dev/null; then
+            printf '\n# agent-cr-httpbin self-signed\n' >> "$CA_BUNDLE"
+            cat "$CERT" >> "$CA_BUNDLE"
+          fi
+          export REQUESTS_CA_BUNDLE="$CA_BUNDLE"
+          export SSL_CERT_FILE="$CA_BUNDLE"
+        fi
+      fi
+      HTTPBIN_ACTIVE=1
+      trap 'kill -9 $HTTPBIN_PID 2>/dev/null || true' EXIT
+    else
+      echo "psf_requests_httpbin: FAIL http=$up_http https=$up_https pid=$HTTPBIN_PID"
+      tail -40 /tmp/agent-cr-httpbin.log 2>/dev/null || true
+      kill -9 $HTTPBIN_PID 2>/dev/null || true
+    fi
+  else
+    echo "psf_requests_httpbin: FAIL to generate cert"
+    cat /tmp/agent-cr-httpbin-cert.log 2>/dev/null || true
+  fi
+fi
+set +e
+{inner_command}
+rc=$?
+exit $rc
+""".strip()
+
     def verify_task_accuracy(
         self,
         sandbox: SandboxHandle,
@@ -3595,9 +4134,14 @@ PY
         )
         self._wait_for_verification_network(sandbox, timeout_s=timeout_s)
         self._ensure_verification_uv(sandbox, timeout_s=timeout_s)
+        if swebench_instance_id.startswith("scikit-learn__"):
+            self._ensure_legacy_cython_pin(sandbox, timeout_s=timeout_s)
         verification_command = "bash /tests/run-tests.sh"
         if swebench_instance_id:
             verification_command = "bash /tests/run-tests.sh 2>&1"
+        if swebench_instance_id.startswith("psf__requests-"):
+            verification_command = self._psf_requests_local_httpbin_wrapper(verification_command)
+        thread_cap = "4"
         result = self.exec_in_sandbox(
             sandbox,
             ["/bin/bash", "-lc", verification_command],
@@ -3608,6 +4152,19 @@ PY
                     "/root/.local/agent-cr-verification/bin:/root/.local/bin:"
                     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
                 ),
+                "OMP_NUM_THREADS": thread_cap,
+                "OPENBLAS_NUM_THREADS": thread_cap,
+                "MKL_NUM_THREADS": thread_cap,
+                "NUMEXPR_NUM_THREADS": thread_cap,
+                "BLIS_NUM_THREADS": thread_cap,
+                "VECLIB_MAXIMUM_THREADS": thread_cap,
+                # joblib/loky read cgroup v2 cpu.max to size the Pool used by
+                # sklearn's cythonize; bundle.py strips the cgroup namespace so
+                # /sys/fs/cgroup/cpu.max inside the container shows the host
+                # root value "max", giving joblib os.cpu_count() (64). Pool(64)
+                # then OOMs under our 8 GB memory cgroup and deadlocks in
+                # _handle_tasks. LOKY_MAX_CPU_COUNT is read verbatim by joblib.
+                "LOKY_MAX_CPU_COUNT": thread_cap,
             },
             timeout_s=timeout_s,
         )
@@ -3683,6 +4240,7 @@ PY
             image_defaults=image_defaults,
             image_rootfs_dir=image_rootfs_dir,
             bundle_spec_writer=self._bundle_spec_writer(),
+            resource_limits=self.sandbox_resource_limits,
         )
         handle = SandboxHandle(
             sandbox_id=SandboxId(sandbox_name),
@@ -3728,6 +4286,7 @@ PY
         if sandbox_snapshot.get("llm_service_type") not in {
             "iflow_trace_replay",
             "mini_swe_trace_replay",
+            "mini_swe_spec_trace_replay",
             "claude_code_trace_replay",
         }:
             return {}
