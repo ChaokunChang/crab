@@ -168,6 +168,11 @@ static __always_inline __s32 fd_from_enter(long syscall_nr, unsigned long arg0)
     case __NR_writev:
     case __NR_pwritev:
     case __NR_pwritev2:
+    case __NR_ftruncate:
+    case __NR_fchmod:
+    case __NR_fchown:
+    case __NR_fsetxattr:
+    case __NR_fremovexattr:
       return (__s32)arg0;
     default:
       return -1;

@@ -25,7 +25,14 @@ logger = logging.getLogger(__name__)
 _JSON_CODEC = get_json_codec("auto")
 
 _OPEN_SYSCALLS = {"open", "openat", "openat2", "creat"}
-_WRITE_SYSCALLS = {"write", "pwrite64", "writev", "pwritev", "pwritev2", "truncate", "ftruncate"}
+# Write-family syscalls that mutate via an existing fd. BPF captures the
+# fd in fd_from_enter, so _is_countable_fs_event can require fd >= 0 and
+# filter on fd_kind to drop writes to terminals/pipes.
+_WRITE_FD_SYSCALLS = {"write", "pwrite64", "writev", "pwritev", "pwritev2", "ftruncate"}
+# truncate(2) is path-based, not fd-based: BPF captures arg0 as the
+# primary path and never populates fd. It belongs with the other
+# unconditional path-based mutations below, not with the fd-gated ones.
+_WRITE_PATH_SYSCALLS = {"truncate"}
 _METADATA_PATH_SYSCALLS = {
     "chmod",
     "fchmodat",
@@ -548,7 +555,7 @@ class HostInspectorDaemon:
             if self._path_is_likely_persistent(path):
                 return True
             return event.fd_kind not in _DEVICE_OR_STREAM_FD_KINDS
-        if syscall in _WRITE_SYSCALLS or syscall in _METADATA_FD_SYSCALLS:
+        if syscall in _WRITE_FD_SYSCALLS or syscall in _METADATA_FD_SYSCALLS:
             fd = int(event.fd or -1)
             if fd < 0:
                 return False
@@ -558,7 +565,7 @@ class HostInspectorDaemon:
             # are excluded below, so true stdout/stderr writes to
             # terminals and pipes are still ignored.
             return str(event.fd_kind or "unknown") in _MUTATING_FD_KINDS
-        if syscall in _METADATA_PATH_SYSCALLS | _CREATE_PATH_SYSCALLS | _DELETE_SYSCALLS | _RENAME_SYSCALLS | _SECONDARY_TARGET_SYSCALLS:
+        if syscall in _WRITE_PATH_SYSCALLS | _METADATA_PATH_SYSCALLS | _CREATE_PATH_SYSCALLS | _DELETE_SYSCALLS | _RENAME_SYSCALLS | _SECONDARY_TARGET_SYSCALLS:
             return True
         return bool(event.path or event.path_secondary)
 
