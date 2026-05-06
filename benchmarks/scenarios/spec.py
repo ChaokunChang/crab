@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 
-from agent_cr import FaultToleranceCheckpointingPolicy, SchedulerConfig
+from agent_cr import FaultToleranceCheckpointingPolicy, LatestOnlyCheckpointManager, SchedulerConfig
 
 from benchmarks.config import BenchmarkConfig
 from benchmarks.scenarios import HarnessSettings, ScenarioDefinition
@@ -58,7 +58,10 @@ def build_harness_settings(config: BenchmarkConfig) -> HarnessSettings:
             config,
             scenario_default_policy=FaultToleranceCheckpointingPolicy(scheduler_config),
         ),
-        checkpoint_manager_factory=lambda base: base,
+        checkpoint_manager_factory=lambda base: LatestOnlyCheckpointManager(
+            base,
+            delete_filesystem_checkpoints=True,
+        ),
         max_workers=config.effective_max_workers,
         # Speculative execution can keep one fork live next to each active
         # sandbox, so size shared resources for the peak live sandbox count.
@@ -66,12 +69,23 @@ def build_harness_settings(config: BenchmarkConfig) -> HarnessSettings:
     )
 
 
+_SPEC_AGENT_TO_LLM_SERVICE = {
+    "mini_swe": "mini_swe_spec_trace_replay",
+    "terminus": "terminus_spec_trace_replay",
+}
+
+
 def prepare_harness(config: BenchmarkConfig, harness) -> None:
     del harness
-    if config.agent != "mini_swe":
-        raise ValueError("scenario='spec' requires agent='mini_swe'")
-    if config.llm_service != "mini_swe_spec_trace_replay":
-        raise ValueError("scenario='spec' requires llm_service='mini_swe_spec_trace_replay'")
+    if config.agent not in _SPEC_AGENT_TO_LLM_SERVICE:
+        raise ValueError(
+            f"scenario='spec' requires agent in {sorted(_SPEC_AGENT_TO_LLM_SERVICE)}, got {config.agent!r}"
+        )
+    expected_llm = _SPEC_AGENT_TO_LLM_SERVICE[config.agent]
+    if config.llm_service != expected_llm:
+        raise ValueError(
+            f"scenario='spec' with agent='{config.agent}' requires llm_service='{expected_llm}'"
+        )
     if config.iterations != 0:
         raise ValueError("scenario='spec' requires iterations=0")
 

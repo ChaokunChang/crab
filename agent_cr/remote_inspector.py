@@ -46,10 +46,13 @@ class HostInspectorServiceClient:
         object_id: str,
         *,
         ignore_process_rules: list[dict[str, object]] | None = None,
+        ignored_path_prefixes: list[str] | None = None,
     ) -> dict[str, object]:
         payload: dict[str, object] = {"sandbox_id": str(sandbox_id), "runtime": runtime, "object_id": object_id}
         if ignore_process_rules is not None:
             payload["ignore_process_rules"] = ignore_process_rules
+        if ignored_path_prefixes is not None:
+            payload["ignored_path_prefixes"] = ignored_path_prefixes
         return self._post("/register", payload)
 
     def unregister_sandbox(self, sandbox_id: SandboxId) -> dict[str, object]:
@@ -58,10 +61,18 @@ class HostInspectorServiceClient:
     def get_proc_and_fs_status(self, sandbox_id: SandboxId) -> dict[str, object]:
         return self._post("/get_proc_and_fs_status", {"sandbox_id": str(sandbox_id)})
 
-    def reset_sandbox(self, sandbox_id: SandboxId, at: datetime | None) -> dict[str, object]:
+    def reset_sandbox(
+        self,
+        sandbox_id: SandboxId,
+        at: datetime | None,
+        *,
+        captures_process: bool = False,
+    ) -> dict[str, object]:
         payload: dict[str, object] = {"sandbox_id": str(sandbox_id)}
         if at is not None:
             payload["at"] = at.isoformat()
+        if captures_process:
+            payload["captures_process"] = True
         return self._post("/reset", payload)
 
     def close(self) -> None:
@@ -78,7 +89,11 @@ class RemoteSandboxInspector(SandboxInspector):
         self._service_client = service_client
         self._lock = Lock()
         self._snapshots: dict[SandboxId, SandboxSnapshot] = {}
-        self._pending_reset_at: dict[SandboxId, datetime] = {}
+        # (reset_at, captures_process). captures_process is sticky-OR
+        # across deferrals: if any superseded pending reset followed a
+        # full checkpoint, the eventual replay must still refresh the
+        # daemon's `acknowledged_deleted_mmaps` baseline.
+        self._pending_reset_at: dict[SandboxId, tuple[datetime, bool]] = {}
         self._telemetry: TelemetrySink = telemetry or NoopTelemetrySink()
         self._sync_timeout_count_lock = Lock()
         self._sync_timeout_count = 0
@@ -99,11 +114,16 @@ class RemoteSandboxInspector(SandboxInspector):
 
         reset_at = snapshot.last_checkpoint_at or snapshot.observed_at
         try:
+            # upsert_snapshot resets are baseline-clearing, NOT
+            # checkpoint-completion resets — they reflect the inspector's
+            # own clean snapshot, with no fresh process image dumped. So
+            # captures_process stays False here; only mark_checkpoint_complete
+            # may flip it on for the post-checkpoint reset.
             self._service_client.reset_sandbox(snapshot.sandbox_id, reset_at)
         except Exception as exc:  # noqa: BLE001
             if self._is_unknown_sandbox_error(exc):
                 with self._lock:
-                    self._pending_reset_at[snapshot.sandbox_id] = reset_at
+                    self._defer_reset_locked(snapshot.sandbox_id, reset_at, captures_process=False)
                 logger.debug(f"pending a sandbox reset for sandbox={snapshot.sandbox_id}")
                 return
             logger.debug(
@@ -153,11 +173,18 @@ class RemoteSandboxInspector(SandboxInspector):
         # next inspect retries the reset — mirroring upsert_snapshot. A
         # raised exception here would escape _execute_checkpoint_flow past
         # operation.finish and create an orphan flow.start in telemetry.
+        #
+        # Pass `captures_process` so the daemon can refresh its
+        # `acknowledged_deleted_mmaps` baseline for full checkpoints (the
+        # process image just dumped any `(deleted)` mmap content inline, so
+        # those paths should no longer fire mmap_invalidation). For
+        # filesystem-only checkpoints we leave the baseline alone — the
+        # process image is unchanged, so its set of frozen content is too.
         try:
-            self._service_client.reset_sandbox(sandbox_id, at)
+            self._service_client.reset_sandbox(sandbox_id, at, captures_process=process)
         except Exception as exc:  # noqa: BLE001
             with self._lock:
-                self._pending_reset_at[sandbox_id] = at
+                self._defer_reset_locked(sandbox_id, at, captures_process=process)
             if self._is_unknown_sandbox_error(exc):
                 logger.debug(
                     "Deferring mark_checkpoint_complete reset for unknown sandbox=%s",
@@ -184,13 +211,37 @@ class RemoteSandboxInspector(SandboxInspector):
                 last_checkpoint_at=at,
             )
 
+    def _defer_reset_locked(
+        self,
+        sandbox_id: SandboxId,
+        reset_at: datetime,
+        *,
+        captures_process: bool,
+    ) -> None:
+        # Caller holds self._lock. captures_process is sticky-OR across
+        # successive deferrals so a full-checkpoint reset can never get
+        # silently downgraded by a later fs-only-checkpoint reset queueing
+        # behind it (the daemon's `acknowledged_deleted_mmaps` baseline must
+        # still be refreshed when the deferred reset eventually replays).
+        existing = self._pending_reset_at.get(sandbox_id)
+        if existing is None:
+            self._pending_reset_at[sandbox_id] = (reset_at, captures_process)
+            return
+        existing_at, existing_captures = existing
+        merged_at = max(existing_at, reset_at)
+        merged_captures = existing_captures or captures_process
+        self._pending_reset_at[sandbox_id] = (merged_at, merged_captures)
+
     def _apply_pending_reset(self, sandbox_id: SandboxId) -> None:
         with self._lock:
-            reset_at = self._pending_reset_at.get(sandbox_id)
-        if reset_at is None:
+            pending = self._pending_reset_at.get(sandbox_id)
+        if pending is None:
             return
+        reset_at, captures_process = pending
         try:
-            self._service_client.reset_sandbox(sandbox_id, reset_at)
+            self._service_client.reset_sandbox(
+                sandbox_id, reset_at, captures_process=captures_process
+            )
         except Exception as exc:  # noqa: BLE001
             if not self._is_unknown_sandbox_error(exc):
                 logger.debug(

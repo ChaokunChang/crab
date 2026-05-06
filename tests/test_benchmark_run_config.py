@@ -17,7 +17,7 @@ from benchmarks.config import (
     load_config,
 )
 from benchmarks.core import resolve_task_records
-from benchmarks.run import run_benchmark_config
+from benchmarks.run import _incomplete_replay_lines, run_benchmark_config
 from benchmarks.scenarios import HarnessSettings, ScenarioDefinition
 from integrations.agents import TaskConfig, TaskDescription
 
@@ -710,6 +710,69 @@ class BenchmarkConfigTests(unittest.TestCase):
 
         self.assertEqual(records[0].task_config.options["max_agent_timeout_sec"], 240.0)
         self.assertEqual(records[0].task_config.options["max_test_timeout_sec"], 15.0)
+
+    def test_resolve_task_records_per_task_scale_overrides_take_precedence(self) -> None:
+        """Per-task scale overrides shadow the global scale. Used to bump
+        max_test_timeout_sec for tasks whose recorded budget was
+        calibrated against an uncapped baseline (e.g. pytorch-model-cli's
+        180s budget that consistently exceeds on our 4-CPU cgroup)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset_path = root / "tasks.jsonl"
+            dataset_path.write_text(
+                "\n".join(
+                    [
+                        # task-keep-default: not overridden → uses global scale
+                        '{"agent_type":"iflow","llm_service_type":"iflow_trace_replay",'
+                        '"task_description":{"prompt":"a"},'
+                        '"task_config":{"options":{"task_id":"task-keep-default",'
+                        '"max_agent_timeout_sec":100,"max_test_timeout_sec":40}}}',
+                        # task-bump: agent and test scales both overridden
+                        '{"agent_type":"iflow","llm_service_type":"iflow_trace_replay",'
+                        '"task_description":{"prompt":"b"},'
+                        '"task_config":{"options":{"task_id":"task-bump",'
+                        '"max_agent_timeout_sec":100,"max_test_timeout_sec":40}}}',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config_path = root / "bench.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "scenario: fault",
+                        "mode: auto",
+                        "agent: iflow",
+                        "llm_service: iflow_trace_replay",
+                        "task_dataset: tasks.jsonl",
+                        "sandboxes: 2",
+                        "max_agent_timeout_scale: 2.0",
+                        "max_test_timeout_scale: 1.0",
+                        "max_agent_timeout_scale_overrides:",
+                        "  task-bump: 5.0",
+                        "max_test_timeout_scale_overrides:",
+                        "  task-bump: 4.0",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+            records = resolve_task_records(
+                config,
+                default_task_description=TaskDescription("ignored"),
+                default_task_config=TaskConfig(),
+            )
+
+        # task-keep-default uses the global 2.0 / 1.0
+        self.assertEqual(records[0].task_config.options["task_id"], "task-keep-default")
+        self.assertEqual(records[0].task_config.options["max_agent_timeout_sec"], 200.0)
+        self.assertEqual(records[0].task_config.options["max_test_timeout_sec"], 40.0)
+        # task-bump uses the override 5.0 / 4.0
+        self.assertEqual(records[1].task_config.options["task_id"], "task-bump")
+        self.assertEqual(records[1].task_config.options["max_agent_timeout_sec"], 500.0)
+        self.assertEqual(records[1].task_config.options["max_test_timeout_sec"], 160.0)
 
     def test_resolve_task_records_leaves_missing_timeout_values_unset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1727,6 +1790,29 @@ class BenchmarkRunDispatchTests(unittest.TestCase):
         self.assertIn("benchmark.phase.teardown end sandboxes=1 max_workers=1 duration_s=", output)
         self.assertIn("benchmark.phase.postprocess start sandboxes=1 max_workers=1", output)
         self.assertIn("benchmark.phase.postprocess end sandboxes=1 max_workers=1 duration_s=", output)
+
+    def test_incomplete_replay_skips_spec_fork_reused_successors(self) -> None:
+        """Spec fork-reused successors are named `<root>-spec-<n>` and
+        inherit parent state via CRIU restore — their per-fork
+        `replay_final_trace_cursor` starts at 0 even though the parent
+        already drove the trace. They're not real timeouts and must not
+        produce INCOMPLETE_REPLAY lines.
+        """
+        rows = [
+            # Real primary timeout — should report.
+            {"sandbox_id": "spec-0", "task_id": "t", "trace_response_count": 29, "replay_final_trace_cursor": 5},
+            # Fork-reused successors — must be skipped.
+            {"sandbox_id": "spec-0-spec-29", "task_id": "t", "trace_response_count": 29, "replay_final_trace_cursor": 0},
+            {"sandbox_id": "spec-1-spec-24", "task_id": "u", "trace_response_count": 25, "replay_final_trace_cursor": 0},
+            # Non-spec partial replay (e.g. fault-mode timeout) — should report.
+            {"sandbox_id": "fault-7", "task_id": "v", "trace_response_count": 12, "replay_final_trace_cursor": 8},
+        ]
+        lines = _incomplete_replay_lines(rows)
+        joined = "\n".join(lines)
+        self.assertIn("sandbox=spec-0 ", joined)
+        self.assertIn("sandbox=fault-7 ", joined)
+        self.assertNotIn("spec-0-spec-29", joined)
+        self.assertNotIn("spec-1-spec-24", joined)
 
     def test_example_yaml_files_load(self) -> None:
         examples = sorted((Path("/root/workspace/agent-cr/benchmarks/examples")).glob("*.yaml"))

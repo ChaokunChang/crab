@@ -286,6 +286,15 @@ class DefaultCWorker(CompositeCheckpointWorker):
             filesystem_written_bytes=filesystem_written_bytes,
         )
         if failed_step is not None:
+            try:
+                self._runtime.discard_partial_checkpoint(job.sandbox_id, checkpoint_id)
+            except Exception:
+                logger.exception(
+                    "Failed to discard partial checkpoint artifacts for job %s sandbox=%s checkpoint=%s",
+                    job.job_id,
+                    job.sandbox_id,
+                    checkpoint_id,
+                )
             return CheckpointResult(
                 job_id=job.job_id,
                 sandbox_id=job.sandbox_id,
@@ -406,6 +415,28 @@ class DefaultCWorker(CompositeCheckpointWorker):
                 job.sandbox_id,
                 checkpoint_id,
             )
+            if not write_manifest_finished:
+                # Manifest never landed → on-disk artifacts are unreachable
+                # via storage.delete_checkpoint. Clean them up directly so
+                # the failed checkpoint doesn't leave a multi-GB orphan.
+                try:
+                    self._checkpoint_manager.delete_checkpoint(job.sandbox_id, checkpoint_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to delete partial artifacts for job %s sandbox=%s checkpoint=%s",
+                        job.job_id,
+                        job.sandbox_id,
+                        checkpoint_id,
+                    )
+                try:
+                    self._runtime.discard_partial_checkpoint(job.sandbox_id, checkpoint_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to discard partial checkpoint runtime artifacts for job %s sandbox=%s checkpoint=%s",
+                        job.job_id,
+                        job.sandbox_id,
+                        checkpoint_id,
+                    )
             return CheckpointResult(
                 job_id=job.job_id,
                 sandbox_id=job.sandbox_id,

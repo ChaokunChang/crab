@@ -483,6 +483,51 @@ class SpecTurnBreakdown:
 
 
 @dataclass(frozen=True)
+class ReplayCadenceSandboxStats:
+    """Per-sandbox replay-cadence summary.
+
+    See docs/replay-cadence-handling.md. The two drain sites correspond
+    to slow-replay handling: foreground build still grinding when the
+    trace's next turn arrives → wait-for-quiescence drain. The
+    fast-forward fields correspond to faster-replay handling: trace's
+    pure-wait turn but the pane already drained → skip the sleep.
+    """
+
+    sandbox_id: str
+    fast_forward_skip_count: int
+    fast_forward_saved_ms: float
+    fast_forward_intended_sleep_ms: float
+    pre_fork_drain_count: int
+    pre_fork_drain_ms: float
+    pre_fork_drain_timeouts: int
+    post_match_drain_count: int
+    post_match_drain_ms: float
+    post_match_drain_timeouts: int
+    non_spec_drain_count: int = 0
+    non_spec_drain_ms: float = 0.0
+    non_spec_drain_timeouts: int = 0
+
+
+@dataclass(frozen=True)
+class ReplayCadenceStats:
+    """Run-wide totals + per-sandbox breakdown for replay-cadence handling."""
+
+    fast_forward_skip_count: int
+    fast_forward_saved_ms: float
+    fast_forward_intended_sleep_ms: float
+    pre_fork_drain_count: int
+    pre_fork_drain_ms: float
+    pre_fork_drain_timeouts: int
+    post_match_drain_count: int
+    post_match_drain_ms: float
+    post_match_drain_timeouts: int
+    per_sandbox: list[ReplayCadenceSandboxStats]
+    non_spec_drain_count: int = 0
+    non_spec_drain_ms: float = 0.0
+    non_spec_drain_timeouts: int = 0
+
+
+@dataclass(frozen=True)
 class SpecForkReuseStats:
     total_turns: int
     finalized_turns: int
@@ -538,6 +583,7 @@ class TelemetryAnalysis:
     spec_turn_breakdown: SpecTurnBreakdown | None = None
     spec_fork_reuse_stats: SpecForkReuseStats | None = None
     spec_draft_overhead_analysis: OverheadAnalysisSummary | None = None
+    replay_cadence_stats: ReplayCadenceStats | None = None
     exclude_failed_tasks: bool = False
     excluded_sandbox_task_pairs: list[tuple[str, str]] = field(default_factory=list)
 
@@ -583,6 +629,9 @@ class TelemetryAnalysis:
             "spec_fork_reuse_stats": None if self.spec_fork_reuse_stats is None else asdict(self.spec_fork_reuse_stats),
             "spec_draft_overhead_analysis": (
                 None if self.spec_draft_overhead_analysis is None else asdict(self.spec_draft_overhead_analysis)
+            ),
+            "replay_cadence_stats": (
+                None if self.replay_cadence_stats is None else asdict(self.replay_cadence_stats)
             ),
             "exclude_failed_tasks": self.exclude_failed_tasks,
             "excluded_sandbox_task_pairs": [
@@ -1720,6 +1769,26 @@ def analyze_telemetry_file(
     request_metric_records: dict[tuple[str, str], _RequestMetricAccumulator] = {}
     spec_turn_counts: Counter[str] = Counter()
     spec_fork_reuse_counts: Counter[str] = Counter()
+    # Replay-cadence handling counters (see docs/replay-cadence-handling.md).
+    # Per-sandbox to surface skewed distributions in the report instead of
+    # only run-wide totals — a few build-heavy sandboxes typically dominate
+    # both the drain-wait time and the fast-forward savings.
+    replay_cadence_per_sandbox: dict[str, dict[str, float]] = defaultdict(
+        lambda: {
+            "fast_forward_skip_count": 0.0,
+            "fast_forward_saved_ms": 0.0,
+            "fast_forward_intended_sleep_ms": 0.0,
+            "pre_fork_drain_count": 0.0,
+            "pre_fork_drain_ms": 0.0,
+            "pre_fork_drain_timeouts": 0.0,
+            "post_match_drain_count": 0.0,
+            "post_match_drain_ms": 0.0,
+            "post_match_drain_timeouts": 0.0,
+            "non_spec_drain_count": 0.0,
+            "non_spec_drain_ms": 0.0,
+            "non_spec_drain_timeouts": 0.0,
+        }
+    )
     fs_sync_timeout_event_count = 0
     fs_sync_timeout_sandbox_ids: set[str] = set()
 
@@ -1855,6 +1924,39 @@ def analyze_telemetry_file(
                     else:
                         key = "rejected_state_changed" if state_changed else "rejected_state_unchanged"
                     spec_fork_reuse_counts[key] += 1
+
+            if name == "terminus.fast_forward.skip":
+                sid = _maybe_str(enriched_attributes.get("sandbox_id"))
+                if sid:
+                    bucket = replay_cadence_per_sandbox[sid]
+                    bucket["fast_forward_skip_count"] += 1
+                    bucket["fast_forward_saved_ms"] += _safe_float(
+                        enriched_attributes.get("saved_ms")
+                    ) or 0.0
+                    bucket["fast_forward_intended_sleep_ms"] += _safe_float(
+                        enriched_attributes.get("intended_sleep_ms")
+                    ) or 0.0
+
+            if name in (
+                "terminus.guard.pre_fork_drain",
+                "terminus.guard.post_match_drain",
+                "terminus.guard.non_spec_drain",
+            ):
+                sid = _maybe_str(enriched_attributes.get("sandbox_id"))
+                if sid:
+                    bucket = replay_cadence_per_sandbox[sid]
+                    if name.endswith("pre_fork_drain"):
+                        prefix = "pre_fork"
+                    elif name.endswith("post_match_drain"):
+                        prefix = "post_match"
+                    else:
+                        prefix = "non_spec"
+                    bucket[f"{prefix}_drain_count"] += 1
+                    bucket[f"{prefix}_drain_ms"] += _safe_float(
+                        enriched_attributes.get("drain_wait_ms")
+                    ) or 0.0
+                    if not _safe_int(enriched_attributes.get("drain_resolved")):
+                        bucket[f"{prefix}_drain_timeouts"] += 1
 
             base_name = ""
             if name.endswith(".start"):
@@ -2106,6 +2208,75 @@ def analyze_telemetry_file(
             rejected_command_mismatch=spec_turn_counts["rejected_command_mismatch"],
         )
 
+    replay_cadence_stats: ReplayCadenceStats | None = None
+    if replay_cadence_per_sandbox:
+        per_sandbox_rows = []
+        totals = {
+            "fast_forward_skip_count": 0,
+            "fast_forward_saved_ms": 0.0,
+            "fast_forward_intended_sleep_ms": 0.0,
+            "pre_fork_drain_count": 0,
+            "pre_fork_drain_ms": 0.0,
+            "pre_fork_drain_timeouts": 0,
+            "post_match_drain_count": 0,
+            "post_match_drain_ms": 0.0,
+            "post_match_drain_timeouts": 0,
+            "non_spec_drain_count": 0,
+            "non_spec_drain_ms": 0.0,
+            "non_spec_drain_timeouts": 0,
+        }
+        for sid in sorted(replay_cadence_per_sandbox):
+            bucket = replay_cadence_per_sandbox[sid]
+            row = ReplayCadenceSandboxStats(
+                sandbox_id=sid,
+                fast_forward_skip_count=int(bucket["fast_forward_skip_count"]),
+                fast_forward_saved_ms=float(bucket["fast_forward_saved_ms"]),
+                fast_forward_intended_sleep_ms=float(bucket["fast_forward_intended_sleep_ms"]),
+                pre_fork_drain_count=int(bucket["pre_fork_drain_count"]),
+                pre_fork_drain_ms=float(bucket["pre_fork_drain_ms"]),
+                pre_fork_drain_timeouts=int(bucket["pre_fork_drain_timeouts"]),
+                post_match_drain_count=int(bucket["post_match_drain_count"]),
+                post_match_drain_ms=float(bucket["post_match_drain_ms"]),
+                post_match_drain_timeouts=int(bucket["post_match_drain_timeouts"]),
+                non_spec_drain_count=int(bucket["non_spec_drain_count"]),
+                non_spec_drain_ms=float(bucket["non_spec_drain_ms"]),
+                non_spec_drain_timeouts=int(bucket["non_spec_drain_timeouts"]),
+            )
+            per_sandbox_rows.append(row)
+            totals["fast_forward_skip_count"] += row.fast_forward_skip_count
+            totals["fast_forward_saved_ms"] += row.fast_forward_saved_ms
+            totals["fast_forward_intended_sleep_ms"] += row.fast_forward_intended_sleep_ms
+            totals["pre_fork_drain_count"] += row.pre_fork_drain_count
+            totals["pre_fork_drain_ms"] += row.pre_fork_drain_ms
+            totals["pre_fork_drain_timeouts"] += row.pre_fork_drain_timeouts
+            totals["post_match_drain_count"] += row.post_match_drain_count
+            totals["post_match_drain_ms"] += row.post_match_drain_ms
+            totals["post_match_drain_timeouts"] += row.post_match_drain_timeouts
+            totals["non_spec_drain_count"] += row.non_spec_drain_count
+            totals["non_spec_drain_ms"] += row.non_spec_drain_ms
+            totals["non_spec_drain_timeouts"] += row.non_spec_drain_timeouts
+        if (
+            totals["fast_forward_skip_count"] > 0
+            or totals["pre_fork_drain_count"] > 0
+            or totals["post_match_drain_count"] > 0
+            or totals["non_spec_drain_count"] > 0
+        ):
+            replay_cadence_stats = ReplayCadenceStats(
+                fast_forward_skip_count=int(totals["fast_forward_skip_count"]),
+                fast_forward_saved_ms=float(totals["fast_forward_saved_ms"]),
+                fast_forward_intended_sleep_ms=float(totals["fast_forward_intended_sleep_ms"]),
+                pre_fork_drain_count=int(totals["pre_fork_drain_count"]),
+                pre_fork_drain_ms=float(totals["pre_fork_drain_ms"]),
+                pre_fork_drain_timeouts=int(totals["pre_fork_drain_timeouts"]),
+                post_match_drain_count=int(totals["post_match_drain_count"]),
+                post_match_drain_ms=float(totals["post_match_drain_ms"]),
+                post_match_drain_timeouts=int(totals["post_match_drain_timeouts"]),
+                non_spec_drain_count=int(totals["non_spec_drain_count"]),
+                non_spec_drain_ms=float(totals["non_spec_drain_ms"]),
+                non_spec_drain_timeouts=int(totals["non_spec_drain_timeouts"]),
+                per_sandbox=per_sandbox_rows,
+            )
+
     spec_reuse_stats: SpecForkReuseStats | None = None
     if spec_fork_reuse_counts["total"] > 0:
         spec_reuse_stats = SpecForkReuseStats(
@@ -2162,6 +2333,7 @@ def analyze_telemetry_file(
         spec_turn_breakdown=spec_breakdown,
         spec_fork_reuse_stats=spec_reuse_stats,
         spec_draft_overhead_analysis=spec_draft_overhead_analysis,
+        replay_cadence_stats=replay_cadence_stats,
         exclude_failed_tasks=exclude_failed_tasks,
         excluded_sandbox_task_pairs=excluded_pairs,
     )

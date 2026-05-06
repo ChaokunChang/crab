@@ -1,0 +1,75 @@
+scenario: fault
+mode: auto
+provider: openai
+agent: iflow
+llm_service: iflow_trace_replay
+task_dataset: /root/workspace/agent-cr/results/datasets/termnius_iflow_replay_x115.jsonl
+sandboxes: 115
+max_workers: 64
+phase_workers:
+  setup: 64
+  run: 64
+  verification: 64
+executor:
+  checkpoint_workers: 64
+  restore_workers: 64
+  checkpoint_queue_size: 10000
+  max_retries: 0
+  retry_backoff_seconds: 0.05
+  coordination_workers: 64
+  composite_step_workers: 64
+scheduler:
+  min_checkpoint_interval_seconds: 0.0
+  force_checkpoint_after_seconds: 0.0
+  require_change_signal: true
+  prefer_checkpoint_during_llm_request: true
+  require_llm_request_for_checkpoint: false
+  inspect_without_pause: false
+llm_server:
+  launch_mode: process
+host_inspector:
+  launch_mode: process
+iterations: 10
+output: /root/workspace/agent-cr/logs/iflow/fault.auto.benchmark.10.csv
+log_file: /root/workspace/agent-cr/logs/iflow/fault.auto.benchmark.10.log
+telemetry:
+  output: /root/workspace/agent-cr/logs/iflow/fault.auto.benchmark.10.telemetry.jsonl
+  detail_level: detailed
+  capture_command_output: false
+  max_text_attribute_bytes: 2048
+  keep_in_memory_copy: false
+  writer_mode: async
+  queue_capacity: 16384000
+  batch_max_records: 256000
+  flush_interval_ms: 50
+  overflow_policy: drop_new
+  serializer: auto
+  report:
+    enabled: true
+    output_dir: /root/workspace/agent-cr/logs/iflow/fault.auto.benchmark.10.report
+    top_k: 50
+    log_scale_charts: false
+    export_svg: true
+monitoring:
+  enabled: true
+  sample_interval_ms: 1000
+  include_host: true
+  include_sandboxes: true
+zpool_size: 150G
+zpool_name: agentcrbench-150
+zpool_image: /root/workspace/agent-cr/data/agent_cr/results/zpool/agentcrbench-150.zpool.img
+reuse_zpool: true
+benchmark_root: /root/workspace/agent-cr/data/agent_cr/results
+# Optional: keep hot host-side runtime/checkpoint/storage writes off the file-backed zpool.
+# Point these at a different filesystem or device than zpool_image for the biggest win.
+# storage_planes:
+#   runtime_root: /mnt/agent-cr-runtime
+#   storage_root: /mnt/agent-cr-runtime/storage
+#   agent_host_root: /mnt/agent-cr-runtime/agents
+log_level: info
+scenario_options:
+  injection_rate: 0.0
+  first_forced_event_chunk: 5
+llm_service_options:
+  response_delay_policy: trace_replay
+  response_delay_scaling_factor: 1.0

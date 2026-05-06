@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import re
 import threading
 import time
@@ -14,9 +15,17 @@ from integrations.llm_services.mini_swe_trace_replay.service import (
     _config_with_legacy_alias,
     parse_replay_trace,
 )
+from integrations.llm_services.speculation.schema import (
+    DEFAULT_REPORT_LEVEL,
+    SCORE_LEVELS,
+    SpeculationTurn,
+    load_sidecar,
+)
+
+_logger = logging.getLogger(__name__)
 
 _DEFAULT_ACCEPTANCE_RATE = 0.5
-_DEFAULT_DRAFT_DELAY_SCALING_FACTOR = 0.5
+_DEFAULT_DRAFT_DELAY_SCALING_FACTOR = 1.0
 _DEFAULT_RESPONSE_DELAY_MS = 0
 _DEFAULT_MINIMAL_DELAY_MS = 0.0
 _DEFAULT_MAXIMAL_DELAY_MS = 1_000_000_000.0
@@ -104,6 +113,30 @@ class TraceReplayLLMState:
         if not isinstance(raw_trace_path, str) or not raw_trace_path.strip():
             raise ValueError("mini_swe_spec_trace_replay requires llm_service_config.trace_path")
         self._parsed = parse_replay_trace(Path(raw_trace_path).expanduser().resolve())
+
+        # Phase B: optional sidecar for real draft-model decisions.
+        # Must be explicitly enabled via use_spec_sidecar=true; defaults to simulated decisions.
+        self._use_spec_sidecar = bool(config.get("use_spec_sidecar", False))
+        self._sidecar_by_turn: dict[int, SpeculationTurn] | None = None
+        raw_sidecar_path = config.get("sidecar_path")
+        if self._use_spec_sidecar and isinstance(raw_sidecar_path, str) and raw_sidecar_path.strip():
+            sidecar_path = Path(raw_sidecar_path).expanduser().resolve()
+            try:
+                sidecar = load_sidecar(sidecar_path)
+                self._sidecar_by_turn = {t.turn_index: t for t in sidecar.turns if t.error is None}
+                _logger.info(
+                    "Loaded speculation sidecar %s (%d turns)", sidecar_path, len(self._sidecar_by_turn)
+                )
+            except Exception as exc:
+                _logger.warning("Failed to load sidecar %s: %s — falling back to simulated decisions", sidecar_path, exc)
+
+        raw_score_level = str(config.get("score_level", DEFAULT_REPORT_LEVEL)).strip().lower()
+        if raw_score_level not in SCORE_LEVELS:
+            raise ValueError(
+                f"score_level must be one of {list(SCORE_LEVELS)}, got {raw_score_level!r}"
+            )
+        self._score_level = raw_score_level
+
         raw_policy = str(config.get("response_delay_policy", "fixed")).strip().lower()
         if raw_policy not in _RESPONSE_DELAY_POLICIES:
             raise ValueError(
@@ -235,6 +268,9 @@ class TraceReplayLLMState:
             "maximal_delay": self._maximal_delay_ms,
             "acceptance_rate": self._acceptance_rate,
             "mismatch_policy": self._mismatch_policy,
+            "use_spec_sidecar": self._use_spec_sidecar,
+            "score_level": self._score_level,
+            "sidecar_turns": len(self._sidecar_by_turn) if self._sidecar_by_turn is not None else None,
             "trace_cursor": oracle_trace_cursor,
             "oracle_trace_cursor": oracle_trace_cursor,
             "draft_trace_cursor": draft_trace_cursor,
@@ -294,11 +330,21 @@ class TraceReplayLLMState:
                 original_command=command,
                 trace_index=trace_index,
             )
-        effective_delay_ms = self._effective_delay_ms(trace_delay_ms, role=role)
+        sidecar_turn = self._sidecar_by_turn.get(trace_index) if self._sidecar_by_turn is not None else None
+        sidecar_draft_delay_ms = sidecar_turn.draft_latency_ms if sidecar_turn is not None else None
+        effective_delay_ms = self._effective_delay_ms(
+            trace_delay_ms, role=role, sidecar_draft_delay_ms=sidecar_draft_delay_ms
+        )
         return _completion_response(message, trace_index=trace_index), effective_delay_ms
 
     def _draft_decision(self, *, trace_index: int, pair_id: str) -> bool:
         _ = pair_id
+        # Sidecar-based real decision (Phase B).
+        if self._sidecar_by_turn is not None:
+            turn = self._sidecar_by_turn.get(trace_index)
+            if turn is not None:
+                return turn.accepted.get(self._score_level, False)
+        # Fallback: simulated SHA256 decision.
         key = f"turn-{trace_index}"
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
         value = int(digest[:8], 16) / float(0xFFFFFFFF)
@@ -326,14 +372,26 @@ class TraceReplayLLMState:
             return fallback
         return "pwd"
 
-    def _effective_delay_ms(self, trace_delay_ms: float | None, *, role: str) -> float:
-        if self._response_delay_policy == "trace_replay":
-            if trace_delay_ms is not None:
-                delay_ms = trace_delay_ms * self._response_delay_scaling_factor
+    def _effective_delay_ms(
+        self,
+        trace_delay_ms: float | None,
+        *,
+        role: str,
+        sidecar_draft_delay_ms: float | None = None,
+    ) -> float:
+        if role == _SPEC_ROLE_DRAFT and sidecar_draft_delay_ms is not None:
+            # Use real draft-model latency from the sidecar, scaled by
+            # draft_response_delay_scaling_factor (oracle response_delay_scaling_factor
+            # is not applied — it's oracle-specific).
+            delay_ms = sidecar_draft_delay_ms * self._draft_response_delay_scaling_factor
+        else:
+            if self._response_delay_policy == "trace_replay":
+                if trace_delay_ms is not None:
+                    delay_ms = trace_delay_ms * self._response_delay_scaling_factor
+                else:
+                    delay_ms = float(self._response_delay_ms)
             else:
                 delay_ms = float(self._response_delay_ms)
-        else:
-            delay_ms = float(self._response_delay_ms)
-        if role == _SPEC_ROLE_DRAFT:
-            delay_ms *= self._draft_response_delay_scaling_factor
+            if role == _SPEC_ROLE_DRAFT:
+                delay_ms *= self._draft_response_delay_scaling_factor
         return min(self._maximal_delay_ms, max(self._minimal_delay_ms, delay_ms))

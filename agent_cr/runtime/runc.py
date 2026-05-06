@@ -23,6 +23,23 @@ from .base import CommandResult, CommandRunner, SubprocessCommandRunner
 logger = logging.getLogger(__name__)
 _HOST_INSPECTOR_REGISTER_ATTEMPTS = 3
 _HOST_INSPECTOR_REGISTER_RETRY_DELAY_S = 0.2
+
+# Runtime-default ignore rules added to every sandbox's
+# `host_inspector_ignore_process_rules`. These cover host-side helpers that
+# transiently enter the sandbox cgroup during checkpoint/restore: their
+# writes (notably CRIU's `dump.log` / `restore.log` to host paths) get
+# attributed to the sandbox by `bpf_get_current_cgroup_id()` and end up in
+# `live_dirty_entries`. Reset clears the table when the checkpoint
+# completes, but events queued by the per-sandbox event worker land
+# AFTER the reset and immediately re-set `filesystem_changed=True` —
+# blocking every subsequent `should_checkpoint=False` skip and forcing
+# the scheduler to take a (mostly redundant) checkpoint on every LLM
+# turn. With the rule active, the daemon drops these events at the
+# user-space ignore-rule check before they ever touch the dirty
+# entries.
+_RUNTIME_DEFAULT_IGNORE_PROCESS_RULES: tuple[dict[str, object], ...] = (
+    {"executable_basename": "criu"},
+)
 _RESILIENT_EXEC_RECOVERY_TIMEOUT_S = 300.0
 _DEFAULT_RUNTIME_COMMAND_TIMEOUT_SECONDS = 60.0
 _DEFAULT_ZFS_PREPARE_TIMEOUT_SECONDS = 300.0
@@ -135,6 +152,17 @@ class RuncCheckpointOptions:
     tcp_established: bool = True
     shell_job: bool = True
     tcp_skip_in_flight: bool = True
+    # Permit dumping anonymous AF_UNIX sockets whose peer lives outside
+    # the container. The runc-exec stdio plumbing creates exactly such a
+    # pair (peer is the host runc CLI), so any in-flight `runc exec` at
+    # checkpoint time produces one. nofault/spec dodge this by gating
+    # checkpoints to LLM-request boundaries (no exec in flight), but spot
+    # preemption fires whenever the host says — usually mid-`tmux
+    # wait-for marker`. Without this, CRIU aborts with "External socket
+    # is used" and the preemption checkpoint fails. On restore the socket
+    # comes back disconnected; the orphaned tmux client errors out and
+    # the terminus wait-for loop reissues a fresh runc exec.
+    ext_unix_sk: bool = True
     extra_args: tuple[str, ...] = ()
 
 
@@ -143,6 +171,7 @@ class RuncRestoreOptions:
     detach: bool = True
     tcp_established: bool = True
     shell_job: bool = True
+    ext_unix_sk: bool = True
     extra_args: tuple[str, ...] = ()
 
 
@@ -182,6 +211,17 @@ class RuncRuntime(Runtime):
         self._zfs_prepare_timeout_seconds = float(resolved_options.zfs_prepare_timeout_seconds)
         self._lock = Lock()
         self._items: dict[SandboxId, SandboxDescription] = {}
+        # In-flight `runc exec` subprocesses keyed by sandbox. The spot
+        # preemption flow drains these before checkpointing because each
+        # one wires an anonymous AF_UNIX stdio pair from the host runc
+        # CLI into a process inside the container — CRIU sees one half
+        # of that stream connection in the dump set and aborts with
+        # "Can't dump half of stream unix connection" even with
+        # --ext-unix-sk. Killing the host runc subprocess fires
+        # PR_SET_PDEATHSIG SIGKILL on the in-container exec'd process,
+        # closing the socket so CRIU can dump cleanly.
+        self._active_execs_lock = Lock()
+        self._active_execs: dict[SandboxId, set[subprocess.Popen]] = {}
         self._paths.metadata_root.mkdir(parents=True, exist_ok=True)
         self._paths.checkpoint_root.mkdir(parents=True, exist_ok=True)
 
@@ -590,6 +630,34 @@ class RuncRuntime(Runtime):
         except RuntimeError as exc:
             if "container not running" in str(exc) or "container does not exist" in str(exc):
                 self.sync_runtime_state(sandbox_id, is_running=False)
+                raise
+            # Defensive resume on freeze-timeout-style failures. runc's
+            # pause writes "FROZEN" to cgroup.freeze and polls for
+            # acknowledgement; if the kernel is slow under load (54-sandbox
+            # ZFS+CRIU concurrent burst seen in benchmark
+            # 20260429_031243), runc gives up after 10s but the kernel
+            # may still complete the freeze asynchronously. The container
+            # then sits stuck in FROZEN forever — the next `runc exec`
+            # fails with "cannot exec in a paused container", and the
+            # restore handler waits 300s then declares the sandbox dead.
+            #
+            # We don't know whether the cgroup actually froze, but
+            # `runc resume` is idempotent for an already-thawed cgroup
+            # (it returns "container not paused"), so calling it
+            # unconditionally is safe and self-healing.
+            #
+            # Heavy-load corollary: the resume's own 10s freezer-poll
+            # can ALSO time out (build-cython-ext fault-35 in run
+            # 20260430_123407). The cgroup.freeze=0 write itself
+            # succeeded — only the kernel's THAWED ack was slow — so by
+            # the time we retry a few seconds later the kernel has
+            # finished thawing and the second resume's poll completes
+            # immediately AND updates runc's state.json from "paused"
+            # to "running". Without that retry, state.json stays at
+            # "paused" and every subsequent `runc exec` is rejected
+            # with "cannot exec in a paused container" until the agent
+            # gives up at the 300s restore-wait deadline.
+            self._defensive_resume(sandbox_id)
             raise
         self._update_description(replace(description, status="paused"))
 
@@ -621,6 +689,58 @@ class RuncRuntime(Runtime):
                 return
             raise
         self._update_description(replace(description, status="running"))
+
+    _DEFENSIVE_RESUME_RETRY_DELAYS_S = (0.0, 5.0)
+    _DEFENSIVE_RESUME_BENIGN_ERRORS = (
+        "container not paused",
+        "container not running",
+        "container does not exist",
+    )
+
+    def _defensive_resume(self, sandbox_id: SandboxId) -> None:
+        """Best-effort thaw after a `runc pause` failure.
+
+        Calls `runc resume` up to len(_DEFENSIVE_RESUME_RETRY_DELAYS_S) times.
+        First attempt is immediate. If it fails because runc's freezer-poll
+        timed out (the cgroup.freeze=0 write itself succeeded — only the
+        kernel's THAWED ack was slow), the kernel finishes thawing on its
+        own within a few seconds; the next attempt's poll completes
+        immediately AND updates runc's state.json to "running". Without
+        this second pass, state.json stays "paused" and every subsequent
+        `runc exec` is rejected, leaving the sandbox unrecoverable until
+        the agent's 300s restore wait runs out.
+
+        Final-attempt failure is logged but not raised — the caller is
+        already propagating the original pause exception with its own
+        retry/abort policy.
+        """
+        last_attempt = len(self._DEFENSIVE_RESUME_RETRY_DELAYS_S) - 1
+        for attempt, delay in enumerate(self._DEFENSIVE_RESUME_RETRY_DELAYS_S):
+            if delay > 0:
+                time.sleep(delay)
+            try:
+                self._run_command(
+                    [self._runtime_bin, "--root", str(self._paths.state_root), "resume", str(sandbox_id)],
+                    operation="sandbox.runtime_pause_recover_resume",
+                    sandbox_id=sandbox_id,
+                    expected_error_substrings=self._DEFENSIVE_RESUME_BENIGN_ERRORS,
+                )
+                return
+            except Exception:
+                if attempt < last_attempt:
+                    logger.warning(
+                        "Defensive resume attempt %d failed sandbox=%s; retrying in %.1fs",
+                        attempt + 1,
+                        sandbox_id,
+                        self._DEFENSIVE_RESUME_RETRY_DELAYS_S[attempt + 1],
+                    )
+                    continue
+                logger.exception(
+                    "Defensive resume after pause failure also failed sandbox=%s after %d attempts",
+                    sandbox_id,
+                    attempt + 1,
+                )
+                return
 
     def sync_runtime_state(self, sandbox_id: SandboxId, *, is_running: bool) -> None:
         description = self.describe(sandbox_id)
@@ -749,16 +869,31 @@ class RuncRuntime(Runtime):
                 },
             ),
         )
-        completed = subprocess.run(
+        proc = subprocess.Popen(
             command,
-            check=False,
             stdin=subprocess.DEVNULL,
             stdout=stdout_target,
             stderr=stderr_target,
             text=True,
-            timeout=timeout_s,
         )
+        with self._active_execs_lock:
+            self._active_execs.setdefault(sandbox_id, set()).add(proc)
+        try:
+            try:
+                stdout, stderr = proc.communicate(timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+                raise
+        finally:
+            with self._active_execs_lock:
+                bucket = self._active_execs.get(sandbox_id)
+                if bucket is not None:
+                    bucket.discard(proc)
+                    if not bucket:
+                        self._active_execs.pop(sandbox_id, None)
         duration_ms = (time.perf_counter() - started) * 1000.0
+        completed = subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
         stdout = "" if completed.stdout is None else completed.stdout
         stderr = "" if completed.stderr is None else completed.stderr
         success = completed.returncode == 0
@@ -811,6 +946,40 @@ class RuncRuntime(Runtime):
             ),
         )
         return SandboxExecResult(args=tuple(command), returncode=int(completed.returncode), stdout=stdout, stderr=stderr)
+
+    def cancel_active_execs(self, sandbox_id: SandboxId, *, timeout_s: float = 2.0) -> int:
+        """Terminate all in-flight `runc exec` subprocesses targeting
+        `sandbox_id`. Returns the count of subprocesses signaled.
+
+        Used by the spot preemption flow so CRIU can dump the container
+        without hitting the half-stream unix-socket abort caused by
+        runc-exec stdio sockets crossing the container boundary.
+        Killing the host runc subprocess fires PR_SET_PDEATHSIG SIGKILL
+        on the in-container exec'd process, which closes the socket from
+        the in-container side and lets CRIU complete the dump."""
+        with self._active_execs_lock:
+            procs = list(self._active_execs.get(sandbox_id, ()))
+        if not procs:
+            return 0
+        for proc in procs:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        for proc in procs:
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                proc.wait(timeout=remaining if remaining > 0 else 0.05)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        return len(procs)
 
     def resilient_exec(
         self,
@@ -1278,6 +1447,55 @@ class RuncRuntime(Runtime):
     def process_work_path(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> Path:
         return self._paths.checkpoint_root / str(sandbox_id) / str(checkpoint_id) / "work"
 
+    def discard_partial_checkpoint(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> None:
+        # Best-effort cleanup. CRIU may have written ~GB of pages-N.img
+        # before the composite checkpoint's other step failed (e.g. zfs
+        # snapshot timeout); without this, the partial dir lives on as a
+        # manifest-less orphan because LocalCheckpointManager.delete_checkpoint
+        # walks artifacts to find runtime paths and we never persisted any
+        # artifacts when the step failed.
+        process_root = self._paths.checkpoint_root / str(sandbox_id) / str(checkpoint_id)
+        if process_root.exists():
+            try:
+                shutil.rmtree(process_root, ignore_errors=True)
+            except Exception:
+                logger.exception(
+                    "Failed to remove partial checkpoint directory sandbox=%s checkpoint=%s path=%s",
+                    sandbox_id,
+                    checkpoint_id,
+                    process_root,
+                )
+        dataset = self.dataset_name_for(sandbox_id)
+        snapshot = f"{dataset}@{checkpoint_id}"
+        if self._zfs_snapshot_exists(snapshot):
+            try:
+                self._run_command(
+                    [self._zfs_bin, "destroy", snapshot],
+                    operation="sandbox.discard_partial_checkpoint",
+                    check=False,
+                    metadata={"snapshot": snapshot},
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to destroy partial zfs snapshot sandbox=%s checkpoint=%s snapshot=%s",
+                    sandbox_id,
+                    checkpoint_id,
+                    snapshot,
+                )
+
+    def _zfs_snapshot_exists(self, snapshot: str) -> bool:
+        result = self._run_command(
+            [self._zfs_bin, "list", "-H", "-o", "name", "-t", "snapshot", snapshot],
+            operation="sandbox.zfs_snapshot_exists",
+            check=False,
+            metadata={"snapshot": snapshot},
+        )
+        return result.returncode == 0
+
     def _persist(self, description: SandboxDescription) -> None:
         path = self._metadata_path(description.sandbox_id)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1301,17 +1519,48 @@ class RuncRuntime(Runtime):
             if tmp.exists():
                 tmp.unlink(missing_ok=True)
 
+    def _sandbox_ignored_path_prefixes(self, sandbox_id: SandboxId) -> list[str]:
+        """Per-sandbox host-side path prefixes that should never count as
+        sandbox state changes. Concatenated with `/` so a sandbox-id
+        accidental substring of another (e.g. `spec-0` vs `spec-0-spec-1`)
+        cannot leak the parent's filter onto the child."""
+        sb = str(sandbox_id)
+        return [
+            f"{self._paths.checkpoint_root}/{sb}/",
+            f"{self._paths.bundle_root}/{sb}/",
+            f"{self._paths.state_root}/{sb}/",
+            f"{self._paths.metadata_root}/{sb}/",
+        ]
+
     def _register_with_host_inspector(self, description: SandboxDescription) -> None:
         if self._host_inspector_client is None:
             return
-        ignore_process_rules = description.metadata.get("host_inspector_ignore_process_rules")
+        per_sandbox_rules = description.metadata.get("host_inspector_ignore_process_rules")
+        # Always layer the runtime defaults on top of any per-sandbox rules
+        # so CRIU/runc helper writes can't masquerade as sandbox state
+        # changes regardless of which agent is running.
+        merged_rules: list[dict[str, object]] = [
+            dict(rule) for rule in _RUNTIME_DEFAULT_IGNORE_PROCESS_RULES
+        ]
+        if per_sandbox_rules is not None:
+            merged_rules.extend(dict(rule) for rule in per_sandbox_rules)
+        # Path-prefix filter for host-side helper writes that get attributed
+        # to the sandbox cgroup. Targets the per-sandbox checkpoint/bundle
+        # directories CRIU writes `dump.log`/`restore.log` and runc writes
+        # state metadata into. The PID-based ignore rule above also covers
+        # CRIU, but CRIU's PIDs are short-lived enough that
+        # /proc/PID/exe is often gone by the time the daemon classifies the
+        # event — the path-prefix filter doesn't depend on the PID still
+        # existing and catches the residual writes.
+        ignored_path_prefixes = self._sandbox_ignored_path_prefixes(description.sandbox_id)
         for attempt in range(1, _HOST_INSPECTOR_REGISTER_ATTEMPTS + 1):
             try:
                 self._host_inspector_client.register_sandbox(
                     description.sandbox_id,
                     self.name,
                     str(description.sandbox_id),
-                    ignore_process_rules=None if ignore_process_rules is None else list(ignore_process_rules),
+                    ignore_process_rules=merged_rules,
+                    ignored_path_prefixes=ignored_path_prefixes,
                 )
                 return
             except Exception as exc:
@@ -1517,6 +1766,8 @@ class RuncRuntime(Runtime):
             args.append("--shell-job")
         if self._checkpoint_options.tcp_skip_in_flight:
             args.append("--tcp-skip-in-flight")
+        if self._checkpoint_options.ext_unix_sk:
+            args.append("--ext-unix-sk")
         args.extend(self._checkpoint_options.extra_args)
         return args
 
@@ -1526,6 +1777,8 @@ class RuncRuntime(Runtime):
             args.append("--tcp-established")
         if self._restore_options.shell_job:
             args.append("--shell-job")
+        if self._restore_options.ext_unix_sk:
+            args.append("--ext-unix-sk")
         args.extend(self._restore_options.extra_args)
         return args
 

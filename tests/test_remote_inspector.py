@@ -10,6 +10,7 @@ class RecordingServiceClient(HostInspectorServiceClient):
     def __init__(self) -> None:
         super().__init__("http://127.0.0.1:1")
         self.reset_calls: list[tuple[SandboxId, datetime | None]] = []
+        self.reset_captures_process: list[bool] = []
 
     def get_proc_and_fs_status(self, sandbox_id: SandboxId) -> dict[str, object]:
         _ = sandbox_id
@@ -26,8 +27,15 @@ class RecordingServiceClient(HostInspectorServiceClient):
             },
         }
 
-    def reset_sandbox(self, sandbox_id: SandboxId, at: datetime | None) -> dict[str, object]:
+    def reset_sandbox(
+        self,
+        sandbox_id: SandboxId,
+        at: datetime | None,
+        *,
+        captures_process: bool = False,
+    ) -> dict[str, object]:
         self.reset_calls.append((sandbox_id, at))
+        self.reset_captures_process.append(bool(captures_process))
         return {"ok": True}
 
 
@@ -39,8 +47,14 @@ class FailingServiceClient(HostInspectorServiceClient):
         _ = sandbox_id
         raise RuntimeError("boom")
 
-    def reset_sandbox(self, sandbox_id: SandboxId, at: datetime | None) -> dict[str, object]:
-        _ = (sandbox_id, at)
+    def reset_sandbox(
+        self,
+        sandbox_id: SandboxId,
+        at: datetime | None,
+        *,
+        captures_process: bool = False,
+    ) -> dict[str, object]:
+        _ = (sandbox_id, at, captures_process)
         raise RuntimeError("boom")
 
 
@@ -67,11 +81,18 @@ class DeferredResetServiceClient(HostInspectorServiceClient):
             },
         }
 
-    def reset_sandbox(self, sandbox_id: SandboxId, at: datetime | None) -> dict[str, object]:
+    def reset_sandbox(
+        self,
+        sandbox_id: SandboxId,
+        at: datetime | None,
+        *,
+        captures_process: bool = False,
+    ) -> dict[str, object]:
         if not self.registered:
             raise KeyError(str(sandbox_id))
         self.reset_calls.append((sandbox_id, at))
         self._last_reset_at = at
+        _ = captures_process
         return {"ok": True}
 
 
@@ -108,6 +129,26 @@ class RemoteInspectorTests(unittest.TestCase):
         inspector.mark_checkpoint_complete(SandboxId("sbx-1"), process=True, filesystem=False, at=at)
 
         self.assertEqual(client.reset_calls, [(SandboxId("sbx-1"), at)])
+        # process=True must propagate so the daemon refreshes its
+        # acknowledged_deleted_mmaps baseline; otherwise a libc rewrite
+        # captured by this full checkpoint would re-fire mmap_invalidation
+        # on the next status() and force the next checkpoint to be full
+        # too — the latch-forever bug we're explicitly preventing.
+        self.assertEqual(client.reset_captures_process, [True])
+
+    def test_mark_checkpoint_complete_passes_false_for_fs_only(self) -> None:
+        """fs-only checkpoints must NOT refresh the acknowledged baseline:
+        the process image is unchanged, so its frozen content set is too.
+        Forwarding captures_process=True here would erase paths captured
+        by an earlier full checkpoint and reintroduce the latch."""
+        client = RecordingServiceClient()
+        inspector = RemoteSandboxInspector(client)
+        at = datetime(2026, 3, 11, 12, 2, tzinfo=timezone.utc)
+
+        inspector.mark_checkpoint_complete(SandboxId("sbx-1"), process=False, filesystem=True, at=at)
+
+        self.assertEqual(client.reset_calls, [(SandboxId("sbx-1"), at)])
+        self.assertEqual(client.reset_captures_process, [False])
 
     def test_remote_inspector_uses_seed_snapshot_until_remote_registration_then_syncs_reset(self) -> None:
         client = DeferredResetServiceClient()

@@ -67,6 +67,8 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
             "mini_swe_trace_replay",
             "mini_swe_spec_trace_replay",
             "claude_code_trace_replay",
+            "terminus_trace_replay",
+            "terminus_spec_trace_replay",
         ],
         default=None,
     )
@@ -345,6 +347,8 @@ def is_replay_llm_service_type(llm_service_type: str | None) -> bool:
         "mini_swe_trace_replay",
         "mini_swe_spec_trace_replay",
         "claude_code_trace_replay",
+        "terminus_trace_replay",
+        "terminus_spec_trace_replay",
     }
 
 

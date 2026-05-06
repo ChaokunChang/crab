@@ -134,12 +134,17 @@ def _apply_task_timeout_scales(
     *,
     max_agent_timeout_scale: float,
     max_test_timeout_scale: float,
+    max_agent_timeout_scale_overrides: dict[str, float] | None = None,
+    max_test_timeout_scale_overrides: dict[str, float] | None = None,
 ) -> BenchmarkTaskRecord:
     options = dict(record.task_config.options)
+    task_id = str(options.get("task_id", "")).strip()
+    agent_scale = (max_agent_timeout_scale_overrides or {}).get(task_id, max_agent_timeout_scale)
+    test_scale = (max_test_timeout_scale_overrides or {}).get(task_id, max_test_timeout_scale)
     changed = False
     for key, scale in (
-        ("max_agent_timeout_sec", max_agent_timeout_scale),
-        ("max_test_timeout_sec", max_test_timeout_scale),
+        ("max_agent_timeout_sec", agent_scale),
+        ("max_test_timeout_sec", test_scale),
     ):
         if key not in options:
             continue
@@ -173,12 +178,19 @@ def resolve_task_records(
     ]
     if config.llm_service_options:
         records = [_apply_llm_service_options(r, config.llm_service_options) for r in records]
-    if config.max_agent_timeout_scale != 1.0 or config.max_test_timeout_scale != 1.0:
+    if (
+        config.max_agent_timeout_scale != 1.0
+        or config.max_test_timeout_scale != 1.0
+        or config.max_agent_timeout_scale_overrides
+        or config.max_test_timeout_scale_overrides
+    ):
         records = [
             _apply_task_timeout_scales(
                 r,
                 max_agent_timeout_scale=config.max_agent_timeout_scale,
                 max_test_timeout_scale=config.max_test_timeout_scale,
+                max_agent_timeout_scale_overrides=config.max_agent_timeout_scale_overrides,
+                max_test_timeout_scale_overrides=config.max_test_timeout_scale_overrides,
             )
             for r in records
         ]

@@ -27,6 +27,8 @@ from integrations.llm_services.iflow_trace_replay.service import TraceReplayLLMS
 from integrations.llm_services.claude_code_trace_replay.service import TraceReplayLLMState as ClaudeCodeTraceReplayLLMState
 from integrations.llm_services.mini_swe_trace_replay.service import TraceReplayLLMState as MiniSWETraceReplayLLMState
 from integrations.llm_services.mini_swe_spec_trace_replay.service import TraceReplayLLMState as MiniSWESpecTraceReplayLLMState
+from integrations.llm_services.terminus_trace_replay.service import TraceReplayLLMState as TerminusTraceReplayLLMState
+from integrations.llm_services.terminus_spec_trace_replay.service import TraceReplayLLMState as TerminusSpecTraceReplayLLMState
 from integrations.llm_services.manual.service import ManualLLMState, handle_control_request
 from integrations.llm_services.simulated.service import SimulatedLLMState, handle_request as handle_simulated_request
 from integrations.llm_services.simulated_for_iflow.service import (
@@ -57,6 +59,8 @@ def default_llm_service_type_for_agent(agent_type: str) -> str:
         return "mini_swe_trace_replay"
     if agent_type == "claude_code":
         return "claude_code_trace_replay"
+    if agent_type == "terminus":
+        return "terminus_trace_replay"
     return "simulated"
 
 
@@ -67,6 +71,8 @@ def validate_llm_service_type(*, provider: str, llm_service_type: str) -> None:
         "iflow_trace_replay",
         "mini_swe_trace_replay",
         "mini_swe_spec_trace_replay",
+        "terminus_trace_replay",
+        "terminus_spec_trace_replay",
     }
     supported = {
         "simulated",
@@ -76,6 +82,8 @@ def validate_llm_service_type(*, provider: str, llm_service_type: str) -> None:
         "mini_swe_trace_replay",
         "mini_swe_spec_trace_replay",
         "claude_code_trace_replay",
+        "terminus_trace_replay",
+        "terminus_spec_trace_replay",
     }
     if llm_service_type not in supported:
         raise ValueError(f"unsupported llm service type: {llm_service_type}")
@@ -233,6 +241,46 @@ class ClaudeCodeTraceReplayServiceState:
         self._state.restore(consumed_response_count=consumed_response_count)
 
 
+class TerminusTraceReplayServiceState:
+    def __init__(self, *, llm_service_config: dict[str, object] | None = None) -> None:
+        self._state = TerminusTraceReplayLLMState(llm_service_config=llm_service_config)
+
+    def handle_request(self, *, path: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
+        return self._state.handle_request(path=path, headers=headers, payload=payload)
+
+    def snapshot(self, *, include_events: bool = True) -> dict[str, Any]:
+        return self._state.snapshot(include_events=include_events)
+
+    def reset(self) -> None:
+        self._state.reset()
+
+    def restore(self, *, consumed_response_count: int) -> None:
+        self._state.restore(consumed_response_count=consumed_response_count)
+
+
+class TerminusSpecTraceReplayServiceState:
+    def __init__(self, *, llm_service_config: dict[str, object] | None = None) -> None:
+        self._state = TerminusSpecTraceReplayLLMState(llm_service_config=llm_service_config)
+
+    def handle_request(self, *, path: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
+        return self._state.handle_request(path=path, headers=headers, payload=payload)
+
+    def snapshot(self, *, include_events: bool = True) -> dict[str, Any]:
+        return self._state.snapshot(include_events=include_events)
+
+    def reset(self) -> None:
+        self._state.reset()
+
+    def restore(self, *, consumed_response_count: int) -> None:
+        self._state.restore(consumed_response_count=consumed_response_count)
+
+    def export_state(self) -> dict[str, Any]:
+        return self._state.export_state()
+
+    def import_state(self, state: dict[str, Any]) -> None:
+        self._state.import_state(state)
+
+
 def build_llm_service_registry() -> dict[str, type[LLMServiceState]]:
     return {
         "manual": ManualServiceState,
@@ -242,6 +290,8 @@ def build_llm_service_registry() -> dict[str, type[LLMServiceState]]:
         "mini_swe_trace_replay": MiniSWETraceReplayServiceState,
         "mini_swe_spec_trace_replay": MiniSWESpecTraceReplayServiceState,
         "claude_code_trace_replay": ClaudeCodeTraceReplayServiceState,
+        "terminus_trace_replay": TerminusTraceReplayServiceState,
+        "terminus_spec_trace_replay": TerminusSpecTraceReplayServiceState,
     }
 
 

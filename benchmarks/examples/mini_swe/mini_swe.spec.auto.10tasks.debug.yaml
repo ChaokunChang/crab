@@ -1,0 +1,80 @@
+scenario: spec
+mode: auto
+provider: openai
+agent: mini_swe
+llm_service: mini_swe_spec_trace_replay
+task_dataset: /root/workspace/agent-cr/results/datasets/swebench_miniswe_replay.jsonl
+sandboxes: 10
+max_workers: 10
+phase_workers:
+  setup: 10
+  run: 10
+  verification: 10
+phase_merging:
+  setup_and_run: true
+  setup_and_run_executor_pool: shared
+verification:
+  enabled: true
+executor:
+  checkpoint_workers: 10
+  restore_workers: 10
+  checkpoint_queue_size: 10000
+  max_retries: 0
+  retry_backoff_seconds: 0.05
+  coordination_workers: 10
+  composite_step_workers: 10
+scheduler:
+  min_checkpoint_interval_seconds: 0.0
+  force_checkpoint_after_seconds: 0.0
+  require_change_signal: true
+  prefer_checkpoint_during_llm_request: true
+  require_llm_request_for_checkpoint: false
+  inspect_without_pause: false
+  checkpoint_full_baseline_on_first_checkpoint: true
+llm_server:
+  launch_mode: process
+host_inspector:
+  launch_mode: process
+iterations: 0
+output: /root/workspace/agent-cr/logs/mini_swe/spec.auto.10tasks.debug.csv
+log_file: /root/workspace/agent-cr/logs/mini_swe/spec.auto.10tasks.debug.log
+log_file_mode: write
+telemetry:
+  output: /root/workspace/agent-cr/logs/mini_swe/spec.auto.10tasks.debug.telemetry.jsonl
+  file_mode: write
+  detail_level: detailed
+  capture_command_output: false
+  max_text_attribute_bytes: 2048
+  keep_in_memory_copy: false
+  writer_mode: async
+  queue_capacity: 16384000
+  batch_max_records: 256000
+  flush_interval_ms: 50
+  overflow_policy: drop_new
+  serializer: auto
+  report:
+    enabled: true
+    output_dir: /root/workspace/agent-cr/logs/mini_swe/spec.auto.10tasks.debug.report
+    top_k: 50
+    log_scale_charts: false
+    export_svg: true
+monitoring:
+  enabled: true
+  sample_interval_ms: 1000
+  include_host: true
+  include_sandboxes: true
+reuse_zpool: true
+benchmark_root: /root/workspace/agent-cr/data/agent_cr/results
+zpool_size: 200G
+zpool_name: agentcrbench-200
+zpool_image: /root/workspace/agent-cr/data/agent_cr/results/zpool/agentcrbench-200G.zpool.img
+runtime_command_timeout_seconds: 300
+runtime_zfs_prepare_timeout_seconds: 900
+log_level: debug
+scenario_options:
+  acceptance_rate: 0.5
+  draft_response_delay_scaling_factor: 0.1
+  mismatch_policy: preserve_command_class
+llm_service_options:
+  response_delay_policy: trace_replay
+  response_delay_scaling_factor: 1.0

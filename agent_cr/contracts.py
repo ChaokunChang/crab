@@ -164,6 +164,19 @@ class Runtime(ABC):
     ) -> dict[str, object]:
         raise NotImplementedError
 
+    def discard_partial_checkpoint(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> None:
+        """Remove any artifacts a checkpoint step left on disk before the
+        composite checkpoint failed. Best-effort; safe to call when nothing
+        was written. Subclasses should override to clean up runtime-specific
+        scratch (CRIU image dir, ZFS @snapshot) so a failure of one composite
+        step does not orphan the other step's output.
+        """
+        return None
+
     @abstractmethod
     def delete_runtime(
         self,

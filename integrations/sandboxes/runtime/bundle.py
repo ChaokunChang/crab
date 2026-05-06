@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -23,19 +25,102 @@ class SandboxResourceLimits:
     memory_bytes: int | None = None
     pids_limit: int | None = None
     cpu_period_us: int = DEFAULT_CPU_PERIOD_US
+    cpu_set: str | None = None
+    auto_cpu_set: bool = True
 
     def is_empty(self) -> bool:
         return (
             self.cpus is None
             and self.memory_bytes is None
             and self.pids_limit is None
+            and self.cpu_set is None
         )
+
+
+_SANDBOX_INDEX_RE = re.compile(r"(\d+)")
+
+
+def derive_default_cpu_set(sandbox_name: str, cpus: int) -> str | None:
+    """Pick a cpuset for the sandbox so `sched_getaffinity()` and
+    `len(os.sched_getaffinity(0))`-aware tools (joblib/loky, pytest-xdist,
+    `nproc`, OpenMP) see exactly `cpus` CPUs instead of the host count.
+
+    The cgroup `cpu.max` quota alone does not constrain affinity-based
+    pool sizing — `os.cpu_count()` and `nproc` read host visibility, not
+    the quota. Pinning a cpuset slot per sandbox keeps the worker pools
+    bounded without forcing every sandbox onto the same physical cores.
+
+    The first integer component of `sandbox_name` is used as the slot
+    index so a parent sandbox and its speculative forks (e.g. `spec-3`
+    and `spec-3-spec-1`) share the same physical cores. Slots wrap modulo
+    the host CPU count.
+    """
+    if cpus is None or cpus <= 0:
+        return None
+    host_cpus = os.cpu_count() or 0
+    if host_cpus <= 0:
+        return None
+    cpus = min(int(cpus), host_cpus)
+    match = _SANDBOX_INDEX_RE.search(sandbox_name)
+    slot = int(match.group(1)) if match is not None else 0
+    start = (slot * cpus) % host_cpus
+    end = start + cpus - 1
+    if end >= host_cpus:
+        # Wrap-around windows would split the cpuset; collapse to the
+        # head of the host range so we always emit a contiguous span.
+        start = 0
+        end = cpus - 1
+    return f"{start}-{end}" if cpus > 1 else f"{start}"
+
+
+_CPU_VISIBILITY_TARGETS = (
+    "/sys/devices/system/cpu/online",
+    "/sys/devices/system/cpu/possible",
+    "/sys/devices/system/cpu/present",
+)
+
+
+def _write_cpu_visibility_overlay(bundle_dir: Path, cpus: int) -> Path | None:
+    """Write a fake `/sys/devices/system/cpu/online`-style file in the bundle
+    so glibc's `__get_nprocs()` (used by `sysconf(_SC_NPROCESSORS_ONLN)`,
+    `os.cpu_count()`, `multiprocessing.cpu_count()`, `nproc`'s fallback,
+    and most other "how many CPUs are there" callers) sees `cpus` CPUs
+    instead of the host count.
+
+    cgroup `cpuset.cpus` already constrains `sched_getaffinity()`, but
+    glibc 2.39 reads `/sys/devices/system/cpu/online` directly for
+    `__get_nprocs()` — it does not consult affinity. Without this overlay,
+    `os.cpu_count()` returns the host count even with cpuset applied,
+    which is what blows up `concurrent.futures.ProcessPoolExecutor`'s
+    default worker count (e.g. PyStan/httpstan's forkserver pool).
+    """
+    if cpus is None or cpus <= 0:
+        return None
+    overlay_dir = bundle_dir / "cpu-visibility"
+    overlay_dir.mkdir(parents=True, exist_ok=True)
+    target = overlay_dir / "online"
+    body = f"0-{cpus - 1}\n" if cpus > 1 else "0\n"
+    target.write_text(body)
+    return target
+
+
+def _cpu_visibility_mounts(overlay_path: Path) -> list[dict[str, object]]:
+    return [
+        {
+            "destination": destination,
+            "source": str(overlay_path),
+            "type": "bind",
+            "options": ["rbind", "ro"],
+        }
+        for destination in _CPU_VISIBILITY_TARGETS
+    ]
 
 
 def _apply_resource_limits(linux_cfg: dict, limits: SandboxResourceLimits | None) -> None:
     if limits is None or limits.is_empty():
         return
     resources = dict(linux_cfg.get("resources") or {})
+    cpu_cfg = dict(resources.get("cpu") or {})
     if limits.cpus is not None:
         cpus = int(limits.cpus)
         if cpus <= 0:
@@ -43,9 +128,11 @@ def _apply_resource_limits(linux_cfg: dict, limits: SandboxResourceLimits | None
         period = int(limits.cpu_period_us)
         if period <= 0:
             raise ValueError(f"resource_limits.cpu_period_us must be positive, got {period}")
-        cpu_cfg = dict(resources.get("cpu") or {})
         cpu_cfg["period"] = period
         cpu_cfg["quota"] = cpus * period
+    if limits.cpu_set:
+        cpu_cfg["cpus"] = str(limits.cpu_set)
+    if cpu_cfg:
         resources["cpu"] = cpu_cfg
     if limits.memory_bytes is not None:
         memory = int(limits.memory_bytes)
@@ -218,9 +305,21 @@ def write_bundle_config(
     linux_cfg["namespaces"] = namespaces
     linux_cfg["cgroupsPath"] = cgroup_path
     linux_cfg.pop("seccomp", None)
+    if (
+        resource_limits is not None
+        and resource_limits.cpus is not None
+        and resource_limits.cpu_set is None
+        and resource_limits.auto_cpu_set
+    ):
+        derived = derive_default_cpu_set(sandbox_name, int(resource_limits.cpus))
+        if derived is not None:
+            from dataclasses import replace as _dc_replace
+
+            resource_limits = _dc_replace(resource_limits, cpu_set=derived)
     _apply_resource_limits(linux_cfg, resource_limits)
     cfg["linux"] = linux_cfg
-    mounts = [mount for mount in cfg.get("mounts", []) if mount.get("destination") != "/work"]
+    excluded_destinations = {"/work", *_CPU_VISIBILITY_TARGETS}
+    mounts = [mount for mount in cfg.get("mounts", []) if mount.get("destination") not in excluded_destinations]
     if work_dir_host_path is not None:
         work_dir_host_path.mkdir(parents=True, exist_ok=True)
         mounts.append(
@@ -231,6 +330,10 @@ def write_bundle_config(
                 "options": ["rbind", "rw"],
             }
         )
+    if resource_limits is not None and resource_limits.cpus is not None:
+        overlay_path = _write_cpu_visibility_overlay(bundle_dir, int(resource_limits.cpus))
+        if overlay_path is not None:
+            mounts.extend(_cpu_visibility_mounts(overlay_path))
     cfg["mounts"] = mounts
     cfg["process"]["terminal"] = False
     cfg["process"]["cwd"] = image_defaults.working_dir if image_defaults and image_defaults.working_dir else "/work"

@@ -16,8 +16,20 @@ from ..http_utils import PooledHTTPServer
 from ..json_codec import get_json_codec
 from ..models import utc_now
 from .fs_helper import LibbpfFilesystemMonitor
-from .process_filter import parse_process_ignore_rules, pid_matches_ignore_rules
-from .process_monitor import dirty_pids, list_cgroup_pids, reset_soft_dirty_for_pids
+from .process_filter import (
+    PidIdentityCache,
+    classify_pid_against_rules,
+    parse_process_ignore_rules,
+    pid_matches_ignore_rules,
+)
+from .process_monitor import (
+    MmapPathCache,
+    all_deleted_mmap_paths,
+    dirty_pids,
+    list_cgroup_pids,
+    path_invalidates_mmap,
+    reset_soft_dirty_for_pids,
+)
 from .runtime_resolver import ResolvedSandbox, RuntimeResolver
 from .state import SandboxRecord
 
@@ -71,6 +83,21 @@ def _isoformat(ts: datetime | None) -> str | None:
     return None if ts is None else ts.isoformat()
 
 
+def _parse_ignored_path_prefixes(raw: object | None) -> tuple[str, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise TypeError("ignored_path_prefixes must be a list of strings")
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            raise TypeError("ignored_path_prefixes entries must be strings")
+        cleaned = item.strip()
+        if cleaned:
+            out.append(cleaned)
+    return tuple(out)
+
+
 def _parse_ts(raw: str | None) -> datetime | None:
     if raw is None:
         return None
@@ -94,6 +121,24 @@ class HostInspectorDaemon:
         self._records: dict[str, SandboxRecord] = {}
         self._bpf_ignored_pids: set[int] = set()
         self._bpf_ignored_pids_lock = Lock()
+        # Cache pid → ProcessIdentity reads on the high-rate fs-event hot
+        # path. Without this, every fs event triggered 2 syscalls in
+        # `read_process_identity` (and a parent-chain walk for
+        # ancestor-scoped rules), and `_handle_fs_event` ran
+        # ~10–40k times/sec under tmux pane workloads — that proc-read
+        # fan-out was the dominant cost responsible for the
+        # `fs_monitor.sync(timeout_s=5.0)` barrier missing its budget.
+        self._pid_identity_cache = PidIdentityCache()
+        # Cache /proc/<pid>/maps reads on the per-event hot path. The
+        # mmap-invalidation check in `_handle_fs_event` was the second
+        # dominant per-worker cost (after pid identity reads), since
+        # every fs event re-read the maps file for every live pid in
+        # the cgroup. Caching for 1s lets bursty event streams
+        # against the same pid set reuse one read; the kernel-truth
+        # fallback in status() reads `(deleted)` mmaps uncached, so a
+        # stale event-path miss is recovered on the next status()
+        # call without correctness loss.
+        self._mmap_path_cache = MmapPathCache()
 
     def _sandbox_lock(self, sandbox_id: str) -> Lock:
         with self._sandbox_locks_guard:
@@ -115,12 +160,14 @@ class HostInspectorDaemon:
         """
         with self._bpf_ignored_pids_lock:
             to_add = new_ignored_pids - self._bpf_ignored_pids
-            # Union of ignored sets across all sandboxes (except the
+            # Union of fs-eligible ignored sets across all sandboxes (the
             # caller's new set is already included in new_ignored_pids).
+            # `record.fs_ignored_pids` excludes pids ignored under
+            # scope=process_only, so they never enter the kernel filter.
             with self._records_lock:
                 union = set(new_ignored_pids)
                 for record in self._records.values():
-                    union |= set(record.ignored_pids)
+                    union |= set(record.fs_ignored_pids)
             to_remove = self._bpf_ignored_pids - union
             for pid in to_add:
                 try:
@@ -152,16 +199,18 @@ class HostInspectorDaemon:
         object_id: str,
         *,
         ignore_process_rules: object | None = None,
+        ignored_path_prefixes: object | None = None,
     ) -> dict[str, object]:
         resolved = self._resolver.resolve(runtime, object_id)
         observed_at = utc_now()
         parsed_ignore_rules = parse_process_ignore_rules(ignore_process_rules)
+        parsed_path_prefixes = _parse_ignored_path_prefixes(ignored_path_prefixes)
         sandbox_lock = self._sandbox_lock(sandbox_id)
         with sandbox_lock:
             with self._records_lock:
                 previous = self._records.get(sandbox_id)
         all_current_pids = list_cgroup_pids(resolved.cgroup_path)
-        tracked_pids, ignored_pids = self._split_pids(all_current_pids, parsed_ignore_rules)
+        tracked_pids, ignored_pids, fs_ignored_pids = self._split_pids(all_current_pids, parsed_ignore_rules)
         record = SandboxRecord(
             sandbox_id=sandbox_id,
             runtime=runtime,
@@ -172,8 +221,10 @@ class HostInspectorDaemon:
             cgroup_path=resolved.cgroup_path,
             cgroup_id=resolved.cgroup_id,
             ignore_process_rules=parsed_ignore_rules,
+            ignored_path_prefixes=parsed_path_prefixes,
             tracked_pids=tracked_pids,
             ignored_pids=ignored_pids,
+            fs_ignored_pids=fs_ignored_pids,
             current_pids=tracked_pids,
             process_changed=False,
             filesystem_changed=False,
@@ -191,7 +242,33 @@ class HostInspectorDaemon:
             self._fs_monitor.remove_sandbox(sandbox_id)
         if resolved.cgroup_id is not None:
             self._fs_monitor.upsert_sandbox(sandbox_id, resolved.cgroup_id)
-        self._sync_bpf_ignored_pids(ignored_pids)
+        # Push the path-prefix filter into the C helper so matching
+        # events get dropped before they cross the JSON/parse boundary.
+        # Must come AFTER upsert_sandbox so the helper can find the
+        # registration record by sandbox_id.
+        if hasattr(self._fs_monitor, "set_ignored_path_prefixes"):
+            try:
+                self._fs_monitor.set_ignored_path_prefixes(sandbox_id, parsed_path_prefixes)
+            except Exception:
+                logger.exception(
+                    "Failed to push ignored_path_prefixes to fs helper sandbox=%s",
+                    sandbox_id,
+                )
+        # Push fs-eligible (scope=all) ignore rules to the helper so it
+        # can drop matched events before they cross IPC. The Python
+        # `_handle_fs_event` still re-evaluates the same rules as
+        # belt-and-suspenders for any path that bypasses the helper.
+        if hasattr(self._fs_monitor, "set_ignore_process_rules"):
+            try:
+                self._fs_monitor.set_ignore_process_rules(sandbox_id, parsed_ignore_rules)
+            except Exception:
+                logger.exception(
+                    "Failed to push ignore_process_rules to fs helper sandbox=%s",
+                    sandbox_id,
+                )
+        # Only the fs-ignored subset goes into the kernel filter; pids
+        # ignored under scope=process_only must keep delivering fs events.
+        self._sync_bpf_ignored_pids(fs_ignored_pids)
         logger.debug(
             "register sandbox=%s runtime=%s object=%s cgroup_id=%s init_pid=%s previous_cgroup_id=%s observed_at=%s",
             sandbox_id,
@@ -239,7 +316,14 @@ class HostInspectorDaemon:
         # observed worst case without masking a genuine pipeline stall; a
         # sync that cannot complete in 5s signals real breakage rather than
         # steady-state backpressure.
-        fs_sync_timeout = not self._fs_monitor.sync(timeout_s=5.0)
+        #
+        # We pass `sandbox_id` so the barrier fences only the worker
+        # bucket that owns this sandbox. Without it, a single noisy
+        # sandbox's event burst (apt-get, tar, build) would block every
+        # other sandbox's status() until its bucket drained — the
+        # cross-sandbox HOL blocking that produced the bulk of the
+        # cumulative fs_sync_timeout warnings in benchmark runs.
+        fs_sync_timeout = not self._fs_monitor.sync(sandbox_id, timeout_s=5.0)
         if fs_sync_timeout:
             # If sync did not complete in time, we cannot trust the
             # cached filesystem_changed signal: in-flight events may
@@ -286,7 +370,7 @@ class HostInspectorDaemon:
             resolved = self._resolver.resolve(record.runtime, record.object_id)
             resolve_ms = (time.monotonic() - resolve_start) * 1000.0
             all_current_pids = list_cgroup_pids(resolved.cgroup_path)
-            tracked_pids, ignored_pids = self._split_pids(all_current_pids, record.ignore_process_rules)
+            tracked_pids, ignored_pids, fs_ignored_pids = self._split_pids(all_current_pids, record.ignore_process_rules)
             dirty = dirty_pids(tracked_pids)
             live_dirty_entries = self._reconcile_live_dirty_entries(record.live_dirty_entries, resolved.init_pid)
             filesystem_changed = bool(live_dirty_entries) or any(
@@ -294,6 +378,55 @@ class HostInspectorDaemon:
             )
             if fs_sync_timeout:
                 filesystem_changed = True
+            mmap_invalidated = record.mmap_invalidated
+            mmap_invalidated_path = record.mmap_invalidated_path
+            if not mmap_invalidated:
+                # Kernel-truth fallback for the eBPF-event-driven detection in
+                # _handle_fs_event: at high concurrency the perf ringbuf can
+                # drop file-write events for a sandbox (apt-get install often
+                # rewrites both libc.so.6 and ld-linux-x86-64.so.2 within a
+                # tight burst), and a missed event leaves mmap_invalidated
+                # False. The kernel marks any /proc/{pid}/maps entry whose
+                # backing file was unlinked with a ` (deleted)` suffix, so
+                # scanning the live pids' maps here recovers the signal even
+                # when the corresponding eBPF event never made it through.
+                #
+                # Scan EVERY pid that CRIU will dump (tracked + ignored +
+                # init), not just tracked. The whole point of CRIU's process
+                # checkpoint is that it captures the entire cgroup, so a
+                # `(deleted)` mmap on ANY of those pids is what breaks
+                # restore from a stale process image. Excluding ignored pids
+                # here was a fault-7 footgun: with the tmux ignore rules
+                # active, `tracked_pids` is empty (sleep init / tmux server
+                # / pane bash all matched), so this fallback never fired
+                # even though sleep — the actual init that mmaps libc.so.6
+                # — sat in `ignored_pids` waiting to be detected.
+                #
+                # Latching is suppressed by `acknowledged_deleted_mmaps`:
+                # once a full process checkpoint runs, reset() captures the
+                # current `(deleted)` set, and only NEW paths fire here
+                # afterwards. CRIU stores unlinked file content inline in
+                # the dump image, so a path already captured won't break
+                # any future restore from that image.
+                live_pids = set(tracked_pids) | set(ignored_pids)
+                if resolved.init_pid:
+                    live_pids.add(int(resolved.init_pid))
+                deleted_path: str | None = None
+                if live_pids:
+                    for candidate in all_deleted_mmap_paths(live_pids):
+                        if candidate not in record.acknowledged_deleted_mmaps:
+                            deleted_path = candidate
+                            break
+                if deleted_path is not None:
+                    mmap_invalidated = True
+                    mmap_invalidated_path = deleted_path
+                    logger.info(
+                        "status mmap_invalidation_via_proc_maps sandbox=%s path=%s live_pids=%s acknowledged=%d",
+                        sandbox_id,
+                        deleted_path,
+                        sorted(live_pids),
+                        len(record.acknowledged_deleted_mmaps),
+                    )
             updated = replace(
                 record,
                 runtime_name=resolved.runtime_name,
@@ -305,9 +438,16 @@ class HostInspectorDaemon:
                 dirty_pids=dirty,
                 tracked_pids=tracked_pids,
                 ignored_pids=ignored_pids,
-                process_changed=(tracked_pids != record.baseline_pids) or bool(dirty),
+                fs_ignored_pids=fs_ignored_pids,
+                process_changed=(
+                    (tracked_pids != record.baseline_pids)
+                    or bool(dirty)
+                    or mmap_invalidated
+                ),
                 filesystem_changed=filesystem_changed,
                 live_dirty_entries=live_dirty_entries,
+                mmap_invalidated=mmap_invalidated,
+                mmap_invalidated_path=mmap_invalidated_path,
                 observed_at=max(record.observed_at or utc_now(), utc_now()),
                 last_error=None,
             )
@@ -327,7 +467,7 @@ class HostInspectorDaemon:
             self._fs_monitor.remove_sandbox(sandbox_id)
             if resolved.cgroup_id is not None:
                 self._fs_monitor.upsert_sandbox(sandbox_id, resolved.cgroup_id)
-        self._sync_bpf_ignored_pids(ignored_pids)
+        self._sync_bpf_ignored_pids(fs_ignored_pids)
         logger.debug(
             "status sandbox=%s cgroup_id=%s init_pid=%s process_changed=%s filesystem_changed=%s "
             "live_dirty=%d unreconciled=%d last_reset_at=%s observed_at=%s",
@@ -347,7 +487,13 @@ class HostInspectorDaemon:
             response["metadata"] = _metadata
         return response
 
-    def reset(self, sandbox_id: str, at: datetime | None = None) -> dict[str, object]:
+    def reset(
+        self,
+        sandbox_id: str,
+        at: datetime | None = None,
+        *,
+        captures_process: bool = False,
+    ) -> dict[str, object]:
         when = at or utc_now()
         sandbox_lock = self._sandbox_lock(sandbox_id)
         lock_hold_start = time.monotonic()
@@ -373,10 +519,29 @@ class HostInspectorDaemon:
             resolved = self._resolver.resolve(existing.runtime, existing.object_id)
             resolve_ms = (time.monotonic() - resolve_start) * 1000.0
             all_current_pids = list_cgroup_pids(resolved.cgroup_path)
-            tracked_pids, ignored_pids = self._split_pids(all_current_pids, existing.ignore_process_rules)
+            tracked_pids, ignored_pids, fs_ignored_pids = self._split_pids(all_current_pids, existing.ignore_process_rules)
             soft_dirty_start = time.monotonic()
             baseline_pids = reset_soft_dirty_for_pids(tracked_pids)
             soft_dirty_ms = (time.monotonic() - soft_dirty_start) * 1000.0
+
+            # When this reset follows a full process checkpoint, snapshot
+            # the `(deleted)` mmap paths CRIU just captured inline. Future
+            # mmap_invalidation checks will skip these — the dump image
+            # already has their content frozen, so they cannot break a
+            # future restore from that image. For fs-only checkpoints we
+            # preserve the existing baseline (the process image is unchanged
+            # by an fs-only checkpoint, so its frozen content set is too).
+            if captures_process:
+                live_pids = set(tracked_pids) | set(ignored_pids)
+                if resolved.init_pid:
+                    live_pids.add(int(resolved.init_pid))
+                acknowledged = (
+                    frozenset(all_deleted_mmap_paths(live_pids))
+                    if live_pids
+                    else frozenset()
+                )
+            else:
+                acknowledged = existing.acknowledged_deleted_mmaps
 
             updated = replace(
                 existing,
@@ -390,8 +555,12 @@ class HostInspectorDaemon:
                 dirty_pids=set(),
                 tracked_pids=tracked_pids,
                 ignored_pids=ignored_pids,
+                fs_ignored_pids=fs_ignored_pids,
                 process_changed=False,
                 filesystem_changed=False,
+                mmap_invalidated=False,
+                mmap_invalidated_path=None,
+                acknowledged_deleted_mmaps=acknowledged,
                 last_reset_at=when,
                 observed_at=max(existing.observed_at or when, when),
                 fs_event_count_since_reset=0,
@@ -416,7 +585,7 @@ class HostInspectorDaemon:
             )
         if resolved.cgroup_id is not None:
             self._fs_monitor.upsert_sandbox(sandbox_id, resolved.cgroup_id)
-        self._sync_bpf_ignored_pids(ignored_pids)
+        self._sync_bpf_ignored_pids(fs_ignored_pids)
         hold_ms = (time.monotonic() - lock_hold_start) * 1000.0
         if hold_ms > _LOCK_HOLD_WARN_MS:
             logger.warning(
@@ -463,7 +632,36 @@ class HostInspectorDaemon:
                     getattr(event, "path", None),
                 )
             return
-        if int(event.pid or 0) > 0 and pid_matches_ignore_rules(int(event.pid or 0), record.ignore_process_rules):
+        # Path-prefix filter: drop events whose target path is on a
+        # known host-side path the runtime declared at register time.
+        # Catches CRIU/runc transient-cgroup attribution where the PID is
+        # too short-lived for the proc-identity-based ignore rule to fire
+        # in time. Cheap O(N_prefixes) string check before the more
+        # expensive proc-read path.
+        if record.ignored_path_prefixes:
+            for candidate in (
+                getattr(event, "path", None),
+                getattr(event, "path_secondary", None),
+            ):
+                if not candidate:
+                    continue
+                cstr = str(candidate)
+                if any(cstr.startswith(prefix) for prefix in record.ignored_path_prefixes):
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            "fs_event drop=ignored_path_prefix sandbox=%s syscall=%s pid=%s path=%s",
+                            event.sandbox_id,
+                            getattr(event, "syscall", None),
+                            getattr(event, "pid", None),
+                            cstr,
+                        )
+                    return
+        if int(event.pid or 0) > 0 and pid_matches_ignore_rules(
+            int(event.pid or 0),
+            record.ignore_process_rules,
+            fs_only=True,
+            cache=self._pid_identity_cache,
+        ):
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
                     "fs_event drop=ignore_rule sandbox=%s syscall=%s pid=%s path=%s",
@@ -515,6 +713,66 @@ class HostInspectorDaemon:
             record.filesystem_changed = bool(record.live_dirty_entries) or any(
                 bool(item.get("counts_as_change")) for item in record.unreconciled_fs_events
             )
+            if not record.mmap_invalidated:
+                # A write/delete against a path currently mmapped by any live
+                # process in the sandbox cgroup invalidates that process's prior
+                # CRIU checkpoint (the file's build-ID on disk is now out of
+                # sync with the recorded vma). We must check the FULL set
+                # CRIU dumps — tracked + ignored pids + init — because the
+                # long-lived "ignored" pid (e.g. the container's
+                # `sleep infinity` PID 1, the tmux server, or any pane-bash
+                # descendant) is exactly the process whose mmap'd libc.so.6
+                # apt-get install rewrites under. With tmux ignore rules
+                # active, `current_pids` (= tracked) is empty, so falling
+                # back to `{init_pid}` alone would miss any deletion seen
+                # only via the tmux server / pane bash. Surface as
+                # process_changed in status() so the scheduler promotes the
+                # next checkpoint to a full one.
+                #
+                # `acknowledged_deleted_mmaps` is the snapshot captured by
+                # the most recent full process checkpoint; CRIU stored the
+                # content of those paths inline in the dump image, so they
+                # cannot break a future restore from that image — skip them
+                # here to keep one libc rewrite from latching every
+                # subsequent checkpoint as full forever.
+                live_pids = (
+                    set(record.current_pids)
+                    | set(record.ignored_pids)
+                )
+                if record.init_pid:
+                    live_pids.add(int(record.init_pid))
+                if live_pids:
+                    for candidate in (
+                        getattr(event, "path", None),
+                        getattr(event, "path_secondary", None),
+                    ):
+                        candidate_str = str(candidate or "")
+                        if not candidate_str:
+                            continue
+                        matched = path_invalidates_mmap(live_pids, candidate_str, cache=self._mmap_path_cache)
+                        if matched is None:
+                            continue
+                        # Suppression keys on the MATCHED path — the
+                        # canonical file that's actually mmap'd. The event
+                        # path itself can be a transient name (e.g.
+                        # `.dpkg-new`) that gets renamed onto the real
+                        # filename, so checking the candidate would never
+                        # hit the baseline. Once a path is acknowledged,
+                        # CRIU has its content frozen inline; further
+                        # rewrites of the same path don't break restore.
+                        if matched in record.acknowledged_deleted_mmaps:
+                            continue
+                        record.mmap_invalidated = True
+                        record.mmap_invalidated_path = matched
+                        logger.info(
+                            "fs_event mmap_invalidation sandbox=%s syscall=%s path=%s live_pids=%s acknowledged=%d",
+                            event.sandbox_id,
+                            getattr(event, "syscall", None),
+                            matched,
+                            sorted(live_pids),
+                            len(record.acknowledged_deleted_mmaps),
+                        )
+                        break
             record.observed_at = max(
                 record.observed_at or now,
                 _parse_ts(event.timestamp) or now,
@@ -952,15 +1210,35 @@ class HostInspectorDaemon:
         self,
         pids: set[int],
         ignore_process_rules,
-    ) -> tuple[set[int], set[int]]:
+    ) -> tuple[set[int], set[int], set[int]]:
+        """Split `pids` into (tracked, ignored, fs_ignored).
+
+        - `tracked`: pids that contribute to the process-changed signal.
+        - `ignored`: pids removed from process tracking (union of scope=all
+          and scope=process_only matches).
+        - `fs_ignored`: subset of `ignored` whose fs events should also be
+          dropped. This is the set we sync to the eBPF kernel filter and
+          consult in `_handle_fs_event`. scope=process_only rules
+          deliberately do NOT contribute here, so file writes from a
+          process-only-ignored PID still surface as filesystem changes.
+        """
         tracked: set[int] = set()
         ignored: set[int] = set()
+        fs_ignored: set[int] = set()
+        if not ignore_process_rules:
+            tracked = set(pids)
+            return tracked, ignored, fs_ignored
         for pid in sorted(pids):
-            if pid_matches_ignore_rules(pid, ignore_process_rules):
+            matched_any, matched_fs = classify_pid_against_rules(
+                pid, ignore_process_rules, cache=self._pid_identity_cache,
+            )
+            if matched_any:
                 ignored.add(pid)
+                if matched_fs:
+                    fs_ignored.add(pid)
             else:
                 tracked.add(pid)
-        return tracked, ignored
+        return tracked, ignored, fs_ignored
 
     def _record_to_response(self, record: SandboxRecord) -> dict[str, object]:
         return {
@@ -1060,6 +1338,7 @@ class HostInspectorServer:
                             runtime=str(payload["runtime"]),
                             object_id=str(payload["object_id"]),
                             ignore_process_rules=payload.get("ignore_process_rules"),
+                            ignored_path_prefixes=payload.get("ignored_path_prefixes"),
                         )
                         logger.debug(f"host-inspector: register {payload=} {result=}")
                         self._write_json(HTTPStatus.OK, {"ok": True, "status": result})
@@ -1074,7 +1353,11 @@ class HostInspectorServer:
                         return
                     if self.path == "/reset":
                         payload = self._read_json()
-                        result = daemon.reset(str(payload["sandbox_id"]), at=_parse_ts(payload.get("at")))
+                        result = daemon.reset(
+                            str(payload["sandbox_id"]),
+                            at=_parse_ts(payload.get("at")),
+                            captures_process=bool(payload.get("captures_process", False)),
+                        )
                         logger.debug(f"host-inspector: reset {payload=} {result=}")
                         self._write_json(HTTPStatus.OK, {"ok": True, "status": result})
                         return

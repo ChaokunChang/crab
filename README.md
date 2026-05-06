@@ -141,7 +141,18 @@ Notes:
 
 - `notify_fault(...)` queues a fault recovery event.
 - `notify_preemption(...)` records preemption metadata, queues a recovery event, and can trigger a fresh checkpoint before restore depending on policy.
-- The recovery loop either restores a checkpoint or falls back to the configured `relaunch_handler`.
+- The recovery loop restores a checkpoint when one is available; the relaunch fallback is opt-in.
+
+### Relaunch Fallback Toggle
+
+`AgentCRSystem.relaunch_on_restore_failure` is `False` by default.
+
+- When `False` (the default): a recovery restore failure surfaces as a hard error in the recovery record (`status="failed"`) and `relaunch_handler` is not invoked. The same applies when no restorable checkpoint is available: status becomes `"no_checkpoint"`.
+- When `True`: recovery falls back to `relaunch_handler` after a restore failure (or when no checkpoint exists), which preserves the previous availability behavior.
+
+The relaunch path is intentionally off by default because it can mask real bugs — a corrupt checkpoint, a broken restore plumbing change, or a misconfigured baseline policy all silently degrade to "relaunched" otherwise. Pair this default with `scheduler.checkpoint_full_baseline_on_first_checkpoint=true` to make every recovery use a complete checkpoint and treat any restore failure as a regression to investigate.
+
+The benchmark harness exposes the same opt-in via the top-level `relaunch_on_restore_failure: true | false` YAML field, threaded through to the underlying `AgentCRSystem`.
 
 ### Restore Validation Toggle
 
@@ -228,7 +239,9 @@ python3 -m benchmarks.run --config benchmarks/examples/fault.manual.yaml
 python3 -m benchmarks.run --config benchmarks/examples/fault.auto.yaml
 python3 -m benchmarks.run --config benchmarks/examples/spot.auto.yaml
 python3 -m benchmarks.run --config benchmarks/examples/tree.auto.yaml
-python3 -m benchmarks.run --config benchmarks/examples/mini_swe.spec.auto.10tasks.debug.yaml
+python3 -m benchmarks.run --config benchmarks/examples/mini_swe/mini_swe.spec.auto.10tasks.debug.yaml
+python3 -m benchmarks.run --config benchmarks/examples/terminus/terminus.fault.auto.10tasks.debug.yaml
+python3 -m benchmarks.run --config benchmarks/examples/terminus/terminus.spec.auto.10tasks.debug.yaml
 ```
 
 Each benchmark run is now driven by a YAML config. The top-level fields are:
@@ -237,8 +250,8 @@ Each benchmark run is now driven by a YAML config. The top-level fields are:
 scenario: fault | spot | tree | e2e | spec
 mode: manual | auto
 provider: openai | anthropic
-agent: simulated | iflow | mini_swe | claude_code
-llm_service: simulated | manual | simulated_for_iflow | iflow_trace_replay | mini_swe_trace_replay | mini_swe_spec_trace_replay | claude_code_trace_replay
+agent: simulated | iflow | mini_swe | claude_code | terminus
+llm_service: simulated | manual | simulated_for_iflow | iflow_trace_replay | mini_swe_trace_replay | mini_swe_spec_trace_replay | claude_code_trace_replay | terminus_trace_replay | terminus_spec_trace_replay
 task_dataset: path/to/tasks.jsonl
 sandboxes: 1
 max_workers: 32  # legacy fallback for all phases when phase_workers is omitted
@@ -331,6 +344,7 @@ transfer_delay_ms: 0.0
 work_dir_host_root: logs/tmp
 max_agent_timeout_scale: 1.0
 max_test_timeout_scale: 1.0
+relaunch_on_restore_failure: false  # opt-in fallback to relaunch_handler when a recovery restore fails
 scenario_options: {}
 llm_service_options: {}  # merged into per-task llm_service_config
 ```
@@ -342,8 +356,8 @@ For the fault scenario, `scenario_options` also supports:
 
 For the speculative-execution scenario (`scenario: spec`):
 
-- `agent` must be `mini_swe`
-- `llm_service` must be `mini_swe_spec_trace_replay`
+- `agent` must be `mini_swe` or `terminus`
+- `llm_service` must be the matching `<agent>_spec_trace_replay` (i.e. `mini_swe_spec_trace_replay` or `terminus_spec_trace_replay`)
 - `iterations` must be exactly `0`
 - `scenario_options.acceptance_rate` controls how often the draft command is accepted. Legacy alias: `accept_rate`.
 - `scenario_options.draft_response_delay_scaling_factor` controls how much faster the draft replay stream is than the oracle replay stream. Legacy alias: `speculative_delay_scaling_factor`.
@@ -532,7 +546,7 @@ The per-scenario knobs live under `scenario_options`:
 python3 -m benchmarks.run --config benchmarks/examples/fault.auto.yaml
 python3 -m benchmarks.run --config benchmarks/examples/spot.auto.yaml
 python3 -m benchmarks.run --config benchmarks/examples/tree.auto.yaml
-python3 -m benchmarks.run --config benchmarks/examples/mini_swe.spec.auto.10tasks.debug.yaml
+python3 -m benchmarks.run --config benchmarks/examples/mini_swe/mini_swe.spec.auto.10tasks.debug.yaml
 ```
 
 The real-host benchmarks allocate temporary runtime state, create a ZFS pool, build the simulated agent image, and launch `runc` sandboxes through the shared harness in [benchmarks/real_host_scenario_base.py](/root/workspace/agent-cr/benchmarks/real_host_scenario_base.py).

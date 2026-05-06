@@ -102,6 +102,14 @@ class AgentCRSystem:
     restore_metadata_handler: Callable[[SandboxId, CheckpointManifest], None] | None = None
     recovery_delay_seconds: float = 0.0
     enforce_restore_checkpoint_validation: bool = False
+    # When False (the default), a restore failure during recovery surfaces as a
+    # hard error rather than silently falling back to `relaunch_handler`. The
+    # relaunch path is intended as an availability backstop, but it tends to
+    # mask real bugs (corrupt checkpoints, broken restore plumbing) — especially
+    # for callers that set `checkpoint_full_baseline_on_first_checkpoint=true`
+    # and therefore expect every recovery to use a complete checkpoint. Set to
+    # True to opt back into relaunch on restore failure.
+    relaunch_on_restore_failure: bool = False
     _interceptor_lock: Lock = field(init=False, repr=False)
     _interceptor_pending: set[SandboxId] = field(init=False, repr=False)
     _coordination_lock: Lock = field(init=False, repr=False)
@@ -449,8 +457,15 @@ class AgentCRSystem:
             return self._recovery_records.get(sandbox_id)
 
     def notify_interceptor_state_change(self, sandbox_id: SandboxId) -> None:
+        # Reconcile against the actual gate state instead of blindly adding.
+        # The monitor loop (auto_cr only) does the same reconciliation on its
+        # own cadence; in manual mode where the monitor doesn't run, this is
+        # the *only* path that prunes the set, so an unconditional add would
+        # leak the sandbox forever and make has_pending_interceptor_signal
+        # return True permanently — which deadlocks wait_for_task_completion's
+        # replay-complete short-circuit.
+        self._refresh_interceptor_pending_state(sandbox_id)
         with self._interceptor_lock:
-            self._interceptor_pending.add(sandbox_id)
             pending = sandbox_id in self._interceptor_pending
         if self.request_state_store is not None:
             self.request_state_store.notify_waiters()
@@ -486,7 +501,14 @@ class AgentCRSystem:
             if change is not None:
                 self._refresh_interceptor_pending_state(change.sandbox_id)
                 if change.event_type == "request_start":
-                    if self._should_coordinate_live_request(change.sandbox_id, change.request_id):
+                    coord_decision = self._should_coordinate_live_request(change.sandbox_id, change.request_id)
+                    logger.debug(
+                        "DIAG.monitor.request_start sandbox=%s request_id=%s should_coord=%s",
+                        change.sandbox_id,
+                        "" if change.request_id is None else change.request_id,
+                        coord_decision,
+                    )
+                    if coord_decision:
                         self._dispatch_coordination(change.sandbox_id)
                     else:
                         logger.debug(
@@ -494,17 +516,47 @@ class AgentCRSystem:
                             change.sandbox_id,
                             "" if change.request_id is None else change.request_id,
                         )
+                else:
+                    logger.debug(
+                        "DIAG.monitor.event sandbox=%s event_type=%s request_id=%s",
+                        change.sandbox_id,
+                        change.event_type,
+                        "" if change.request_id is None else change.request_id,
+                    )
             self._dispatch_pending_coordination()
 
     def _should_coordinate_live_request(self, sandbox_id: SandboxId, request_id: str | None) -> bool:
         if self.request_state_store is None or self.response_gate_registry is None:
+            logger.debug(
+                "DIAG.coord.check.no_store sandbox=%s",
+                sandbox_id,
+            )
             return False
         request_state = self.request_state_store.get(sandbox_id)
         if not request_state.llm_request_in_flight:
+            logger.debug(
+                "DIAG.coord.check.no_in_flight sandbox=%s request_id=%s active_llm_requests=%d",
+                sandbox_id,
+                "" if request_id is None else request_id,
+                request_state.active_llm_requests,
+            )
             return False
         if request_id is None:
-            return self.response_gate_registry.get_oldest_pending(sandbox_id) is not None
-        return self.response_gate_registry.find_pending_request(sandbox_id, request_id) is not None
+            oldest = self.response_gate_registry.get_oldest_pending(sandbox_id)
+            logger.debug(
+                "DIAG.coord.check.no_request_id sandbox=%s oldest_pending=%s",
+                sandbox_id,
+                "" if oldest is None else oldest.request_id,
+            )
+            return oldest is not None
+        found = self.response_gate_registry.find_pending_request(sandbox_id, request_id)
+        logger.debug(
+            "DIAG.coord.check.find_pending sandbox=%s request_id=%s found=%s",
+            sandbox_id,
+            request_id,
+            "" if found is None else found.generation,
+        )
+        return found is not None
 
     def _run_recovery_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -525,6 +577,10 @@ class AgentCRSystem:
     def _dispatch_coordination(self, sandbox_id: SandboxId) -> None:
         with self._coordination_lock:
             if sandbox_id in self._active_coordination:
+                logger.debug(
+                    "DIAG.coord.dispatch.skipped_already_active sandbox=%s",
+                    sandbox_id,
+                )
                 return
             self._active_coordination.add(sandbox_id)
             pool = self._coordination_pool
@@ -532,14 +588,29 @@ class AgentCRSystem:
             with self._coordination_lock:
                 self._active_coordination.discard(sandbox_id)
             raise RuntimeError("coordination pool is not running")
+        logger.info("DIAG.coord.dispatch.submitted sandbox=%s", sandbox_id)
         pool.submit(self._coordinate_sandbox_request, sandbox_id)
 
     def _coordinate_sandbox_request(self, sandbox_id: SandboxId) -> None:
+        iteration = 0
         try:
             while not self._stop_event.is_set() and self._should_coordinate_any_pending_request(sandbox_id):
+                iteration += 1
                 pending_request = self._next_pending_live_request(sandbox_id)
                 if pending_request is None:
+                    logger.debug(
+                        "DIAG.coord.loop.no_pending sandbox=%s iter=%d",
+                        sandbox_id,
+                        iteration,
+                    )
                     break
+                logger.debug(
+                    "DIAG.coord.loop.execute sandbox=%s iter=%d request_id=%s generation=%s",
+                    sandbox_id,
+                    iteration,
+                    pending_request.request_id,
+                    pending_request.generation,
+                )
                 try:
                     self._execute_checkpoint_flow(sandbox_id, pending_request=pending_request)
                 except Exception:
@@ -554,11 +625,19 @@ class AgentCRSystem:
                     self._release_response_gate(sandbox_id, pending_request)
                     self._refresh_interceptor_pending_state(sandbox_id)
         finally:
+            should_redispatch = False
             with self._coordination_lock:
                 self._active_coordination.discard(sandbox_id)
             self._refresh_interceptor_pending_state(sandbox_id)
             if self._should_coordinate_any_pending_request(sandbox_id):
+                should_redispatch = True
                 self._dispatch_coordination(sandbox_id)
+            logger.info(
+                "DIAG.coord.loop.exit sandbox=%s iters=%d redispatched=%s",
+                sandbox_id,
+                iteration,
+                should_redispatch,
+            )
 
     def _handle_recovery_event(self, event: RecoveryEvent) -> None:
         if not self._acquire_coordination(event.sandbox_id):
@@ -623,6 +702,7 @@ class AgentCRSystem:
                     )
                 else:
                     logger.info("Triggering preemption checkpoint flow for sandbox=%s", event.sandbox_id)
+                    self._drain_active_runtime_execs(event.sandbox_id)
                     try:
                         checkpoint_result = self._execute_checkpoint_flow(event.sandbox_id)
                     except Exception:
@@ -736,7 +816,10 @@ class AgentCRSystem:
                         event.sandbox_id,
                         checkpoint_id,
                     )
-                elif self.relaunch_handler is not None:
+                elif (
+                    self.relaunch_handler is not None
+                    and self.relaunch_on_restore_failure
+                ):
                     logger.warning(
                         "Recovery restore failed; invoking relaunch handler sandbox=%s checkpoint=%s message=%s",
                         event.sandbox_id,
@@ -751,15 +834,26 @@ class AgentCRSystem:
                     status = "relaunched"
                     message = "restore_failed_relaunch_handler_invoked"
                 else:
-                    status = "restore_failed"
-                    message = restore_result.message
-                    logger.warning(
-                        "Recovery restore failed sandbox=%s checkpoint=%s message=%s",
+                    # Restore failed and either no relaunch handler is wired or
+                    # the relaunch fallback is opted out via
+                    # relaunch_on_restore_failure=False (the default). Surface
+                    # this as a hard error so latent bugs in checkpoint capture
+                    # / restore are not masked by a silent relaunch.
+                    logger.error(
+                        "Recovery restore failed sandbox=%s checkpoint=%s message=%s "
+                        "(set relaunch_on_restore_failure=True to fall back to relaunch_handler)",
                         event.sandbox_id,
                         checkpoint_id,
                         restore_result.message,
                     )
-            elif self.relaunch_handler is not None:
+                    raise RuntimeError(
+                        f"recovery restore failed sandbox={event.sandbox_id} "
+                        f"checkpoint={checkpoint_id} message={restore_result.message}"
+                    )
+            elif (
+                self.relaunch_handler is not None
+                and self.relaunch_on_restore_failure
+            ):
                 logger.info("No checkpoint available; invoking relaunch handler for sandbox=%s", event.sandbox_id)
                 self.relaunch_handler(
                     event.sandbox_id,
@@ -771,7 +865,11 @@ class AgentCRSystem:
             else:
                 status = "no_checkpoint"
                 message = "no restorable checkpoint available"
-                logger.warning("No checkpoint available for sandbox=%s and no relaunch handler configured", event.sandbox_id)
+                logger.warning(
+                    "No checkpoint available for sandbox=%s and relaunch fallback is disabled "
+                    "(set relaunch_on_restore_failure=True to fall back to relaunch_handler)",
+                    event.sandbox_id,
+                )
             if event.event_type == "preemption":
                 self._clear_snapshot_metadata(
                     event.sandbox_id,
@@ -822,6 +920,30 @@ class AgentCRSystem:
                 self._dispatch_coordination(event.sandbox_id)
             if pinned_restore_ids:
                 self._unpin_restore_checkpoints(event.sandbox_id, pinned_restore_ids)
+
+    def _drain_active_runtime_execs(self, sandbox_id: SandboxId) -> None:
+        """Ask the runtime to terminate any in-flight `runc exec`
+        subprocesses for `sandbox_id`. Called before the spot
+        preemption checkpoint flow so CRIU doesn't trip over half-
+        stream unix-socket connections wired by runc-exec stdio."""
+        cancel = getattr(self.runtime, "cancel_active_execs", None)
+        if not callable(cancel):
+            return
+        try:
+            cancelled = cancel(sandbox_id, timeout_s=2.0)
+        except Exception:
+            logger.debug(
+                "Failed to drain active runtime execs sandbox=%s",
+                sandbox_id,
+                exc_info=True,
+            )
+            return
+        if cancelled:
+            logger.info(
+                "Drained %d in-flight runtime exec(s) before preemption checkpoint sandbox=%s",
+                cancelled,
+                sandbox_id,
+            )
 
     def _execute_checkpoint_flow(
         self,
@@ -1436,6 +1558,7 @@ def build_default_system(
     checkpoint_manager: CheckpointManager | None = None,
     relaunch_handler: Callable[[SandboxId, str, bool], None] | None = None,
     enforce_restore_checkpoint_validation: bool = False,
+    relaunch_on_restore_failure: bool = False,
 ) -> AgentCRSystem:
     logger.info("Building default agent-cr system with runtime=%s storage_root=%s", runtime, storage_root)
     scheduler_cfg = scheduler_config or SchedulerConfig()
@@ -1515,4 +1638,5 @@ def build_default_system(
         relaunch_handler=relaunch_handler,
         recovery_delay_seconds=0.0,
         enforce_restore_checkpoint_validation=enforce_restore_checkpoint_validation,
+        relaunch_on_restore_failure=relaunch_on_restore_failure,
     )

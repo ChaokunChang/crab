@@ -288,6 +288,7 @@ class ContractTests(unittest.TestCase):
                     "--tcp-established",
                     "--shell-job",
                     "--tcp-skip-in-flight",
+                    "--ext-unix-sk",
                     "sbx-1",
                 ),
             )
@@ -307,6 +308,7 @@ class ContractTests(unittest.TestCase):
                     str(base / "checkpoints" / "sbx-1" / "ckpt-1" / "work"),
                     "--tcp-established",
                     "--shell-job",
+                    "--ext-unix-sk",
                     "sbx-1",
                 ),
             )
@@ -353,6 +355,7 @@ class ContractTests(unittest.TestCase):
                     str(base / "checkpoints" / "sbx-1" / "ckpt-1" / "work"),
                     "--leave-running=true",
                     "--tcp-established",
+                    "--ext-unix-sk",
                     "--manage-cgroups-mode=soft",
                     "sbx-1",
                 ),
@@ -371,6 +374,7 @@ class ContractTests(unittest.TestCase):
                     "--work-path",
                     str(base / "checkpoints" / "sbx-1" / "ckpt-1" / "work"),
                     "--shell-job",
+                    "--ext-unix-sk",
                     "--manage-cgroups-mode=soft",
                     "sbx-1",
                 ),

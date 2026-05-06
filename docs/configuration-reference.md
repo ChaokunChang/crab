@@ -247,8 +247,8 @@ Defined in `benchmarks/config.py`. Loaded from YAML via `load_config()`.
 | `scenario` | `str` | *(required)* | Scenario type: `e2e`, `fault`, `spot`, `tree`, `spec`. |
 | `mode` | `str` | *(required)* | Execution mode: `manual` or `auto`. |
 | `provider` | `str` | `"openai"` | LLM provider: `openai` or `anthropic`. |
-| `agent` | `str` | `"simulated"` | Agent type: `simulated`, `iflow`, `mini_swe`, or `claude_code`. |
-| `llm_service` | `str \| null` | `null` | LLM service type override: `simulated`, `manual`, `simulated_for_iflow`, `iflow_trace_replay`, `mini_swe_trace_replay`, `mini_swe_spec_trace_replay`, or `claude_code_trace_replay`. |
+| `agent` | `str` | `"simulated"` | Agent type: `simulated`, `iflow`, `mini_swe`, `claude_code`, or `terminus`. |
+| `llm_service` | `str \| null` | `null` | LLM service type override: `simulated`, `manual`, `simulated_for_iflow`, `iflow_trace_replay`, `mini_swe_trace_replay`, `mini_swe_spec_trace_replay`, `claude_code_trace_replay`, `terminus_trace_replay`, or `terminus_spec_trace_replay`. |
 | `task_dataset` | `path \| null` | `null` | Path to a task dataset file (relative to config file). |
 | `sandboxes` | `int` | `1` | Number of concurrent sandboxes. Must be > 0. |
 | `max_workers` | `int \| null` | `null` | Max worker threads. Defaults to `sandboxes` count. |
@@ -268,6 +268,7 @@ Defined in `benchmarks/config.py`. Loaded from YAML via `load_config()`.
 | `llm_service_options` | `mapping` | `{}` | Mapping merged into each task record's `llm_service_config`. Dataset-level values still take precedence. |
 | `max_agent_timeout_scale` | `float` | `1.0` | Multiplies dataset-provided `task_config.options.max_agent_timeout_sec` values before task launch. Missing dataset values stay unset. |
 | `max_test_timeout_scale` | `float` | `1.0` | Multiplies dataset-provided `task_config.options.max_test_timeout_sec` values before task launch. Missing dataset values stay unset. |
+| `relaunch_on_restore_failure` | `bool` | `false` | Opt-in fallback to `relaunch_handler` when a recovery restore fails or no restorable checkpoint exists. With the default `false`, the recovery record is marked `failed` / `no_checkpoint` and the relaunch handler is not invoked, so latent bugs in checkpoint capture or restore plumbing surface loudly instead of being masked. Threaded through to `AgentCRSystem.relaunch_on_restore_failure`. |
 
 When `output`, `log_file`, `telemetry.output`, or `telemetry.report.output_dir` are configured outside the resolved benchmark run root, the runner keeps writing those configured paths and also copies each existing artifact by basename into `<benchmark_root_home>/<benchmark_run_name>/` after the run.
 
@@ -451,7 +452,7 @@ The `Overhead Analysis` section also includes a dedicated `llm.gate_wait` CDF so
 
 These keys are merged into each task record's `llm_service_config` before the benchmark launches. Dataset-provided `llm_service_config` values still win when both sides define the same key.
 
-For replay-backed LLM services such as `iflow_trace_replay`, `mini_swe_trace_replay`, `mini_swe_spec_trace_replay`, and `claude_code_trace_replay`:
+For replay-backed LLM services such as `iflow_trace_replay`, `mini_swe_trace_replay`, `mini_swe_spec_trace_replay`, `claude_code_trace_replay`, `terminus_trace_replay`, and `terminus_spec_trace_replay`:
 
 | YAML Key | Type | Default | Description |
 |---|---|---|---|
@@ -461,7 +462,7 @@ For replay-backed LLM services such as `iflow_trace_replay`, `mini_swe_trace_rep
 | `llm_service_options.minimal_delay` | `float` | `0.0` | Lower clamp in milliseconds applied after the replay policy chooses a delay and after any scaling factor is applied. |
 | `llm_service_options.maximal_delay` | `float` | `1e9` | Upper clamp in milliseconds applied after the replay policy chooses a delay and after any scaling factor is applied. Must be greater than or equal to `minimal_delay`. |
 
-`mini_swe_spec_trace_replay` also understands additional speculative controls when they appear in the effective `llm_service_config`:
+`mini_swe_spec_trace_replay` and `terminus_spec_trace_replay` also understand additional speculative controls when they appear in the effective `llm_service_config`:
 
 | YAML Key | Type | Default | Description |
 |---|---|---|---|
@@ -510,8 +511,8 @@ These keys are merged into each task row's `llm_service_config` for `scenario: s
 
 Additional `spec` scenario constraints:
 
-- `agent` must be `mini_swe`
-- `llm_service` must be `mini_swe_spec_trace_replay`
+- `agent` must be `mini_swe` or `terminus`
+- `llm_service` must be the matching `<agent>_spec_trace_replay` (`mini_swe_spec_trace_replay` for `mini_swe`, `terminus_spec_trace_replay` for `terminus`)
 - `iterations` must be exactly `0`
 
 ---

@@ -63,11 +63,11 @@ Workers are split into `ProcessCheckpointWorker` / `FilesystemCheckpointWorker` 
 
 YAML-driven scenarios in `benchmarks/examples/`. Key fields:
 ```yaml
-scenario: e2e | fault | spot | tree
+scenario: e2e | fault | spot | tree | spec
 mode: manual | auto
 provider: openai | anthropic
-agent: simulated | iflow
-llm_service: simulated | manual | iflow_trace_replay
+agent: simulated | iflow | mini_swe | claude_code | terminus
+llm_service: simulated | manual | iflow_trace_replay | mini_swe_trace_replay | mini_swe_spec_trace_replay | claude_code_trace_replay | terminus_trace_replay | terminus_spec_trace_replay
 sandboxes: <count>
 benchmark_root_home: path/to/benchmark-runs
 benchmark_run_name: null  # optional; defaults to a timestamp
@@ -78,8 +78,8 @@ reuse_zpool: bool   # keep ZFS pool across runs
 
 ### Integrations (`integrations/`)
 
-- **`agents/`**: `SimulatedAgent`, `iFlowAgent` — implement the agent contract
-- **`llm_services/`**: `SimulatedLLMService`, `ManualLLMService`, `iFlowTraceReplayService` — injectable LLM backends
+- **`agents/`**: `SimulatedAgent`, `iFlowAgent`, `MiniSweAgent`, `ClaudeCodeAgent`, `TerminusAgent` — implement the agent contract
+- **`llm_services/`**: `SimulatedLLMService`, `ManualLLMService`, plus trace-replay services for iflow / mini_swe / claude_code / terminus and spec-replay services for mini_swe / terminus
 - **`sandboxes/`**: runtime launcher, network setup, Docker Compose integration
 
 ### Key Data Models (`agent_cr/models.py`)

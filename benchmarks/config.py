@@ -329,6 +329,13 @@ class BenchmarkConfig:
     llm_service_options: dict[str, object] = field(default_factory=dict)
     max_agent_timeout_scale: float = 1.0
     max_test_timeout_scale: float = 1.0
+    # Per-task scale overrides keyed by task_id. Take precedence over the
+    # scalar `max_*_timeout_scale` for matching tasks. Useful for traces
+    # whose recorded `max_test_timeout_sec` is calibrated against an
+    # uncapped baseline and exceeds the global scale on our 4-CPU
+    # cgroup (e.g. pytorch-model-cli still needs >180s even at 8 CPUs).
+    max_agent_timeout_scale_overrides: dict[str, float] = field(default_factory=dict)
+    max_test_timeout_scale_overrides: dict[str, float] = field(default_factory=dict)
     telemetry_report: TelemetryReportConfig = field(default_factory=TelemetryReportConfig)
     monitoring: MonitoringConfig = field(default_factory=MonitoringConfig)
     executor: BenchmarkExecutorConfig = field(default_factory=BenchmarkExecutorConfig)
@@ -341,6 +348,7 @@ class BenchmarkConfig:
     sandbox_resource_limits: SandboxResourceLimitsConfig = field(default_factory=SandboxResourceLimitsConfig)
     benchmark_root_home: Path | None = None
     benchmark_run_name: str | None = None
+    relaunch_on_restore_failure: bool = False
 
     def __post_init__(self) -> None:
         benchmark_root = _coerce_optional_path(self.benchmark_root)
@@ -632,10 +640,19 @@ def load_config(path: Path) -> BenchmarkConfig:
     agent = str(data.get("agent", "simulated"))
     llm_service = None if data.get("llm_service") is None else str(data["llm_service"])
     if scenario == "spec":
-        if agent != "mini_swe":
-            raise ValueError("scenario='spec' requires agent='mini_swe'")
-        if llm_service != "mini_swe_spec_trace_replay":
-            raise ValueError("scenario='spec' requires llm_service='mini_swe_spec_trace_replay'")
+        spec_agent_to_llm = {
+            "mini_swe": "mini_swe_spec_trace_replay",
+            "terminus": "terminus_spec_trace_replay",
+        }
+        if agent not in spec_agent_to_llm:
+            raise ValueError(
+                f"scenario='spec' requires agent in {sorted(spec_agent_to_llm)}, got {agent!r}"
+            )
+        expected_llm_service = spec_agent_to_llm[agent]
+        if llm_service != expected_llm_service:
+            raise ValueError(
+                f"scenario='spec' with agent='{agent}' requires llm_service='{expected_llm_service}'"
+            )
 
     scenario_options = data.get("scenario_options", {})
     if scenario_options is None:
@@ -652,6 +669,21 @@ def load_config(path: Path) -> BenchmarkConfig:
     max_test_timeout_scale = float(data.get("max_test_timeout_scale", 1.0))
     if max_test_timeout_scale < 0:
         raise ValueError(f"max_test_timeout_scale must be non-negative, got {max_test_timeout_scale!r}")
+
+    def _parse_scale_overrides(key: str) -> dict[str, float]:
+        raw = data.get(key) or {}
+        if not isinstance(raw, dict):
+            raise ValueError(f"{key} must be an object mapping task_id → scale")
+        out: dict[str, float] = {}
+        for task_id, value in raw.items():
+            scale = float(value)
+            if scale < 0:
+                raise ValueError(f"{key}[{task_id!r}] must be non-negative, got {scale!r}")
+            out[str(task_id)] = scale
+        return out
+
+    max_agent_timeout_scale_overrides = _parse_scale_overrides("max_agent_timeout_scale_overrides")
+    max_test_timeout_scale_overrides = _parse_scale_overrides("max_test_timeout_scale_overrides")
 
     base_dir = config_path.parent
     telemetry_options = data.get("telemetry", {})
@@ -826,6 +858,8 @@ def load_config(path: Path) -> BenchmarkConfig:
         llm_service_options=llm_service_options,
         max_agent_timeout_scale=max_agent_timeout_scale,
         max_test_timeout_scale=max_test_timeout_scale,
+        max_agent_timeout_scale_overrides=max_agent_timeout_scale_overrides,
+        max_test_timeout_scale_overrides=max_test_timeout_scale_overrides,
         telemetry_report=telemetry_report,
         monitoring=monitoring,
         executor=executor,
@@ -838,4 +872,5 @@ def load_config(path: Path) -> BenchmarkConfig:
         sandbox_resource_limits=sandbox_resource_limits,
         benchmark_root_home=benchmark_root_home,
         benchmark_run_name=benchmark_run_name,
+        relaunch_on_restore_failure=bool(data.get("relaunch_on_restore_failure", False)),
     )

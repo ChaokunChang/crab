@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+import copy
 import errno
 import hashlib
 import json
@@ -281,6 +282,42 @@ class _SpeculativeSandboxController:
             if not checkpoints:
                 return None
             checkpoint_id = checkpoints[-1]
+            # Refuse to base a fork on a partial (fs-only) checkpoint.
+            # `resolve_checkpoint_copy_plan` would walk back to find an
+            # older full checkpoint and stitch its process image to the
+            # newer fs snapshot, but the older process state's open file
+            # descriptors / mmap'd inodes (`var/lib/dpkg/updates/tmp.i`,
+            # the bash-mmap'd libc/ld-linux/gconv-modules ghost dumps,
+            # etc.) frequently no longer match the newer fs's view of
+            # the same paths once the agent has run anything that
+            # rewrites system state (`apt-get install`, `make install`,
+            # dpkg update, …). CRIU then aborts the restore with
+            # `Can't open file ... on restore: No such file or
+            # directory` / `Unable to open fd=N id=0xM` — observed in
+            # the spec.compcert smoke as 17/19 fork restores failing.
+            # Even when the composite restore happens to *succeed*
+            # (10-sandbox spec.spec_friendly), the resulting fork's
+            # process state is older than the active's actual state,
+            # so a subsequent promote rolls the in-flight `make all`
+            # back to the older composite point and the build never
+            # reaches `make install`. Skip spec for this turn instead
+            # — the next turn will still see the latest full checkpoint
+            # if the inspector has emitted process_changed since then.
+            try:
+                latest_manifest = storage.get_manifest(
+                    self._active_sandbox.sandbox_id, checkpoint_id
+                )
+            except FileNotFoundError:
+                return None
+            if not latest_manifest.process_artifacts:
+                logger.debug(
+                    "Skipping spec fork creation: latest checkpoint is fs-only "
+                    "(process state stale relative to fs snapshot) "
+                    "active=%s checkpoint=%s",
+                    self._active_sandbox.sandbox_id,
+                    checkpoint_id,
+                )
+                return None
             self._fork_counter += 1
             fork_epoch = self._fork_epoch
             fork_name = f"{self._fork_name_root}-spec-{self._fork_counter}"
@@ -347,6 +384,30 @@ class _SpeculativeSandboxController:
 
     def state_changed(self, sandbox: SandboxHandle) -> bool:
         return self._harness.sandbox_state_changed(sandbox)
+
+    def cancel_fork_runtime(self, fork: SandboxHandle) -> None:
+        """Force-kill the fork's container immediately, without
+        cleaning up its ZFS dataset / network lease / inspector
+        registration. Used on the spec-mismatch critical path so the
+        wasted spec_exec on the fork stops competing with the about-
+        to-run oracle exec on the active sandbox for host CPU/IO. The
+        rest of the cleanup (dataset destroy, lease release, etc.) is
+        left to the deferred `_finalize_speculative_fork` →
+        `release_fork` chain, which runs off the agent's critical
+        path."""
+        if fork is None:
+            return
+        delete = getattr(self._harness, "_delete_runtime", None)
+        if not callable(delete):
+            return
+        try:
+            delete(fork.sandbox_id)
+        except Exception:
+            logger.debug(
+                "Failed to cancel fork runtime sandbox=%s",
+                fork.sandbox_id,
+                exc_info=True,
+            )
 
     def invalidate_fork(self) -> None:
         with self._lock:
@@ -646,7 +707,13 @@ wait_for_apt_lock() {
   done
 }
 need_python_packages=0
-if ! python3 -m venv --help >/dev/null 2>&1; then
+# `python3 -m venv --help` succeeds even when ensurepip is missing (the
+# `venv` module ships with the stdlib, but actually creating a venv
+# requires the python3-venv package's ensurepip data files). Probe
+# ensurepip directly so we don't silently leave the container in a
+# state where the verification's `uv venv` later dies with
+# "ensurepip is not available".
+if ! python3 -c "import ensurepip" >/dev/null 2>&1; then
   need_python_packages=1
 fi
 if ! python3 -m pip --version >/dev/null 2>&1; then
@@ -657,6 +724,7 @@ export PATH="$shim_bin:$PATH"
 cat > "$shim_bin/apt-get" <<'EOF'
 #!/bin/sh
 REAL_APT_GET=/usr/bin/apt-get
+APT_UPDATE_MARKER=/var/lib/agent-cr-verification/apt-update.ok
 first_cmd=""
 for arg in "$@"; do
   case "$arg" in
@@ -668,6 +736,12 @@ for arg in "$@"; do
   esac
 done
 if [ "$first_cmd" = "update" ]; then
+  # Skip caller-driven `apt-get update` to keep verify fast — but we'll
+  # still run it on demand below before any real install, so the cached
+  # package index can't pin us to a version Ubuntu has already retired
+  # (observed: libpython3.12-dev_3.12.3-1ubuntu0.12 → 404 once 0.13
+  # rolled out). One `apt-get update` per verify, only when we'd
+  # otherwise hit the network anyway.
   exit 0
 fi
 if [ "$first_cmd" = "install" ]; then
@@ -682,7 +756,7 @@ if [ "$first_cmd" = "install" ]; then
         fi
         ;;
       python3-venv)
-        if ! python3 -m venv --help >/dev/null 2>&1; then
+        if ! python3 -c "import ensurepip" >/dev/null 2>&1; then
           can_skip=0
         fi
         ;;
@@ -698,6 +772,12 @@ if [ "$first_cmd" = "install" ]; then
   done
   if [ "$can_skip" -eq 1 ]; then
     exit 0
+  fi
+  if [ ! -f "$APT_UPDATE_MARKER" ]; then
+    install -d -m 755 "$(dirname "$APT_UPDATE_MARKER")" 2>/dev/null || true
+    if "$REAL_APT_GET" update -qq >/dev/null 2>&1; then
+      : > "$APT_UPDATE_MARKER" 2>/dev/null || true
+    fi
   fi
 fi
 exec "$REAL_APT_GET" "$@"
@@ -829,6 +909,8 @@ PY
         sandbox_resource_limits: SandboxResourceLimits | None = None,
         fork_reuse_enabled: bool = False,
         eager_fork_cleanup_on_reject: bool = False,
+        fast_forward_idle_waits: bool = True,
+        relaunch_on_restore_failure: bool = False,
     ) -> None:
         self.provider = provider
         self.transfer_delay_ms = transfer_delay_ms
@@ -892,6 +974,8 @@ PY
         self.sandbox_resource_limits = sandbox_resource_limits
         self.fork_reuse_enabled = bool(fork_reuse_enabled)
         self.eager_fork_cleanup_on_reject = bool(eager_fork_cleanup_on_reject)
+        self.fast_forward_idle_waits = bool(fast_forward_idle_waits)
+        self.relaunch_on_restore_failure = bool(relaunch_on_restore_failure)
         self._tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self.uses_temporary_root = False
         self.root: Path | None = None
@@ -1205,6 +1289,7 @@ PY
             extra_checkpoint_metadata_provider=self._llm_service_checkpoint_metadata,
             restore_metadata_handler=self._restore_llm_service_state,
             recovery_delay_seconds=self.transfer_delay_ms / 1000.0 if self.auto_cr else 0.0,
+            relaunch_on_restore_failure=self.relaunch_on_restore_failure,
         )
         if self.telemetry is not None and self.runtime is not None and self.monitoring_enabled:
             self._resource_monitor = BenchmarkResourceMonitor(
@@ -1228,7 +1313,19 @@ PY
             sandbox_id_resolver=self.resolve_interceptor_sandbox_id,
             host="0.0.0.0",
             port=0,
-            max_workers=max(1, self.max_workers),
+            # Spec scenarios fire draft+oracle PER sandbox concurrently —
+            # 2× the request fan-out of nofault. Sizing the interceptor
+            # pool to just `max_workers` causes the second request of each
+            # spec pair to queue behind the first inside the interceptor's
+            # PooledHTTPServer, completely defeating the design's
+            # "draft and oracle run in parallel" promise. (Smoking gun:
+            # the second request's `interceptor.request.received` lands
+            # within ms of the first request's `interceptor.response.released`,
+            # not within ms of the first's `received`.) The router pool
+            # already uses `max(32, max_workers*4)` for the same reason —
+            # apply the same headroom here so the interceptor is never the
+            # serialization point for parallel-by-design request pairs.
+            max_workers=max(32, self.max_workers * 4),
         )
         self.interceptor.start()
         wait_for_http_json(f"http://127.0.0.1:{self.interceptor.port}/healthz")
@@ -1272,6 +1369,24 @@ PY
             "interceptor.stop",
             lambda: self.interceptor.stop() if self.interceptor is not None else None,
         )
+        # task_executor.shutdown MUST run before runtime.delete_all.
+        # Pre-fix, runtimes were deleted while in-flight terminus
+        # tasks were still mid-turn; the next `runc exec` then failed
+        # with "container does not exist" and the task entered a 300s
+        # restore-wait, hanging task_executor.shutdown. Observed in
+        # benchmarks 20260429_031243 and 20260429_063012, both stuck
+        # at task_executor.shutdown for 17+ minutes.
+        #
+        # request_stop() above signals each task to exit at its next
+        # turn check; task_executor.shutdown(wait=True,
+        # cancel_futures=True) cancels pending futures and waits for
+        # in-flight tasks to actually return. With containers still
+        # alive, the agents can finish a turn cleanly. Only after
+        # they're all done do we tear runtimes down.
+        _run_teardown_step(
+            "task_executor.shutdown",
+            lambda: self._task_executor.shutdown(wait=True, cancel_futures=True),
+        )
         _run_teardown_step(
             "runtime.delete_all",
             lambda: [
@@ -1280,10 +1395,6 @@ PY
             ]
             if self.runtime is not None
             else None,
-        )
-        _run_teardown_step(
-            "task_executor.shutdown",
-            lambda: self._task_executor.shutdown(wait=True, cancel_futures=True),
         )
         _run_teardown_step(
             "executor.shutdown",
@@ -1679,13 +1790,17 @@ PY
         task_config: TaskConfig,
     ) -> BaseAgent:
         extra_kwargs: dict[str, object] = {}
-        if agent_type == "mini_swe" and sandbox.llm_service_type == "mini_swe_spec_trace_replay":
+        if (agent_type == "mini_swe" and sandbox.llm_service_type == "mini_swe_spec_trace_replay") or (
+            agent_type == "terminus" and sandbox.llm_service_type == "terminus_spec_trace_replay"
+        ):
             extra_kwargs["speculation_controller"] = _SpeculativeSandboxController(
                 self,
                 sandbox,
                 fork_reuse_enabled=self.fork_reuse_enabled,
                 eager_cleanup_on_reject=self.eager_fork_cleanup_on_reject,
             )
+        if agent_type == "terminus":
+            extra_kwargs["fast_forward_idle_waits"] = self.fast_forward_idle_waits
         return self.get_agent_class(agent_type)(
             sandbox,
             task_description,
@@ -2865,6 +2980,11 @@ PY
         sandbox: SandboxHandle,
         result: RestoreResult,
     ) -> bool:
+        # Same opt-in as the system-level restore-failure handler: relaunch is
+        # an availability fallback that can hide real bugs, so it stays off
+        # unless the operator explicitly enables it.
+        if not self.relaunch_on_restore_failure:
+            return False
         if sandbox.launch_source != "compose":
             return False
         if not benchmark_support.is_replay_llm_service_type(sandbox.llm_service_type):
@@ -3275,6 +3395,15 @@ PY
             self.network_manager.register_guest_ip(network_lease.guest_ip, target.sandbox_id)
         self._clone_host_work_dir(source.sandbox_id, target.sandbox_id)
 
+        # When the source sandbox was launched via docker-compose translation,
+        # its bundle has compose-derived bind mounts (e.g. /logs). The fork's
+        # bare bundle from _prepare_sandbox_handle is missing those, so CRIU's
+        # restore can't map the original mountpoint IDs and aborts with
+        # `Error (criu/mount.c:3024): mnt: No mapping for X:(null) mountpoint`.
+        # Copy the source bundle's mounts list onto the fork before any restore
+        # so the in-memory mount layout the process image references exists.
+        self._replicate_source_bundle_mounts(source=source, target=target)
+
         rootfs_path = target.bundle_dir / "rootfs"
         rootfs_path.mkdir(parents=True, exist_ok=True)
         manifests = {manifest.checkpoint_id: manifest for manifest in self.list_checkpoint_manifests(source.sandbox_id)}
@@ -3412,6 +3541,109 @@ PY
                 self.runtime._persist(description)
         return target
 
+    def _replicate_source_bundle_mounts(
+        self,
+        *,
+        source: SandboxHandle,
+        target: SandboxHandle,
+    ) -> None:
+        """Replicate compose-derived bundle config from source onto fork.
+
+        The fork's bundle is built by `_prepare_sandbox_handle` (the runc-direct
+        path), which produces a *minimal* spec. The source sandbox went through
+        compose translation, which adds extra mounts (e.g. /logs) and a richer
+        `process.capabilities` set (CAP_SETUID/SETGID/DAC_OVERRIDE/etc.). When
+        the fork is later restored from the source's checkpoint or runs apt-get
+        in verification, those deltas matter:
+
+        - **mounts**: CRIU's process image references mountpoint IDs from the
+          source spec; a mismatch fails restore with `mnt: No mapping for
+          X:(null) mountpoint`.
+        - **process.capabilities**: apt-get's package-install sub-process
+          drops privileges to `nobody` via setgroups/setegid, which needs
+          CAP_SETGID/CAP_SETUID. The bare-bundle's three-cap default fails
+          with `setgroups 65534 failed - setgroups (1: Operation not permitted)`.
+        - **process.user**: copied for forward compatibility with non-root
+          containers.
+
+        Per-sandbox host paths inside mount sources (`.../sandbox-X/logs/`)
+        are rewritten to the fork's equivalents so a checkpoint+restore on
+        the fork doesn't accidentally write into the source sandbox's state.
+        """
+        source_cfg_path = source.bundle_dir / "config.json"
+        target_cfg_path = target.bundle_dir / "config.json"
+        if not source_cfg_path.is_file() or not target_cfg_path.is_file():
+            return
+        try:
+            source_cfg = json.loads(source_cfg_path.read_text(encoding="utf-8"))
+            target_cfg = json.loads(target_cfg_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        changed = False
+        source_mounts = source_cfg.get("mounts")
+        if isinstance(source_mounts, list) and source_mounts:
+            source_token = f"/{source.sandbox_id}/"
+            target_token = f"/{target.sandbox_id}/"
+            rewritten: list[dict[str, object]] = []
+            for mount in source_mounts:
+                if not isinstance(mount, dict):
+                    continue
+                new_mount = dict(mount)
+                raw_source = new_mount.get("source")
+                if isinstance(raw_source, str) and source_token in raw_source:
+                    rewritten_source = raw_source.replace(source_token, target_token)
+                    rewritten_path = Path(rewritten_source)
+                    try:
+                        rewritten_path.mkdir(parents=True, exist_ok=True)
+                        new_mount["source"] = rewritten_source
+                    except OSError:
+                        pass
+                rewritten.append(new_mount)
+            target_cfg["mounts"] = rewritten
+            changed = True
+        source_process = source_cfg.get("process")
+        if isinstance(source_process, dict):
+            target_process = target_cfg.setdefault("process", {})
+            if isinstance(target_process, dict):
+                source_caps = source_process.get("capabilities")
+                if isinstance(source_caps, dict):
+                    target_process["capabilities"] = copy.deepcopy(source_caps)
+                    changed = True
+                source_user = source_process.get("user")
+                if isinstance(source_user, dict):
+                    target_process["user"] = copy.deepcopy(source_user)
+                    changed = True
+                # Replicate cwd / env / noNewPrivileges so agent commands
+                # resolve relative paths against the same working directory the
+                # source uses (compose-derived workdir, e.g. /app). After
+                # promotion the harness swaps active.bundle_dir to the fork's
+                # bundle, so a fork with cwd=/work would silently make every
+                # subsequent `sed -i ars.R` operate on /work/ars.R instead of
+                # /app/ars.R, leaving the source path frozen at its pre-fork
+                # state. Same pattern for env (PATH/TEST_DIR etc) and
+                # noNewPrivileges (must stay False to allow capability use).
+                source_cwd = source_process.get("cwd")
+                if isinstance(source_cwd, str) and source_cwd:
+                    target_process["cwd"] = source_cwd
+                    changed = True
+                source_env = source_process.get("env")
+                if isinstance(source_env, list):
+                    target_process["env"] = list(source_env)
+                    changed = True
+                if "noNewPrivileges" in source_process:
+                    target_process["noNewPrivileges"] = bool(
+                        source_process["noNewPrivileges"]
+                    )
+                    changed = True
+        if not changed:
+            return
+        target_cfg_path.write_text(json.dumps(target_cfg, indent=2), encoding="utf-8")
+        logger.debug(
+            "Replicated source bundle layout to fork source=%s target=%s",
+            source.sandbox_id,
+            target.sandbox_id,
+        )
+
     def _clone_host_work_dir(self, source_sandbox_id: SandboxId, target_sandbox_id: SandboxId) -> None:
         source_work_dir = benchmark_support.resolve_work_dir_host_path(self.work_dir_host_root, str(source_sandbox_id))
         target_work_dir = benchmark_support.resolve_work_dir_host_path(self.work_dir_host_root, str(target_sandbox_id))
@@ -3445,7 +3677,15 @@ PY
         target = self.clone_checkpoint_to_fork(source, checkpoint_id, fork_name)
         network_lease = self.network_manager.lease_for(target.sandbox_id)
         work_dir_host_path = benchmark_support.resolve_work_dir_host_path(self.work_dir_host_root, str(target.sandbox_id))
-        sandbox_image = self.ensure_sandbox_image(target.agent_type) if target.agent_type is not None else None
+        # Compose-backed agents (mini_swe, claude_code, terminus) materialize
+        # their rootfs from the task's docker-compose file, not from a per-agent
+        # Dockerfile, so there's no sandbox image to build. write_bundle_config
+        # already tolerates None for image_defaults / image_rootfs_dir; only
+        # call ensure_sandbox_image for runc-direct agents.
+        if target.agent_type is not None and target.launch_source != "compose":
+            sandbox_image = self.ensure_sandbox_image(target.agent_type)
+        else:
+            sandbox_image = None
         sandbox_bundle.write_bundle_config(
             bundle_dir=target.bundle_dir,
             llm_base_url=target.llm_base_url or "",
@@ -4288,6 +4528,8 @@ exit $rc
             "mini_swe_trace_replay",
             "mini_swe_spec_trace_replay",
             "claude_code_trace_replay",
+            "terminus_trace_replay",
+            "terminus_spec_trace_replay",
         }:
             return {}
         state = sandbox_snapshot.get("state")

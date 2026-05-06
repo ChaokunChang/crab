@@ -17,7 +17,7 @@ It reads a benchmark YAML config, resolves the corresponding artifact paths, inf
 Run the default text report:
 
 ```bash
-python3 -m benchmarks.diagnose --config benchmarks/examples/iflow.fault.auto.115tasks.debug.4.yaml
+python3 -m benchmarks.diagnose --config benchmarks/examples/iflow/iflow.fault.auto.115tasks.debug.4.yaml
 ```
 
 Useful options:
@@ -47,7 +47,7 @@ from benchmarks.diagnose import (
     render_run_diagnosis_text,
 )
 
-report = diagnose_benchmark_config(Path("benchmarks/examples/iflow.fault.auto.115tasks.debug.4.yaml"))
+report = diagnose_benchmark_config(Path("benchmarks/examples/iflow/iflow.fault.auto.115tasks.debug.4.yaml"))
 print(render_run_diagnosis_text(report))
 ```
 

@@ -1429,6 +1429,101 @@ def render_report_html(
             "</section>"
         )
 
+    replay_cadence_section = ""
+    rcs = analysis.replay_cadence_stats
+    if rcs is not None and (
+        rcs.fast_forward_skip_count > 0
+        or rcs.pre_fork_drain_count > 0
+        or rcs.post_match_drain_count > 0
+        or rcs.non_spec_drain_count > 0
+    ):
+        def _fmt_ms(value: float) -> str:
+            return f"{value:.0f}"
+
+        def _fmt_avg(total: float, count: int) -> str:
+            if count <= 0:
+                return "—"
+            return f"{total / count:.0f}"
+
+        per_sandbox_rows_html = "".join(
+            "<tr>"
+            f"<td>{escape(row.sandbox_id)}</td>"
+            f"<td>{row.fast_forward_skip_count}</td>"
+            f"<td>{_fmt_ms(row.fast_forward_saved_ms)}</td>"
+            f"<td>{_fmt_ms(row.fast_forward_intended_sleep_ms)}</td>"
+            f"<td>{row.pre_fork_drain_count}</td>"
+            f"<td>{_fmt_ms(row.pre_fork_drain_ms)}</td>"
+            f"<td>{row.pre_fork_drain_timeouts}</td>"
+            f"<td>{row.post_match_drain_count}</td>"
+            f"<td>{_fmt_ms(row.post_match_drain_ms)}</td>"
+            f"<td>{row.post_match_drain_timeouts}</td>"
+            f"<td>{row.non_spec_drain_count}</td>"
+            f"<td>{_fmt_ms(row.non_spec_drain_ms)}</td>"
+            f"<td>{row.non_spec_drain_timeouts}</td>"
+            "</tr>"
+            for row in rcs.per_sandbox
+        )
+        replay_cadence_section = (
+            "<section><h2>Replay Cadence Handling</h2>"
+            "<p>Two mechanisms handle drift between the recorded trace's pacing and the "
+            "replay host's actual command durations (see "
+            "<code>docs/replay-cadence-handling.md</code>):</p>"
+            "<ul>"
+            "<li><strong>Drain guards</strong> (slower replay): when a build started in turn N is "
+            "still grinding when the trace's turn N+k arrives, the spec controller waits for the "
+            "active pane to drain before running oracle. Without the guard, promoting a fork "
+            "onto a busy active would kill the in-flight build.</li>"
+            "<li><strong>Fast-forward</strong> (faster replay): when the trace's pure-wait turn "
+            "arrives but the active pane already drained, the agent skips the recorded "
+            "<code>min_timeout_sec</code> sleep instead of dozing through it. Gated by an "
+            "<code>is_pane_idle</code> + <code>capture_pane</code> stability probe.</li>"
+            "</ul>"
+            "<table><thead><tr>"
+            "<th>Mechanism</th><th>Events</th><th>Total wall-time moved (ms)</th>"
+            "<th>Avg per event (ms)</th><th>Timeouts</th>"
+            "</tr></thead><tbody>"
+            f"<tr><td>Fast-forward (skipped sleep)</td>"
+            f"<td>{rcs.fast_forward_skip_count}</td>"
+            f"<td>{_fmt_ms(rcs.fast_forward_saved_ms)} saved "
+            f"(of {_fmt_ms(rcs.fast_forward_intended_sleep_ms)} would-be sleep)</td>"
+            f"<td>{_fmt_avg(rcs.fast_forward_saved_ms, rcs.fast_forward_skip_count)}</td>"
+            "<td>—</td></tr>"
+            f"<tr><td>Pre-fork drain (slow replay)</td>"
+            f"<td>{rcs.pre_fork_drain_count}</td>"
+            f"<td>{_fmt_ms(rcs.pre_fork_drain_ms)} waited</td>"
+            f"<td>{_fmt_avg(rcs.pre_fork_drain_ms, rcs.pre_fork_drain_count)}</td>"
+            f"<td>{rcs.pre_fork_drain_timeouts}</td></tr>"
+            f"<tr><td>Post-match drain (slow replay)</td>"
+            f"<td>{rcs.post_match_drain_count}</td>"
+            f"<td>{_fmt_ms(rcs.post_match_drain_ms)} waited</td>"
+            f"<td>{_fmt_avg(rcs.post_match_drain_ms, rcs.post_match_drain_count)}</td>"
+            f"<td>{rcs.post_match_drain_timeouts}</td></tr>"
+            f"<tr><td>Non-spec drain (slow replay)</td>"
+            f"<td>{rcs.non_spec_drain_count}</td>"
+            f"<td>{_fmt_ms(rcs.non_spec_drain_ms)} waited</td>"
+            f"<td>{_fmt_avg(rcs.non_spec_drain_ms, rcs.non_spec_drain_count)}</td>"
+            f"<td>{rcs.non_spec_drain_timeouts}</td></tr>"
+            "</tbody></table>"
+            "<p style='margin-top:0.75rem;font-weight:600'>Per-sandbox breakdown</p>"
+            "<table><thead><tr>"
+            "<th>Sandbox</th>"
+            "<th>FF skips</th><th>FF saved (ms)</th><th>FF intended sleep (ms)</th>"
+            "<th>Pre-fork drains</th><th>Pre-fork wait (ms)</th><th>Pre-fork timeouts</th>"
+            "<th>Post-match drains</th><th>Post-match wait (ms)</th><th>Post-match timeouts</th>"
+            "<th>Non-spec drains</th><th>Non-spec wait (ms)</th><th>Non-spec timeouts</th>"
+            "</tr></thead><tbody>"
+            f"{per_sandbox_rows_html}"
+            "</tbody></table>"
+            "<p style='margin-top:0.5rem;font-size:0.9em;color:#555'>"
+            "Fast-forward is gated by <code>scenario_options.fast_forward_idle_waits</code> "
+            "(default <code>true</code>); turn it off to measure the unmoderated trace cadence. "
+            "Drain timeouts mean <code>wait_for_quiescence</code> hit "
+            "<code>_SPEC_PRE_FORK_QUIESCENCE_TIMEOUT_S</code> without the foreground command "
+            "exiting — the agent then falls through to running oracle on the still-busy active "
+            "(same behavior as before the guards existed).</p>"
+            "</section>"
+        )
+
     spec_section = ""
     if "spec_saved.svg" in figures or analysis.spec_draft_overhead_analysis is not None:
         breakdown_html = ""
@@ -1686,6 +1781,7 @@ def render_report_html(
     {turn_section}
     {restore_section}
     {spec_section}
+    {replay_cadence_section}
     {resource_section}
     <section>
       <h2>Top Runtime Hotspots</h2>
@@ -2242,6 +2338,45 @@ def generate_report_bundle(
                 {"metric": "rejected_state_unchanged_draft_incomplete", "value": frs.rejected_state_unchanged_draft_incomplete},
                 {"metric": "gap_state_unchanged_to_cache_eligible", "value": frs.state_unchanged - frs.cache_eligible},
                 {"metric": "gap_cache_eligible_to_reused", "value": frs.cache_eligible - frs.forks_reused},
+            ],
+        )
+
+    rcs = analysis.replay_cadence_stats
+    if rcs is not None:
+        _write_csv(
+            target_dir / "replay_cadence_per_sandbox.csv",
+            [
+                "sandbox_id",
+                "fast_forward_skip_count",
+                "fast_forward_saved_ms",
+                "fast_forward_intended_sleep_ms",
+                "pre_fork_drain_count",
+                "pre_fork_drain_ms",
+                "pre_fork_drain_timeouts",
+                "post_match_drain_count",
+                "post_match_drain_ms",
+                "post_match_drain_timeouts",
+                "non_spec_drain_count",
+                "non_spec_drain_ms",
+                "non_spec_drain_timeouts",
+            ],
+            [
+                {
+                    "sandbox_id": row.sandbox_id,
+                    "fast_forward_skip_count": row.fast_forward_skip_count,
+                    "fast_forward_saved_ms": f"{row.fast_forward_saved_ms:.3f}",
+                    "fast_forward_intended_sleep_ms": f"{row.fast_forward_intended_sleep_ms:.3f}",
+                    "pre_fork_drain_count": row.pre_fork_drain_count,
+                    "pre_fork_drain_ms": f"{row.pre_fork_drain_ms:.3f}",
+                    "pre_fork_drain_timeouts": row.pre_fork_drain_timeouts,
+                    "post_match_drain_count": row.post_match_drain_count,
+                    "post_match_drain_ms": f"{row.post_match_drain_ms:.3f}",
+                    "post_match_drain_timeouts": row.post_match_drain_timeouts,
+                    "non_spec_drain_count": row.non_spec_drain_count,
+                    "non_spec_drain_ms": f"{row.non_spec_drain_ms:.3f}",
+                    "non_spec_drain_timeouts": row.non_spec_drain_timeouts,
+                }
+                for row in rcs.per_sandbox
             ],
         )
 

@@ -253,6 +253,7 @@ class SystemIntegrationTests(unittest.TestCase):
         request_store: InMemoryRequestStateStore | None = None,
         relaunch_handler=None,
         enforce_restore_checkpoint_validation: bool = False,
+        relaunch_on_restore_failure: bool = False,
     ) -> tuple[AgentCRSystem, CRExecutor]:
         runtime = RuncRuntimeAdapter(
             command_runner=runner,
@@ -311,6 +312,7 @@ class SystemIntegrationTests(unittest.TestCase):
             request_state_store=request_store,
             relaunch_handler=relaunch_handler,
             enforce_restore_checkpoint_validation=enforce_restore_checkpoint_validation,
+            relaunch_on_restore_failure=relaunch_on_restore_failure,
         )
         return system, executor
 
@@ -560,6 +562,7 @@ class SystemIntegrationTests(unittest.TestCase):
                     "--tcp-established",
                     "--shell-job",
                     "--tcp-skip-in-flight",
+                    "--ext-unix-sk",
                     "sbx-int",
                 ),
                 runner.commands,
@@ -591,6 +594,7 @@ class SystemIntegrationTests(unittest.TestCase):
                     str(root / "checkpoints" / "sbx-int" / str(checkpoint_result.checkpoint_id) / "work"),
                     "--tcp-established",
                     "--shell-job",
+                    "--ext-unix-sk",
                     "sbx-int",
                 ),
                 runner.commands,
@@ -868,6 +872,7 @@ class SystemIntegrationTests(unittest.TestCase):
                     str(root / "checkpoints" / "sbx-auto-fault" / str(checkpoint_result.checkpoint_id) / "work"),
                     "--tcp-established",
                     "--shell-job",
+                    "--ext-unix-sk",
                     "sbx-auto-fault",
                 ),
                 runner.commands,
@@ -1135,6 +1140,7 @@ class SystemIntegrationTests(unittest.TestCase):
                     str(root / "checkpoints" / "sbx-stale-skip" / str(safe_checkpoint.checkpoint_id) / "work"),
                     "--tcp-established",
                     "--shell-job",
+                    "--ext-unix-sk",
                     "sbx-stale-skip",
                 ),
                 runner.commands,
@@ -1159,6 +1165,7 @@ class SystemIntegrationTests(unittest.TestCase):
                     (sandbox_id, event_type, preserve_fs)
                 ),
                 enforce_restore_checkpoint_validation=True,
+                relaunch_on_restore_failure=True,
             )
             sandbox_id = system.sandbox_manager.launch(
                 "runc",
@@ -1286,6 +1293,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 restore_metadata_handler=lambda sandbox_id, manifest: restored_metadata.append(
                     (sandbox_id, manifest.checkpoint_id)
                 ),
+                relaunch_on_restore_failure=True,
             )
             sandbox_id = system.sandbox_manager.launch(
                 "runc",
@@ -1329,6 +1337,123 @@ class SystemIntegrationTests(unittest.TestCase):
             self.assertEqual(record.status, "relaunched")
             self.assertEqual(relaunched, [(sandbox_id, "fault", True)])
             self.assertEqual(restored_metadata, [(sandbox_id, checkpoint_result.checkpoint_id)])
+
+    def test_fault_notification_surfaces_restore_failure_when_relaunch_fallback_is_disabled(self) -> None:
+        # With the default `relaunch_on_restore_failure=False`, a restore
+        # failure during recovery must NOT silently fall through to
+        # relaunch_handler. The system instead records a failed recovery and
+        # leaves relaunch_handler untouched, so latent bugs surface loudly.
+        with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
+            root = Path(tmp)
+            runner = FailingRestoreRunner()
+            telemetry = InMemoryTelemetrySink()
+            collector = InMemoryEBPFEventCollector()
+            inspector = EBPFSandboxInspector(collector)
+            request_store = InMemoryRequestStateStore()
+            relaunched: list[tuple[SandboxId, str, bool]] = []
+
+            runtime = RuncRuntimeAdapter(
+                command_runner=runner,
+                paths=RuncRuntimePaths(
+                    state_root=root / "runtime-state",
+                    bundle_root=root / "bundles",
+                    checkpoint_root=root / "checkpoints",
+                    zfs_dataset_prefix="pool/agent-cr",
+                ),
+            )
+            storage = LocalCheckpointManager(StorageConfig(root_dir=root / "storage"))
+            executor = CRExecutor(
+                ExecutorConfig(max_workers=1),
+                DefaultCWorker(
+                    AdapterProcessCWorker(runtime),
+                    AdapterFileSystemCWorker(runtime),
+                    storage,
+                    runtime,
+                ),
+                DefaultRWorker(
+                    AdapterProcessRWorker(runtime),
+                    AdapterFileSystemRWorker(runtime),
+                    storage,
+                ),
+                telemetry,
+            )
+            sandbox_manager = RuncSandboxManager(
+                command_runner=runner,
+                paths=RuncSandboxManagerPaths(
+                    state_root=root / "runtime-state",
+                    bundle_root=root / "bundles",
+                    metadata_root=root / "sandbox-metadata",
+                    zfs_dataset_prefix="pool/agent-cr",
+                ),
+            )
+            scheduler_cfg = SchedulerConfig(
+                min_checkpoint_interval_seconds=0.0,
+                force_checkpoint_after_seconds=0.0,
+                require_change_signal=True,
+            )
+            scheduler = CRScheduler(
+                scheduler_cfg,
+                inspector,
+                sandbox_manager,
+                InMemorySchedulerStateStore(),
+                telemetry,
+                FaultToleranceCheckpointingPolicy(scheduler_cfg),
+            )
+            system = AgentCRSystem(
+                scheduler=scheduler,
+                executor=executor,
+                storage=storage,
+                inspector=inspector,
+                runtime=sandbox_manager,
+                telemetry=telemetry,
+                request_state_store=request_store,
+                relaunch_handler=lambda sandbox_id, event_type, preserve_fs: relaunched.append(
+                    (sandbox_id, event_type, preserve_fs)
+                ),
+                # relaunch_on_restore_failure stays at its default False value
+            )
+            sandbox_id = system.sandbox_manager.launch(
+                "runc",
+                {
+                    "sandbox_id": "sbx-no-fallback",
+                    "bundle_path": str(root / "bundles" / "sbx-no-fallback"),
+                },
+            )
+            inspector.upsert_snapshot(
+                SandboxSnapshot(
+                    sandbox_id=sandbox_id,
+                    runtime_name="runc",
+                    is_running=True,
+                    process_changed=True,
+                    filesystem_changed=True,
+                    observed_at=utc_now(),
+                )
+            )
+            checkpoint_result = system.checkpoint_if_due(sandbox_id)
+            self.assertIsNotNone(checkpoint_result)
+            inspector.upsert_snapshot(
+                SandboxSnapshot(
+                    sandbox_id=sandbox_id,
+                    runtime_name="runc",
+                    is_running=False,
+                    process_changed=True,
+                    filesystem_changed=True,
+                    observed_at=utc_now(),
+                    last_checkpoint_at=utc_now(),
+                )
+            )
+
+            system.start()
+            try:
+                system.notify_fault(sandbox_id)
+                record = self._wait_for_record(system, sandbox_id, "fault")
+            finally:
+                system.stop()
+                executor.shutdown()
+
+            self.assertEqual(record.status, "failed")
+            self.assertIn("recovery restore failed", (record.message or "").lower())
+            self.assertEqual(relaunched, [])
 
     def test_restore_once_fails_when_runtime_does_not_come_back(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:

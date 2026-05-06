@@ -1453,7 +1453,14 @@ class BenchmarkHelperTests(unittest.TestCase):
 
             payload = json.loads(config_path.read_text(encoding="utf-8"))
             resources = payload["linux"]["resources"]
-            self.assertNotIn("cpus", resources["cpu"])
+            self.assertIn("cpus", resources["cpu"])
+            host_cpus = os.cpu_count() or 1
+            limit_cpus = min(4, host_cpus)
+            slot = 0  # "sandbox-rl" has no integer component → slot 0
+            start = (slot * limit_cpus) % host_cpus
+            end = start + limit_cpus - 1
+            expected = f"{start}-{end}" if limit_cpus > 1 else str(start)
+            self.assertEqual(resources["cpu"]["cpus"], expected)
             self.assertEqual(resources["cpu"]["period"], 100_000)
             self.assertEqual(resources["cpu"]["quota"], 400_000)
             self.assertEqual(resources["memory"]["limit"], 2 * 1024 * 1024 * 1024)
@@ -1465,6 +1472,23 @@ class BenchmarkHelperTests(unittest.TestCase):
             self.assertIn("MKL_NUM_THREADS=4", env)
             self.assertIn("NUMEXPR_MAX_THREADS=4", env)
             self.assertIn("LOKY_MAX_CPU_COUNT=4", env)
+            mounts = payload.get("mounts", [])
+            cpu_overlay_dests = {
+                "/sys/devices/system/cpu/online",
+                "/sys/devices/system/cpu/possible",
+                "/sys/devices/system/cpu/present",
+            }
+            overlay_mounts = [m for m in mounts if m["destination"] in cpu_overlay_dests]
+            self.assertEqual(
+                {m["destination"] for m in overlay_mounts},
+                cpu_overlay_dests,
+            )
+            for m in overlay_mounts:
+                self.assertEqual(m["type"], "bind")
+                self.assertIn("ro", m["options"])
+                src = Path(str(m["source"]))
+                self.assertTrue(src.is_file())
+                self.assertEqual(src.read_text(encoding="utf-8"), "0-3\n")
 
     def test_write_bundle_config_without_resource_limits_leaves_resources_unset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

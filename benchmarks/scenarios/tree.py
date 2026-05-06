@@ -641,13 +641,20 @@ def _source_specs(config: BenchmarkConfig):
         if config.llm_service_options:
             from benchmarks.core import _apply_llm_service_options  # local import to avoid broad module churn
             records = [_apply_llm_service_options(r, config.llm_service_options) for r in records]
-        if config.max_agent_timeout_scale != 1.0 or config.max_test_timeout_scale != 1.0:
+        if (
+            config.max_agent_timeout_scale != 1.0
+            or config.max_test_timeout_scale != 1.0
+            or config.max_agent_timeout_scale_overrides
+            or config.max_test_timeout_scale_overrides
+        ):
             from benchmarks.core import _apply_task_timeout_scales  # local import to avoid broad module churn
             records = [
                 _apply_task_timeout_scales(
                     r,
                     max_agent_timeout_scale=config.max_agent_timeout_scale,
                     max_test_timeout_scale=config.max_test_timeout_scale,
+                    max_agent_timeout_scale_overrides=config.max_agent_timeout_scale_overrides,
+                    max_test_timeout_scale_overrides=config.max_test_timeout_scale_overrides,
                 )
                 for r in records
             ]

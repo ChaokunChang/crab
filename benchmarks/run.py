@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 from pathlib import Path
 import shutil
 import time
@@ -90,6 +91,55 @@ def _failed_sandbox_lines(rows: list[dict[str, object]]) -> list[str]:
         lines.append(f"FAILED sandbox={sandbox_id} task={task_id} error={task_error}")
     if lines:
         lines.insert(0, f"--- Failed sandboxes ({len(lines)}) ---")
+    return lines
+
+
+_SPEC_FORK_SUFFIX = re.compile(r"-spec-\d+$")
+
+
+def _incomplete_replay_lines(rows: list[dict[str, object]]) -> list[str]:
+    """Surface replay-mode rows where the agent stopped before consuming the
+    full trace (typically because it hit max_agent_timeout_sec). The row can
+    still pass verification — partial trace execution often leaves a working
+    final state — but the operator should know which sandboxes were truncated
+    so they can decide whether to raise the timeout or accept the partial
+    coverage.
+
+    Only the active (primary) sandbox row is meaningful here. Spec-mode
+    fork-reused successors are named `<root>-spec-<n>` (see
+    `_SpecForkManager.ensure_fork` in real_host_scenario_base.py) and inherit
+    parent state via CRIU restore — their `replay_final_trace_cursor` is
+    per-fork and starts at 0 even though the parent already drove the trace
+    to completion. Surfacing them produced false-positive INCOMPLETE_REPLAY
+    lines on every spec run.
+    """
+    seen: set[str] = set()
+    incomplete: list[tuple[str, str, int, int]] = []
+    for row in rows:
+        sandbox_id = str(row.get("sandbox_id", ""))
+        if sandbox_id in seen:
+            continue
+        if _SPEC_FORK_SUFFIX.search(sandbox_id):
+            continue
+        try:
+            response_count = int(row.get("trace_response_count") or 0)
+            cursor = int(row.get("replay_final_trace_cursor") or 0)
+        except (TypeError, ValueError):
+            continue
+        if response_count <= 0 or cursor >= response_count:
+            continue
+        seen.add(sandbox_id)
+        task_id = str(row.get("task_id", ""))
+        incomplete.append((sandbox_id, task_id, cursor, response_count))
+    if not incomplete:
+        return []
+    lines = [f"--- Incomplete trace replay ({len(incomplete)} sandboxes stopped before consuming full trace) ---"]
+    for sandbox_id, task_id, cursor, response_count in incomplete:
+        missed = response_count - cursor
+        lines.append(
+            f"INCOMPLETE_REPLAY sandbox={sandbox_id} task={task_id} "
+            f"cursor={cursor} trace_response_count={response_count} missed={missed}"
+        )
     return lines
 
 
@@ -342,6 +392,10 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
             eager_fork_cleanup_on_reject=bool(
                 config.scenario_options.get("eager_fork_cleanup_on_reject", False)
             ),
+            fast_forward_idle_waits=bool(
+                config.scenario_options.get("fast_forward_idle_waits", True)
+            ),
+            relaunch_on_restore_failure=config.relaunch_on_restore_failure,
         )
         with harness_context as harness:
             if scenario.prepare_harness is not None:
@@ -408,6 +462,9 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
             failed_lines = _failed_sandbox_lines(rows)
             if failed_lines:
                 _emit_lines(failed_lines)
+            incomplete_lines = _incomplete_replay_lines(rows)
+            if incomplete_lines:
+                _emit_lines(incomplete_lines)
             artifact_lines = _artifact_lines(
                 log_file=config.log_file,
                 output=config.output,
