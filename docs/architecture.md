@@ -107,6 +107,44 @@ Two invariants matter here:
 
 The benchmark YAML `scheduler:` block can override that flag, but the repository defaults remain on the paused-inspection path.
 
+## Incremental Process Checkpoint Chains
+
+Opt-in via `SchedulerConfig.incremental_process_enabled=True`. Default off. When enabled, the scheduler's decision passes a `produce_pre_dump=True` flag down to the worker for every chain participant — anchors and chain nodes alike. The flag travels on `SchedulerCheckpointDecision` and `CheckpointJob`, separate from `is_incremental_process` (which discriminates "this checkpoint chains off a parent's pre-dump" from "this is a chain root").
+
+`AdapterProcessCWorker.checkpoint(...)` runs a two-phase CRIU dance whenever `produce_pre_dump=True` and the runtime advertises `supports_incremental_process=True`:
+
+1. `runtime.pre_dump_process(sandbox_id, ckpt, parent_checkpoint_id=...)` writes `<ckpt>/pre_dump/`. If `parent_checkpoint_id` is set, the command carries `--parent-path ../<parent>/pre_dump` and only dirty pages are written; if `parent_checkpoint_id` is `None`, the pre-dump dumps full memory and starts a new chain.
+2. `runtime.checkpoint_process(sandbox_id, ckpt, leave_running=..., parent_checkpoint_id=ckpt)` writes `<ckpt>/process/` with `--parent-path ../pre_dump`. This is the restorable artifact — it always chains off the just-taken sibling pre-dump, regardless of whether step 1 had a parent.
+
+Anchors and chain nodes therefore write the same on-disk shape (`pre_dump/` + `process/`); they differ only in whether step 1 had a parent. `process_kind` on the manifest is `"incremental"` only when the manifest's `parent_checkpoint_id` is set; anchors stay `"full"` so the chain validator can stop walking at them.
+
+The scheduler's `InMemorySchedulerStateStore` tracks `last_process_checkpoint_id` and `process_chain_length` per sandbox. `_resolve_incremental_process(...)` consults the store after the policy decides:
+
+- no last process checkpoint → emit an anchor (`produce_pre_dump=True`, no parent)
+- `chain_length + 1 >= full_process_checkpoint_interval` or `>= max_process_chain_length` → emit a fresh anchor and reset the chain length to 0
+- otherwise → emit a chain node (`is_incremental_process=True`, `parent_process_checkpoint_id=last_id`)
+
+`mark_checkpoint_complete(...)` records each successful process checkpoint. The chain length resets to 0 on anchors and increments on nodes.
+
+### Restore-time chain validation
+
+`_validate_incremental_chain(...)` in `workers/composite.py` runs before `DefaultRWorker` invokes `runc restore`. It loads the target manifest and walks `parent_checkpoint_id` toward the chain root. For each ancestor it confirms that the `pre_dump/` directory still exists on disk via `runtime.pre_dump_location(...)`. A missing intermediate dir raises `FileNotFoundError` with the missing checkpoint id; the restore returns `FailureCode.STORAGE_ERROR` rather than letting CRIU silently produce a corrupt restore.
+
+Validation is a no-op on full manifests (anchors / non-incremental checkpoints) and on runtimes that advertise `supports_incremental_process=False`.
+
+### Retention
+
+Two new contracts on `CheckpointManager`:
+
+- `descendants(sandbox_id, checkpoint_id) -> list[CheckpointId]` — transitive descendants whose `parent_checkpoint_id` chain bottoms out at `checkpoint_id`, returned newest-first.
+- `delete_checkpoint(..., cascade: bool = False)` — refuses to drop a parent with live descendants unless `cascade=True`; cascading deletes leaves first so children never end up orphaned.
+
+`LocalCheckpointManager.delete_all_checkpoints(...)` iterates `reversed(list_checkpoints(...))` so the descendants check passes without needing cascade.
+
+`DelegatingCheckpointManager._protected_checkpoint_ids(...)` (the base class for `LatestOnlyCheckpointManager` and `DeleteAfterRestoreCheckpointManager`) walks `parent_checkpoint_id` from each protected id and adds every ancestor to the protected set. As a result, `LatestOnlyCheckpointManager` keeps the entire chain back to its anchor on disk while it is the latest checkpoint; once the active chain advances past an old chain (e.g. after a chain reset), the old chain falls out of the protected set and `_prune_unprotected(...)` evicts it leaf-first.
+
+`KeepAllCheckpointManager` is unaffected — it never deletes anything. `DeleteAfterRestoreCheckpointManager` already iterated newest-first on restore-complete, so it is implicitly safe.
+
 ## Restore Flow
 
 `restore_once(...)`:

@@ -1,0 +1,30 @@
+scenario: fault
+mode: auto
+provider: openai
+agent: simulated
+llm_service: simulated
+sandboxes: 10
+phase_workers:
+  setup: 4
+  run: 10
+  verification: 4
+rootfs_reuse:
+  enabled: true
+phase_merging:
+  setup_and_run: false
+iterations: 10
+output: ../../logs/tmp/fault.auto.incremental.csv
+log_file: ../../logs/tmp/fault.auto.incremental.log
+log_level: info
+scenario_options:
+  injection_rate: 0.3
+  first_forced_event_chunk: 2
+scheduler:
+  # Opt into CRIU's incremental dump path. Each "incremental" checkpoint is a
+  # `runc checkpoint --pre-dump` (chained off the previous pre-dump) followed
+  # by a `runc checkpoint --parent-path` (the restorable artifact). Every
+  # `full_process_checkpoint_interval`-th checkpoint is a stand-alone full
+  # dump that resets the chain so restore cost stays bounded.
+  incremental_process_enabled: true
+  full_process_checkpoint_interval: 8
+  max_process_chain_length: 16

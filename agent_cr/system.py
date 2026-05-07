@@ -250,7 +250,14 @@ class AgentCRSystem:
             )
             result = self.executor.run_checkpoint(job)
             if result.status.value == "succeeded":
-                self.scheduler.mark_checkpoint_complete(sandbox_id, result.finished_at)
+                self.scheduler.mark_checkpoint_complete(
+                    sandbox_id,
+                    result.finished_at,
+                    process_checkpoint_id=(
+                        result.checkpoint_id if job.checkpoint_process else None
+                    ),
+                    is_incremental_process=job.is_incremental_process,
+                )
                 self.inspector.mark_checkpoint_complete(
                     sandbox_id,
                     process=job.checkpoint_process,
@@ -979,6 +986,9 @@ class AgentCRSystem:
             checkpoint_process=decision.checkpoint_process,
             checkpoint_filesystem=decision.checkpoint_filesystem,
             leave_running=decision.leave_running,
+            is_incremental_process=decision.is_incremental_process,
+            parent_process_checkpoint_id=decision.parent_process_checkpoint_id,
+            produce_pre_dump=decision.produce_pre_dump,
             metadata={"policy": decision.policy_name, **decision.metadata, **checkpoint_metadata},
         )
         result: CheckpointResult | None = None
@@ -986,7 +996,14 @@ class AgentCRSystem:
         try:
             result = self.executor.submit_checkpoint(job).result()
             if result.status.value == "succeeded":
-                self.scheduler.mark_checkpoint_complete(sandbox_id, result.finished_at)
+                self.scheduler.mark_checkpoint_complete(
+                    sandbox_id,
+                    result.finished_at,
+                    process_checkpoint_id=(
+                        result.checkpoint_id if job.checkpoint_process else None
+                    ),
+                    is_incremental_process=job.is_incremental_process,
+                )
                 self.inspector.mark_checkpoint_complete(
                     sandbox_id,
                     process=job.checkpoint_process,
@@ -1609,7 +1626,9 @@ def build_default_system(
         telemetry=telemetry,
         step_workers=executor_cfg.resolved_composite_step_workers,
     )
-    r_worker = DefaultRWorker(process_r, fs_r, storage, telemetry=telemetry)
+    r_worker = DefaultRWorker(
+        process_r, fs_r, storage, telemetry=telemetry, runtime=runtime_impl
+    )
 
     executor = CRExecutor(executor_cfg, c_worker, r_worker, telemetry)
     scheduler = CRScheduler(

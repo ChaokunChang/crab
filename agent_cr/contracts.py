@@ -121,8 +121,34 @@ class Runtime(ABC):
         checkpoint_id: CheckpointId,
         *,
         leave_running: bool,
+        parent_checkpoint_id: CheckpointId | None = None,
     ) -> RuntimeOperationStatus:
         raise NotImplementedError
+
+    def pre_dump_process(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+        *,
+        parent_checkpoint_id: CheckpointId | None = None,
+    ) -> RuntimeOperationStatus:
+        """Memory-only pre-dump that establishes a parent for subsequent
+        incremental checkpoints. The container keeps running. Subclasses that
+        do not support incremental process checkpointing leave this as the
+        default no-op; the worker layer only invokes it when the runtime's
+        capability advertises support.
+        """
+        _ = parent_checkpoint_id
+        return RuntimeOperationStatus(
+            executed=False,
+            reason=f"{self.name}_pre_dump_not_implemented",
+            metadata={
+                "phase": "process_pre_dump",
+                "runtime": self.name,
+                "sandbox_id": str(sandbox_id),
+                "checkpoint_id": str(checkpoint_id),
+            },
+        )
 
     @abstractmethod
     def restore_process(
@@ -139,6 +165,17 @@ class Runtime(ABC):
         checkpoint_id: CheckpointId,
     ) -> str | None:
         raise NotImplementedError
+
+    def pre_dump_location(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> str | None:
+        """On-disk path of the pre-dump image directory, when this runtime
+        supports incremental process checkpointing. Default: None.
+        """
+        _ = (sandbox_id, checkpoint_id)
+        return None
 
     @abstractmethod
     def checkpoint_filesystem(
@@ -283,12 +320,26 @@ class CheckpointManager(ABC):
         self,
         sandbox_id: SandboxId,
         checkpoint_id: CheckpointId,
+        *,
+        cascade: bool = False,
     ) -> None:
         raise NotImplementedError
 
     @abstractmethod
     def delete_all_checkpoints(self, sandbox_id: SandboxId) -> None:
         raise NotImplementedError
+
+    def descendants(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> list[CheckpointId]:
+        """Transitive incremental descendants of ``checkpoint_id``.
+        Default implementation returns an empty list; managers that
+        track ``parent_checkpoint_id`` should override.
+        """
+        _ = (sandbox_id, checkpoint_id)
+        return []
 
     @abstractmethod
     def handle_checkpoint_complete(self, manifest: CheckpointManifest) -> None:
@@ -410,3 +461,31 @@ class SchedulerStateStore(ABC):
     @abstractmethod
     def get_last_checkpoint(self, sandbox_id: SandboxId) -> datetime | None:
         raise NotImplementedError
+
+    def record_process_checkpoint(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+        *,
+        is_incremental: bool,
+    ) -> None:
+        """Record that a process checkpoint just succeeded. Updates the
+        per-sandbox chain bookkeeping the scheduler consults to decide
+        full vs incremental for the next checkpoint. Default no-op for
+        stores that don't track chain state.
+        """
+        _ = (sandbox_id, checkpoint_id, is_incremental)
+
+    def get_last_process_checkpoint(self, sandbox_id: SandboxId) -> CheckpointId | None:
+        """Return the most recent successful process checkpoint id, or
+        None if there isn't one yet.
+        """
+        _ = sandbox_id
+        return None
+
+    def get_process_chain_length(self, sandbox_id: SandboxId) -> int:
+        """Number of incremental process checkpoints since the last full
+        process checkpoint. 0 means the chain is anchored at a full.
+        """
+        _ = sandbox_id
+        return 0

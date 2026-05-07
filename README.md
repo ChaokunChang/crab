@@ -132,6 +132,46 @@ Notes:
 - `checkpoint_once(...)` pauses the sandbox, runs the checkpoint workers, records completion, and resumes when appropriate.
 - `checkpoint_if_due(...)` asks the scheduler/policy whether a checkpoint should run and only executes when the decision says yes.
 
+### Incremental Process Checkpoints (opt-in)
+
+Enable with `SchedulerConfig.incremental_process_enabled=True` (or the matching benchmark YAML field). The setting applies to every scheduler policy — default, fault tolerance, spot preemption, and tree search.
+
+When enabled, each chain participant runs a CRIU pre-dump + final-dump pair:
+
+1. `runc checkpoint --pre-dump --image-path <ckpt>/pre_dump [--parent-path ../<prev>/pre_dump]` — writes only memory pages dirtied since the parent pre-dump (or every page if this is an anchor). Process keeps running, soft-dirty page tracking stays armed.
+2. `runc checkpoint --image-path <ckpt>/process --parent-path ../pre_dump --leave-running=<bool>` — full process tree state plus the small delta accumulated between the pre-dump and freeze. This is the restorable artifact.
+
+Anchors and chain nodes use the same shape; the only difference is that an anchor's pre-dump has no `--parent-path`. A new anchor is emitted automatically every `full_process_checkpoint_interval` checkpoints, or earlier if `max_process_chain_length` is hit. The very first checkpoint per sandbox is always an anchor.
+
+Both knobs cap chain length but they exist for different reasons:
+
+- `full_process_checkpoint_interval` (default `8`) is the **policy knob**. Tune it to balance restore cost (longer chains = more pre-dump dirs to walk on restore, more chained pages to apply) against per-checkpoint savings (longer chains = fewer expensive anchor dumps).
+- `max_process_chain_length` (default `16`) is the **safety cap**. It exists for cases where the in-memory state store mis-tracks the chain length — a missed `record_process_checkpoint`, a corrupted counter after a recovery, a future bug that bypasses the interval check. Without it, any such bug would let chains grow unbounded; the cap puts a hard ceiling on blast radius regardless of policy logic. In normal operation the interval always trips first and the cap is dead code; it is load-bearing only when something is wrong.
+
+Whichever check fires first forces a fresh anchor.
+
+What counts toward the chain-length counter (`InMemorySchedulerStateStore._process_chain_length`):
+
+- **Successful chain nodes** — increment by 1.
+- **Successful anchors** — reset the counter to 0.
+- **Skipped checkpoints** (scheduler decided `should_checkpoint=False`, or policy returned early) — do not count. `mark_checkpoint_complete` is never called.
+- **Filesystem-only checkpoints** (`checkpoint_process=False`) — do not count. The system passes `process_checkpoint_id=None` and the chain-length update is gated on a non-`None` process id.
+- **Failed process checkpoints** — do not count. `mark_checkpoint_complete` is only called when `result.status == "succeeded"`.
+
+So both knobs measure only **successful, process-bearing** chain nodes since the last anchor. The decision rule is `next_chain_length = current + 1; if next_chain_length >= full_process_checkpoint_interval or next_chain_length >= max_process_chain_length, emit a fresh anchor`.
+
+Restore is unchanged — CRIU walks `parent` symlinks each pre-dump dir already contains. The system additionally validates the chain on disk before invoking restore: missing intermediate pre-dump directories surface as `FileNotFoundError` naming the missing checkpoint id rather than producing a corrupted sandbox.
+
+Retention is chain-aware:
+
+- `LocalCheckpointManager.delete_checkpoint(...)` rejects deleting a parent that has live descendants unless `cascade=True` is passed. `delete_all_checkpoints(...)` iterates leaves first so the check never trips.
+- `LatestOnlyCheckpointManager` extends "latest" to mean the entire `parent_checkpoint_id` chain — every ancestor of a protected checkpoint stays on disk so a mid-chain restore is always satisfiable. Old fulls and completed chains are still evicted as soon as the active chain advances past them.
+- `KeepAllCheckpointManager` and `DeleteAfterRestoreCheckpointManager` keep their existing semantics (the latter already iterates newest-first on restore-complete, so the chain check passes naturally).
+
+`CheckpointManifest` gains `parent_checkpoint_id` and `process_kind ∈ {full, incremental}`. These fields are only written into canonical JSON when non-default, so legacy v1 manifests still validate against their stored integrity hashes.
+
+A self-contained example pair lives at `benchmarks/examples/terminus/terminus.nofault.auto.incremental_demo.{baseline,incremental}.yaml`. On a curated 8-task subset of the terminus replay dataset, enabling incremental cut total process-dump bytes by 99%, the freeze-blocking final dump's mean latency by 44%, and end-to-end checkpoint flow p90 by 35%, while wall-clock and `success_ratio` stayed identical to the baseline. Memory-heavy workloads (statistical models, ML training) benefit most; filesystem-bound workloads see no change because the filesystem path was already ZFS-incremental.
+
 ### Manual Restore
 
 - `restore_once(...)` prepares the sandbox, resolves the restorable manifest, and runs filesystem restore before process restore.
@@ -288,6 +328,9 @@ scheduler:
   prefer_checkpoint_during_llm_request: true
   require_llm_request_for_checkpoint: false
   inspect_without_pause: false
+  incremental_process_enabled: false
+  full_process_checkpoint_interval: 8
+  max_process_chain_length: 16
 llm_server:
   launch_mode: process
 host_inspector:
@@ -409,6 +452,9 @@ The benchmark YAML also exposes run-phase tuning for the core Agent-CR system:
 - `scheduler.policy` defaults to `scenario_default`. Set it to `no_checkpointing` only when you explicitly want a scenario to run without checkpoint capture.
 - `scheduler.checkpoint_full_baseline_on_first_checkpoint` forces the first checkpoint for a sandbox to include both process and filesystem state even when the scheduler would otherwise choose a narrower scope.
 - `scheduler.inspect_without_pause` is opt-in and defaults to `false`. Turning it on allows the scheduler to inspect before pausing, but that is intentionally not the default because live inspection of a running sandbox can be risky depending on the inspector.
+- `scheduler.incremental_process_enabled` is opt-in and defaults to `false`. When enabled, every chain participant becomes a `runc checkpoint --pre-dump` followed by a final `runc checkpoint --parent-path`, so non-anchor checkpoints write only memory pages dirtied since the parent pre-dump. Restore is unchanged — CRIU walks the chain through the `parent` symlink it writes itself. Requires a runtime that advertises `supports_incremental_process=True` (the `runc` runtime does; the in-memory test runtime does not). When the runtime does not support it, the worker logs a warning and falls back to a single full dump.
+- `scheduler.full_process_checkpoint_interval` defaults to `8`. After this many checkpoints in a chain (anchor counted as #1), the next checkpoint becomes a fresh anchor that resets the chain. Bound it small enough to keep restore-time chain walks short and to limit blast radius if any pre-dump dir is lost.
+- `scheduler.max_process_chain_length` defaults to `16`. Hard safety cap. Whichever of `full_process_checkpoint_interval` and `max_process_chain_length` triggers first wins; the cap exists so a state-store mis-track can't grow chains indefinitely.
 - `llm_server.launch_mode` defaults to `process`, which runs the benchmark LLM router in a separate process to reduce thread pressure in the main benchmark process. `thread` remains available for tests and debugging.
 - `host_inspector.launch_mode` also defaults to `process`, which keeps the host inspector and its filesystem-monitor threads out of the main benchmark process.
 - `host_inspector.log_level` defaults to `INFO`. Set to `DEBUG` to log every eBPF filesystem event and every register/status/reset call — useful for diagnosing missed filesystem-change signals.

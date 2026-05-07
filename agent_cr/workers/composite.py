@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import logging
+from pathlib import Path
 import time
 from typing import Callable
 
@@ -170,6 +171,59 @@ def _committed_trace_cursor(metadata: dict[str, object]) -> int:
     # served. Capturing the next in-flight LLM request should not rewind that
     # committed replay position during restore selection.
     return _trace_cursor_from_metadata(metadata)
+
+
+def _validate_incremental_chain(
+    runtime: Runtime,
+    checkpoint_manager: CheckpointManager,
+    manifest: CheckpointManifest,
+) -> None:
+    """Walk ``manifest``'s parent chain and verify every ancestor's pre-dump
+    and final-dump image directories still exist on disk. CRIU follows the
+    `parent` symlinks each pre-dump dropped, so a missing ancestor means
+    restore would silently corrupt or hang. Raises FileNotFoundError naming
+    the missing checkpoint id when any ancestor is unreachable.
+    """
+    if manifest.process_kind != "incremental":
+        return
+    if not runtime.capabilities().supports_incremental_process:
+        # The runtime doesn't model incremental chains; nothing to validate.
+        return
+
+    visited: set[CheckpointId] = set()
+    cursor = manifest
+    while cursor.parent_checkpoint_id is not None:
+        parent_id = cursor.parent_checkpoint_id
+        if parent_id in visited:
+            raise RuntimeError(
+                f"detected cycle in incremental checkpoint chain at {parent_id}"
+            )
+        visited.add(parent_id)
+
+        pre_dump_path_str = runtime.pre_dump_location(manifest.sandbox_id, parent_id)
+        if pre_dump_path_str is None:
+            raise FileNotFoundError(
+                f"runtime did not provide pre-dump location for parent="
+                f"{parent_id} sandbox={manifest.sandbox_id}"
+            )
+        pre_dump_path = Path(pre_dump_path_str)
+        if not pre_dump_path.exists():
+            raise FileNotFoundError(
+                f"missing pre-dump directory in incremental chain: "
+                f"sandbox={manifest.sandbox_id} parent={parent_id} path={pre_dump_path}"
+            )
+
+        try:
+            parent_manifest = checkpoint_manager.get_manifest(manifest.sandbox_id, parent_id)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                f"missing manifest for incremental parent: sandbox="
+                f"{manifest.sandbox_id} parent={parent_id}"
+            ) from exc
+
+        if parent_manifest.process_kind == "full":
+            return  # chain root reached
+        cursor = parent_manifest
 
 
 def _copy_process_restore_metadata(target: dict[str, object], source: dict[str, object]) -> None:
@@ -343,6 +397,18 @@ class DefaultCWorker(CompositeCheckpointWorker):
         process_refs = [x for x in refs if x.kind == ArtifactKind.PROCESS]
         fs_refs = [x for x in refs if x.kind == ArtifactKind.FILESYSTEM]
 
+        # A checkpoint is "incremental" only if it chains off a parent's
+        # pre_dump. Anchors (chain root, chain reset) produce a pre_dump but
+        # are themselves "full" — they are the root the chain restores from.
+        is_chain_node = (
+            job.is_incremental_process
+            and job.parent_process_checkpoint_id is not None
+            and self._runtime.capabilities().supports_incremental_process
+        )
+        process_kind = "incremental" if is_chain_node else "full"
+        parent_checkpoint_id = (
+            job.parent_process_checkpoint_id if is_chain_node else None
+        )
         manifest = CheckpointManifest(
             schema_version="v1",
             checkpoint_id=checkpoint_id,
@@ -364,6 +430,8 @@ class DefaultCWorker(CompositeCheckpointWorker):
                 "filesystem_checkpoint_used_bytes": filesystem_used_bytes,
                 "checkpoint_estimated_io_bytes": estimated_io_bytes,
             },
+            parent_checkpoint_id=parent_checkpoint_id,
+            process_kind=process_kind,
         ).with_integrity()
         manifest_started = time.perf_counter()
         persist_manifest = start_operation(
@@ -643,11 +711,13 @@ class DefaultRWorker(CompositeRestoreWorker):
         filesystem_worker: FileSystemRWorker,
         checkpoint_manager: CheckpointManager,
         telemetry: TelemetrySink | None = None,
+        runtime: Runtime | None = None,
     ):
         self._process_worker = process_worker
         self._filesystem_worker = filesystem_worker
         self._checkpoint_manager = checkpoint_manager
         self._telemetry = telemetry or NoopTelemetrySink()
+        self._runtime = runtime
 
     def restore(self, job: RestoreJob) -> RestoreResult:
         started = utc_now()
@@ -693,6 +763,31 @@ class DefaultRWorker(CompositeRestoreWorker):
             {"sandbox_id": str(job.sandbox_id), "checkpoint_id": str(job.checkpoint_id)},
         )
         resolve_manifest_operation.finish(status="succeeded")
+
+        if self._runtime is not None:
+            try:
+                _validate_incremental_chain(
+                    self._runtime, self._checkpoint_manager, manifest
+                )
+            except (FileNotFoundError, RuntimeError) as exc:
+                logger.error(
+                    "Incremental chain validation failed for restore job %s sandbox=%s checkpoint=%s: %s",
+                    job.job_id,
+                    job.sandbox_id,
+                    job.checkpoint_id,
+                    exc,
+                )
+                return RestoreResult(
+                    job_id=job.job_id,
+                    sandbox_id=job.sandbox_id,
+                    checkpoint_id=job.checkpoint_id,
+                    status=JobStatus.FAILED,
+                    started_at=started,
+                    finished_at=utc_now(),
+                    failure_code=FailureCode.STORAGE_ERROR,
+                    message=str(exc),
+                )
+
         restore_metric_attributes = _restore_metric_attributes(job, manifest)
         restore_source_gap_turns = _safe_int(manifest.metadata.get(_RESTORE_SOURCE_GAP_TURNS))
         restore_source_gap_ms = _safe_float(manifest.metadata.get(_RESTORE_SOURCE_GAP_MS))

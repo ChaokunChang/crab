@@ -109,8 +109,14 @@ class NoArtifactCheckpointManager:
         _ = sandbox_id
         return [self.manifest.checkpoint_id]
 
-    def delete_checkpoint(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> None:
-        _ = (sandbox_id, checkpoint_id)
+    def delete_checkpoint(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+        *,
+        cascade: bool = False,
+    ) -> None:
+        _ = (sandbox_id, checkpoint_id, cascade)
 
     def delete_all_checkpoints(self, sandbox_id: SandboxId) -> None:
         _ = sandbox_id
@@ -144,7 +150,14 @@ class ManifestCheckpointManager:
     def get_artifact(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId, reference) -> bytes:
         raise NotImplementedError
 
-    def delete_checkpoint(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> None:
+    def delete_checkpoint(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+        *,
+        cascade: bool = False,
+    ) -> None:
+        _ = cascade
         self._manifests.pop((sandbox_id, checkpoint_id), None)
 
     def delete_all_checkpoints(self, sandbox_id: SandboxId) -> None:
@@ -212,8 +225,14 @@ class RecordingCheckpointManager:
     def list_checkpoints(self, sandbox_id: SandboxId) -> list[CheckpointId]:
         return list(self._ordered.get(sandbox_id, []))
 
-    def delete_checkpoint(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> None:
-        _ = (sandbox_id, checkpoint_id)
+    def delete_checkpoint(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+        *,
+        cascade: bool = False,
+    ) -> None:
+        _ = (sandbox_id, checkpoint_id, cascade)
 
     def delete_all_checkpoints(self, sandbox_id: SandboxId) -> None:
         _ = sandbox_id

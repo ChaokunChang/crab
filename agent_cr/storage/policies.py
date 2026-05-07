@@ -103,11 +103,20 @@ class DelegatingCheckpointManager(CheckpointManager):
         self,
         sandbox_id: SandboxId,
         checkpoint_id: CheckpointId,
+        *,
+        cascade: bool = False,
     ) -> None:
-        self._delegate.delete_checkpoint(sandbox_id, checkpoint_id)
+        self._delegate.delete_checkpoint(sandbox_id, checkpoint_id, cascade=cascade)
 
     def delete_all_checkpoints(self, sandbox_id: SandboxId) -> None:
         self._delegate.delete_all_checkpoints(sandbox_id)
+
+    def descendants(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> list[CheckpointId]:
+        return self._delegate.descendants(sandbox_id, checkpoint_id)
 
     def handle_checkpoint_complete(self, manifest: CheckpointManifest) -> None:
         self._delegate.handle_checkpoint_complete(manifest)
@@ -175,6 +184,20 @@ class DelegatingCheckpointManager(CheckpointManager):
             )
         with self._pin_lock_for(sandbox_id):
             protected.update(self._pinned_checkpoint_counts.get(sandbox_id, {}).keys())
+        # An incremental checkpoint can only be restored if every ancestor in
+        # its `parent_checkpoint_id` chain is still on disk (CRIU walks the
+        # `parent` symlinks each pre-dump dropped). Pull in those ancestors so
+        # retention never evicts a chain root while a descendant is protected.
+        for protected_id in list(protected):
+            chain = manifest_by_id.get(protected_id)
+            seen: set[CheckpointId] = set()
+            while chain is not None and chain.parent_checkpoint_id is not None:
+                parent_id = chain.parent_checkpoint_id
+                if parent_id in seen:
+                    break
+                seen.add(parent_id)
+                protected.add(parent_id)
+                chain = manifest_by_id.get(parent_id)
         return protected
 
     def _restore_dependency_checkpoint_ids(
@@ -211,7 +234,10 @@ class DelegatingCheckpointManager(CheckpointManager):
             manifests=manifests,
             manifest_by_id=manifest_by_id,
         )
-        for checkpoint_id in checkpoint_ids:
+        # Newest-first: an incremental descendant always sorts after its
+        # parent, so deleting in reverse evicts the leaf before the ancestor
+        # and the descendants-check in delete_checkpoint never trips.
+        for checkpoint_id in reversed(checkpoint_ids):
             if checkpoint_id not in protected:
                 self.delete_checkpoint(sandbox_id, checkpoint_id)
 

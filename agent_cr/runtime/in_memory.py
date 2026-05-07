@@ -135,20 +135,55 @@ class InMemoryRuntime(Runtime):
         checkpoint_id: CheckpointId,
         *,
         leave_running: bool,
+        parent_checkpoint_id: CheckpointId | None = None,
     ) -> RuntimeOperationStatus:
-        metadata = {
+        metadata: dict[str, object] = {
             "phase": "process_checkpoint",
             "runtime": self._name,
             "sandbox_id": str(sandbox_id),
             "checkpoint_id": str(checkpoint_id),
             "leave_running": leave_running,
         }
+        command = [
+            "docker",
+            "checkpoint",
+            "create",
+            f"--leave-running={'true' if leave_running else 'false'}",
+        ]
+        if parent_checkpoint_id is not None:
+            metadata["parent_checkpoint_id"] = str(parent_checkpoint_id)
+            metadata["process_kind"] = "incremental"
+            command.append(f"--parent={parent_checkpoint_id}")
+        command.extend([str(sandbox_id), str(checkpoint_id)])
         return RuntimeOperationStatus(
             executed=False,
             reason=f"{self._name}_runtime_not_implemented",
-            command=tuple(
-                ["docker", "checkpoint", "create", f"--leave-running={'true' if leave_running else 'false'}", str(sandbox_id), str(checkpoint_id)]
-            ),
+            command=tuple(command),
+            metadata=metadata,
+        )
+
+    def pre_dump_process(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+        *,
+        parent_checkpoint_id: CheckpointId | None = None,
+    ) -> RuntimeOperationStatus:
+        metadata: dict[str, object] = {
+            "phase": "process_pre_dump",
+            "runtime": self._name,
+            "sandbox_id": str(sandbox_id),
+            "checkpoint_id": str(checkpoint_id),
+        }
+        command = ["docker", "checkpoint", "pre-dump"]
+        if parent_checkpoint_id is not None:
+            metadata["parent_checkpoint_id"] = str(parent_checkpoint_id)
+            command.append(f"--parent={parent_checkpoint_id}")
+        command.extend([str(sandbox_id), str(checkpoint_id)])
+        return RuntimeOperationStatus(
+            executed=False,
+            reason=f"{self._name}_runtime_not_implemented",
+            command=tuple(command),
             metadata=metadata,
         )
 

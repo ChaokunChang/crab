@@ -71,6 +71,7 @@ class RuntimeCapabilities:
     supports_filesystem_checkpoint: bool
     supports_incremental_filesystem: bool = False
     supports_custom_checkpoint_dir: bool = False
+    supports_incremental_process: bool = False
 
 
 @dataclass(frozen=True)
@@ -173,6 +174,8 @@ class CheckpointManifest:
     filesystem_artifacts: list[ArtifactReference]
     metadata: dict[str, Any] = field(default_factory=dict)
     integrity: dict[str, str] = field(default_factory=dict)
+    parent_checkpoint_id: CheckpointId | None = None
+    process_kind: str = "full"
 
     def validate_schema(self) -> None:
         if self.schema_version != MANIFEST_SCHEMA_VERSION:
@@ -213,7 +216,7 @@ class CheckpointManifest:
         )
 
     def _payload_dict(self, *, include_integrity: bool) -> dict[str, Any]:
-        payload = {
+        payload: dict[str, Any] = {
             "schema_version": self.schema_version,
             "checkpoint_id": str(self.checkpoint_id),
             "sandbox_id": str(self.sandbox_id),
@@ -224,12 +227,20 @@ class CheckpointManifest:
             "filesystem_artifacts": [a.to_dict() for a in self.filesystem_artifacts],
             "metadata": self.metadata,
         }
+        # Only emit incremental fields when they hold non-default values so
+        # legacy (v1, full-checkpoint-only) manifests round-trip with their
+        # original integrity hash unchanged.
+        if self.parent_checkpoint_id is not None:
+            payload["parent_checkpoint_id"] = str(self.parent_checkpoint_id)
+        if self.process_kind != "full":
+            payload["process_kind"] = self.process_kind
         if include_integrity:
             payload["integrity"] = self.integrity
         return payload
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "CheckpointManifest":
+        parent_raw = raw.get("parent_checkpoint_id")
         manifest = cls(
             schema_version=str(raw["schema_version"]),
             checkpoint_id=CheckpointId(str(raw["checkpoint_id"])),
@@ -245,6 +256,8 @@ class CheckpointManifest:
             ],
             metadata=dict(raw.get("metadata", {})),
             integrity=dict(raw.get("integrity", {})),
+            parent_checkpoint_id=(None if parent_raw is None else CheckpointId(str(parent_raw))),
+            process_kind=str(raw.get("process_kind", "full")),
         )
         manifest.validate_schema()
         manifest.validate_integrity()
@@ -260,11 +273,22 @@ class CheckpointJob:
     checkpoint_process: bool = True
     checkpoint_filesystem: bool = True
     leave_running: bool = False
+    is_incremental_process: bool = False
+    parent_process_checkpoint_id: CheckpointId | None = None
+    produce_pre_dump: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.checkpoint_process and not self.checkpoint_filesystem:
             raise ValueError("checkpoint job must include at least one checkpoint scope")
+        if self.is_incremental_process and not self.checkpoint_process:
+            raise ValueError("is_incremental_process requires checkpoint_process=True")
+        if self.is_incremental_process and self.parent_process_checkpoint_id is None:
+            raise ValueError("is_incremental_process requires parent_process_checkpoint_id")
+        if self.is_incremental_process and not self.produce_pre_dump:
+            raise ValueError("is_incremental_process requires produce_pre_dump=True")
+        if self.produce_pre_dump and not self.checkpoint_process:
+            raise ValueError("produce_pre_dump requires checkpoint_process=True")
 
 
 @dataclass(frozen=True)
@@ -338,6 +362,9 @@ class SchedulerCheckpointDecision:
     reason: str
     policy_name: str
     metadata: dict[str, Any] = field(default_factory=dict)
+    is_incremental_process: bool = False
+    parent_process_checkpoint_id: CheckpointId | None = None
+    produce_pre_dump: bool = False
 
 
 @dataclass(frozen=True)

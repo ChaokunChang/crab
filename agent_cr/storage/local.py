@@ -183,11 +183,27 @@ class LocalCheckpointManager(CheckpointManager):
         self,
         sandbox_id: SandboxId,
         checkpoint_id: CheckpointId,
+        *,
+        cascade: bool = False,
     ) -> None:
         manifest: CheckpointManifest | None = None
         manifest_path = self._manifest_path(sandbox_id, checkpoint_id)
         if manifest_path.exists():
             manifest = self.get_manifest(sandbox_id, checkpoint_id)
+
+        descendants = self.descendants(sandbox_id, checkpoint_id)
+        if descendants:
+            if not cascade:
+                raise RuntimeError(
+                    "refusing to delete checkpoint with live incremental descendants: "
+                    f"sandbox={sandbox_id} checkpoint={checkpoint_id} "
+                    f"descendants={[str(d) for d in descendants]} "
+                    "(pass cascade=True to drop the whole chain)"
+                )
+            # Cascade: delete descendants first (they hold the actual page
+            # data we'd otherwise orphan).
+            for descendant in descendants:
+                self.delete_checkpoint(sandbox_id, descendant, cascade=False)
 
         if manifest is not None:
             self._delete_runtime_references(manifest)
@@ -202,8 +218,53 @@ class LocalCheckpointManager(CheckpointManager):
         logger.debug("Deleted checkpoint sandbox=%s checkpoint=%s", sandbox_id, checkpoint_id)
 
     def delete_all_checkpoints(self, sandbox_id: SandboxId) -> None:
+        # Reverse order = newest first. Combined with the descendants check
+        # in delete_checkpoint, this evicts incremental tails before their
+        # ancestors so cascade is never needed.
         for checkpoint_id in reversed(self.list_checkpoints(sandbox_id)):
             self.delete_checkpoint(sandbox_id, checkpoint_id)
+
+    def descendants(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> list[CheckpointId]:
+        """Transitive descendants whose `parent_checkpoint_id` chain
+        bottoms out at ``checkpoint_id``. Returned newest-first so callers
+        deleting them in order never orphan a child.
+        """
+        sandbox_dir = self._manifests_root / str(sandbox_id)
+        if not sandbox_dir.exists():
+            return []
+
+        parent_by_child: dict[CheckpointId, CheckpointId] = {}
+        order: dict[CheckpointId, str] = {}
+        for path in sandbox_dir.glob("*.json"):
+            try:
+                raw = _STORAGE_JSON_CODEC.loads(path.read_bytes())
+            except (FileNotFoundError, ValueError):
+                continue
+            cid_raw = raw.get("checkpoint_id")
+            if cid_raw is None:
+                continue
+            cid = CheckpointId(str(cid_raw))
+            order[cid] = str(raw.get("created_at", ""))
+            parent_raw = raw.get("parent_checkpoint_id")
+            if parent_raw is not None:
+                parent_by_child[cid] = CheckpointId(str(parent_raw))
+
+        target = checkpoint_id
+        descendants: set[CheckpointId] = set()
+        # BFS on the reverse parent map. Cheap because chains are short.
+        frontier = {target}
+        while frontier:
+            next_frontier: set[CheckpointId] = set()
+            for cid, parent in parent_by_child.items():
+                if parent in frontier and cid not in descendants and cid != target:
+                    descendants.add(cid)
+                    next_frontier.add(cid)
+            frontier = next_frontier
+        return sorted(descendants, key=lambda c: order.get(c, ""), reverse=True)
 
     def handle_checkpoint_complete(self, manifest: CheckpointManifest) -> None:
         _ = manifest

@@ -18,12 +18,19 @@ class SchedulerConfig:
     prefer_checkpoint_during_llm_request: bool = True
     require_llm_request_for_checkpoint: bool = False
     inspect_without_pause: bool = False
+    incremental_process_enabled: bool = False
+    full_process_checkpoint_interval: int = 8
+    max_process_chain_length: int = 16
 
     def __post_init__(self) -> None:
         if self.min_checkpoint_interval_seconds < 0:
             raise ValueError("min_checkpoint_interval_seconds must be >= 0")
         if self.force_checkpoint_after_seconds < 0:
             raise ValueError("force_checkpoint_after_seconds must be >= 0")
+        if self.full_process_checkpoint_interval < 1:
+            raise ValueError("full_process_checkpoint_interval must be >= 1")
+        if self.max_process_chain_length < 1:
+            raise ValueError("max_process_chain_length must be >= 1")
 
 
 @dataclass(frozen=True)

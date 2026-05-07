@@ -243,6 +243,7 @@ class RuncRuntime(Runtime):
             supports_filesystem_checkpoint=True,
             supports_incremental_filesystem=True,
             supports_custom_checkpoint_dir=True,
+            supports_incremental_process=True,
         )
 
     def _resolve_launch_request(
@@ -1051,38 +1052,44 @@ class RuncRuntime(Runtime):
         checkpoint_id: CheckpointId,
         *,
         leave_running: bool,
+        parent_checkpoint_id: CheckpointId | None = None,
     ) -> RuntimeOperationStatus:
         image_path = Path(self.process_checkpoint_location(sandbox_id, checkpoint_id) or "")
         work_path = self.process_work_path(sandbox_id, checkpoint_id)
         image_path.mkdir(parents=True, exist_ok=True)
         work_path.mkdir(parents=True, exist_ok=True)
-        command = [
-            self._runtime_bin,
-            "--root",
-            str(self._paths.state_root),
-            "checkpoint",
-            "--image-path",
-            str(image_path),
-            "--work-path",
-            str(work_path),
-            f"--leave-running={'true' if leave_running else 'false'}",
-        ]
-        command.extend(self._checkpoint_optional_args())
-        command.append(str(sandbox_id))
+
+        parent_image_path = self._resolve_parent_pre_dump_path(
+            sandbox_id=sandbox_id,
+            parent_checkpoint_id=parent_checkpoint_id,
+        )
+        command = self._build_checkpoint_command(
+            sandbox_id=sandbox_id,
+            image_path=image_path,
+            work_path=work_path,
+            leave_running=leave_running,
+            pre_dump=False,
+            parent_image_path=parent_image_path,
+        )
+        metadata: dict[str, object] = {
+            "phase": "process_checkpoint",
+            "runtime": self.name,
+            "image_path": str(image_path),
+            "work_path": str(work_path),
+            "bundle_path": str(self.bundle_path_for(sandbox_id)),
+            "state_root": str(self._paths.state_root),
+            "leave_running": leave_running,
+        }
+        if parent_checkpoint_id is not None:
+            metadata["parent_checkpoint_id"] = str(parent_checkpoint_id)
+            metadata["parent_image_path"] = str(parent_image_path)
+            metadata["process_kind"] = "incremental"
         status = self._run_status(
             command,
             operation="sandbox.checkpoint_process",
             sandbox_id=sandbox_id,
             checkpoint_id=checkpoint_id,
-            metadata={
-                "phase": "process_checkpoint",
-                "runtime": self.name,
-                "image_path": str(image_path),
-                "work_path": str(work_path),
-                "bundle_path": str(self.bundle_path_for(sandbox_id)),
-                "state_root": str(self._paths.state_root),
-                "leave_running": leave_running,
-            },
+            metadata=metadata,
         )
         size_bytes, file_count = self._summarize_directory(image_path)
         return replace(
@@ -1094,6 +1101,113 @@ class RuncRuntime(Runtime):
                 "process_checkpoint_file_count": file_count,
             },
         )
+
+    def pre_dump_process(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+        *,
+        parent_checkpoint_id: CheckpointId | None = None,
+    ) -> RuntimeOperationStatus:
+        image_path = Path(self.pre_dump_location(sandbox_id, checkpoint_id) or "")
+        work_path = self.pre_dump_work_path(sandbox_id, checkpoint_id)
+        image_path.mkdir(parents=True, exist_ok=True)
+        work_path.mkdir(parents=True, exist_ok=True)
+
+        parent_image_path = self._resolve_parent_pre_dump_path(
+            sandbox_id=sandbox_id,
+            parent_checkpoint_id=parent_checkpoint_id,
+        )
+        command = self._build_checkpoint_command(
+            sandbox_id=sandbox_id,
+            image_path=image_path,
+            work_path=work_path,
+            leave_running=True,
+            pre_dump=True,
+            parent_image_path=parent_image_path,
+        )
+        metadata: dict[str, object] = {
+            "phase": "process_pre_dump",
+            "runtime": self.name,
+            "image_path": str(image_path),
+            "work_path": str(work_path),
+            "bundle_path": str(self.bundle_path_for(sandbox_id)),
+            "state_root": str(self._paths.state_root),
+        }
+        if parent_checkpoint_id is not None:
+            metadata["parent_checkpoint_id"] = str(parent_checkpoint_id)
+            metadata["parent_image_path"] = str(parent_image_path)
+        status = self._run_status(
+            command,
+            operation="sandbox.pre_dump_process",
+            sandbox_id=sandbox_id,
+            checkpoint_id=checkpoint_id,
+            metadata=metadata,
+        )
+        size_bytes, file_count = self._summarize_directory(image_path)
+        return replace(
+            status,
+            metadata={
+                **status.metadata,
+                "checkpoint_scope": "process_pre_dump",
+                "pre_dump_size_bytes": size_bytes,
+                "pre_dump_file_count": file_count,
+            },
+        )
+
+    def _build_checkpoint_command(
+        self,
+        *,
+        sandbox_id: SandboxId,
+        image_path: Path,
+        work_path: Path,
+        leave_running: bool,
+        pre_dump: bool,
+        parent_image_path: Path | None,
+    ) -> list[str]:
+        command = [
+            self._runtime_bin,
+            "--root",
+            str(self._paths.state_root),
+            "checkpoint",
+            "--image-path",
+            str(image_path),
+            "--work-path",
+            str(work_path),
+        ]
+        if pre_dump:
+            # --pre-dump implies the container keeps running and enables
+            # CRIU's track-mem so the next dump can be incremental. runc
+            # rejects a combined --pre-dump and --leave-running=false, so
+            # we omit --leave-running entirely in this branch.
+            command.append("--pre-dump")
+        else:
+            command.append(f"--leave-running={'true' if leave_running else 'false'}")
+        if parent_image_path is not None:
+            # runc's --parent-path is resolved relative to --image-path's
+            # directory; CRIU then writes a `parent` symlink into the new
+            # image dir so restore walks the chain automatically.
+            rel = os.path.relpath(parent_image_path, image_path)
+            command.extend(["--parent-path", rel])
+        command.extend(self._checkpoint_optional_args())
+        command.append(str(sandbox_id))
+        return command
+
+    def _resolve_parent_pre_dump_path(
+        self,
+        *,
+        sandbox_id: SandboxId,
+        parent_checkpoint_id: CheckpointId | None,
+    ) -> Path | None:
+        if parent_checkpoint_id is None:
+            return None
+        parent = Path(self.pre_dump_location(sandbox_id, parent_checkpoint_id) or "")
+        if not parent.exists():
+            raise FileNotFoundError(
+                f"parent pre-dump directory missing for incremental checkpoint: "
+                f"sandbox={sandbox_id} parent={parent_checkpoint_id} path={parent}"
+            )
+        return parent
 
     def restore_process(
         self,
@@ -1133,6 +1247,16 @@ class RuncRuntime(Runtime):
         checkpoint_id: CheckpointId,
     ) -> str | None:
         return str(self._paths.checkpoint_root / str(sandbox_id) / str(checkpoint_id) / "process")
+
+    def pre_dump_location(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> str | None:
+        return str(self._paths.checkpoint_root / str(sandbox_id) / str(checkpoint_id) / "pre_dump")
+
+    def pre_dump_work_path(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> Path:
+        return self._paths.checkpoint_root / str(sandbox_id) / str(checkpoint_id) / "pre_dump_work"
 
     def checkpoint_filesystem(
         self,

@@ -161,8 +161,15 @@ class BenchmarkSchedulerConfig:
     prefer_checkpoint_during_llm_request: bool | None = None
     require_llm_request_for_checkpoint: bool | None = None
     inspect_without_pause: bool | None = None
+    incremental_process_enabled: bool | None = None
+    full_process_checkpoint_interval: int | None = None
+    max_process_chain_length: int | None = None
 
     def __post_init__(self) -> None:
+        if self.full_process_checkpoint_interval is not None and self.full_process_checkpoint_interval < 1:
+            raise ValueError("scheduler.full_process_checkpoint_interval must be >= 1")
+        if self.max_process_chain_length is not None and self.max_process_chain_length < 1:
+            raise ValueError("scheduler.max_process_chain_length must be >= 1")
         if self.policy is None:
             return
         if self.policy not in _SCHEDULER_POLICIES:
@@ -206,6 +213,21 @@ class BenchmarkSchedulerConfig:
                 base.inspect_without_pause
                 if self.inspect_without_pause is None
                 else self.inspect_without_pause
+            ),
+            incremental_process_enabled=(
+                base.incremental_process_enabled
+                if self.incremental_process_enabled is None
+                else self.incremental_process_enabled
+            ),
+            full_process_checkpoint_interval=(
+                base.full_process_checkpoint_interval
+                if self.full_process_checkpoint_interval is None
+                else self.full_process_checkpoint_interval
+            ),
+            max_process_chain_length=(
+                base.max_process_chain_length
+                if self.max_process_chain_length is None
+                else self.max_process_chain_length
             ),
         )
 
@@ -508,6 +530,21 @@ def _load_scheduler_config(payload: object) -> BenchmarkSchedulerConfig:
         ),
         inspect_without_pause=(
             None if data.get("inspect_without_pause") is None else bool(data["inspect_without_pause"])
+        ),
+        incremental_process_enabled=(
+            None
+            if data.get("incremental_process_enabled") is None
+            else bool(data["incremental_process_enabled"])
+        ),
+        full_process_checkpoint_interval=(
+            None
+            if data.get("full_process_checkpoint_interval") is None
+            else int(data["full_process_checkpoint_interval"])
+        ),
+        max_process_chain_length=(
+            None
+            if data.get("max_process_chain_length") is None
+            else int(data["max_process_chain_length"])
         ),
     )
 
