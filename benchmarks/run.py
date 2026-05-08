@@ -267,6 +267,7 @@ def _copy_artifact_replica(source: Path, benchmark_run_root: Path) -> Path | Non
 def _replicate_artifacts_to_benchmark_run_root(
     *,
     harness_context: object | None,
+    config_path: Path | None,
     log_file: Path | None,
     output: Path | None,
     telemetry_output: Path | None,
@@ -280,6 +281,7 @@ def _replicate_artifacts_to_benchmark_run_root(
     benchmark_run_root = Path(root).expanduser().resolve()
     _flush_logging_handlers()
     for label, path in (
+        ("config", config_path),
         ("log_file", log_file),
         ("output", output),
         ("telemetry_output", telemetry_output),
@@ -507,6 +509,7 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
         )
         _replicate_artifacts_to_benchmark_run_root(
             harness_context=harness_context,
+            config_path=config.config_path,
             log_file=config.log_file,
             output=config.output,
             telemetry_output=telemetry_output,
@@ -521,6 +524,7 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
         )
         _replicate_artifacts_to_benchmark_run_root(
             harness_context=harness_context,
+            config_path=config.config_path,
             log_file=config.log_file,
             output=config.output,
             telemetry_output=telemetry_output,
