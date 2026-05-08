@@ -236,6 +236,87 @@ class RuncCheckpointCommandTests(unittest.TestCase):
             runtime = self._make_runtime(runner, Path(raw))
             self.assertTrue(runtime.capabilities().supports_lazy_restore)
 
+    def test_runtime_image_path_in_use_default_returns_false(self) -> None:
+        # No daemons registered → predicate is uniformly False.
+        runner = _CapturingRunner()
+        with tempfile.TemporaryDirectory() as raw:
+            runtime = self._make_runtime(runner, Path(raw))
+            self.assertFalse(
+                runtime.runtime_image_path_in_use(Path(raw) / "checkpoints" / "anywhere")
+            )
+
+    def test_runtime_image_path_in_use_after_register_and_reap(self) -> None:
+        # Spawn a benign sleep PID into the daemon registry by hand,
+        # exercise both directions of path containment, then reap and
+        # confirm the registry empties out.
+        from agent_cr.runtime.runc import _LazyPagesDaemonHandle
+
+        runner = _CapturingRunner()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            runtime = self._make_runtime(runner, root)
+            sandbox = SandboxId("sbx-fork")
+            ckpt = CheckpointId("ck-leaf")
+            image_path = root / "checkpoints" / str(sandbox) / str(ckpt) / "process"
+            image_path.mkdir(parents=True)
+
+            # Use a real subprocess so reap_lazy_pages_daemon actually has
+            # something to signal; bash sleep is reliable enough.
+            import subprocess
+            proc = subprocess.Popen(["sleep", "30"])
+            try:
+                runtime._register_lazy_pages_daemon(
+                    pid=proc.pid,
+                    sandbox_id=sandbox,
+                    checkpoint_id=ckpt,
+                    image_path=image_path,
+                    work_path=image_path.parent / "work",
+                )
+                # Daemon image_path is the leaf process dir. Pruning the
+                # checkpoint dir (its parent) must report in-use because
+                # ``rmtree`` on the parent would break the daemon's reads.
+                checkpoint_dir = image_path.parent
+                self.assertTrue(runtime.runtime_image_path_in_use(checkpoint_dir))
+                # The image dir itself is also in use.
+                self.assertTrue(runtime.runtime_image_path_in_use(image_path))
+                # An unrelated sibling is not.
+                sibling = root / "checkpoints" / "other-sbx" / "ck"
+                sibling.mkdir(parents=True)
+                self.assertFalse(runtime.runtime_image_path_in_use(sibling))
+            finally:
+                runtime.reap_lazy_pages_daemon(proc.pid)
+                proc.wait(timeout=5)
+            # Reaper unregisters; further checks are False.
+            self.assertFalse(runtime.runtime_image_path_in_use(image_path.parent))
+
+    def test_runtime_image_path_in_use_drops_dead_daemons(self) -> None:
+        # If a daemon exits on its own (CRIU does this once all faults
+        # are served) the registry can still hold its handle until the
+        # next reap call. ``runtime_image_path_in_use`` snapshots the
+        # registry and prunes dead PIDs lazily so retention isn't
+        # blocked forever waiting for an explicit reap.
+        runner = _CapturingRunner()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            runtime = self._make_runtime(runner, root)
+            image_path = root / "checkpoints" / "sbx" / "ck" / "process"
+            image_path.mkdir(parents=True)
+            import subprocess
+            proc = subprocess.Popen(["true"])
+            proc.wait()
+            # Register the now-dead pid; the predicate must observe its
+            # death and prune itself instead of falsely guarding.
+            runtime._register_lazy_pages_daemon(
+                pid=proc.pid,
+                sandbox_id=SandboxId("sbx"),
+                checkpoint_id=CheckpointId("ck"),
+                image_path=image_path,
+                work_path=image_path.parent / "work",
+            )
+            self.assertFalse(runtime.runtime_image_path_in_use(image_path))
+            # The follow-up live check has already pruned the entry.
+            self.assertEqual(runtime._lazy_pages_daemons, {})
+
     def test_materialize_linked_pre_dumps_replaces_symlinks_with_copies(self) -> None:
         runner = _CapturingRunner()
         with tempfile.TemporaryDirectory() as raw:

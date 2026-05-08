@@ -139,6 +139,20 @@ def _repair_postfix_rootfs_permissions(rootfs_path: Path) -> None:
 
 
 @dataclass(frozen=True)
+class _LazyPagesDaemonHandle:
+    """Records an in-flight ``criu lazy-pages`` daemon and the on-disk
+    paths it depends on. Used by ``RuncRuntime.runtime_image_path_in_use``
+    so storage retention can defer pruning a runtime checkpoint tree
+    that's actively serving userfaultfd page faults."""
+
+    pid: int
+    sandbox_id: SandboxId
+    checkpoint_id: CheckpointId
+    image_path: Path
+    work_path: Path
+
+
+@dataclass(frozen=True)
 class RuncRuntimePaths:
     state_root: Path = Path("/run/agent-cr/runc")
     bundle_root: Path = Path("/var/lib/agent-cr/bundles")
@@ -231,6 +245,21 @@ class RuncRuntime(Runtime):
         # closing the socket so CRIU can dump cleanly.
         self._active_execs_lock = Lock()
         self._active_execs: dict[SandboxId, set[subprocess.Popen]] = {}
+        # Active `criu lazy-pages` daemons indexed by daemon PID. The CRIU
+        # daemon serves userfaultfd page faults from the on-disk image set
+        # for the lifetime of the restored process. If the runtime image
+        # tree the daemon is reading from is pruned out from under it
+        # (retention deleting a chain ancestor whose pages the leaf depends
+        # on, or the source sandbox being destroyed before the fork's
+        # daemon finishes), the kernel raises SIGBUS on the restored
+        # process — not a clean restore failure, a fatal signal. Without
+        # explicit tracking, this is currently kept latent only because
+        # B's chain-pin holds the source's manifests for the fork's
+        # lifetime, but the dependency is implicit. The registry below
+        # makes the contract explicit so the storage layer can consult
+        # ``runtime_image_path_in_use`` before pruning a runtime tree.
+        self._lazy_pages_lock = Lock()
+        self._lazy_pages_daemons: dict[int, _LazyPagesDaemonHandle] = {}
         self._paths.metadata_root.mkdir(parents=True, exist_ok=True)
         self._paths.checkpoint_root.mkdir(parents=True, exist_ok=True)
 
@@ -1338,6 +1367,13 @@ class RuncRuntime(Runtime):
                     proc.pid,
                     socket_path,
                 )
+                self._register_lazy_pages_daemon(
+                    pid=proc.pid,
+                    sandbox_id=sandbox_id,
+                    checkpoint_id=checkpoint_id,
+                    image_path=image_path,
+                    work_path=work_path,
+                )
                 return proc.pid
             if proc.poll() is not None:
                 logger.warning(
@@ -1362,19 +1398,42 @@ class RuncRuntime(Runtime):
         self.reap_lazy_pages_daemon(proc.pid)
         return None
 
+    def _register_lazy_pages_daemon(
+        self,
+        *,
+        pid: int,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+        image_path: Path,
+        work_path: Path,
+    ) -> None:
+        handle = _LazyPagesDaemonHandle(
+            pid=pid,
+            sandbox_id=sandbox_id,
+            checkpoint_id=checkpoint_id,
+            image_path=image_path.resolve(),
+            work_path=work_path,
+        )
+        with self._lazy_pages_lock:
+            self._lazy_pages_daemons[pid] = handle
+
     def reap_lazy_pages_daemon(self, pid: int | None) -> None:
         """Idempotent SIGTERM→SIGKILL of a previously-spawned lazy-pages
         daemon. Safe to call with None or after the daemon has already
         exited on its own (CRIU's lazy-pages exits once all pages have
-        been faulted in by the restored process)."""
+        been faulted in by the restored process). Also unregisters the
+        daemon from the runtime's tracking so storage retention can
+        prune the previously-protected runtime tree."""
         if pid is None:
             return
         try:
             os.kill(pid, 15)  # SIGTERM
         except ProcessLookupError:
+            self._unregister_lazy_pages_daemon(pid)
             return
         except OSError as exc:
             logger.debug("Failed to SIGTERM lazy-pages daemon pid=%d: %s", pid, exc)
+            self._unregister_lazy_pages_daemon(pid)
             return
         # Brief grace, then SIGKILL if still alive.
         deadline = time.monotonic() + 1.0
@@ -1382,14 +1441,70 @@ class RuncRuntime(Runtime):
             try:
                 os.kill(pid, 0)
             except ProcessLookupError:
+                self._unregister_lazy_pages_daemon(pid)
                 return
             time.sleep(0.05)
         try:
             os.kill(pid, 9)  # SIGKILL
         except ProcessLookupError:
-            return
+            pass
         except OSError as exc:
             logger.debug("Failed to SIGKILL lazy-pages daemon pid=%d: %s", pid, exc)
+        self._unregister_lazy_pages_daemon(pid)
+
+    def _unregister_lazy_pages_daemon(self, pid: int) -> None:
+        with self._lazy_pages_lock:
+            self._lazy_pages_daemons.pop(pid, None)
+
+    def _live_lazy_pages_daemons(self) -> list[_LazyPagesDaemonHandle]:
+        """Snapshot the registry, dropping any entries whose PID is no
+        longer alive. CRIU lazy-pages exits cleanly once all pages have
+        been faulted in by the restored process; we may therefore have
+        stale entries the explicit ``reap_lazy_pages_daemon`` path never
+        reached. Pruning here keeps ``runtime_image_path_in_use`` from
+        falsely reporting an image dir as in-use after its daemon is
+        already gone."""
+        with self._lazy_pages_lock:
+            handles = list(self._lazy_pages_daemons.values())
+        live: list[_LazyPagesDaemonHandle] = []
+        for handle in handles:
+            try:
+                os.kill(handle.pid, 0)
+            except ProcessLookupError:
+                self._unregister_lazy_pages_daemon(handle.pid)
+                continue
+            except OSError:
+                # EPERM etc. — assume alive; we cannot prove otherwise.
+                pass
+            live.append(handle)
+        return live
+
+    def runtime_image_path_in_use(self, path: Path) -> bool:
+        """Predicate the storage layer consults before pruning a runtime
+        checkpoint tree (``LocalCheckpointManager._delete_process_runtime_paths``).
+        Returns True when ``path`` (or one of its ancestors) is the image
+        source for an in-flight ``criu lazy-pages`` daemon. The kernel
+        will SIGBUS the restored process if its on-disk page source
+        disappears mid-fault; deferring the prune until the daemon
+        exits is the difference between a clean retention cycle and a
+        fork crash. Resolves symlinks on both sides so a fork's
+        chain-shared symlink into a source's ancestor still matches."""
+        try:
+            resolved = path.resolve()
+        except (OSError, RuntimeError):
+            resolved = path
+        for handle in self._live_lazy_pages_daemons():
+            try:
+                # `is_relative_to` (Python 3.9+) treats equality as a
+                # match too, so a daemon whose image_path IS `resolved`
+                # also returns True.
+                if handle.image_path == resolved or handle.image_path.is_relative_to(resolved):
+                    return True
+                if resolved.is_relative_to(handle.image_path):
+                    return True
+            except (OSError, ValueError):
+                continue
+        return False
 
     def process_checkpoint_location(
         self,

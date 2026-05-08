@@ -1602,7 +1602,21 @@ def build_default_system(
         )
     else:
         raise ValueError(f"unsupported runtime: {runtime}")
-    storage = checkpoint_manager or LocalCheckpointManager(store_cfg)
+    storage = checkpoint_manager or LocalCheckpointManager(
+        store_cfg,
+        runtime_image_path_in_use=runtime_impl.runtime_image_path_in_use,
+    )
+    if checkpoint_manager is None:
+        # When the caller supplied their own manager (likely wrapped in a
+        # retention policy), late-bind the safety predicate so it can
+        # still defer pruning a runtime tree with an active lazy-pages
+        # daemon. Caller-supplied managers may not be ``LocalCheckpointManager``;
+        # ``setattr``-style installation would be wrong on those, so we
+        # only call the setter when the manager exposes it.
+        pass
+    setter = getattr(storage, "set_runtime_image_path_in_use", None)
+    if callable(setter):
+        setter(runtime_impl.runtime_image_path_in_use)
     request_store = request_state_store or InMemoryRequestStateStore()
     response_gate_registry = SandboxResponseGateRegistry()
     base_inspector: SandboxInspector

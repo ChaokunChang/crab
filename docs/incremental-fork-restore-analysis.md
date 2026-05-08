@@ -251,8 +251,29 @@ enough to slow active sandboxes' commands.
   run). Could be reduced by predicting which checkpoints will produce a
   fork that wins the race — e.g., skip prefork when oracle is consistently
   faster for this task.
-- **B's chain pin is also load-bearing for D's safety.** If retention
-  pruned a chain ancestor while a lazy-pages daemon was still serving
-  that ancestor's pages, the fork would SIGBUS. We added the pin for B
-  but it's a prerequisite for D too. Documenting this here so the
-  reasoning isn't lost.
+- **D now installs its own runtime-side safety pin** (resolved follow-up
+  from the original PR; see [docs/lazy-restore-safety-contract.md](lazy-restore-safety-contract.md)
+  for the full design). Previously this section read: *"B's chain pin
+  is load-bearing for D's safety. If retention pruned a chain ancestor
+  while a lazy-pages daemon was still serving that ancestor's pages,
+  the fork would SIGBUS."* That is now fixed independent of B:
+  - `RuncRuntime` tracks active `criu lazy-pages` daemons in
+    `_lazy_pages_daemons` (registered on socket-readiness, unregistered
+    on `reap_lazy_pages_daemon`).
+  - `Runtime.runtime_image_path_in_use(path)` returns True when the
+    given path or any ancestor / descendant is the on-disk image source
+    for a live daemon.
+  - `LocalCheckpointManager` accepts an optional
+    `runtime_image_path_in_use` callable and consults it in
+    `_delete_process_runtime_paths` before `shutil.rmtree`-ing a
+    runtime checkpoint dir. If the predicate says in-use, the prune is
+    deferred; the next retention pass after the daemon exits reclaims
+    the tree.
+  - The benchmark harness (and `build_default_system`) wire
+    `runtime.runtime_image_path_in_use` into the storage manager at
+    construction time.
+
+  D's safety no longer depends on B being on. The chain pin from B is
+  still useful — and is the primary protection while the *fork* (not
+  just its lazy-pages daemon) is alive — but the SIGBUS risk surface
+  for "D enabled without B" is now closed.

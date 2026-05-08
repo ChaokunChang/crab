@@ -871,6 +871,68 @@ class StorageTests(unittest.TestCase):
             self.assertIn(mid, survived)
             self.assertIn(leaf_b, survived)
 
+    def test_runtime_image_path_in_use_defers_prune(self) -> None:
+        """``LocalCheckpointManager._delete_process_runtime_paths`` must
+        consult the runtime safety predicate before pruning a runtime
+        checkpoint tree. When the runtime says the path is in use (an
+        active lazy-pages daemon is reading from it), the dir stays on
+        disk; the next retention pass after the daemon exits cleans it
+        up. Without this gate, the kernel would SIGBUS the restored
+        process the next time it raised a userfault for an unloaded
+        page."""
+        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+            checkpoint_root = Path(tmp) / "runtime-state"
+            (checkpoint_root / "process").mkdir(parents=True)
+            (checkpoint_root / "process" / "pages-1.img").write_bytes(b"PAGES")
+
+            calls: list[Path] = []
+
+            def in_use(path: Path) -> bool:
+                calls.append(path)
+                # First call (with daemon alive): defer.
+                return len(calls) == 1
+
+            mgr = LocalCheckpointManager(
+                StorageConfig(root_dir=Path(tmp)),
+                runtime_image_path_in_use=in_use,
+            )
+            payload = {
+                "process_checkpoint_location": str(checkpoint_root / "process"),
+            }
+            # First prune attempt: predicate says in-use → directory stays.
+            mgr._delete_process_runtime_paths(payload)
+            self.assertTrue(checkpoint_root.exists())
+            self.assertTrue((checkpoint_root / "process" / "pages-1.img").exists())
+            # Second pass (predicate now says free): directory is removed.
+            mgr._delete_process_runtime_paths(payload)
+            self.assertFalse(checkpoint_root.exists())
+            self.assertEqual(len(calls), 2)
+
+    def test_runtime_image_path_in_use_predicate_exception_does_not_wedge_retention(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+            checkpoint_root = Path(tmp) / "runtime-state"
+            (checkpoint_root / "process").mkdir(parents=True)
+
+            def boom(path: Path) -> bool:
+                raise RuntimeError("predicate is broken")
+
+            mgr = LocalCheckpointManager(
+                StorageConfig(root_dir=Path(tmp)),
+                runtime_image_path_in_use=boom,
+            )
+            payload = {"process_checkpoint_location": str(checkpoint_root / "process")}
+            # Exception is swallowed (logged); prune proceeds rather than
+            # leaking storage indefinitely.
+            mgr._delete_process_runtime_paths(payload)
+            self.assertFalse(checkpoint_root.exists())
+
+    def test_runtime_image_path_in_use_late_bind(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+            mgr = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
+            self.assertIsNone(mgr._runtime_image_path_in_use)
+            mgr.set_runtime_image_path_in_use(lambda _p: True)
+            self.assertTrue(callable(mgr._runtime_image_path_in_use))
+
     def test_keep_all_manager_retains_checkpoints(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
             sid = SandboxId("sbx-1")

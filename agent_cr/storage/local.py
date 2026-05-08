@@ -5,6 +5,7 @@ import logging
 import os
 from pathlib import Path
 import shutil
+from typing import Callable
 
 from ..config import StorageConfig
 from ..contracts import CheckpointManager
@@ -34,6 +35,7 @@ class LocalCheckpointManager(CheckpointManager):
         *,
         command_runner: CommandRunner | None = None,
         zfs_bin: str = "zfs",
+        runtime_image_path_in_use: Callable[[Path], bool] | None = None,
     ):
         self._config = config
         self._root = Path(config.root_dir)
@@ -41,8 +43,28 @@ class LocalCheckpointManager(CheckpointManager):
         self._artifacts_root = self._root / config.artifacts_dirname
         self._runner = command_runner or SubprocessCommandRunner()
         self._zfs_bin = zfs_bin
+        # Optional runtime-side predicate consulted before ``shutil.rmtree``-ing
+        # a runtime checkpoint tree. Returns True when the tree (or a
+        # descendant) is the on-disk image source for an active runtime
+        # operation whose mid-flight failure would manifest as a fatal
+        # signal rather than a clean error — concretely, an in-flight
+        # ``criu lazy-pages`` daemon serving userfaultfd faults. When the
+        # predicate says "in use" we leave the runtime tree in place and
+        # log a warning; the next retention pass after the daemon exits
+        # will reclaim it. None means "no safety check installed" (e.g.
+        # in-memory tests, runtimes without lazy-pages support).
+        self._runtime_image_path_in_use = runtime_image_path_in_use
         self._manifests_root.mkdir(parents=True, exist_ok=True)
         self._artifacts_root.mkdir(parents=True, exist_ok=True)
+
+    def set_runtime_image_path_in_use(
+        self,
+        callback: Callable[[Path], bool] | None,
+    ) -> None:
+        """Late-bind the runtime safety predicate. Used when storage is
+        constructed before the runtime instance is available (e.g., the
+        benchmark harness builds storage first)."""
+        self._runtime_image_path_in_use = callback
 
     def _manifest_path(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> Path:
         return self._manifests_root / str(sandbox_id) / f"{checkpoint_id}.json"
@@ -415,8 +437,7 @@ class LocalCheckpointManager(CheckpointManager):
         if image_path:
             self._remove_runtime_dir(Path(str(image_path)).parent)
 
-    @staticmethod
-    def _remove_runtime_dir(path: Path) -> None:
+    def _remove_runtime_dir(self, path: Path) -> None:
         # The fork-side runtime checkpoint dir for a chain ancestor is a
         # symlink pointing at the source's image dir (created by
         # ``Runtime.link_ancestor_pre_dump``). ``shutil.rmtree`` on a
@@ -429,8 +450,34 @@ class LocalCheckpointManager(CheckpointManager):
             except FileNotFoundError:
                 pass
             return
-        if path.exists():
-            shutil.rmtree(path, ignore_errors=True)
+        if not path.exists():
+            return
+        # Defer pruning when the runtime says this tree (or a descendant
+        # of it) is the on-disk image source for an in-flight lazy-pages
+        # daemon. Removing it now would SIGBUS the restored process the
+        # next time the kernel raises a userfault for an unloaded page.
+        # The next retention pass after the daemon exits will reclaim
+        # the tree.
+        check = self._runtime_image_path_in_use
+        if check is not None:
+            try:
+                in_use = bool(check(path))
+            except Exception:
+                logger.exception(
+                    "Runtime image-path safety check raised for path=%s; "
+                    "treating as not in use to avoid wedging retention.",
+                    path,
+                )
+                in_use = False
+            if in_use:
+                logger.warning(
+                    "Deferring runtime checkpoint dir prune; in use by an "
+                    "active runtime operation (lazy-pages daemon serving "
+                    "userfault faults from this image source). path=%s",
+                    path,
+                )
+                return
+        shutil.rmtree(path, ignore_errors=True)
 
     def _delete_filesystem_runtime_paths(self, payload: dict[str, object]) -> None:
         snapshot = None

@@ -1534,7 +1534,17 @@ PY
             host_inspector_client=self.host_inspector_client,
             telemetry=self.telemetry,
         )
-        base_storage = LocalCheckpointManager(StorageConfig(root_dir=self.storage_root))
+        base_storage = LocalCheckpointManager(
+            StorageConfig(root_dir=self.storage_root),
+            # Wire the runtime's lazy-pages daemon registry into storage
+            # so retention defers pruning a runtime checkpoint tree while
+            # an in-flight ``criu lazy-pages`` daemon is still serving
+            # userfault page faults from it. Without this gate, a
+            # well-timed ``LatestOnlyCheckpointManager._prune_unprotected``
+            # would SIGBUS the restored fork. See the docstring on
+            # ``Runtime.runtime_image_path_in_use`` for the contract.
+            runtime_image_path_in_use=self.runtime.runtime_image_path_in_use,
+        )
         self.storage = self.checkpoint_manager_factory(base_storage)
         self.executor = CRExecutor(
             self.executor_config,

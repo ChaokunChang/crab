@@ -211,6 +211,25 @@ class Runtime(ABC):
         _ = sandbox_id
         return 0
 
+    def runtime_image_path_in_use(self, path: Path) -> bool:
+        """Storage retention safety predicate. Returns True when ``path``
+        (or a descendant) is the on-disk image source for a runtime
+        operation whose mid-flight failure would manifest as a fatal
+        signal rather than a clean error — currently this means any
+        active ``criu lazy-pages`` daemon serving userfaultfd page
+        faults from that tree. Pruning the runtime tree from under such
+        a daemon SIGBUSes the restored process; storage layers that
+        consult this predicate before ``shutil.rmtree``-ing a runtime
+        checkpoint dir defer the prune (with a logged warning) until
+        the daemon exits.
+
+        Default: False (no-op for runtimes that don't issue daemon-
+        backed restores). The runc runtime overrides this to consult
+        its lazy-pages daemon registry.
+        """
+        _ = path
+        return False
+
     @abstractmethod
     def checkpoint_filesystem(
         self,
