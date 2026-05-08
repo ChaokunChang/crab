@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 from pathlib import Path
 import shutil
 
@@ -125,6 +126,104 @@ class LocalCheckpointManager(CheckpointManager):
             size,
         )
         return reference
+
+    def link_ancestor_artifact(
+        self,
+        source_sandbox_id: SandboxId,
+        target_sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+        reference: ArtifactReference,
+    ) -> ArtifactReference:
+        """Materialize ``reference`` (which lives under ``source_sandbox_id``'s
+        storage tree) at ``target_sandbox_id``'s artifact path as a relative
+        symlink instead of a byte copy. Returns a new ``ArtifactReference``
+        whose ``relative_path`` points at the target-side symlink so the fork
+        manifest references its own storage tree (transparent to readers and
+        survives source materialization). The byte payload is unchanged so
+        ``size_bytes`` and ``sha256`` carry over."""
+        source_path = self._root / reference.relative_path
+        if not source_path.exists():
+            raise FileNotFoundError(f"source artifact not found: {source_path}")
+        target_path = self._artifact_path(
+            target_sandbox_id,
+            checkpoint_id,
+            reference.kind.value,
+            reference.name,
+        )
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        # Idempotent: if a previous link or copy is already in place at the
+        # target path (e.g. a retried fork prep), drop it before linking.
+        if target_path.exists() or target_path.is_symlink():
+            target_path.unlink()
+        rel_target = os.path.relpath(source_path, target_path.parent)
+        os.symlink(rel_target, target_path)
+        new_rel = str(target_path.relative_to(self._root))
+        logger.debug(
+            "Linked ancestor artifact %s for source=%s target=%s checkpoint=%s "
+            "(target_path=%s -> %s)",
+            reference.name,
+            source_sandbox_id,
+            target_sandbox_id,
+            checkpoint_id,
+            target_path,
+            rel_target,
+        )
+        return ArtifactReference(
+            kind=reference.kind,
+            name=reference.name,
+            relative_path=new_rel,
+            size_bytes=reference.size_bytes,
+            sha256=reference.sha256,
+            metadata=dict(reference.metadata),
+        )
+
+    def is_linked_artifact(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+        reference: ArtifactReference,
+    ) -> bool:
+        _ = (sandbox_id, checkpoint_id)
+        path = self._root / reference.relative_path
+        return path.is_symlink()
+
+    def materialize_linked_artifacts(self, sandbox_id: SandboxId) -> int:
+        """Replace any symlinked artifacts under ``sandbox_id`` with byte
+        copies of their targets. Used before destroying a source sandbox
+        whose ancestor blobs are still referenced by active fork storage:
+        the fork calls this on itself to inline the borrowed bytes before
+        the source's storage tree disappears.
+
+        Returns the count of symlinks replaced. Idempotent: real files
+        and dangling symlinks are skipped.
+        """
+        sandbox_dir = self._artifacts_root / str(sandbox_id)
+        if not sandbox_dir.exists():
+            return 0
+        materialized = 0
+        for path in sandbox_dir.rglob("*"):
+            if not path.is_symlink():
+                continue
+            try:
+                resolved = path.resolve(strict=True)
+            except FileNotFoundError:
+                logger.warning(
+                    "Skipping dangling symlink during materialization: %s", path
+                )
+                continue
+            data = resolved.read_bytes()
+            tmp = path.with_suffix(path.suffix + ".materializing")
+            tmp.write_bytes(data)
+            path.unlink()
+            tmp.replace(path)
+            materialized += 1
+        if materialized:
+            logger.info(
+                "Materialized %d linked artifact(s) under sandbox=%s",
+                materialized,
+                sandbox_id,
+            )
+        return materialized
 
     def get_artifact(
         self,
@@ -305,9 +404,7 @@ class LocalCheckpointManager(CheckpointManager):
     def _delete_process_runtime_paths(self, payload: dict[str, object]) -> None:
         checkpoint_location = payload.get("process_checkpoint_location")
         if checkpoint_location:
-            checkpoint_root = Path(str(checkpoint_location)).parent
-            if checkpoint_root.exists():
-                shutil.rmtree(checkpoint_root, ignore_errors=True)
+            self._remove_runtime_dir(Path(str(checkpoint_location)).parent)
         status = payload.get("status", {})
         if not isinstance(status, dict):
             return
@@ -316,9 +413,24 @@ class LocalCheckpointManager(CheckpointManager):
             return
         image_path = metadata.get("image_path")
         if image_path:
-            checkpoint_root = Path(str(image_path)).parent
-            if checkpoint_root.exists():
-                shutil.rmtree(checkpoint_root, ignore_errors=True)
+            self._remove_runtime_dir(Path(str(image_path)).parent)
+
+    @staticmethod
+    def _remove_runtime_dir(path: Path) -> None:
+        # The fork-side runtime checkpoint dir for a chain ancestor is a
+        # symlink pointing at the source's image dir (created by
+        # ``Runtime.link_ancestor_pre_dump``). ``shutil.rmtree`` on a
+        # symlink-to-dir raises NotADirectoryError; ``ignore_errors=True``
+        # would mask that and leak the symlink. Detect symlinks first and
+        # ``os.unlink`` them so we never traverse into the source's bytes.
+        if path.is_symlink():
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            return
+        if path.exists():
+            shutil.rmtree(path, ignore_errors=True)
 
     def _delete_filesystem_runtime_paths(self, payload: dict[str, object]) -> None:
         snapshot = None

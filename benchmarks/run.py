@@ -392,6 +392,24 @@ def run_benchmark_config(config: BenchmarkConfig) -> list[dict[str, object]]:
             eager_fork_cleanup_on_reject=bool(
                 config.scenario_options.get("eager_fork_cleanup_on_reject", False)
             ),
+            fork_chain_sharing_enabled=bool(
+                config.scenario_options.get("enable_fork_chain_sharing", False)
+            ),
+            background_prefork_enabled=bool(
+                config.scenario_options.get("enable_background_prefork", False)
+            ),
+            prefork_min_interval_seconds=float(
+                config.scenario_options.get("prefork_min_interval_seconds", 0.0)
+            ),
+            prefork_wait_timeout_seconds=float(
+                config.scenario_options.get("prefork_wait_timeout_seconds", 0.0)
+            ),
+            prefork_max_concurrent_global=int(
+                config.scenario_options.get("prefork_max_concurrent_global", 0)
+            ),
+            lazy_restore_enabled=bool(
+                config.scenario_options.get("enable_lazy_restore", False)
+            ),
             fast_forward_idle_waits=bool(
                 config.scenario_options.get("fast_forward_idle_waits", True)
             ),

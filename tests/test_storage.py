@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import time
 import unittest
@@ -644,6 +645,231 @@ class StorageTests(unittest.TestCase):
             mgr.handle_restore_complete(sid, ckpt)
 
             self.assertEqual(mgr.list_checkpoints(sid), [])
+
+    def _real_artifact(
+        self,
+        mgr: LocalCheckpointManager,
+        sid: SandboxId,
+        ckpt: CheckpointId,
+        kind: ArtifactKind,
+        name: str,
+        data: bytes,
+    ) -> ArtifactReference:
+        return mgr.put_artifact(
+            sid,
+            ckpt,
+            ArtifactPayload(kind=kind, name=name, data=data, metadata={}),
+        )
+
+    def test_link_ancestor_artifact_creates_relative_symlink(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+            mgr = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
+            src = SandboxId("source")
+            tgt = SandboxId("target")
+            ckpt = CheckpointId("ckpt-anc")
+            src_ref = self._real_artifact(mgr, src, ckpt, ArtifactKind.PROCESS, "proc.bin", b"PAYLOAD")
+
+            linked_ref = mgr.link_ancestor_artifact(src, tgt, ckpt, src_ref)
+
+            self.assertEqual(linked_ref.size_bytes, src_ref.size_bytes)
+            self.assertEqual(linked_ref.sha256, src_ref.sha256)
+            self.assertNotEqual(linked_ref.relative_path, src_ref.relative_path)
+            target_path = Path(tmp) / linked_ref.relative_path
+            self.assertTrue(target_path.is_symlink())
+            # Symlink target is relative for portability across moves.
+            self.assertFalse(Path(os.readlink(target_path)).is_absolute())
+            self.assertTrue(mgr.is_linked_artifact(tgt, ckpt, linked_ref))
+            # Reading through the link returns the source bytes; SHA256 still
+            # validates inside get_artifact.
+            self.assertEqual(mgr.get_artifact(tgt, ckpt, linked_ref), b"PAYLOAD")
+
+    def test_link_ancestor_artifact_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+            mgr = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
+            src = SandboxId("source")
+            tgt = SandboxId("target")
+            ckpt = CheckpointId("ckpt-anc")
+            src_ref = self._real_artifact(mgr, src, ckpt, ArtifactKind.PROCESS, "proc.bin", b"X")
+            mgr.link_ancestor_artifact(src, tgt, ckpt, src_ref)
+            # Second call replaces the symlink in place rather than erroring.
+            relinked = mgr.link_ancestor_artifact(src, tgt, ckpt, src_ref)
+            self.assertTrue(mgr.is_linked_artifact(tgt, ckpt, relinked))
+
+    def test_materialize_linked_artifacts_replaces_with_real_files(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+            mgr = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
+            src = SandboxId("source")
+            tgt = SandboxId("target")
+            ckpt = CheckpointId("ckpt-anc")
+            src_ref = self._real_artifact(mgr, src, ckpt, ArtifactKind.PROCESS, "proc.bin", b"INLINE")
+            linked_ref = mgr.link_ancestor_artifact(src, tgt, ckpt, src_ref)
+
+            count = mgr.materialize_linked_artifacts(tgt)
+            self.assertEqual(count, 1)
+            target_path = Path(tmp) / linked_ref.relative_path
+            self.assertFalse(target_path.is_symlink())
+            self.assertEqual(target_path.read_bytes(), b"INLINE")
+            # Idempotent: a second call finds nothing to materialize.
+            self.assertEqual(mgr.materialize_linked_artifacts(tgt), 0)
+
+    def test_pin_chain_protects_ancestors_from_pruning(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+            sid = SandboxId("chain-sbx")
+            base = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
+            mgr = LatestOnlyCheckpointManager(base)
+            anchor = CheckpointId("ckpt-anchor")
+            mid = CheckpointId("ckpt-mid")
+            leaf = CheckpointId("ckpt-leaf")
+            new = CheckpointId("ckpt-new")
+            anchor_m = CheckpointManifest(
+                schema_version="v1",
+                checkpoint_id=anchor,
+                sandbox_id=sid,
+                created_at=utc_now(),
+                runtime_name="runc",
+                runtime_version=None,
+                process_artifacts=[self._reference(ArtifactKind.PROCESS, "p")],
+                filesystem_artifacts=[self._reference(ArtifactKind.FILESYSTEM, "f")],
+                metadata={},
+                process_kind="full",
+            ).with_integrity()
+            mid_m = CheckpointManifest(
+                schema_version="v1",
+                checkpoint_id=mid,
+                sandbox_id=sid,
+                created_at=utc_now() + timedelta(seconds=1),
+                runtime_name="runc",
+                runtime_version=None,
+                process_artifacts=[self._reference(ArtifactKind.PROCESS, "p")],
+                filesystem_artifacts=[self._reference(ArtifactKind.FILESYSTEM, "f")],
+                metadata={},
+                process_kind="incremental",
+                parent_checkpoint_id=anchor,
+            ).with_integrity()
+            leaf_m = CheckpointManifest(
+                schema_version="v1",
+                checkpoint_id=leaf,
+                sandbox_id=sid,
+                created_at=utc_now() + timedelta(seconds=2),
+                runtime_name="runc",
+                runtime_version=None,
+                process_artifacts=[self._reference(ArtifactKind.PROCESS, "p")],
+                filesystem_artifacts=[self._reference(ArtifactKind.FILESYSTEM, "f")],
+                metadata={},
+                process_kind="incremental",
+                parent_checkpoint_id=mid,
+            ).with_integrity()
+            new_m = CheckpointManifest(
+                schema_version="v1",
+                checkpoint_id=new,
+                sandbox_id=sid,
+                created_at=utc_now() + timedelta(seconds=3),
+                runtime_name="runc",
+                runtime_version=None,
+                process_artifacts=[self._reference(ArtifactKind.PROCESS, "p")],
+                filesystem_artifacts=[self._reference(ArtifactKind.FILESYSTEM, "f")],
+                metadata={},
+                process_kind="full",
+            ).with_integrity()
+            for manifest in (anchor_m, mid_m, leaf_m):
+                mgr.put_manifest(manifest)
+                mgr.handle_checkpoint_complete(manifest)
+            self._flush_manager(mgr)
+
+            self.assertTrue(mgr.pin_chain(sid, leaf))
+            mgr.put_manifest(new_m)
+            mgr.handle_checkpoint_complete(new_m)
+            self._flush_manager(mgr)
+            # All ancestors of leaf must survive even though `new` is newer
+            # and the LatestOnly policy would otherwise drop them.
+            survived = set(mgr.list_checkpoints(sid))
+            self.assertIn(anchor, survived)
+            self.assertIn(mid, survived)
+            self.assertIn(leaf, survived)
+
+            mgr.unpin_chain(sid, leaf)
+            mgr.handle_checkpoint_complete(new_m)
+            self._flush_manager(mgr)
+            self.assertEqual(set(mgr.list_checkpoints(sid)), {new})
+
+    def test_pin_chain_refcounts_overlap_for_two_forks(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+            sid = SandboxId("chain-sbx")
+            base = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
+            mgr = LatestOnlyCheckpointManager(base)
+            anchor = CheckpointId("ckpt-anchor")
+            mid = CheckpointId("ckpt-mid")
+            leaf_a = CheckpointId("ckpt-a")
+            leaf_b = CheckpointId("ckpt-b")
+            anchor_m = CheckpointManifest(
+                schema_version="v1",
+                checkpoint_id=anchor,
+                sandbox_id=sid,
+                created_at=utc_now(),
+                runtime_name="runc",
+                runtime_version=None,
+                process_artifacts=[self._reference(ArtifactKind.PROCESS, "p")],
+                filesystem_artifacts=[self._reference(ArtifactKind.FILESYSTEM, "f")],
+                metadata={},
+                process_kind="full",
+            ).with_integrity()
+            mid_m = CheckpointManifest(
+                schema_version="v1",
+                checkpoint_id=mid,
+                sandbox_id=sid,
+                created_at=utc_now() + timedelta(seconds=1),
+                runtime_name="runc",
+                runtime_version=None,
+                process_artifacts=[self._reference(ArtifactKind.PROCESS, "p")],
+                filesystem_artifacts=[self._reference(ArtifactKind.FILESYSTEM, "f")],
+                metadata={},
+                process_kind="incremental",
+                parent_checkpoint_id=anchor,
+            ).with_integrity()
+            leaf_a_m = CheckpointManifest(
+                schema_version="v1",
+                checkpoint_id=leaf_a,
+                sandbox_id=sid,
+                created_at=utc_now() + timedelta(seconds=2),
+                runtime_name="runc",
+                runtime_version=None,
+                process_artifacts=[self._reference(ArtifactKind.PROCESS, "p")],
+                filesystem_artifacts=[self._reference(ArtifactKind.FILESYSTEM, "f")],
+                metadata={},
+                process_kind="incremental",
+                parent_checkpoint_id=mid,
+            ).with_integrity()
+            leaf_b_m = CheckpointManifest(
+                schema_version="v1",
+                checkpoint_id=leaf_b,
+                sandbox_id=sid,
+                created_at=utc_now() + timedelta(seconds=3),
+                runtime_name="runc",
+                runtime_version=None,
+                process_artifacts=[self._reference(ArtifactKind.PROCESS, "p")],
+                filesystem_artifacts=[self._reference(ArtifactKind.FILESYSTEM, "f")],
+                metadata={},
+                process_kind="incremental",
+                parent_checkpoint_id=mid,
+            ).with_integrity()
+            for manifest in (anchor_m, mid_m, leaf_a_m, leaf_b_m):
+                mgr.put_manifest(manifest)
+
+            # Two forks share `anchor` and `mid` ancestors. Unpinning one
+            # fork's chain must not drop pins still held by the other.
+            self.assertTrue(mgr.pin_chain(sid, leaf_a))
+            self.assertTrue(mgr.pin_chain(sid, leaf_b))
+            mgr.unpin_chain(sid, leaf_a)
+            self._flush_manager(mgr)
+            mgr.handle_checkpoint_complete(leaf_b_m)
+            self._flush_manager(mgr)
+            survived = set(mgr.list_checkpoints(sid))
+            # leaf_b's chain (anchor, mid, leaf_b) still pinned; leaf_a is
+            # not protected anymore (LatestOnly default behavior would also
+            # protect latest checkpoints, but we're checking ancestors).
+            self.assertIn(anchor, survived)
+            self.assertIn(mid, survived)
+            self.assertIn(leaf_b, survived)
 
     def test_keep_all_manager_retains_checkpoints(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:

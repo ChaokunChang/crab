@@ -177,6 +177,40 @@ class Runtime(ABC):
         _ = (sandbox_id, checkpoint_id)
         return None
 
+    def link_ancestor_pre_dump(
+        self,
+        source_sandbox_id: SandboxId,
+        target_sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> bool:
+        """Make a chain ancestor's process checkpoint image directory visible
+        under ``target_sandbox_id``'s runtime checkpoint root by symlinking
+        instead of byte-copying. Used during fork prep on incremental chains:
+        without this, ``clone_checkpoint_to_fork`` would ``shutil.copytree``
+        every ancestor's gigabyte-scale CRIU image into the fork's tree.
+
+        CRIU walks the ``parent`` symlink chain inside the image set during
+        ``runc restore``; that chain is internal to CRIU's images, so the
+        per-checkpoint directory symlinks set up here are transparent to
+        restore. Returns True when the link was created (or already in
+        place); False when the runtime does not support pre-dump linking.
+        Default: False (no-op for runtimes without incremental process
+        support).
+        """
+        _ = (source_sandbox_id, target_sandbox_id, checkpoint_id)
+        return False
+
+    def materialize_linked_pre_dumps(self, sandbox_id: SandboxId) -> int:
+        """Replace any pre-dump dir symlinks under ``sandbox_id``'s runtime
+        checkpoint root with byte copies of their targets. Inverse of
+        ``link_ancestor_pre_dump``: used before destroying a source sandbox
+        whose ancestor images are still referenced by a fork that has been
+        promoted into the active role. Returns the count of dirs
+        materialized. Default: 0 (no-op for runtimes that never link).
+        """
+        _ = sandbox_id
+        return 0
+
     @abstractmethod
     def checkpoint_filesystem(
         self,

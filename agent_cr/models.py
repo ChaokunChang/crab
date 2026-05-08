@@ -72,6 +72,7 @@ class RuntimeCapabilities:
     supports_incremental_filesystem: bool = False
     supports_custom_checkpoint_dir: bool = False
     supports_incremental_process: bool = False
+    supports_lazy_restore: bool = False
 
 
 @dataclass(frozen=True)

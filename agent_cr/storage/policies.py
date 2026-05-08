@@ -264,6 +264,55 @@ class DelegatingCheckpointManager(CheckpointManager):
             if not sandbox_pins:
                 self._pinned_checkpoint_counts.pop(sandbox_id, None)
 
+    def pin_chain(self, sandbox_id: SandboxId, leaf_checkpoint_id: CheckpointId) -> bool:
+        """Pin every checkpoint on ``leaf_checkpoint_id``'s parent chain so a
+        fork that borrows the chain (via ``Runtime.link_ancestor_pre_dump``)
+        cannot have any ancestor's image bytes pruned out from under its
+        lazy-pages daemon or restore. Existing per-checkpoint refcount
+        deduplicates naturally for overlapping forks. Walks via
+        ``parent_checkpoint_id`` until a chain root or a missing manifest is
+        reached; returns False (rolling back any partial pins) if the leaf
+        manifest doesn't exist.
+        """
+        try:
+            self.get_manifest(sandbox_id, leaf_checkpoint_id)
+        except FileNotFoundError:
+            return False
+        pinned: list[CheckpointId] = []
+        seen: set[CheckpointId] = set()
+        current: CheckpointId | None = leaf_checkpoint_id
+        try:
+            while current is not None and current not in seen:
+                seen.add(current)
+                if not self.pin_checkpoint(sandbox_id, current):
+                    raise FileNotFoundError(current)
+                pinned.append(current)
+                try:
+                    manifest = self.get_manifest(sandbox_id, current)
+                except FileNotFoundError:
+                    break
+                current = manifest.parent_checkpoint_id
+        except FileNotFoundError:
+            for cid in pinned:
+                self.unpin_checkpoint(sandbox_id, cid)
+            return False
+        return True
+
+    def unpin_chain(self, sandbox_id: SandboxId, leaf_checkpoint_id: CheckpointId) -> None:
+        """Reverse ``pin_chain``. Walks the same parent chain; tolerates a
+        chain that has been partially pruned (best-effort unpin per id).
+        """
+        seen: set[CheckpointId] = set()
+        current: CheckpointId | None = leaf_checkpoint_id
+        while current is not None and current not in seen:
+            seen.add(current)
+            self.unpin_checkpoint(sandbox_id, current)
+            try:
+                manifest = self.get_manifest(sandbox_id, current)
+            except FileNotFoundError:
+                return
+            current = manifest.parent_checkpoint_id
+
 
 class LatestOnlyCheckpointManager(DelegatingCheckpointManager):
     def __init__(

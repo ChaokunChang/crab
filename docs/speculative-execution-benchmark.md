@@ -154,6 +154,25 @@ For `scenario: spec`, `scenario_options` are merged into each task row's `llm_se
   - the rejected fork is never cached for reuse in this mode (its post-action state is undefined once the sandbox is destroyed), so combining this with `enable_fork_reuse=true` only disables reuse on rejects — accepts still populate the reuse cache normally.
   - `benchmark.spec.hidden_penalty_ms` now reports the bounded cleanup window rather than the unbounded background exec tail. Raw `speculative_exec_ms` stays unchanged.
   - wired through `BenchmarkConfig.scenario_options["eager_fork_cleanup_on_reject"]` → `RealHostScenarioHarness(eager_fork_cleanup_on_reject=...)` → `_SpeculativeSandboxController.eager_cleanup_on_reject`
+- `enable_fork_chain_sharing`
+  - default `false`
+  - **Phase B fork-prep optimization.** Replace per-fork `shutil.copytree` of every chain ancestor's CRIU image with relative symlinks; pin-refcount the chain so retention can't prune ancestors. See [Fork-Prep Optimizations](#fork-prep-optimizations-b--a--d) for the headline numbers and the [configuration reference](configuration-reference.md#speculative-execution-scenario-benchmarksscenariosspecpy) for the wiring.
+  - effective only when `incremental_process_enabled=true` (no ancestors to share otherwise).
+- `enable_background_prefork`
+  - default `false`
+  - **Phase A fork-prep optimization.** Speculatively warm a fork after each successful checkpoint so `ensure_fork()` returns from cache. Pair with `prefork_max_concurrent_global=2` and `prefork_min_interval_seconds=2.0` to avoid disk-I/O contention with active workloads.
+- `prefork_max_concurrent_global`
+  - default `0` (throttle disabled)
+  - Class-level bounded semaphore caps in-flight preforks across ALL sandboxes. Required for stable throughput in multi-sandbox runs; without it, the un-throttled prefork ablation produced a 23 s `fork_restore_ms` outlier.
+- `prefork_min_interval_seconds`
+  - default `0.0`
+  - Per-sandbox debounce on `kick_prefork`.
+- `prefork_wait_timeout_seconds`
+  - default `0.0`
+  - When `ensure_fork()` is called and a prefork is in flight, wait up to this many seconds for it before falling through to synchronous clone.
+- `enable_lazy_restore`
+  - default `false`
+  - **Phase D fork-prep optimization.** Plumbs `runc restore --lazy-pages` and spawns the `criu lazy-pages` daemon ahead of restore. Pages stream in via userfaultfd. Requires runc 1.3+ with `--lazy-pages` support, CRIU 4.x, and userfaultfd kernel support.
 
 ### LLM Service Options
 
@@ -213,6 +232,66 @@ Metric semantics:
 
 When these metrics are present, the telemetry HTML report adds a speculative-execution section with saved-time, agent-loop-penalty, hidden-reject-cost, net-gain, and accept-rate charts. When the fork-reuse attributes (`fork_finalized`, `reuse_candidate`) are present, the same section also renders the [Fork Reuse](#fork-reuse) funnel, gap attribution, fork-source, and outcome-matrix tables and exports `spec_fork_reuse.csv`.
 Task-level report rows and charts are grouped by stable `task_run_id`, so promoted speculative sandboxes from one benchmark task run are merged together instead of appearing as separate task rows.
+
+## Fork-Prep Optimizations (B + A + D)
+
+Speculative execution is critical-path-bound by fork prep latency. The agent races draft-fork preparation against the oracle LLM round-trip; if the fork isn't ready by oracle-arrival, the speculative decision is wasted even when correct. Three composable optimizations attack different parts of fork latency. All three default off; each can be enabled in `scenario_options` independently.
+
+| Phase | Flag | Targets | Mechanism |
+|---|---|---|---|
+| **B** chain-ancestor sharing | `enable_fork_chain_sharing` | Per-fork artifact-copy overhead, scales with `max_process_chain_length` | Symlink ancestor CRIU image dirs into the fork via `Runtime.link_ancestor_pre_dump`; pin-refcount the chain via `Storage.pin_chain`. Materialize on promote so the source can be safely destroyed. |
+| **A** background pre-fork | `enable_background_prefork` (+ `prefork_max_concurrent_global`, `prefork_min_interval_seconds`, `prefork_wait_timeout_seconds`) | Wall-clock latency by overlap with oracle RTT | `_SpeculativeSandboxController` speculatively prepares a fork after each checkpoint completes; `ensure_fork()` returns from cache. Throttled by a class-level semaphore so background warming doesn't starve active workloads. |
+| **D** lazy-pages restore | `enable_lazy_restore` | `runc restore` blocking-call duration; wasted I/O on discarded forks | `RuncRestoreOptions.lazy_pages` plumbs `--lazy-pages` to runc; pages stream via userfaultfd from a `criu lazy-pages` daemon spawned ahead of restore. Discarded forks never read pages they didn't touch. |
+
+**B's chain-pin is load-bearing for the safety of all three.** The pinning prevents `LatestOnlyCheckpointManager` from pruning ancestors while a fork holds them; without it, lazy-pages could SIGBUS mid-fault if the source pruned, and chain-sharing's symlinks could dangle. Always enable `incremental_process_enabled=true` together with these knobs (otherwise chain sharing has nothing to share and the new code paths are no-ops).
+
+### CRIU / runc / kernel preconditions
+
+- **runc** must support `--lazy-pages` (verified on 1.3.4). Older versions silently ignore the flag.
+- **CRIU** 4.x with `criu lazy-pages` subcommand. Confirm with `criu lazy-pages --help`.
+- **Kernel** needs `CONFIG_USERFAULTFD=y` and either `unprivileged_userfaultfd=1` (`/proc/sys/vm/unprivileged_userfaultfd`) OR the runc process running with `CAP_SYS_PTRACE` (root has this by default). Confirm with `cat /proc/sys/vm/unprivileged_userfaultfd && uname -r`.
+- **No special config** needed for B (chain-sharing) or A (prefork) — they're pure userspace plumbing.
+
+### Headline results
+
+8-task subset of `terminus_replay_spec_friendly`, 8 sandboxes, `incremental_process_enabled=true` baseline. Configs in [`benchmarks/examples/terminus/terminus.spec.auto.incremental_demo.{baseline,chain_sharing,prefork,lazy,b_plus_d,all_opts}.yaml`](/root/workspace/agent-cr/benchmarks/examples/terminus). Comparison helper: [`benchmarks/examples/terminus/incremental_demo_compare.py`](/root/workspace/agent-cr/benchmarks/examples/terminus/incremental_demo_compare.py).
+
+| variant | mean | p95 | p99 | max | wall-clock | spec_accept_rate | success |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| baseline | 146 | 702 | 2 847 | 7 013 | 2 268 s | 6.2 % | 8/8 |
+| chain_sharing (B) | **88** | 486 | 1 402 | 2 474 | **2 193 s (−3.3 %)** | 6.2 % | 8/8 |
+| lazy (D) | 118 | 489 | 2 613 | 3 481 | 2 235 s (−1.5 %) | 6.2 % | 8/8 |
+| b_plus_d | 120 | 577 | 2 060 | 3 845 | 2 275 s (+0.3 %) | 6.2 % | 8/8 |
+| prefork (A, throttled max=2) | 44 | 350 | 1 039 | 1 837 | 2 451 s (+8.1 %) | 5.3 % | 8/8 |
+| all_opts (throttled) | **41** | 358 | **724** | **1 099** | 2 398 s (+5.7 %) | 4.8 % | 8/8 |
+
+`fork_restore_ms` columns are milliseconds.
+
+**Throttle effect** (rstan-to-pystan, the worst-affected task in the un-throttled prefork variant):
+
+| variant | mean | p99 | max |
+|---|---:|---:|---:|
+| prefork un-throttled | 145.8 | 1 182.7 | **23 421.5** |
+| prefork throttled (`prefork_max_concurrent_global=2`) | 43.7 | 1 038.7 | **1 836.9 (−92 %)** |
+| all_opts un-throttled | 66.3 | 722.1 | 9 175.5 |
+| all_opts throttled | 40.7 | 724.4 | **1 099.1 (−88 %)** |
+
+### When to enable which
+
+- **B (chain_sharing) — recommended default-on for any spec run with `incremental_process_enabled=true`.** Faster forks (mean −40 %) AND faster wall-clock (−3.3 %) with zero observed regression on accept_rate / saved time. The chain pin also fixes a latent retention correctness issue: without it, `LatestOnlyCheckpointManager` can prune a chain ancestor while a fork holds a `pre_dump/parent` symlink into it.
+- **D (lazy_restore) — recommended default-on for spec scenarios.** Modest pure latency win (mean −19 %, wall-clock −1.5 %). Per-restore subprocess time is statistically identical to baseline (median 164 ms either way); the win comes from pages faulting concurrently with active execution, and from discarded forks never reading pages they didn't touch. Only constraint is platform: runc 1.3+ with `--lazy-pages`, CRIU 4.x, and kernel userfaultfd. Falls back gracefully when the daemon spawn fails (logs warning, restore fails clearly rather than silently).
+- **A (background_prefork) — opt-in only.** Cache hits drop `fork_restore_ms` p99 by ~58 % via `spec_fork_reuse_count` shifting from 3 to 17–21, but the prefork worker's continuous `zfs clone` + CRIU image copy + daemon spawn + dataset destroy contends with the active sandbox's regular `runc exec` calls for the same disk and CPU. **A single-sandbox smoke (rstan_smoke) confirms the wall-clock cost is intrinsic to the host, not cross-sandbox queueing**: with only one sandbox running and no other work on the disk, prefork still cost +322 s (+17.4 %) for a 4.8 s saving on the agent-loop wait — a ~67× cost-to-benefit ratio on this task. The throttle (`prefork_max_concurrent_global=2`) eliminates the catastrophic 23 s outliers but doesn't reduce average I/O pressure. Use A when per-turn fork latency jitter matters more than aggregate wall-clock (interactive use, latency-sensitive measurements). Skip when the workload is I/O-bound on its own (R compilation, package installs, dpkg), when wall-clock throughput is the optimization target, or when most tasks have low acceptance rate (most preforks are then overhead with no compensating speculation gain).
+- **All-opts (B+A+D) — only for benchmark publication of fork-prep latency.** Best `fork_restore_ms` percentiles (p99 = 724 ms vs 2 847 ms baseline, p95 = 358 ms vs 702 ms) at +5.7 % wall-clock cost — the cost is inherited entirely from A. Not the configuration to minimize task completion time.
+
+For a full per-task wall-clock decomposition, single-sandbox smoke confirmation of A's intrinsic cost, and rationale for each per-optimization decision, see [docs/incremental-fork-restore-analysis.md](incremental-fork-restore-analysis.md).
+
+### New telemetry attributes / metrics
+
+- `benchmark.fork.chain_sharing_links` — per-fork count of ancestor pre-dump dirs symlinked instead of copied (B).
+- `benchmark.fork.chain_sharing_bytes_saved` — per-fork bytes avoided by ancestor symlinking (B).
+- `_SpeculativeSandboxController._prefork_hits` / `_prefork_wasted` / `_prefork_skipped_throttled` — per-controller counters (A); not yet emitted as telemetry, accessible via test harness.
+- `RuntimeOperationStatus.metadata.lazy_pages: bool` — set on every `restore_process` to indicate whether `--lazy-pages` was used (D).
+- `RuntimeOperationStatus.metadata.lazy_pages_daemon_pid: int | None` — pid of the spawned `criu lazy-pages` daemon when `lazy_pages=True` (D).
 
 ## Stale-Fork Diagnosis Notes
 

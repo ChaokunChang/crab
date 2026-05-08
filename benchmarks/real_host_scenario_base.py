@@ -51,6 +51,7 @@ from agent_cr import (
     LocalCheckpointManager,
     RequestInterceptorHook,
     RequestAwareSandboxInspector,
+    RuncRestoreOptions,
     RuncRuntime,
     RuncRuntimePaths,
     RuncRuntimeOptions,
@@ -252,6 +253,45 @@ class PreparedBenchmarkSandbox:
 
 
 class _SpeculativeSandboxController:
+    # Class-level throttle: caps total in-flight preforks across ALL active
+    # sandboxes so the background warming work cannot saturate disk/CPU and
+    # starve the active workload. Initialized lazily by `_acquire_global_slot`
+    # off the first kick that supplies a non-zero `prefork_max_concurrent`.
+    # Per-sandbox dedup (`_prefork_in_flight`) and min-interval still apply
+    # in addition to this cap.
+    _global_prefork_lock: "threading.Lock" = threading.Lock()
+    _global_prefork_semaphore: "threading.BoundedSemaphore | None" = None
+    _global_prefork_max: int = 0
+
+    @classmethod
+    def _acquire_global_slot(cls, max_concurrent: int) -> bool:
+        """Try to claim a global prefork slot. Non-blocking: returns False
+        when the cap is full (caller should skip this prefork). Returns True
+        unconditionally when ``max_concurrent <= 0`` (throttle disabled)."""
+        if max_concurrent <= 0:
+            return True
+        with cls._global_prefork_lock:
+            if cls._global_prefork_semaphore is None or cls._global_prefork_max != max_concurrent:
+                cls._global_prefork_semaphore = threading.BoundedSemaphore(max_concurrent)
+                cls._global_prefork_max = max_concurrent
+            sem = cls._global_prefork_semaphore
+        return sem.acquire(blocking=False)
+
+    @classmethod
+    def _release_global_slot(cls, max_concurrent: int) -> None:
+        if max_concurrent <= 0:
+            return
+        with cls._global_prefork_lock:
+            sem = cls._global_prefork_semaphore
+        if sem is None:
+            return
+        try:
+            sem.release()
+        except ValueError:
+            # Released more than acquired (e.g. throttle reconfigured mid-run);
+            # nothing to do.
+            pass
+
     def __init__(
         self,
         harness: "RealHostScenarioHarness",
@@ -259,22 +299,102 @@ class _SpeculativeSandboxController:
         *,
         fork_reuse_enabled: bool = False,
         eager_cleanup_on_reject: bool = False,
+        background_prefork_enabled: bool = False,
+        prefork_min_interval_seconds: float = 0.0,
+        prefork_wait_timeout_seconds: float = 0.0,
+        prefork_max_concurrent_global: int = 0,
     ) -> None:
         self._harness = harness
         self._active_sandbox = active_sandbox
         self._fork_name_root = str(active_sandbox.sandbox_id)
         self._lock = threading.Lock()
         self._cached_fork: SandboxHandle | None = None
+        # Tracks which checkpoint the cached fork was restored from. Set by
+        # both the prefork path and a successful synchronous ensure_fork; used
+        # by ensure_fork to detect a stale cache when a newer checkpoint has
+        # landed between caching and the next spec turn.
+        self._cached_fork_checkpoint_id: CheckpointId | None = None
         self._fork_counter = 0
         self._fork_epoch = 0
         self._fork_reuse_enabled = bool(fork_reuse_enabled)
         self.eager_cleanup_on_reject = bool(eager_cleanup_on_reject)
+        self._background_prefork_enabled = bool(background_prefork_enabled)
+        self._prefork_min_interval_seconds = max(0.0, float(prefork_min_interval_seconds))
+        self._prefork_wait_timeout_seconds = max(0.0, float(prefork_wait_timeout_seconds))
+        self._prefork_max_concurrent_global = max(0, int(prefork_max_concurrent_global))
+        self._prefork_skipped_throttled = 0
+        self._prefork_executor: ThreadPoolExecutor | None = None
+        if self._background_prefork_enabled:
+            self._prefork_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix=f"agent-cr-prefork-{self._fork_name_root}",
+            )
+        self._prefork_future: Future[None] | None = None
+        self._prefork_in_flight = False
+        self._last_prefork_at = 0.0
+        self._prefork_hits = 0
+        self._prefork_wasted = 0
 
     def ensure_fork(self):
+        # If a background prefork is in flight, give it a brief chance to
+        # land in the cache so the synchronous-clone path doesn't race
+        # ahead and double the work. Skipped (timeout=0) when prefork is
+        # off or the caller hasn't opted in.
+        wait_timeout = self._prefork_wait_timeout_seconds
+        if (
+            self._background_prefork_enabled
+            and wait_timeout > 0
+            and self._prefork_future is not None
+            and not self._prefork_future.done()
+        ):
+            try:
+                self._prefork_future.result(timeout=wait_timeout)
+            except (FutureTimeoutError, Exception):
+                pass
         with self._lock:
+            storage = self._harness.storage
+            if storage is None:
+                return None
+            checkpoints = storage.list_checkpoints(self._active_sandbox.sandbox_id)
+            if not checkpoints:
+                # No checkpoints yet — discard any stale cached fork to
+                # avoid handing back a fork rooted at a vanished base.
+                stale = self._cached_fork
+                self._cached_fork = None
+                self._cached_fork_checkpoint_id = None
+                stale_fork_to_destroy = stale
+                if stale_fork_to_destroy is None:
+                    return None
+                # Fall through; we'll destroy below outside the lock.
+                self._fork_epoch += 1
+            else:
+                stale_fork_to_destroy = None
             cached_fork = self._cached_fork
+            cached_id = self._cached_fork_checkpoint_id
             if cached_fork is not None:
-                return cached_fork, False, True
+                latest = checkpoints[-1]
+                if cached_id is None or cached_id == latest:
+                    # Treat untagged caches (legacy fork-reuse path) as
+                    # fresh; tagged caches must match the latest checkpoint
+                    # or we drop them.
+                    self._prefork_hits += 1
+                    return cached_fork, False, True
+                # Stale cached prefork — newer checkpoint landed since.
+                # Drop the cache; destroy outside the lock.
+                stale_fork_to_destroy = cached_fork
+                self._cached_fork = None
+                self._cached_fork_checkpoint_id = None
+                self._fork_epoch += 1
+                self._prefork_wasted += 1
+        if stale_fork_to_destroy is not None:
+            try:
+                self._harness.destroy_sandbox_dataset(stale_fork_to_destroy)
+            except Exception:
+                logger.exception(
+                    "Failed to destroy stale cached fork sandbox=%s",
+                    stale_fork_to_destroy.sandbox_id,
+                )
+        with self._lock:
             storage = self._harness.storage
             if storage is None:
                 return None
@@ -356,6 +476,7 @@ class _SpeculativeSandboxController:
                 invalidate_stale_fork = True
             else:
                 self._cached_fork = fork
+                self._cached_fork_checkpoint_id = checkpoint_id
         if invalidate_stale_fork:
             logger.debug(
                 "Discarding stale speculative fork after cache invalidation source=%s target=%s checkpoint=%s",
@@ -413,6 +534,7 @@ class _SpeculativeSandboxController:
         with self._lock:
             fork = self._cached_fork
             self._cached_fork = None
+            self._cached_fork_checkpoint_id = None
             self._fork_epoch += 1
         if fork is None:
             return
@@ -426,13 +548,159 @@ class _SpeculativeSandboxController:
         with self._lock:
             if reusable and self._fork_reuse_enabled:
                 self._cached_fork = fork
+                # Legacy fork-reuse caches stay untagged (None); ensure_fork
+                # treats those as fresh for backward compatibility.
+                self._cached_fork_checkpoint_id = None
                 return
             if self._cached_fork is fork:
                 self._cached_fork = None
+                self._cached_fork_checkpoint_id = None
         try:
             self._harness.destroy_sandbox_dataset(fork)
         except Exception:
             logger.exception("Failed to delete speculative fork sandbox=%s", fork.sandbox_id)
+
+    def kick_prefork(self) -> None:
+        """Speculatively prepare a fork from the latest checkpoint so the
+        next ``ensure_fork()`` returns instantly instead of paying clone +
+        restore latency. Safe to call repeatedly: deduplicates against an
+        in-flight prefork, an already-warm cache, and a min-interval
+        debounce. No-op when ``background_prefork_enabled`` is False.
+        """
+        if not self._background_prefork_enabled:
+            return
+        executor = self._prefork_executor
+        if executor is None:
+            return
+        storage = self._harness.storage
+        if storage is None:
+            return
+        with self._lock:
+            if self._prefork_in_flight:
+                return
+            if self._cached_fork is not None:
+                # Already have a fork ready; nothing to prefetch.
+                return
+            now = time.monotonic()
+            if (
+                self._prefork_min_interval_seconds > 0
+                and (now - self._last_prefork_at) < self._prefork_min_interval_seconds
+            ):
+                return
+            try:
+                checkpoints = storage.list_checkpoints(self._active_sandbox.sandbox_id)
+            except Exception:
+                logger.debug(
+                    "Skipping prefork: storage list_checkpoints failed sandbox=%s",
+                    self._active_sandbox.sandbox_id,
+                    exc_info=True,
+                )
+                return
+            if not checkpoints:
+                return
+            target_checkpoint_id = checkpoints[-1]
+            try:
+                manifest = storage.get_manifest(
+                    self._active_sandbox.sandbox_id, target_checkpoint_id
+                )
+            except FileNotFoundError:
+                return
+            if not manifest.process_artifacts:
+                # Same fs-only-skip rule as ensure_fork.
+                return
+            # Per-sandbox state is committed; now compete for the global
+            # in-flight slot. If full, skip this kick: another sandbox is
+            # already burning the disk/CPU on its own prefork, and queueing
+            # a second one would only deepen the contention that hurts
+            # active-sandbox throughput. Counted in telemetry as a
+            # throttle-skip rather than a wasted prefork.
+            if not self._acquire_global_slot(self._prefork_max_concurrent_global):
+                self._prefork_skipped_throttled += 1
+                return
+            self._fork_counter += 1
+            fork_epoch = self._fork_epoch
+            fork_name = f"{self._fork_name_root}-prefork-{self._fork_counter}"
+            self._prefork_in_flight = True
+            self._last_prefork_at = now
+        future = executor.submit(
+            self._run_prefork,
+            target_checkpoint_id,
+            fork_name,
+            fork_epoch,
+        )
+        self._prefork_future = future
+
+    def _run_prefork(
+        self,
+        checkpoint_id: CheckpointId,
+        fork_name: str,
+        fork_epoch: int,
+    ) -> None:
+        fork: SandboxHandle | None = None
+        try:
+            fork = self._harness.clone_checkpoint_to_fork(
+                self._active_sandbox,
+                checkpoint_id,
+                fork_name,
+            )
+            if fork.task_run is not None:
+                fork.task_run.configure_bundle()
+            restore_result = self._harness.restore_once(fork, checkpoint_id)
+            if restore_result.status.value != "succeeded":
+                logger.warning(
+                    "Prefork restore did not succeed source=%s target=%s checkpoint=%s status=%s",
+                    self._active_sandbox.sandbox_id,
+                    fork.sandbox_id,
+                    checkpoint_id,
+                    restore_result.status.value,
+                )
+                self._harness.destroy_sandbox_dataset(fork)
+                return
+        except Exception:
+            logger.exception(
+                "Prefork preparation failed sandbox=%s checkpoint=%s",
+                self._active_sandbox.sandbox_id,
+                checkpoint_id,
+            )
+            if fork is not None:
+                try:
+                    self._harness.destroy_sandbox_dataset(fork)
+                except Exception:
+                    logger.exception(
+                        "Failed to destroy failed prefork sandbox=%s",
+                        fork.sandbox_id,
+                    )
+            return
+        finally:
+            self._release_global_slot(self._prefork_max_concurrent_global)
+            with self._lock:
+                self._prefork_in_flight = False
+        # Commit the cache only if no invalidation has bumped the epoch
+        # since prefork started. Otherwise destroy the just-restored fork.
+        commit = False
+        with self._lock:
+            if fork_epoch == self._fork_epoch and self._cached_fork is None:
+                self._cached_fork = fork
+                self._cached_fork_checkpoint_id = checkpoint_id
+                commit = True
+        if not commit:
+            self._prefork_wasted += 1
+            try:
+                self._harness.destroy_sandbox_dataset(fork)
+            except Exception:
+                logger.exception(
+                    "Failed to destroy stale prefork sandbox=%s",
+                    fork.sandbox_id,
+                )
+
+    def shutdown(self) -> None:
+        """Idempotent shutdown of the prefork executor. Called by the
+        harness when the active sandbox is destroyed so we don't leak
+        the worker thread or block process exit."""
+        executor = self._prefork_executor
+        self._prefork_executor = None
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
 
 
 class RealHostScenarioHarness:
@@ -909,6 +1177,12 @@ PY
         sandbox_resource_limits: SandboxResourceLimits | None = None,
         fork_reuse_enabled: bool = False,
         eager_fork_cleanup_on_reject: bool = False,
+        fork_chain_sharing_enabled: bool = False,
+        background_prefork_enabled: bool = False,
+        prefork_min_interval_seconds: float = 0.0,
+        prefork_wait_timeout_seconds: float = 0.0,
+        prefork_max_concurrent_global: int = 0,
+        lazy_restore_enabled: bool = False,
         fast_forward_idle_waits: bool = True,
         relaunch_on_restore_failure: bool = False,
     ) -> None:
@@ -974,6 +1248,12 @@ PY
         self.sandbox_resource_limits = sandbox_resource_limits
         self.fork_reuse_enabled = bool(fork_reuse_enabled)
         self.eager_fork_cleanup_on_reject = bool(eager_fork_cleanup_on_reject)
+        self.fork_chain_sharing_enabled = bool(fork_chain_sharing_enabled)
+        self.background_prefork_enabled = bool(background_prefork_enabled)
+        self.prefork_min_interval_seconds = float(prefork_min_interval_seconds)
+        self.prefork_wait_timeout_seconds = float(prefork_wait_timeout_seconds)
+        self.prefork_max_concurrent_global = max(0, int(prefork_max_concurrent_global))
+        self.lazy_restore_enabled = bool(lazy_restore_enabled)
         self.fast_forward_idle_waits = bool(fast_forward_idle_waits)
         self.relaunch_on_restore_failure = bool(relaunch_on_restore_failure)
         self._tmpdir: tempfile.TemporaryDirectory[str] | None = None
@@ -1021,6 +1301,8 @@ PY
         self._task_attempts: dict[str, int] = {}
         self._resource_monitor: BenchmarkResourceMonitor | None = None
         self._rootfs_reuse_session_key = self.run_id or uuid.uuid4().hex
+        self._fork_chain_pins: dict[SandboxId, tuple[SandboxId, CheckpointId]] = {}
+        self._speculation_controllers_by_sandbox: dict[SandboxId, "_SpeculativeSandboxController"] = {}
 
     @property
     def benchmark_bridge_ip(self) -> str:
@@ -1234,6 +1516,7 @@ PY
         self.host_inspector_client = HostInspectorServiceClient(self.host_inspector_url)
         self.base_inspector = RemoteSandboxInspector(self.host_inspector_client, telemetry=self.telemetry)
         self.inspector = RequestAwareSandboxInspector(self.base_inspector, self.request_state_store)
+        runc_restore_options = RuncRestoreOptions(lazy_pages=self.lazy_restore_enabled)
         self.runtime = RuncRuntime(
             paths=RuncRuntimePaths(
                 state_root=self.runtime_state_root,
@@ -1245,7 +1528,9 @@ PY
             options=RuncRuntimeOptions(
                 command_timeout_seconds=self.runtime_command_timeout_seconds,
                 zfs_prepare_timeout_seconds=self.runtime_zfs_prepare_timeout_seconds,
+                restore=runc_restore_options,
             ),
+            restore_options=runc_restore_options,
             host_inspector_client=self.host_inspector_client,
             telemetry=self.telemetry,
         )
@@ -1291,6 +1576,20 @@ PY
             recovery_delay_seconds=self.transfer_delay_ms / 1000.0 if self.auto_cr else 0.0,
             relaunch_on_restore_failure=self.relaunch_on_restore_failure,
         )
+        # Auto-mode checkpoints land via the system's internal coordinator,
+        # not via harness wrappers. Wrap the scheduler's per-completion hook
+        # so the speculation controllers' kick_prefork fires regardless of
+        # who triggered the checkpoint. Manual paths additionally call
+        # `_notify_speculation_checkpoint_complete` directly; the controller
+        # dedupes prefork via `_prefork_in_flight`, so duplicate notify is
+        # safe.
+        _orig_mark_complete = self.system.scheduler.mark_checkpoint_complete
+
+        def _mark_complete_with_prefork_notify(sandbox_id_arg, *args, **kwargs):
+            _orig_mark_complete(sandbox_id_arg, *args, **kwargs)
+            self._notify_speculation_checkpoint_complete(sandbox_id_arg, None)
+
+        self.system.scheduler.mark_checkpoint_complete = _mark_complete_with_prefork_notify  # type: ignore[method-assign]
         if self.telemetry is not None and self.runtime is not None and self.monitoring_enabled:
             self._resource_monitor = BenchmarkResourceMonitor(
                 telemetry=self.telemetry,
@@ -1701,6 +2000,21 @@ PY
         return bool(snapshot.process_changed or snapshot.filesystem_changed)
 
     def _swap_speculative_sandbox_state(self, active: SandboxHandle, fork: SandboxHandle) -> None:
+        # If the fork was prepped in chain-sharing mode, its runtime checkpoint
+        # tree contains symlinks into the about-to-be-destroyed active's
+        # tree. Inline those bytes now (under the fork's current sandbox id,
+        # before the id swap below) so subsequent incremental checkpoints
+        # taken by the new-active's CRIU don't follow `--parent-path` into a
+        # destroyed source. Also materialize the storage-side artifact JSON
+        # for symmetry, in case storage-layer linking is ever wired in.
+        self._inline_fork_chain_artifacts(fork.sandbox_id)
+        self._fork_chain_pins.pop(fork.sandbox_id, None)
+        # Re-key the speculation controller so subsequent checkpoint
+        # completions on the now-active sandbox (which carries the fork's
+        # old id post-swap) still find their controller.
+        controller = self._speculation_controllers_by_sandbox.pop(active.sandbox_id, None)
+        if controller is not None:
+            self._speculation_controllers_by_sandbox[fork.sandbox_id] = controller
         active_id = active.sandbox_id
         fork_id = fork.sandbox_id
         active_bundle_dir = active.bundle_dir
@@ -1793,12 +2107,18 @@ PY
         if (agent_type == "mini_swe" and sandbox.llm_service_type == "mini_swe_spec_trace_replay") or (
             agent_type == "terminus" and sandbox.llm_service_type == "terminus_spec_trace_replay"
         ):
-            extra_kwargs["speculation_controller"] = _SpeculativeSandboxController(
+            controller = _SpeculativeSandboxController(
                 self,
                 sandbox,
                 fork_reuse_enabled=self.fork_reuse_enabled,
                 eager_cleanup_on_reject=self.eager_fork_cleanup_on_reject,
+                background_prefork_enabled=self.background_prefork_enabled,
+                prefork_min_interval_seconds=self.prefork_min_interval_seconds,
+                prefork_wait_timeout_seconds=self.prefork_wait_timeout_seconds,
+                prefork_max_concurrent_global=self.prefork_max_concurrent_global,
             )
+            self._speculation_controllers_by_sandbox[sandbox.sandbox_id] = controller
+            extra_kwargs["speculation_controller"] = controller
         if agent_type == "terminus":
             extra_kwargs["fast_forward_idle_waits"] = self.fast_forward_idle_waits
         return self.get_agent_class(agent_type)(
@@ -2877,7 +3197,38 @@ PY
         if sandbox.launch_source not in {"runc", "compose"}:
             raise RuntimeError(f"checkpoint_manual unsupported for launch_source={sandbox.launch_source}")
         logger.debug("Benchmark requesting checkpoint_manual for sandbox=%s", sandbox.sandbox_id)
-        return self.system.checkpoint_once(sandbox.sandbox_id, leave_running=leave_running)
+        result = self.system.checkpoint_once(sandbox.sandbox_id, leave_running=leave_running)
+        self._notify_speculation_checkpoint_complete(sandbox.sandbox_id, result)
+        return result
+
+    def _notify_speculation_checkpoint_complete(
+        self,
+        sandbox_id: SandboxId,
+        result: object,
+    ) -> None:
+        """Kick the per-sandbox speculation controller's prefork. Idempotent
+        per controller; the controller itself dedupes against an in-flight
+        prefork or a still-warm cache. Called from every harness path that
+        produces a new checkpoint on the active sandbox."""
+        controller = self._speculation_controllers_by_sandbox.get(sandbox_id)
+        if controller is None:
+            return
+        # Be permissive about result shape: scenarios that pass a non-result
+        # (or no result at all) still benefit from the prefork hint.
+        succeeded = True
+        if result is not None:
+            status = getattr(result, "status", None)
+            value = getattr(status, "value", None)
+            if value is not None and value != "succeeded":
+                succeeded = False
+        if not succeeded:
+            return
+        try:
+            controller.kick_prefork()
+        except Exception:
+            logger.exception(
+                "Failed to kick prefork for sandbox=%s", sandbox_id
+            )
 
     def checkpoint_manual_filesystem_only(self, sandbox: SandboxHandle, leave_running: bool=False):
         assert self.system is not None
@@ -2924,7 +3275,9 @@ PY
         if sandbox.launch_source not in {"runc", "compose"}:
             raise RuntimeError(f"checkpoint_if_due unsupported for launch_source={sandbox.launch_source}")
         logger.debug("Benchmark requesting checkpoint_if_due for sandbox=%s", sandbox.sandbox_id)
-        return self.system.checkpoint_if_due(sandbox.sandbox_id)
+        result = self.system.checkpoint_if_due(sandbox.sandbox_id)
+        self._notify_speculation_checkpoint_complete(sandbox.sandbox_id, result)
+        return result
 
     def restore_once(self, sandbox: SandboxHandle, checkpoint_id: CheckpointId):
         assert self.system is not None
@@ -3273,6 +3626,16 @@ PY
 
     def destroy_sandbox_dataset(self, sandbox: SandboxHandle) -> None:
         assert self.runtime is not None
+        self._release_fork_chain_pin(sandbox.sandbox_id)
+        controller = self._speculation_controllers_by_sandbox.pop(sandbox.sandbox_id, None)
+        if controller is not None:
+            try:
+                controller.shutdown()
+            except Exception:
+                logger.exception(
+                    "Failed to shut down speculation controller sandbox=%s",
+                    sandbox.sandbox_id,
+                )
         self._delete_runtime(sandbox.sandbox_id)
         try:
             self.runtime.describe(sandbox.sandbox_id)
@@ -3289,6 +3652,50 @@ PY
         self.network_manager.release_lease(sandbox.sandbox_id)
         self._sandbox_by_id.pop(sandbox.sandbox_id, None)
         self._drop_sandbox_from_registry(sandbox)
+
+    def _inline_fork_chain_artifacts(self, fork_sandbox_id: SandboxId) -> None:
+        """Replace any chain-shared symlinks under ``fork_sandbox_id`` with
+        byte copies. Called before promoting the fork into the active role
+        (the original active sandbox is about to be destroyed) and before
+        any other ownership transfer that would orphan the symlinks.
+        Best-effort: failures are logged but do not abort the swap.
+        """
+        materialize_runtime = getattr(self.runtime, "materialize_linked_pre_dumps", None)
+        if callable(materialize_runtime):
+            try:
+                materialize_runtime(fork_sandbox_id)
+            except Exception:
+                logger.exception(
+                    "Failed to materialize linked pre-dump dirs for sandbox=%s",
+                    fork_sandbox_id,
+                )
+        materialize_storage = getattr(self.storage, "materialize_linked_artifacts", None)
+        if callable(materialize_storage):
+            try:
+                materialize_storage(fork_sandbox_id)
+            except Exception:
+                logger.exception(
+                    "Failed to materialize linked storage artifacts for sandbox=%s",
+                    fork_sandbox_id,
+                )
+
+    def _release_fork_chain_pin(self, fork_sandbox_id: SandboxId) -> None:
+        pin = self._fork_chain_pins.pop(fork_sandbox_id, None)
+        if pin is None:
+            return
+        source_sandbox_id, leaf_checkpoint_id = pin
+        unpin_chain = getattr(self.storage, "unpin_chain", None)
+        if not callable(unpin_chain):
+            return
+        try:
+            unpin_chain(source_sandbox_id, leaf_checkpoint_id)
+        except Exception:
+            logger.exception(
+                "Failed to unpin chain for fork=%s source=%s leaf=%s",
+                fork_sandbox_id,
+                source_sandbox_id,
+                leaf_checkpoint_id,
+            )
 
     def _drop_sandbox_from_registry(self, sandbox: SandboxHandle) -> None:
         try:
@@ -3426,13 +3833,57 @@ PY
             [(str(copy_id), copy_process, copy_filesystem) for copy_id, copy_process, copy_filesystem in copy_plan],
         )
 
+        chain_sharing_active = self._chain_sharing_active(manifests, checkpoint_id)
+        if chain_sharing_active:
+            pin_chain = getattr(self.storage, "pin_chain", None)
+            if callable(pin_chain) and pin_chain(source.sandbox_id, checkpoint_id):
+                self._fork_chain_pins[target.sandbox_id] = (
+                    source.sandbox_id,
+                    checkpoint_id,
+                )
+            else:
+                # Pin not available (e.g. KeepAll manager) or leaf manifest
+                # vanished between resolve and pin. Without a pin the source's
+                # ancestor blobs could be pruned mid-restore by the
+                # LatestOnly manager; fall back to copy mode for safety.
+                logger.warning(
+                    "Chain-sharing pin failed; falling back to copy mode source=%s target=%s checkpoint=%s",
+                    source.sandbox_id,
+                    target.sandbox_id,
+                    checkpoint_id,
+                )
+                chain_sharing_active = False
+        chain_sharing_links = 0
+        chain_sharing_bytes_saved = 0
         for copy_id, copy_process, copy_filesystem in copy_plan:
             source_manifest = manifests[copy_id]
+            is_leaf = copy_id == checkpoint_id
+            link_this_entry = chain_sharing_active and copy_process and not is_leaf
             process_refs = []
             filesystem_refs = []
             if copy_process:
+                if link_this_entry:
+                    self.runtime.link_ancestor_pre_dump(
+                        source.sandbox_id, target.sandbox_id, copy_id
+                    )
                 for reference in source_manifest.process_artifacts:
                     payload = self.storage.get_artifact(source.sandbox_id, copy_id, reference)
+                    if link_this_entry:
+                        rewritten = self._rewrite_process_artifact_linked(
+                            payload,
+                            target.sandbox_id,
+                            copy_id,
+                        )
+                        chain_sharing_links += 1
+                        chain_sharing_bytes_saved += int(reference.size_bytes or 0)
+                    else:
+                        rewritten = self._rewrite_process_artifact(
+                            payload,
+                            source.sandbox_id,
+                            target.sandbox_id,
+                            copy_id,
+                            preserve_symlinks=chain_sharing_active and is_leaf,
+                        )
                     process_refs.append(
                         self.storage.put_artifact(
                             target.sandbox_id,
@@ -3440,12 +3891,7 @@ PY
                             ArtifactPayload(
                                 kind=reference.kind,
                                 name=reference.name,
-                                data=self._rewrite_process_artifact(
-                                    payload,
-                                    source.sandbox_id,
-                                    target.sandbox_id,
-                                    copy_id,
-                                ),
+                                data=rewritten,
                                 metadata=dict(reference.metadata),
                             ),
                         )
@@ -3482,6 +3928,63 @@ PY
                 metadata=dict(source_manifest.metadata),
             ).with_integrity()
             self.storage.put_manifest(manifest)
+
+        if chain_sharing_active:
+            # The leaf's `pre_dump/parent` symlink (preserved via
+            # symlinks=True above) resolves relatively into the fork's
+            # runtime checkpoint root: <fork>/ckpt-PARENT/pre_dump. We
+            # plant a symlink at <fork>/ckpt-PARENT pointing at
+            # <source>/ckpt-PARENT for every ancestor in the chain so
+            # CRIU's chain walk during runc restore resolves into the
+            # source's bytes without copying. Walk via storage manifests
+            # rather than the copy_plan because resolve_checkpoint_copy_plan
+            # short-circuits when the leaf has both process+filesystem
+            # artifacts (the common case for incremental forks).
+            try:
+                cursor_id: CheckpointId | None = manifests[checkpoint_id].parent_checkpoint_id
+                seen: set[CheckpointId] = set()
+                while cursor_id is not None and cursor_id not in seen:
+                    seen.add(cursor_id)
+                    self.runtime.link_ancestor_pre_dump(
+                        source.sandbox_id, target.sandbox_id, cursor_id
+                    )
+                    chain_sharing_links += 1
+                    parent_manifest = manifests.get(cursor_id)
+                    if parent_manifest is None:
+                        break
+                    chain_sharing_bytes_saved += sum(
+                        int(ref.size_bytes or 0) for ref in parent_manifest.process_artifacts
+                    )
+                    cursor_id = parent_manifest.parent_checkpoint_id
+            except Exception:
+                logger.exception(
+                    "Failed to plant ancestor symlinks for chain sharing source=%s target=%s checkpoint=%s",
+                    source.sandbox_id,
+                    target.sandbox_id,
+                    checkpoint_id,
+                )
+        if chain_sharing_active and chain_sharing_links > 0:
+            logger.info(
+                "Fork chain sharing applied source=%s target=%s checkpoint=%s "
+                "links=%d bytes_saved=%d",
+                source.sandbox_id,
+                target.sandbox_id,
+                checkpoint_id,
+                chain_sharing_links,
+                chain_sharing_bytes_saved,
+            )
+            self.emit_benchmark_metric(
+                "benchmark.fork.chain_sharing_links",
+                float(chain_sharing_links),
+                target,
+                checkpoint_id=checkpoint_id,
+            )
+            self.emit_benchmark_metric(
+                "benchmark.fork.chain_sharing_bytes_saved",
+                float(chain_sharing_bytes_saved),
+                target,
+                checkpoint_id=checkpoint_id,
+            )
 
         description = SandboxDescription(
             sandbox_id=target.sandbox_id,
@@ -4670,22 +5173,89 @@ exit $rc
             )
         )
 
+    def _chain_sharing_active(
+        self,
+        manifests: dict[CheckpointId, CheckpointManifest],
+        leaf_checkpoint_id: CheckpointId,
+    ) -> bool:
+        """Decide whether chain-ancestor sharing is in play for this fork.
+
+        Requires the harness opt-in flag, a runtime that advertises
+        incremental-process support (so ``link_ancestor_pre_dump`` is
+        meaningful), and a leaf manifest with a parent — otherwise there
+        are no ancestors to share.
+        """
+        if not getattr(self, "fork_chain_sharing_enabled", False):
+            return False
+        if self.runtime is None:
+            return False
+        try:
+            capabilities = self.runtime.capabilities()
+        except Exception:
+            return False
+        if not getattr(capabilities, "supports_incremental_process", False):
+            return False
+        leaf = manifests.get(leaf_checkpoint_id)
+        if leaf is None:
+            return False
+        return leaf.parent_checkpoint_id is not None
+
     def _rewrite_process_artifact(
         self,
         payload: bytes,
         source_sandbox_id: SandboxId,
         target_sandbox_id: SandboxId,
         checkpoint_id: CheckpointId,
+        *,
+        preserve_symlinks: bool = False,
     ) -> bytes:
         bundle_root = self._effective_runtime_bundle_root()
         checkpoint_root = self._effective_runtime_checkpoint_root()
         data = json.loads(payload.decode("utf-8"))
         process_root = checkpoint_root / str(target_sandbox_id) / str(checkpoint_id)
+        # When chain-sharing is active, preserve the leaf's `pre_dump/parent`
+        # symlink (which points relatively at ``../../ckpt-PARENT/pre_dump``)
+        # instead of dereferencing it. Default ``copytree`` behavior would
+        # inline every ancestor's pre-dump bytes underneath
+        # ``<target>/ckpt-LEAF/pre_dump/parent/...``, which voids the whole
+        # point of chain sharing. The relative symlink resolves correctly
+        # once we plant the per-ancestor ``<target>/ckpt-PARENT`` symlinks
+        # below via ``Runtime.link_ancestor_pre_dump``.
         shutil.copytree(
             checkpoint_root / str(source_sandbox_id) / str(checkpoint_id),
             process_root,
             dirs_exist_ok=True,
+            symlinks=bool(preserve_symlinks),
         )
+        data["sandbox_id"] = str(target_sandbox_id)
+        data["process_checkpoint_location"] = str(process_root / "process")
+        status = data.get("status", {})
+        if isinstance(status, dict):
+            metadata = status.get("metadata", {})
+            if isinstance(metadata, dict):
+                metadata["sandbox_id"] = str(target_sandbox_id)
+                metadata["checkpoint_id"] = str(checkpoint_id)
+                metadata["bundle_path"] = str(bundle_root / str(target_sandbox_id))
+                metadata["image_path"] = str(process_root / "process")
+                metadata["work_path"] = str(process_root / "work")
+        return json.dumps(data, sort_keys=True, indent=2).encode("utf-8")
+
+    def _rewrite_process_artifact_linked(
+        self,
+        payload: bytes,
+        target_sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> bytes:
+        """Same JSON rewrite as ``_rewrite_process_artifact`` but skips the
+        ``shutil.copytree`` of the runtime checkpoint dir. Caller must have
+        already invoked ``Runtime.link_ancestor_pre_dump`` so the target
+        runtime path resolves to the source's image bytes via symlink. Used
+        when ``fork_chain_sharing_enabled`` is on for chain-ancestor entries.
+        """
+        bundle_root = self._effective_runtime_bundle_root()
+        checkpoint_root = self._effective_runtime_checkpoint_root()
+        data = json.loads(payload.decode("utf-8"))
+        process_root = checkpoint_root / str(target_sandbox_id) / str(checkpoint_id)
         data["sandbox_id"] = str(target_sandbox_id)
         data["process_checkpoint_location"] = str(process_root / "process")
         status = data.get("status", {})

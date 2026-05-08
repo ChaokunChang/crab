@@ -172,6 +172,15 @@ class RuncRestoreOptions:
     tcp_established: bool = True
     shell_job: bool = True
     ext_unix_sk: bool = True
+    # When True, ``runc restore`` is invoked with ``--lazy-pages``: CRIU
+    # maps process memory but defers page population behind a userfaultfd
+    # helper. Restore returns once metadata + the small eager page set are
+    # in place; the bulk of pages stream in on demand. The helper is spawned
+    # as a child of the restored process so cgroup cleanup on ``runc delete``
+    # reaps it automatically. Requires kernel ``unprivileged_userfaultfd=1``
+    # (or CAP_SYS_PTRACE in the runtime caps) and a runc + CRIU version that
+    # supports ``--lazy-pages``.
+    lazy_pages: bool = False
     extra_args: tuple[str, ...] = ()
 
 
@@ -244,6 +253,7 @@ class RuncRuntime(Runtime):
             supports_incremental_filesystem=True,
             supports_custom_checkpoint_dir=True,
             supports_incremental_process=True,
+            supports_lazy_restore=True,
         )
 
     def _resolve_launch_request(
@@ -1218,6 +1228,14 @@ class RuncRuntime(Runtime):
         work_path = self.process_work_path(sandbox_id, checkpoint_id)
         image_path.mkdir(parents=True, exist_ok=True)
         work_path.mkdir(parents=True, exist_ok=True)
+        lazy_daemon_pid: int | None = None
+        if self._restore_options.lazy_pages:
+            lazy_daemon_pid = self._spawn_lazy_pages_daemon(
+                sandbox_id=sandbox_id,
+                checkpoint_id=checkpoint_id,
+                image_path=image_path,
+                work_path=work_path,
+            )
         command = [self._runtime_bin, "--root", str(self._paths.state_root), "restore"]
         if self._restore_options.detach:
             command.append("-d")
@@ -1226,20 +1244,152 @@ class RuncRuntime(Runtime):
         )
         command.extend(self._restore_optional_args())
         command.append(str(sandbox_id))
-        return self._run_status(
-            command,
-            operation="sandbox.restore_process",
-            sandbox_id=sandbox_id,
-            checkpoint_id=checkpoint_id,
-            metadata={
-                "phase": "process_restore",
-                "runtime": self.name,
-                "image_path": str(image_path),
-                "work_path": str(work_path),
-                "bundle_path": str(self.bundle_path_for(sandbox_id)),
-                "state_root": str(self._paths.state_root),
-            },
+        try:
+            return self._run_status(
+                command,
+                operation="sandbox.restore_process",
+                sandbox_id=sandbox_id,
+                checkpoint_id=checkpoint_id,
+                metadata={
+                    "phase": "process_restore",
+                    "runtime": self.name,
+                    "image_path": str(image_path),
+                    "work_path": str(work_path),
+                    "bundle_path": str(self.bundle_path_for(sandbox_id)),
+                    "state_root": str(self._paths.state_root),
+                    "lazy_pages": bool(self._restore_options.lazy_pages),
+                    "lazy_pages_daemon_pid": lazy_daemon_pid,
+                },
+            )
+        except Exception:
+            # Restore raised before _run_status could return. Reap the daemon
+            # so it doesn't leak after a fork-prep failure.
+            if lazy_daemon_pid is not None:
+                self.reap_lazy_pages_daemon(lazy_daemon_pid)
+            raise
+
+    def _spawn_lazy_pages_daemon(
+        self,
+        *,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+        image_path: Path,
+        work_path: Path,
+    ) -> int | None:
+        """Start ``criu lazy-pages -D <image_path> -W <work_path>`` and wait
+        for the unix socket it writes (``lazy-pages.socket``) to appear in
+        the work dir, since ``runc restore --lazy-pages`` invokes CRIU which
+        connects to that socket on first userfaultfd page fault. Without
+        this, restore aborts with ``Error (criu/uffd.c): connect to
+        lazy-pages.socket failed: No such file or directory``.
+
+        Returns the daemon PID on success, or None when spawn or socket
+        wait fails — caller is responsible for falling back (or letting
+        the restore fail with a clear error).
+        """
+        log_path = work_path / "lazy-pages.log"
+        daemon_cmd = [
+            "criu",
+            "lazy-pages",
+            "-D",
+            str(image_path),
+            "-W",
+            str(work_path),
+        ]
+        try:
+            log_handle = open(log_path, "ab")
+        except OSError as exc:
+            logger.warning(
+                "Could not open lazy-pages log path=%s: %s",
+                log_path,
+                exc,
+            )
+            return None
+        try:
+            proc = subprocess.Popen(
+                daemon_cmd,
+                stdout=log_handle,
+                stderr=log_handle,
+                close_fds=True,
+            )
+        except OSError as exc:
+            logger.warning(
+                "Failed to spawn criu lazy-pages daemon sandbox=%s checkpoint=%s: %s",
+                sandbox_id,
+                checkpoint_id,
+                exc,
+            )
+            log_handle.close()
+            return None
+        finally:
+            # Once spawned, Popen has the fd; we can drop our copy. (The
+            # daemon will continue writing through Popen's inherited fd.)
+            log_handle.close()
+        socket_path = work_path / "lazy-pages.socket"
+        # Poll for the socket. CRIU usually creates it within a few ms; cap
+        # the wait so a misconfigured daemon doesn't wedge fork prep forever.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if socket_path.exists():
+                logger.debug(
+                    "criu lazy-pages daemon ready sandbox=%s checkpoint=%s pid=%d socket=%s",
+                    sandbox_id,
+                    checkpoint_id,
+                    proc.pid,
+                    socket_path,
+                )
+                return proc.pid
+            if proc.poll() is not None:
+                logger.warning(
+                    "criu lazy-pages daemon exited before socket appeared "
+                    "sandbox=%s checkpoint=%s pid=%d rc=%s log=%s",
+                    sandbox_id,
+                    checkpoint_id,
+                    proc.pid,
+                    proc.returncode,
+                    log_path,
+                )
+                return None
+            time.sleep(0.02)
+        logger.warning(
+            "Timed out waiting for criu lazy-pages socket sandbox=%s checkpoint=%s pid=%d socket=%s",
+            sandbox_id,
+            checkpoint_id,
+            proc.pid,
+            socket_path,
         )
+        # Best-effort kill so we don't leave a stuck daemon behind.
+        self.reap_lazy_pages_daemon(proc.pid)
+        return None
+
+    def reap_lazy_pages_daemon(self, pid: int | None) -> None:
+        """Idempotent SIGTERM→SIGKILL of a previously-spawned lazy-pages
+        daemon. Safe to call with None or after the daemon has already
+        exited on its own (CRIU's lazy-pages exits once all pages have
+        been faulted in by the restored process)."""
+        if pid is None:
+            return
+        try:
+            os.kill(pid, 15)  # SIGTERM
+        except ProcessLookupError:
+            return
+        except OSError as exc:
+            logger.debug("Failed to SIGTERM lazy-pages daemon pid=%d: %s", pid, exc)
+            return
+        # Brief grace, then SIGKILL if still alive.
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+        try:
+            os.kill(pid, 9)  # SIGKILL
+        except ProcessLookupError:
+            return
+        except OSError as exc:
+            logger.debug("Failed to SIGKILL lazy-pages daemon pid=%d: %s", pid, exc)
 
     def process_checkpoint_location(
         self,
@@ -1254,6 +1404,71 @@ class RuncRuntime(Runtime):
         checkpoint_id: CheckpointId,
     ) -> str | None:
         return str(self._paths.checkpoint_root / str(sandbox_id) / str(checkpoint_id) / "pre_dump")
+
+    def link_ancestor_pre_dump(
+        self,
+        source_sandbox_id: SandboxId,
+        target_sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> bool:
+        source_dir = self._paths.checkpoint_root / str(source_sandbox_id) / str(checkpoint_id)
+        if not source_dir.exists():
+            raise FileNotFoundError(
+                f"source checkpoint runtime dir missing for ancestor link: "
+                f"source={source_sandbox_id} target={target_sandbox_id} "
+                f"checkpoint={checkpoint_id} path={source_dir}"
+            )
+        target_dir = self._paths.checkpoint_root / str(target_sandbox_id) / str(checkpoint_id)
+        target_dir.parent.mkdir(parents=True, exist_ok=True)
+        if target_dir.is_symlink():
+            target_dir.unlink()
+        elif target_dir.exists():
+            # An earlier copy-mode fork prep may have populated this path.
+            # Reclaim it so the symlink takes precedence on retry.
+            shutil.rmtree(target_dir)
+        rel = os.path.relpath(source_dir, target_dir.parent)
+        os.symlink(rel, target_dir)
+        logger.debug(
+            "Linked ancestor checkpoint runtime dir source=%s target=%s "
+            "checkpoint=%s (target=%s -> %s)",
+            source_sandbox_id,
+            target_sandbox_id,
+            checkpoint_id,
+            target_dir,
+            rel,
+        )
+        return True
+
+    def materialize_linked_pre_dumps(self, sandbox_id: SandboxId) -> int:
+        sandbox_root = self._paths.checkpoint_root / str(sandbox_id)
+        if not sandbox_root.exists():
+            return 0
+        materialized = 0
+        for entry in sandbox_root.iterdir():
+            if not entry.is_symlink():
+                continue
+            try:
+                resolved = entry.resolve(strict=True)
+            except FileNotFoundError:
+                logger.warning(
+                    "Skipping dangling pre-dump symlink during materialization: %s",
+                    entry,
+                )
+                continue
+            tmp = entry.with_name(entry.name + ".materializing")
+            if tmp.exists():
+                shutil.rmtree(tmp)
+            shutil.copytree(resolved, tmp, symlinks=True)
+            entry.unlink()
+            tmp.replace(entry)
+            materialized += 1
+        if materialized:
+            logger.info(
+                "Materialized %d linked pre-dump dir(s) under sandbox=%s",
+                materialized,
+                sandbox_id,
+            )
+        return materialized
 
     def pre_dump_work_path(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> Path:
         return self._paths.checkpoint_root / str(sandbox_id) / str(checkpoint_id) / "pre_dump_work"
@@ -1903,6 +2118,8 @@ class RuncRuntime(Runtime):
             args.append("--shell-job")
         if self._restore_options.ext_unix_sk:
             args.append("--ext-unix-sk")
+        if self._restore_options.lazy_pages:
+            args.append("--lazy-pages")
         args.extend(self._restore_options.extra_args)
         return args
 
