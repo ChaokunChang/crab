@@ -1,0 +1,14 @@
+instruction: |-
+  Launch a Python HTTP server in the background that keeps an in-memory
+  counter, exercise it across turns, and write the result to a file.
+author_name: agent-cr
+author_email: dev@example.com
+difficulty: easy
+category: synthetic
+tags:
+  - benchmark
+  - synthetic
+parser_name: pytest
+max_agent_timeout_sec: 180.0
+max_test_timeout_sec: 30.0
+run_tests_in_same_shell: false

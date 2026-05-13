@@ -11,9 +11,14 @@ from threading import Lock
 # filter so the kernel never delivers events for it). scope="process_only"
 # suppresses ONLY the process-state-change signal — fs events from those
 # PIDs still flow to the daemon and `_handle_fs_event`. The latter is what
-# the terminus tmux integration uses: tmux's pane shell and every command
-# spawned inside the pane should not trip `process_changed` every turn,
-# but their file writes are real signal we want to keep counting.
+# the terminus tmux integration uses for the pane bash (matched as
+# basename="bash" AND ancestor="tmux"): bash's heap dirties on every
+# command parse and would otherwise trip `process_changed` every turn,
+# but its file writes (shell redirections) are real signal we keep
+# counting. Long-running non-bash tmux descendants (e.g. background
+# daemons the agent launches with `&`) are NOT matched and contribute
+# to `process_changed` normally, so their in-memory state is captured
+# by process checkpoints.
 SCOPE_ALL = "all"
 SCOPE_PROCESS_ONLY = "process_only"
 _VALID_SCOPES = (SCOPE_ALL, SCOPE_PROCESS_ONLY)

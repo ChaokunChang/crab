@@ -1,0 +1,135 @@
+{
+  "schema_version": "ATIF-v1.6",
+  "session_id": "bg-server-state-smoke-002",
+  "agent": {
+    "name": "terminus-2",
+    "version": "2.0.0",
+    "model_name": "synthetic/bg-server-state",
+    "extra": {"parser": "json", "temperature": 0.0}
+  },
+  "steps": [
+    {
+      "step_id": 1,
+      "timestamp": "2026-05-13T12:00:00.000000+00:00",
+      "source": "user",
+      "message": "Exercise a long-running tmux-descendant process across turns. Launch a Python HTTP server with an in-memory counter, query it twice (once printing to stdout, once appending to a file), then kill the server and verify the inspector observes the three distinct change patterns: full checkpoints while the server runs, an fs-only checkpoint when only the filesystem is touched, and a skipped checkpoint when nothing changes."
+    },
+    {
+      "step_id": 2,
+      "timestamp": "2026-05-13T12:00:03.000000+00:00",
+      "source": "agent",
+      "model_name": "synthetic/bg-server-state",
+      "message": "Analysis: Fresh /app shell. I need to write a small Python HTTP server that holds a counter in memory plus a background heap-churn thread, launch it with nohup &, and confirm it is listening.\nPlan: Write the server to /tmp/server.py, launch via nohup so it survives the pane, sleep 2s, then verify it is bound to 127.0.0.1:8765.",
+      "tool_calls": [
+        {
+          "tool_call_id": "t1_1",
+          "function_name": "bash_command",
+          "arguments": {
+            "keystrokes": "cat > /tmp/server.py <<'PY'\nimport threading, time, json, http.server, socketserver\nSTATE = {\"counter\": 0}\nHEAP_NOISE = []\ndef churn():\n    while True:\n        HEAP_NOISE.append(bytearray(64 * 1024))\n        if len(HEAP_NOISE) > 32:\n            del HEAP_NOISE[:16]\n        time.sleep(0.2)\nclass H(http.server.BaseHTTPRequestHandler):\n    def do_GET(self):\n        STATE[\"counter\"] += 1\n        body = json.dumps({\"counter\": STATE[\"counter\"]}).encode()\n        self.send_response(200)\n        self.send_header(\"Content-Length\", str(len(body)))\n        self.end_headers()\n        self.wfile.write(body)\n    def log_message(self, *a, **k):\n        return\nthreading.Thread(target=churn, daemon=True).start()\nwith socketserver.TCPServer((\"127.0.0.1\", 8765), H) as srv:\n    print(\"serving\", flush=True)\n    srv.serve_forever()\nPY\nnohup python3 /tmp/server.py > /tmp/server.log 2>&1 &\necho \"BG_PID=$!\"\nsleep 2\nss -lntp 2>/dev/null | grep 8765 || (echo '--- /tmp/server.log ---'; cat /tmp/server.log)\n",
+            "duration": 3.0
+          }
+        }
+      ]
+    },
+    {
+      "step_id": 3,
+      "timestamp": "2026-05-13T12:00:08.000000+00:00",
+      "source": "agent",
+      "model_name": "synthetic/bg-server-state",
+      "message": "Analysis: Server should be listening. Query it once and print to stdout. This turn should be a FULL checkpoint: the server's heap dirties (counter increments, heap-churn thread), the python urllib client also briefly enters tracked_pids, and the response goes to the pty (no fs write).\nPlan: One GET via urllib, body printed to stdout.",
+      "tool_calls": [
+        {
+          "tool_call_id": "t2_1",
+          "function_name": "bash_command",
+          "arguments": {
+            "keystrokes": "python3 -c \"import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8765/ask').read().decode())\"\n",
+            "duration": 2.0
+          }
+        }
+      ]
+    },
+    {
+      "step_id": 4,
+      "timestamp": "2026-05-13T12:00:13.000000+00:00",
+      "source": "agent",
+      "model_name": "synthetic/bg-server-state",
+      "message": "Analysis: Counter should now be 1. Query again and APPEND the JSON response to /tmp/result.txt to also produce a filesystem write. This turn should be a FULL checkpoint: server heap dirties AND a regular-file write fires from inside the tmux pane.\nPlan: One GET piped through shell redirection to /tmp/result.txt, then cat the file.",
+      "tool_calls": [
+        {
+          "tool_call_id": "t3_1",
+          "function_name": "bash_command",
+          "arguments": {
+            "keystrokes": "python3 -c \"import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8765/ask').read().decode())\" >> /tmp/result.txt\ncat /tmp/result.txt\n",
+            "duration": 2.0
+          }
+        }
+      ]
+    },
+    {
+      "step_id": 5,
+      "timestamp": "2026-05-13T12:00:18.000000+00:00",
+      "source": "agent",
+      "model_name": "synthetic/bg-server-state",
+      "message": "Analysis: Now kill the server so its pid drops out of tracked_pids. This turn should still be a FULL checkpoint because process_changed=True (tracked_pids: [server_pid] -> []), even though no real filesystem mutation happens.\nPlan: pkill -9 the server, sleep briefly so the kernel reaps it, confirm /tmp/server.py is no longer running.",
+      "tool_calls": [
+        {
+          "tool_call_id": "t4_1",
+          "function_name": "bash_command",
+          "arguments": {
+            "keystrokes": "pkill -9 -f /tmp/server.py\nsleep 1\nif pgrep -af /tmp/server.py >/dev/null; then echo SERVER_STILL_ALIVE; else echo SERVER_KILLED; fi\n",
+            "duration": 2.0
+          }
+        }
+      ]
+    },
+    {
+      "step_id": 6,
+      "timestamp": "2026-05-13T12:00:23.000000+00:00",
+      "source": "agent",
+      "model_name": "synthetic/bg-server-state",
+      "message": "Analysis: Server is gone, so tracked_pids should be empty and stable. Now perform a filesystem-only mutation with a bash-builtin redirect (no fork). The expected scheduler decision is fs-only: process_changed=False (no tracked pids dirty), filesystem_changed=True (write to a real /tmp file).\nPlan: Use bash's builtin echo + > redirection so no helper process is forked.",
+      "tool_calls": [
+        {
+          "tool_call_id": "t5_1",
+          "function_name": "bash_command",
+          "arguments": {
+            "keystrokes": "echo 'post-server content' > /tmp/another.txt\n",
+            "duration": 1.0
+          }
+        }
+      ]
+    },
+    {
+      "step_id": 7,
+      "timestamp": "2026-05-13T12:00:28.000000+00:00",
+      "source": "agent",
+      "model_name": "synthetic/bg-server-state",
+      "message": "Analysis: With no tracked process alive and no fs mutation, the next change-signal evaluation should produce no_change_signal -> should_checkpoint=False. Emit a noop bash-builtin command (echo to the pty, which the inspector classifies as a char-device write and drops).\nPlan: Plain echo to stdout, no redirection, no fork.",
+      "tool_calls": [
+        {
+          "tool_call_id": "t6_1",
+          "function_name": "bash_command",
+          "arguments": {
+            "keystrokes": "echo 'no-change turn: expected to be skipped by the scheduler'\n",
+            "duration": 1.0
+          }
+        }
+      ]
+    },
+    {
+      "step_id": 8,
+      "timestamp": "2026-05-13T12:00:33.000000+00:00",
+      "source": "agent",
+      "model_name": "synthetic/bg-server-state",
+      "message": "Analysis: Done. All four change patterns (full while server runs, full at kill, fs-only after kill, skip-on-noop) have been exercised.\nPlan: Mark the task complete.",
+      "tool_calls": [
+        {
+          "tool_call_id": "t7_1",
+          "function_name": "mark_task_complete",
+          "arguments": {}
+        }
+      ]
+    }
+  ],
+  "final_metrics": {}
+}

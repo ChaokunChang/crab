@@ -657,9 +657,14 @@ class HostInspectorServerTests(unittest.TestCase):
         leaves its fs events flowing — both the eBPF kernel filter and
         `_handle_fs_event` keep delivering them.
 
-        This is what the terminus tmux integration relies on: pane shell
-        + everything spawned inside the pane should not trip
-        process_changed every turn, but their file writes are real signal.
+        This mechanic is what the terminus tmux integration relies on
+        for its pane-bash rule (basename="bash" AND ancestor="tmux"):
+        the pane shell should not trip `process_changed` every turn from
+        heap-dirty noise, but its file writes are real signal. This test
+        exercises the scope=process_only mechanic generically against an
+        ancestor-only rule; the production terminus rule narrows the
+        match to bash so long-running non-bash tmux descendants (e.g.
+        background daemons) still contribute to `process_changed`.
         """
         resolver = FakeResolver()
         fs_monitor = FakeFilesystemMonitor()
@@ -743,10 +748,11 @@ class HostInspectorServerTests(unittest.TestCase):
             self.assertTrue(pid_matches_ignore_rules(555, rules, fs_only=True))
 
     def test_mmap_invalidation_scans_ignored_init_pid_under_tmux_rules(self) -> None:
-        """fault-7 regression: with the terminus tmux rules active, ALL
-        cgroup pids end up in `ignored_pids` (sleep is scope=all, tmux is
-        scope=all, every pane-bash descendant is scope=process_only via
-        ancestor=tmux). `tracked_pids` is empty.
+        """fault-7 regression: under the terminus tmux rules at idle, the
+        only cgroup pids are `sleep` (scope=all), the `tmux` server
+        (scope=all), and the pane `bash` (scope=process_only via
+        basename=bash + ancestor=tmux). All three land in `ignored_pids`
+        and `tracked_pids` is empty.
 
         When apt-get install rewrites libc.so.6, the eBPF link event must
         still fire mmap_invalidation because the long-lived `sleep

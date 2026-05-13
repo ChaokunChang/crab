@@ -284,6 +284,8 @@ python3 -m benchmarks.run --config benchmarks/examples/terminus/terminus.fault.a
 python3 -m benchmarks.run --config benchmarks/examples/terminus/terminus.spec.auto.10tasks.debug.yaml
 ```
 
+Authoring a custom one-task debug smoke (a hand-crafted trajectory + minimal sandbox, useful for verifying a specific inspector signal, scheduler decision, or checkpoint chain shape on a controlled workload) — see [`benchmarks/examples/debug/README.md`](/root/workspace/agent-cr/benchmarks/examples/debug/README.md). The `bg-server-state` files in that directory are a worked example.
+
 Each benchmark run is now driven by a YAML config. The top-level fields are:
 
 ```yaml

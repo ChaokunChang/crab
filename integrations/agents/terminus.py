@@ -1028,20 +1028,109 @@ class TerminusAgent(BaseAgent):
                 # uses scope="all" because tmux's own filesystem activity
                 # (sockets in /tmp, etc.) is not signal we care about.
                 {"executable_basename": "tmux"},
-                # Pane shell + every command it spawns: bash's heap pages
-                # get dirtied by parsing each new heredoc, and short-lived
-                # children (cat, gcc, make, ...) come and go between polls.
-                # Either of those would otherwise flip `process_changed=True`
-                # every turn and force a full process+fs checkpoint, which
-                # is the regression the user observed after the tmux
-                # migration. Use scope="process_only" so file writes from
-                # cat/tee/make/... still reach the fs-event pipeline and
-                # surface as filesystem_changed=True; the scheduler can then
-                # pick fs-only checkpoints (or skip) the way it did before
-                # tmux. CRIU still dumps and restores the entire pidns, so
-                # excluding these PIDs from the change-detection signal
-                # does not affect checkpoint correctness.
-                {"ancestor_executable_basename": "tmux", "scope": "process_only"},
+                # Filter ONLY the pane shell (bash whose ancestor is tmux),
+                # not every descendant of tmux. The criteria in a single
+                # `ProcessIgnoreRule` are AND'd in `matches()`, so this rule
+                # matches a process iff its basename is `bash` AND `tmux`
+                # appears anywhere on its parent chain — i.e., the long-lived
+                # bash inside the tmux pane plus any short-lived
+                # `bash -c "..."` subshells bash itself forks.
+                #
+                # Consequence of NOT having this rule:
+                #   Pane bash sits in the cgroup as a long-lived process and
+                #   stays in `tracked_pids`. Every command terminus sends is
+                #   forked from bash, which dirties bash's heap pages as it
+                #   parses the heredoc and builds argv. The soft-dirty bit
+                #   on those pages flips on every turn, so
+                #   `dirty_pids({bash_pid})` is non-empty every turn,
+                #   `process_changed=True` fires every turn, and the
+                #   scheduler promotes every checkpoint to a full
+                #   process+fs CRIU dump — the per-turn-full-checkpoint
+                #   regression observed after the tmux migration.
+                #
+                # Consequence of HAVING this rule:
+                #   Bash's process-state-change signal is suppressed, so the
+                #   scheduler can pick fs-only checkpoints on turns where
+                #   only bash's heap dirtied. The trade-off is that bash's
+                #   *in-memory* state (env vars, shell functions defined
+                #   in-session, current parser state) between two FULL
+                #   checkpoints is not preserved on fault recovery: bash
+                #   restores from whichever full checkpoint last fired,
+                #   even if later fs-only checkpoints ran. For terminus
+                #   that is acceptable because the user-meaningful pane
+                #   state (cwd, command output, history) is persisted to
+                #   disk or is reproducible from the agent's trace.
+                #
+                # Why this rule is narrowed to basename=bash (and NOT the
+                # broader `ancestor_executable_basename: tmux` shape used
+                # previously):
+                #   The prior shape silenced EVERY tmux descendant. That
+                #   correctly suppressed bash's heap-dirty noise, but also
+                #   dropped the process-changed signal from long-running
+                #   processes the agent itself launches with `&` (e.g.
+                #   `python -m http.server &`, sshd, custom daemons). Those
+                #   processes hold real, non-reproducible state in memory;
+                #   under the blanket rule their heap dirties were never
+                #   observed, so the scheduler never promoted a checkpoint
+                #   to full while they were running, and a fault recovery
+                #   restored the sandbox to a process state that predated
+                #   the daemon entirely while the filesystem advanced past
+                #   it. Pinning the basename to `bash` keeps the
+                #   bash-noise filter and lets every non-bash tmux
+                #   descendant contribute to `process_changed` normally.
+                #
+                # `scope="process_only"` preserves fs events from bash so
+                # shell redirections (`echo … > file`, heredoc `cat > f
+                # <<EOF`) still surface as `filesystem_changed=True`. CRIU
+                # dumps the entire pidns regardless of which PIDs the
+                # inspector classifies as "interesting," so this rule
+                # only affects WHEN a checkpoint fires, not WHAT it
+                # contains.
+                {
+                    "executable_basename": "bash",
+                    "ancestor_executable_basename": "tmux",
+                    "scope": "process_only",
+                },
+                # ---- OPTIONAL build-helper noise allowlist (disabled) -----
+                # Uncomment these to also silence the process-changed signal
+                # for common compile/link helpers (make, gcc, ld, cc1) when
+                # they run inside the tmux pane. Each rule ANDs basename
+                # with ancestor=tmux, so it only matches the in-pane
+                # invocation — a `make` launched outside the tmux subtree
+                # (e.g. by a long-running agent daemon) still trips
+                # process_changed.
+                #
+                # Consequence of ENABLING these rules:
+                #   For build-heavy turns (apt-get build-dep, configure +
+                #   make -jN) the scheduler stops promoting every poll to
+                #   a full process+fs checkpoint just because gcc/ld/cc1
+                #   spawned and dirtied their heap. Build helpers hold
+                #   no non-reproducible state — their work is captured by
+                #   the object files they emit, which the fs side already
+                #   reports. So dropping their process signal trades a
+                #   small recovery-window regression (in-flight compile
+                #   restarts from the last full checkpoint) for a large
+                #   reduction in full-checkpoint churn during builds.
+                #
+                # Consequence of LEAVING these rules disabled (current
+                # behaviour):
+                #   Long-running build helpers contribute their heap
+                #   dirties to `process_changed` and force a full
+                #   checkpoint at every poll while a build is in flight.
+                #   On a multi-minute `make -j`, that means many extra
+                #   CRIU dumps — most of them capturing throwaway gcc/ld
+                #   process state. Correct, just wasteful.
+                #
+                # Recommendation:
+                #   Leave commented until benchmarks show the build-noise
+                #   overhead is meaningful for your workload. Every entry
+                #   added here is a chance to silently drop real state
+                #   from some future workload that happens to spawn the
+                #   same basename as a long-lived helper.
+                # {"executable_basename": "make", "ancestor_executable_basename": "tmux", "scope": "process_only"},
+                # {"executable_basename": "gcc",  "ancestor_executable_basename": "tmux", "scope": "process_only"},
+                # {"executable_basename": "ld",   "ancestor_executable_basename": "tmux", "scope": "process_only"},
+                # {"executable_basename": "cc1",  "ancestor_executable_basename": "tmux", "scope": "process_only"},
             ]
         }
 
