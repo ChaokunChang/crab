@@ -817,6 +817,9 @@ class HostInspectorDaemon:
             fd = int(event.fd or -1)
             if fd < 0:
                 return False
+            resolved_path = str(event.path or "")
+            if resolved_path and not self._path_is_likely_persistent(resolved_path):
+                return False
             # Do not filter by fd number (1/2).  Shell redirection like
             # `cat > file` makes fd 1 point to a regular file, not a
             # terminal.  Rely on fd_kind instead — char/fifo/socket fds

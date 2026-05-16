@@ -2007,6 +2007,11 @@ class RuncRuntime(Runtime):
         # event — the path-prefix filter doesn't depend on the PID still
         # existing and catches the residual writes.
         ignored_path_prefixes = self._sandbox_ignored_path_prefixes(description.sandbox_id)
+        per_sandbox_path_prefixes = description.metadata.get("host_inspector_ignored_path_prefixes")
+        if isinstance(per_sandbox_path_prefixes, list):
+            for item in per_sandbox_path_prefixes:
+                if isinstance(item, str) and item and item not in ignored_path_prefixes:
+                    ignored_path_prefixes.append(item)
         for attempt in range(1, _HOST_INSPECTOR_REGISTER_ATTEMPTS + 1):
             try:
                 self._host_inspector_client.register_sandbox(
