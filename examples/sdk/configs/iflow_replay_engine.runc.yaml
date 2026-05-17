@@ -1,0 +1,101 @@
+# Engine-only SDK config derived from
+# benchmarks/examples/iflow/iflow.fault.auto.madoka.mini.yaml.
+#
+# This intentionally omits benchmark/user workload concerns such as scenario,
+# dataset, agent, LLM service, phase workers, iterations, CSV output, and
+# replay options. The SDK example owns task selection and uses an external LLM
+# replay service; this file only configures the in-process Agent-CR engine.
+
+runtime: runc
+run_id: sdk-iflow-replay-runc
+default_image: ubuntu:22.04
+
+# Similar to the benchmark's max_workers: 2, but scoped to the engine.
+max_workers: 2
+agent_worker_threads: 2
+
+network:
+  enable_sandbox_network: true
+  expected_sandboxes: 2
+
+interceptor:
+  enabled: true
+  host: 127.0.0.1
+  port: 0
+
+forwarder:
+  host: 127.0.0.1
+  port: 0
+
+# Benchmark YAML says zpool_name: agentcr-300. The SDK engine takes the more
+# direct runtime-manager form: a dataset prefix under that pool.
+zfs_dataset_prefix: agentcr-300/agent-cr-sdk-iflow-replay
+
+# Keep SDK engine data out of /tmp so successful runs leave inspectable state.
+storage_planes:
+  runtime_root: /root/workspace/agent-cr/data/agent_cr/sdk/iflow-replay-runc/runtime
+  storage_root: /root/workspace/agent-cr/data/agent_cr/sdk/iflow-replay-runc/storage
+  agent_state_root: /root/workspace/agent-cr/data/agent_cr/sdk/iflow-replay-runc/agent-state
+  work_dir_host_root: /root/workspace/agent-cr/data/agent_cr/sdk/iflow-replay-runc/work
+  image_cache_root: /root/workspace/agent-cr/data/agent_cr/sdk/iflow-replay-runc/image-cache
+
+executor:
+  max_workers: 2
+  checkpoint_workers: 2
+  restore_workers: 2
+  checkpoint_queue_size: 10000
+  max_retries: 0
+  retry_backoff_seconds: 0.05
+  coordination_workers: 2
+  composite_step_workers: 2
+
+scheduler:
+  min_checkpoint_interval_seconds: 0.0
+  force_checkpoint_after_seconds: 0.0
+  require_change_signal: true
+  checkpoint_full_baseline_on_first_checkpoint: true
+  prefer_checkpoint_during_llm_request: true
+  require_llm_request_for_checkpoint: false
+  inspect_without_pause: false
+  incremental_process_enabled: false
+  full_process_checkpoint_interval: 8
+  max_process_chain_length: 16
+
+# The SDK engine currently uses the in-process EBPFSandboxInspector. The
+# benchmark's host_inspector process/thread launcher remains benchmark-only
+# until the daemonized engine lands.
+host_inspector:
+  launch_mode: in_process
+
+runc:
+  command_timeout_seconds: 120.0
+  zfs_prepare_timeout_seconds: 300.0
+  checkpoint:
+    tcp_established: true
+    shell_job: true
+    tcp_skip_in_flight: true
+    ext_unix_sk: true
+  restore:
+    detach: true
+    tcp_established: true
+    shell_job: true
+    ext_unix_sk: true
+    lazy_pages: false
+
+telemetry:
+  output: /root/workspace/agent-cr/logs/sdk/iflow-replay-runc/engine.telemetry.jsonl
+  detail_level: detailed
+  capture_command_output: false
+  max_text_attribute_bytes: 2048
+  keep_in_memory_copy: false
+  writer_mode: async
+  queue_capacity: 16384000
+  batch_max_records: 256000
+  flush_interval_ms: 50
+  overflow_policy: drop_new
+  serializer: auto
+
+logging:
+  file: /root/workspace/agent-cr/logs/sdk/iflow-replay-runc/engine.log
+  level: debug
+  file_mode: write

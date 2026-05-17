@@ -30,3 +30,6 @@ benchmarks/evaluation
 logs.old
 test.png
 tmp/
+data
+results
+logs
