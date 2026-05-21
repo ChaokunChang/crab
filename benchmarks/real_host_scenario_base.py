@@ -121,6 +121,7 @@ _RUNTIME_LAUNCH_METADATA_LIST_KEYS = frozenset(
         "rootfs_init_dirs",
         "rootfs_copy_paths",
         "host_inspector_ignore_process_rules",
+        "host_inspector_ignored_path_prefixes",
     }
 )
 _VERIFICATION_UV_TRANSIENT_ERROR_FRAGMENTS = (

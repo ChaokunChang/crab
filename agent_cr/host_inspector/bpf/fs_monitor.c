@@ -290,6 +290,8 @@ static bool is_countable_fs_event(
        * writes still pass — fd_kind disambiguates them. */
       if (fd <= 0)
         return false;
+      if (primary_path && primary_path[0] != '\0' && !path_is_likely_persistent(primary_path))
+        return false;
       return fd_kind_is_mutating(fd_kind);
     /* Path-based mutations: unconditional keep. */
     case __NR_truncate:
@@ -1373,12 +1375,13 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
    * the duplicate Python check stays in place as a belt-and-suspenders
    * for any path that could regress (e.g. someone bypassing the helper
    * with a unit-test stub). */
+  const char *countable_primary_path = primary_path[0] != '\0' ? primary_path : fd_resolved_path;
   if (!is_countable_fs_event(
         event->syscall_nr,
         event->flags,
         event->fd,
         fd_kind,
-        primary_path,
+        countable_primary_path,
         secondary_path
       ))
     return 0;

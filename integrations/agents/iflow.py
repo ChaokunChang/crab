@@ -315,8 +315,18 @@ class IFlowAgent(BaseAgent):
 
     def extra_launch_metadata(self) -> dict[str, object]:
         metadata = self.sandbox.launch_metadata.get("iflow", {})
+        ignored_path_prefixes = [
+            f"{IFLOW_HOME_MOUNT_PATH}/",
+            f"{NPM_HOME_MOUNT_PATH}/",
+            f"{LOGS_MOUNT_PATH}/",
+        ]
+        for key in ("iflow_home", "npm_home", "logs_dir"):
+            raw_path = metadata.get(key)
+            if isinstance(raw_path, str) and raw_path:
+                ignored_path_prefixes.append(f"{raw_path.rstrip('/')}/")
         return {
             "host_inspector_ignore_process_rules": metadata.get("ignore_process_rules", []),
+            "host_inspector_ignored_path_prefixes": ignored_path_prefixes,
         }
 
     def rootfs_init_dirs(self) -> list[str]:

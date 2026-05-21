@@ -58,6 +58,7 @@ class PreparedIFlowRuntime:
                     f"{RUNTIME_MOUNT_PATH}/node/bin/node",
                     IFLOW_WRAPPER_ARG,
                 ],
+                "scope": "process_only",
             },
             {
                 "executable_basename": "node",
@@ -65,6 +66,7 @@ class PreparedIFlowRuntime:
                     f"{RUNTIME_MOUNT_PATH}/node/bin/node",
                     "@iflow-ai/iflow-cli/bundle/",
                 ],
+                "scope": "process_only",
             },
         ]
 

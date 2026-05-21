@@ -229,6 +229,7 @@ class ClaudeCodeAgent(BaseAgent):
                     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
                 ),
                 "PYTHONUNBUFFERED=1",
+                "PYTHONDONTWRITEBYTECODE=1",
                 "UV_USE_IO_URING=0",
                 f"HOME={CLAUDE_HOME_ROOT_MOUNT_PATH}",
                 f"ANTHROPIC_BASE_URL={api_base_url}",
@@ -373,8 +374,18 @@ class ClaudeCodeAgent(BaseAgent):
 
     def extra_launch_metadata(self) -> dict[str, object]:
         metadata = self.sandbox.launch_metadata.get("claude_code", {})
+        ignored_path_prefixes = [
+            f"{CLAUDE_HOME_ROOT_MOUNT_PATH}/",
+            f"{LOGS_MOUNT_PATH}/",
+            "/tmp/claude-",
+        ]
+        for key in ("claude_home_root", "claude_home", "logs_dir"):
+            raw_path = metadata.get(key)
+            if isinstance(raw_path, str) and raw_path:
+                ignored_path_prefixes.append(f"{raw_path.rstrip('/')}/")
         return {
             "host_inspector_ignore_process_rules": metadata.get("ignore_process_rules", []),
+            "host_inspector_ignored_path_prefixes": ignored_path_prefixes,
             "rootfs_copy_paths": [],
         }
 
