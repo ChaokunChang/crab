@@ -39,6 +39,28 @@ class IFlowAgent(Agent):
     default_image = _DEFAULT_IMAGE
     requires_network_namespace = True
 
+    # Host-inspector filters specific to the iFlow runtime. Callers pass
+    # these to `Sandbox(host_inspector_ignore_process_rules=..., ...)` so
+    # the change signal isn't dominated by the agent's own bookkeeping.
+    # Mirrors integrations/sandboxes/iflow/harness.py:PreparedIFlowRuntime.
+    HOST_INSPECTOR_IGNORE_PROCESS_RULES: tuple[dict[str, object], ...] = (
+        {
+            "executable_basename": "node",
+            "cmdline_contains": [_NODE, "--agent-cr-iflow-wrapper"],
+            "scope": "process_only",
+        },
+        {
+            "executable_basename": "node",
+            "cmdline_contains": [_NODE, "@iflow-ai/iflow-cli/bundle/"],
+            "scope": "process_only",
+        },
+    )
+    HOST_INSPECTOR_IGNORED_PATH_PREFIXES: tuple[str, ...] = (
+        "/root/.iflow/",
+        "/root/.npm/",
+        "/opt/iflow-logs/",
+    )
+
     def __init__(
         self,
         *,
@@ -75,7 +97,7 @@ class IFlowAgent(Agent):
         )
         prepared_state = prepare_iflow_state(
             work_root=state_root,
-            base_url=sbx.openai_base_url or "",
+            base_url=self.openai_base_url or "",
             model_name=self._model,
             max_session_turns=self._max_session_turns,
             telemetry=sbx.engine.system.telemetry,
@@ -93,13 +115,15 @@ class IFlowAgent(Agent):
         logger.info("Installed iFlow SDK runtime into sandbox %s", sbx.sandbox_id)
 
     def execute(self, sbx: "Sandbox", task: str) -> TaskResult:
-        env = {
-            "PATH": "/opt/iflow-runtime/global/bin:/opt/iflow-runtime/node/bin:/usr/local/bin:/usr/bin:/bin",
-            "HOME": "/root",
-            "IFLOW_NON_INTERACTIVE": "true",
-            "UV_USE_IO_URING": "0",
-            "OPENAI_API_KEY": os.environ.get("AGENT_CR_IFLOW_API_KEY", "sk-agent-cr-iflow"),
-        }
+        env = self.command_env(
+            {
+                "PATH": "/opt/iflow-runtime/global/bin:/opt/iflow-runtime/node/bin:/usr/local/bin:/usr/bin:/bin",
+                "HOME": "/root",
+                "IFLOW_NON_INTERACTIVE": "true",
+                "UV_USE_IO_URING": "0",
+                "OPENAI_API_KEY": os.environ.get("AGENT_CR_IFLOW_API_KEY", "sk-agent-cr-iflow"),
+            }
+        )
         result = sbx.commands.run(
             argv=[_NODE, _ENTRYPOINT, "-p", task],
             cwd=sbx.process_cwd,

@@ -21,10 +21,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import subprocess
+import sys
 import tempfile
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import time
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
@@ -41,6 +44,7 @@ from .interceptor import (
     RequestAwareSandboxInspector,
     SandboxResponseGateRegistry,
 )
+from .remote_inspector import HostInspectorServiceClient, RemoteSandboxInspector
 from .runtime import (
     RuncCheckpointOptions,
     RuncRestoreOptions,
@@ -117,6 +121,38 @@ def _as_float(value: object, *, default: float) -> float:
     if value is None:
         return default
     return float(value)
+
+
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _wait_for_http_json(url: str, *, timeout_s: float = 30.0) -> dict[str, object]:
+    deadline = time.time() + timeout_s
+    last_exc: Exception | None = None
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=2.0) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(0.2)
+    raise RuntimeError(f"timed out waiting for {url}: {last_exc}")
+
+
+def _read_log_tail(path: Path | None, *, max_bytes: int = 8192) -> str:
+    if path is None:
+        return ""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes))
+            return fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 def _load_yaml_mapping(path: Path) -> Mapping[str, Any]:
@@ -348,8 +384,24 @@ class EngineConfig:
     log_file_mode: str = "append"
     """`append` or `write` when `log_file` is set."""
 
-    agent_worker_threads: int = 4
-    """Max concurrent `agent.run()` invocations across all sandboxes."""
+    host_inspector_launch_mode: str = "in_process"
+    """`in_process` uses the lightweight `EBPFSandboxInspector` (no real
+    eBPF events — useful for tests). `process` launches the real
+    `agent_cr.host_inspector.server` as a subprocess and routes inspection
+    through a `RemoteSandboxInspector`. `thread` runs the same daemon
+    in-thread."""
+
+    host_inspector_host: str = "127.0.0.1"
+    host_inspector_port: int = 0
+    """0 means pick a free port automatically when launching the real
+    host inspector."""
+
+    host_inspector_log_level: str = "INFO"
+    host_inspector_log_file: Path | None = None
+    """When the real host inspector is launched, write its stdout/stderr
+    to this file. The engine also writes a `host-inspector.stderr.log`
+    sibling so the subprocess output is recoverable when --log-file is
+    unset."""
 
     extra: dict[str, object] = field(default_factory=dict)
 
@@ -372,6 +424,7 @@ class EngineConfig:
         interceptor = _optional_mapping(data.get("interceptor"), label="interceptor")
         forwarder = _optional_mapping(data.get("forwarder"), label="forwarder")
         logging_config = _optional_mapping(data.get("logging"), label="logging")
+        host_inspector = _optional_mapping(data.get("host_inspector"), label="host_inspector")
 
         default_workers = _as_int(data.get("max_workers"), default=None)
         executor_data = _optional_mapping(data.get("executor"), label="executor")
@@ -419,6 +472,21 @@ class EngineConfig:
             data.get("log_file_mode", logging_config.get("file_mode", logging_config.get("log_file_mode", "append")))
         ).strip().lower()
 
+        host_inspector_launch_mode = str(
+            host_inspector.get("launch_mode", "in_process")
+        ).strip().lower()
+        host_inspector_host = str(host_inspector.get("host", "127.0.0.1"))
+        host_inspector_port = int(host_inspector.get("port", 0))
+        host_inspector_log_level = str(host_inspector.get("log_level", "INFO")).upper()
+        host_inspector_log_file_raw = host_inspector.get("log_file")
+        if isinstance(host_inspector_log_file_raw, bool):
+            host_inspector_log_file = None
+        else:
+            host_inspector_log_file = _resolve_config_path(
+                host_inspector_log_file_raw,
+                base_dir=config_base_dir,
+            )
+
         return cls(
             runtime=str(data.get("runtime", "runc")),
             run_id=None if data.get("run_id") is None else str(data.get("run_id")),
@@ -457,19 +525,23 @@ class EngineConfig:
             log_file=log_file,
             log_level=log_level,
             log_file_mode=log_file_mode,
-            agent_worker_threads=int(data.get("agent_worker_threads", default_workers or 4)),
+            host_inspector_launch_mode=host_inspector_launch_mode,
+            host_inspector_host=host_inspector_host,
+            host_inspector_port=host_inspector_port,
+            host_inspector_log_level=host_inspector_log_level,
+            host_inspector_log_file=host_inspector_log_file,
             extra={
                 key: value
                 for key, value in data.items()
                 if key
                 not in {
                     "agent_state_root",
-                    "agent_worker_threads",
                     "default_image",
                     "enable_interceptor",
                     "enable_sandbox_network",
                     "executor",
                     "forwarder",
+                    "host_inspector",
                     "image_cache_root",
                     "interceptor",
                     "interceptor_host",
@@ -524,8 +596,11 @@ class Engine:
         self._forwarder_server = None
         self._forwarder_thread: threading.Thread | None = None
         self._forwarder_base_url: str | None = None
-        self._agent_pool: ThreadPoolExecutor | None = None
         self._network_manager = None
+        self._host_inspector_client: HostInspectorServiceClient | None = None
+        self._host_inspector_process: subprocess.Popen[str] | None = None
+        self._host_inspector_server: Any = None
+        self._host_inspector_process_log_path: Path | None = None
         self._sandboxes: "dict[SandboxId, Sandbox]" = {}
         self._sandbox_lock = threading.Lock()
 
@@ -588,6 +663,7 @@ class Engine:
                 self._network_manager = network_manager
 
             if cfg.runtime == "runc":
+                self._start_host_inspector_if_configured()
                 self._system = self._build_runc_system(storage_root)
             else:
                 self._system = build_default_system(
@@ -653,10 +729,6 @@ class Engine:
                 )
 
             self._system.start()
-            self._agent_pool = ThreadPoolExecutor(
-                max_workers=max(1, cfg.agent_worker_threads),
-                thread_name_prefix="agentcr-agent",
-            )
             self._started = True
 
     def _configure_logging(self, cfg: EngineConfig) -> None:
@@ -713,14 +785,22 @@ class Engine:
             paths=paths,
             options=cfg.runc_options,
             telemetry=telemetry,
+            host_inspector_client=self._host_inspector_client,
         )
         storage_cfg = cfg.storage_config or StorageConfig(root_dir=storage_root)
         storage = LocalCheckpointManager(
             storage_cfg,
             runtime_image_path_in_use=runtime.runtime_image_path_in_use,
         )
+        if self._host_inspector_client is not None:
+            base_inspector = RemoteSandboxInspector(
+                self._host_inspector_client,
+                telemetry=telemetry,
+            )
+        else:
+            base_inspector = EBPFSandboxInspector()
         inspector = RequestAwareSandboxInspector(
-            EBPFSandboxInspector(),
+            base_inspector,
             self._request_state_store,
         )
         executor_cfg = cfg.executor_config or ExecutorConfig()
@@ -762,6 +842,169 @@ class Engine:
             request_state_store=self._request_state_store,
             response_gate_registry=response_gate_registry,
         )
+
+    def _start_host_inspector_if_configured(self) -> None:
+        cfg = self._config
+        mode = (cfg.host_inspector_launch_mode or "in_process").strip().lower()
+        if mode in {"", "in_process", "in-process", "inproc", "fake"}:
+            return
+        if mode not in {"process", "thread"}:
+            raise ValueError(
+                f"unsupported host_inspector.launch_mode={cfg.host_inspector_launch_mode!r}; "
+                "expected 'in_process', 'process', or 'thread'"
+            )
+        assert self._runtime_root is not None
+        runc_state_root = (
+            cfg.runc_paths.state_root
+            if cfg.runc_paths is not None
+            else self._runtime_root / "runtime-state"
+        )
+        runc_state_root.mkdir(parents=True, exist_ok=True)
+        host = cfg.host_inspector_host or "127.0.0.1"
+        if mode == "process":
+            url = self._launch_host_inspector_process(
+                runc_state_root=runc_state_root,
+                host=host,
+                port=cfg.host_inspector_port,
+            )
+        else:
+            url = self._launch_host_inspector_thread(
+                runc_state_root=runc_state_root,
+                host=host,
+                port=cfg.host_inspector_port,
+            )
+        self._host_inspector_client = HostInspectorServiceClient(url)
+        logger.info("Host inspector ready at %s (launch_mode=%s)", url, mode)
+
+    def _launch_host_inspector_process(
+        self,
+        *,
+        runc_state_root: Path,
+        host: str,
+        port: int,
+    ) -> str:
+        cfg = self._config
+        resolved_port = port if port > 0 else _find_free_port()
+        log_path = (
+            cfg.host_inspector_log_file
+            if cfg.host_inspector_log_file is not None
+            else self._default_host_inspector_stderr_log()
+        )
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._host_inspector_process_log_path = log_path
+        command = [
+            sys.executable,
+            "-m",
+            "agent_cr.host_inspector.server",
+            "--host",
+            host,
+            "--port",
+            str(resolved_port),
+            "--runc-state-root",
+            str(runc_state_root),
+            "--max-workers",
+            str(max(1, int(self._config.executor_config.max_workers if self._config.executor_config else 4))),
+            "--log-level",
+            cfg.host_inspector_log_level or "INFO",
+        ]
+        if cfg.host_inspector_log_file is not None:
+            command.extend(["--log-file", str(cfg.host_inspector_log_file)])
+        log_fh = open(log_path, "w", encoding="utf-8")
+        try:
+            self._host_inspector_process = subprocess.Popen(
+                command,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        finally:
+            log_fh.close()
+        url = f"http://{host}:{resolved_port}"
+        try:
+            _wait_for_http_json(f"{url}/healthz")
+        except Exception as exc:
+            if (
+                self._host_inspector_process is not None
+                and self._host_inspector_process.poll() is not None
+            ):
+                returncode = self._host_inspector_process.returncode
+                stderr_tail = _read_log_tail(self._host_inspector_process_log_path)
+                self._stop_host_inspector()
+                raise RuntimeError(
+                    f"host inspector failed to start exit_code={returncode} stderr={stderr_tail.strip()}"
+                ) from exc
+            self._stop_host_inspector()
+            raise
+        return url
+
+    def _launch_host_inspector_thread(
+        self,
+        *,
+        runc_state_root: Path,
+        host: str,
+        port: int,
+    ) -> str:
+        from .host_inspector.fs_helper import LibbpfFilesystemMonitor
+        from .host_inspector.runtime_resolver import RuntimeResolver
+        from .host_inspector.server import HostInspectorDaemon, HostInspectorServer
+
+        daemon = HostInspectorDaemon(
+            resolver=RuntimeResolver(runc_state_root=runc_state_root),
+            fs_monitor=LibbpfFilesystemMonitor(),
+        )
+        max_workers = max(
+            1,
+            int(self._config.executor_config.max_workers if self._config.executor_config else 4),
+        )
+        server = HostInspectorServer(
+            host=host,
+            port=port,
+            daemon=daemon,
+            max_workers=max_workers,
+        )
+        server.start()
+        self._host_inspector_server = server
+        url = f"http://{host}:{server.port}"
+        try:
+            _wait_for_http_json(f"{url}/healthz")
+        except Exception:
+            self._stop_host_inspector()
+            raise
+        return url
+
+    def _default_host_inspector_stderr_log(self) -> Path:
+        if self._config.log_file is not None:
+            return self._config.log_file.parent / "host-inspector.stderr.log"
+        assert self._runtime_root is not None
+        return self._runtime_root / "host-inspector.stderr.log"
+
+    def _stop_host_inspector(self) -> None:
+        server = self._host_inspector_server
+        self._host_inspector_server = None
+        if server is not None:
+            try:
+                server.stop()
+            except Exception:
+                logger.exception("Host inspector server stop failed")
+        process = self._host_inspector_process
+        self._host_inspector_process = None
+        if process is not None:
+            try:
+                process.terminate()
+                try:
+                    process.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5.0)
+            except Exception:
+                logger.exception("Host inspector subprocess stop failed")
+        client = self._host_inspector_client
+        self._host_inspector_client = None
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                logger.debug("Host inspector client close failed", exc_info=True)
 
     def _effective_interceptor_host(self, configured_host: str) -> str:
         if configured_host not in {"127.0.0.1", "localhost"}:
@@ -827,9 +1070,6 @@ class Engine:
             except Exception:
                 logger.debug("Best-effort sandbox kill failed during engine stop", exc_info=True)
         with self._lock:
-            if self._agent_pool is not None:
-                self._agent_pool.shutdown(wait=False)
-                self._agent_pool = None
             if self._interceptor is not None:
                 try:
                     self._interceptor.stop()
@@ -860,6 +1100,7 @@ class Engine:
                 except Exception:
                     logger.exception("AgentCRSystem stop failed")
                 self._system = None
+            self._stop_host_inspector()
             if self._tempdir is not None and self._owns_storage_dir:
                 try:
                     self._tempdir.cleanup()
@@ -933,12 +1174,6 @@ class Engine:
         if self._interceptor is None:
             return None
         return self._interceptor.base_url
-
-    @property
-    def agent_pool(self) -> ThreadPoolExecutor:
-        if self._agent_pool is None:
-            raise RuntimeError("engine is not started")
-        return self._agent_pool
 
     # ------------------------------------------------------------------
     # Per-sandbox upstream URL bookkeeping (delegates to the SDK forwarder

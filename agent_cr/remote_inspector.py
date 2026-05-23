@@ -58,6 +58,26 @@ class HostInspectorServiceClient:
     def unregister_sandbox(self, sandbox_id: SandboxId) -> dict[str, object]:
         return self._post("/unregister", {"sandbox_id": str(sandbox_id)})
 
+    def update_filters(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        ignore_process_rules: list[dict[str, object]] | None = None,
+        ignored_path_prefixes: list[str] | None = None,
+    ) -> dict[str, object]:
+        """Update ignore rules / path prefixes on an already-registered
+        sandbox without resetting baseline pids or accumulated dirty state.
+
+        Use this when an Agent attaches to an existing Sandbox and wants
+        to add its own filters on top of the sandbox-default set; for the
+        initial registration use `register_sandbox` instead."""
+        payload: dict[str, object] = {"sandbox_id": str(sandbox_id)}
+        if ignore_process_rules is not None:
+            payload["ignore_process_rules"] = ignore_process_rules
+        if ignored_path_prefixes is not None:
+            payload["ignored_path_prefixes"] = ignored_path_prefixes
+        return self._post("/update_filters", payload)
+
     def get_proc_and_fs_status(self, sandbox_id: SandboxId) -> dict[str, object]:
         return self._post("/get_proc_and_fs_status", {"sandbox_id": str(sandbox_id)})
 

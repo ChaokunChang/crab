@@ -60,6 +60,18 @@ _HOP_BY_HOP_HEADERS = frozenset(
 )
 
 
+def _join_upstream_url(upstream: str, path: str) -> str:
+    """Join provider base URLs with interceptor paths.
+
+    OpenAI-compatible APIs are commonly configured as `https://host/v1`, while
+    the interceptor forwards paths like `/v1/chat/completions`. Accept that
+    conventional base URL without producing `/v1/v1/...`.
+    """
+    if upstream.endswith("/v1") and path.startswith("/v1/"):
+        return upstream + path[len("/v1"):]
+    return upstream + path
+
+
 class SdkLLMForwarder:
     """Per-sandbox upstream URL registry + raw-bytes passthrough."""
 
@@ -108,7 +120,7 @@ class SdkLLMForwarder:
                 f'{{"error":"no upstream registered for sandbox_id={sandbox_id!r}"}}'
             ).encode("utf-8")
             return 502, [("Content-Type", "application/json")], payload
-        target_url = upstream + path
+        target_url = _join_upstream_url(upstream, path)
         forwarded_headers = {
             key: value
             for key, value in headers.items()

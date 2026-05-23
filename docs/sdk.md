@@ -90,17 +90,7 @@ finishes and returns a `TaskResult` with `exit_code`, `output`, and free-form
 `extra` data the agent fills in.
 
 ```python
-result = agent.run("Refactor utils.py", timeout=600)
-print(result.exit_code, result.output, result.extra)
-```
-
-Use `agent.run_async(task)` only when you intentionally want a background
-host-side task handle:
-
-```python
-task = agent.run_async("Refactor utils.py")
-print(task.done())
-result = task.wait(timeout=600)
+result = agent.run("Refactor utils.py")
 print(result.exit_code, result.output, result.extra)
 ```
 
@@ -120,7 +110,11 @@ class MyAgent(Agent):
         sbx.commands.run("pipx install my-agent", check=True)
 
     def execute(self, sbx, task):                        # required
-        result = sbx.commands.run(f"my-agent -p {task!r}", check=True)
+        result = sbx.commands.run(
+            f"my-agent -p {task!r}",
+            env=self.command_env(),
+            check=True,
+        )
         return TaskResult(exit_code=result.returncode, output=result.stdout)
 ```
 
@@ -193,7 +187,6 @@ with Engine.start("examples/sdk/configs/iflow_replay_engine.runc.yaml") as engin
 | `storage_root`         | Checkpoint storage. Defaults to a tempdir.                 |
 | `interceptor_host/port`| Where the LLM interceptor binds. `0` picks a free port.    |
 | `enable_interceptor`   | Disable when no agents talk to an LLM.                     |
-| `agent_worker_threads` | Max concurrent `agent.run()` invocations.                  |
 | `telemetry_config`     | Optional JSONL telemetry sink for engine/runtime events.   |
 | `log_file/log_level`   | Optional SDK engine log file configuration.                |
 
@@ -233,20 +226,20 @@ When you pass `llm_url=...` to `agent.bind(sbx, ...)`, the engine:
 
 1. Registers the upstream URL under this sandbox in the forwarder.
 2. Sets `ANTHROPIC_BASE_URL` (or `OPENAI_BASE_URL`, depending on the
-   agent's `llm_protocol`) inside the sandbox env to the interceptor URL.
-3. Sets the same env vars in the host-side `agent.run()` thread context so
-   on-host agents using vendor SDKs (anthropic, openai) pick up the
-   interceptor URL with zero code changes.
+   agent's `llm_protocol`) in the process env while `agent.run()` calls
+   `agent.execute(...)`.
+3. Exposes the same values through `agent.command_env(...)` so in-sandbox
+   CLIs can receive them via `sbx.commands.run(..., env=agent.command_env())`.
 4. Stamps every outbound LLM call with `X-Agent-Sandbox-Id` so the
    forwarder can route to the right upstream — sandbox identity flows
    through whether the agent runs in-sandbox (interceptor IP-resolves) or
    on-host (interceptor sees an explicit header).
 
-You do not need to write any LLM-related plumbing in your agent code. If
-your agent SDK does not read env vars, construct the client explicitly:
+If your host-side agent SDK does not read env vars, construct the client
+explicitly:
 
 ```python
-client = anthropic.Anthropic(base_url=sbx.llm_base_url)
+client = anthropic.Anthropic(base_url=agent.llm_base_url)
 ```
 
 ## Running the examples

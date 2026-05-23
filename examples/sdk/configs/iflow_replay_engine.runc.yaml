@@ -12,7 +12,6 @@ default_image: ubuntu:22.04
 
 # Similar to the benchmark's max_workers: 2, but scoped to the engine.
 max_workers: 2
-agent_worker_threads: 2
 
 network:
   enable_sandbox_network: true
@@ -61,11 +60,15 @@ scheduler:
   full_process_checkpoint_interval: 8
   max_process_chain_length: 16
 
-# The SDK engine currently uses the in-process EBPFSandboxInspector. The
-# benchmark's host_inspector process/thread launcher remains benchmark-only
-# until the daemonized engine lands.
+# Launch the real host inspector as a subprocess so the engine sees actual
+# eBPF process/filesystem change signals. `in_process` falls back to the
+# fake EBPFSandboxInspector (no real events — fine for unit tests).
 host_inspector:
-  launch_mode: in_process
+  launch_mode: process
+  host: 127.0.0.1
+  port: 0
+  log_level: DEBUG
+  log_file: /root/workspace/agent-cr/logs/sdk/iflow-replay-runc/host-inspector.log
 
 runc:
   command_timeout_seconds: 120.0

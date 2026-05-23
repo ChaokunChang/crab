@@ -10,7 +10,6 @@ import unittest
 
 from agent_cr.agent import (
     Agent,
-    Task,
     TaskResult,
     list_agents,
     register_agent,
@@ -116,19 +115,6 @@ class TestAgentNamespace(unittest.TestCase):
             self.assertEqual(self.engine._lookup_upstream(sbx.sandbox_id), "https://api.example")
             result = agent.run("bound task")
             self.assertEqual(result.output, "echoed: bound task")
-            self.assertEqual(agent.status()["state"], "done")
-        finally:
-            sbx.kill()
-
-    def test_attach_agent_method(self) -> None:
-        sbx = Sandbox(image="ubuntu:22.04", engine=self.engine)
-        profile = _EchoAgent()
-        try:
-            attached = sbx.attach_agent(profile, llm_url="https://api.example")
-            self.assertIs(attached, profile)
-            self.assertTrue(profile.installed)
-            self.assertIs(profile.sandbox, sbx)
-            self.assertEqual(profile.run("attached method").output, "echoed: attached method")
         finally:
             sbx.kill()
 
@@ -155,50 +141,25 @@ class TestAgentNamespace(unittest.TestCase):
         finally:
             sbx.kill()
 
-    def test_concurrent_task_rejected(self) -> None:
-        import threading
-
-        class _SlowAgent(Agent):
-            name = "test-slow"
-            llm_protocol = "openai"
-
-            def __init__(self) -> None:
-                self.proceed = threading.Event()
-
-            def execute(self, sbx, task):
-                self.proceed.wait(timeout=5.0)
-                return TaskResult(output="done")
-
-        agent = _SlowAgent()
-        sbx = Sandbox(engine=self.engine)
-        try:
-            agent.bind(sbx)
-            t1 = agent.run_async("task one")
-            with self.assertRaises(RuntimeError):
-                agent.run_async("task two")
-            agent.proceed.set()
-            t1.wait()
-        finally:
-            sbx.kill()
-
     def test_no_agent_attached(self) -> None:
         sbx = Sandbox(image="ubuntu:22.04", engine=self.engine)
         agent = _EchoAgent()
         try:
             with self.assertRaises(RuntimeError):
                 agent.run("nope")
-            self.assertEqual(sbx._agent_status(), {"state": "idle"})
         finally:
             sbx.kill()
 
-    def test_status_transitions(self) -> None:
+    def test_command_env_is_agent_owned(self) -> None:
         agent = _EchoAgent()
         sbx = Sandbox(engine=self.engine)
         try:
-            agent.bind(sbx)
-            self.assertEqual(agent.status()["state"], "idle")
-            agent.run("hello")
-            self.assertEqual(agent.status()["state"], "done")
+            agent.bind(sbx, llm_url="https://api.example")
+            env = agent.command_env({"EXTRA": "1"})
+            self.assertEqual(env["OPENAI_BASE_URL"], f"{self.engine.interceptor_base_url}/v1")
+            self.assertEqual(env["OPENAI_API_BASE"], f"{self.engine.interceptor_base_url}/v1")
+            self.assertEqual(env["AGENT_CR_SANDBOX_ID"], str(sbx.sandbox_id))
+            self.assertEqual(env["EXTRA"], "1")
         finally:
             sbx.kill()
 
@@ -237,55 +198,6 @@ class TestAgentRegistry(unittest.TestCase):
     def test_blank_name_rejected(self) -> None:
         with self.assertRaises(ValueError):
             register_agent("", _EchoAgent)
-
-
-class TestTaskHandle(unittest.TestCase):
-    def setUp(self) -> None:
-        self.engine = Engine.start(EngineConfig(runtime="docker"))
-
-    def tearDown(self) -> None:
-        self.engine.stop()
-        shutdown_default_engine()
-
-    def test_task_returns_result(self) -> None:
-        agent = _EchoAgent()
-        sbx = Sandbox(engine=self.engine)
-        try:
-            agent.bind(sbx)
-            t = agent.run_async("payload")
-            self.assertIsInstance(t, Task)
-            r = t.wait()
-            self.assertIsInstance(r, TaskResult)
-            self.assertEqual(r.output, "echoed: payload")
-            self.assertEqual(r.extra["len"], 7)
-        finally:
-            sbx.kill()
-
-    def test_task_result_property_after_wait(self) -> None:
-        agent = _EchoAgent()
-        sbx = Sandbox(engine=self.engine)
-        try:
-            agent.bind(sbx)
-            t = agent.run_async("x")
-            t.wait()
-            self.assertTrue(t.done())
-            self.assertEqual(t.result.output, "echoed: x")
-        finally:
-            sbx.kill()
-
-    def test_task_result_property_before_done_raises(self) -> None:
-        agent = _EchoAgent()
-        sbx = Sandbox(engine=self.engine)
-        try:
-            agent.bind(sbx)
-            t = agent.run_async("y")
-            # The task may not yet have started; result access must raise.
-            if not t.done():
-                with self.assertRaises(RuntimeError):
-                    _ = t.result
-            t.wait()
-        finally:
-            sbx.kill()
 
 
 class TestEngineLifecycle(unittest.TestCase):

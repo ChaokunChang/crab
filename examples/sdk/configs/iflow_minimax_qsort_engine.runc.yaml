@@ -1,0 +1,89 @@
+# Engine-only SDK config for the real MiniMax + iFlow qsort example.
+# The example owns the agent, task, and LLM endpoint; this file only configures
+# the local in-process Agent-CR engine.
+
+runtime: runc
+run_id: sdk-iflow-minimax-qsort-runc
+default_image: ubuntu:22.04
+
+max_workers: 1
+
+network:
+  enable_sandbox_network: true
+  expected_sandboxes: 1
+
+interceptor:
+  enabled: true
+  host: 127.0.0.1
+  port: 0
+
+forwarder:
+  host: 127.0.0.1
+  port: 0
+
+zfs_dataset_prefix: agentcr-300/agent-cr-sdk-iflow-minimax-qsort
+
+storage_planes:
+  runtime_root: /root/workspace/agent-cr/data/agent_cr/sdk/iflow-minimax-qsort-runc/runtime
+  storage_root: /root/workspace/agent-cr/data/agent_cr/sdk/iflow-minimax-qsort-runc/storage
+  agent_state_root: /root/workspace/agent-cr/data/agent_cr/sdk/iflow-minimax-qsort-runc/agent-state
+  work_dir_host_root: /root/workspace/agent-cr/data/agent_cr/sdk/iflow-minimax-qsort-runc/work
+  image_cache_root: /root/workspace/agent-cr/data/agent_cr/sdk/iflow-minimax-qsort-runc/image-cache
+
+executor:
+  max_workers: 1
+  checkpoint_workers: 1
+  restore_workers: 1
+  checkpoint_queue_size: 1000
+  max_retries: 0
+  retry_backoff_seconds: 0.05
+  coordination_workers: 1
+  composite_step_workers: 1
+
+scheduler:
+  min_checkpoint_interval_seconds: 0.0
+  force_checkpoint_after_seconds: 0.0
+  require_change_signal: true
+  checkpoint_full_baseline_on_first_checkpoint: true
+  prefer_checkpoint_during_llm_request: true
+  require_llm_request_for_checkpoint: false
+  inspect_without_pause: false
+  incremental_process_enabled: false
+  full_process_checkpoint_interval: 8
+  max_process_chain_length: 16
+
+host_inspector:
+  launch_mode: in_process
+
+runc:
+  command_timeout_seconds: 120.0
+  zfs_prepare_timeout_seconds: 300.0
+  checkpoint:
+    tcp_established: true
+    shell_job: true
+    tcp_skip_in_flight: true
+    ext_unix_sk: true
+  restore:
+    detach: true
+    tcp_established: true
+    shell_job: true
+    ext_unix_sk: true
+    lazy_pages: false
+
+telemetry:
+  output: /root/workspace/agent-cr/logs/sdk/iflow-minimax-qsort-runc/engine.telemetry.jsonl
+  detail_level: detailed
+  capture_command_output: false
+  max_text_attribute_bytes: 2048
+  keep_in_memory_copy: false
+  writer_mode: async
+  queue_capacity: 16384000
+  batch_max_records: 256000
+  flush_interval_ms: 50
+  overflow_policy: drop_new
+  serializer: auto
+
+logging:
+  file: /root/workspace/agent-cr/logs/sdk/iflow-minimax-qsort-runc/engine.log
+  level: debug
+  file_mode: write

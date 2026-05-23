@@ -97,7 +97,6 @@ from .workers import (
 # bound to an existing sandbox with `agent.bind(sbx, llm_url=...)`.
 from .agent import (
     Agent,
-    Task,
     TaskResult,
     list_agents,
     register_agent,
@@ -121,7 +120,6 @@ __all__ = [
     "Engine",
     "EngineConfig",
     "Sandbox",
-    "Task",
     "TaskResult",
     "get_default_engine",
     "list_agents",

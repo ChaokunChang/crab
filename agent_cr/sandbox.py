@@ -3,7 +3,7 @@
 This module is what users import when they want an E2B-style sandbox with
 Agent-CR's checkpoint/restore semantics layered on top:
 
-    from agent_cr import Agent, Sandbox
+    from agent_cr import Sandbox
 
     sbx = Sandbox(image="ubuntu:22.04")
     agent = ClaudeCodeAgent().bind(sbx, llm_url="https://api.anthropic.com")
@@ -25,7 +25,6 @@ daemon mode (planned) swaps that default for a real connection.
 from __future__ import annotations
 
 import logging
-import os
 import shlex
 import socket
 import threading
@@ -34,12 +33,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
 
-from .agent import Agent, Task, TaskResult, llm_env_vars_for, resolve_agent
 from .ids import CheckpointId, SandboxId
 from .models import JobStatus, SandboxExecResult, SandboxSnapshot, utc_now
 from .templates import SandboxTemplate
 
 if TYPE_CHECKING:
+    from .agent import Agent
     from .engine import Engine
 
 logger = logging.getLogger(__name__)
@@ -206,7 +205,7 @@ class Sandbox:
     to reattach to an already-running sandbox owned by the same engine.
 
     Most operations are short methods on the sandbox or one of its
-    sub-namespaces (`commands`, `files`, `agent`, `checkpoints`).
+    sub-namespaces (`commands`, `files`, `checkpoints`).
     """
 
     def __init__(
@@ -239,12 +238,20 @@ class Sandbox:
             "timeout": timeout,
             "labels": dict(labels or {}),
         }
+        # Host-inspector filters are layered from two internal sources:
+        #   * `_default_*` — auto-derived from the bundle's idle init command
+        #     (e.g. `sh -c sleep infinity`). Set in `_prepare_runc_launch`
+        #     after the bundle has been written. The Sandbox knows what its
+        #     own init looks like; users do not specify these.
+        #   * `_agent_*` — installed by `Agent.bind(sbx)` via the public
+        #     `add_host_inspector_filters(...)` method on this class.
+        #     Calling `bind()` again replaces this set; defaults are never
+        #     touched.
+        self._default_ignore_process_rules: list[dict[str, object]] = []
+        self._default_ignored_path_prefixes: list[str] = []
+        self._agent_ignore_process_rules: list[dict[str, object]] = []
+        self._agent_ignored_path_prefixes: list[str] = []
         self._exposed_ports: dict[int, str] = {}
-        self._llm_url: str | None = None
-        self._agent: Agent | None = None
-        self._agent_installed = False
-        self._current_task: Task | None = None
-        self._agent_task_lock = threading.Lock()
         self._desired_name = name
         self._desired_image = image
         self._template = template
@@ -288,67 +295,25 @@ class Sandbox:
         self._mark_inspector_running()
         self._engine._register_sandbox(self)
         logger.info(
-            "Sandbox launched: id=%s runtime=%s image=%s llm_url=%s",
+            "Sandbox launched: id=%s runtime=%s image=%s",
             sandbox_id,
             runtime_name,
             plan.image,
-            self._llm_url,
         )
 
     def _default_image(self) -> str | None:
         return self._engine.config.default_image
 
-    def attach_agent(
-        self,
-        agent: str | Agent | type[Agent],
-        *,
-        llm_url: str | None = None,
-        install: bool = True,
-    ) -> Agent:
-        """Attach and optionally install an agent profile into this sandbox.
-
-        User code normally calls `agent.bind(sbx, llm_url=...)`; this method is
-        the sandbox-side operation that records the binding.
-        """
-        profile = resolve_agent(agent)
-        if self._agent is not None and self._agent is not profile:
-            raise RuntimeError(
-                f"sandbox already has agent {type(self._agent).__name__}; "
-                "create a new sandbox to attach a different agent"
-            )
-        if getattr(profile, "requires_network_namespace", False) and self._network_lease is None:
-            raise RuntimeError(
-                "this agent requires a sandbox network namespace; create the "
-                "sandbox with network=True or use an Engine with sandbox networking enabled"
-            )
-        profile._set_bound_sandbox(self)
-        self._agent = profile
-        if llm_url:
-            self._llm_url = llm_url.rstrip("/")
-        if self._llm_url:
-            self._engine.register_upstream(self.sandbox_id, self._llm_url)
-        if install:
-            self._install_attached_agent(cleanup_on_error=False)
-        return profile
-
-    def _install_attached_agent(self, *, cleanup_on_error: bool) -> None:
-        if self._agent is None or self._agent_installed:
-            return
+    def _install_attached_agent(self, agent: "Agent") -> None:
         try:
-            self._agent.install(self)
-            self._agent_installed = True
+            agent.install(self)
         except Exception as exc:
             logger.error(
                 "Agent install failed: sandbox=%s agent=%s error=%s",
                 self.sandbox_id,
-                type(self._agent).__name__,
+                type(agent).__name__,
                 exc,
             )
-            if cleanup_on_error:
-                try:
-                    self.kill()
-                except Exception:
-                    pass
             raise
 
     def _prepare_runc_launch(self, plan: _LaunchPlan, sandbox_id: SandboxId) -> dict[str, object]:
@@ -373,7 +338,7 @@ class Sandbox:
         if self._template is not None:
             sandbox_bundle.write_bundle_config(
                 bundle_dir=bundle_dir,
-                llm_base_url=self._llm_env_base_url("openai") or "",
+                llm_base_url="",
                 provider="openai",
                 sandbox_name=str(sandbox_id),
                 status_port=self._find_free_port(),
@@ -396,6 +361,10 @@ class Sandbox:
             self._process_cwd = plan.process_cwd
             plan.metadata.update(template_data.runtime_metadata)
             plan.metadata.update(template_data.metadata)
+            # The template's `configure_runc_bundle` may have rewritten
+            # `process.args` (e.g. with the compose `command:`), so derive
+            # the default ignore rules from the *final* bundle contents.
+            self._default_ignore_process_rules = self._derive_init_ignore_rules(bundle_dir)
             plan.metadata.update(
                 {
                     "sandbox_id": str(sandbox_id),
@@ -403,12 +372,13 @@ class Sandbox:
                     "work_dir_host_path": None if work_dir_host_path is None else str(work_dir_host_path),
                     "sdk_process_cwd": plan.process_cwd,
                     **self._network_launch_metadata(network_lease),
+                    **self._host_inspector_launch_metadata(),
                 }
             )
             return dict(plan.metadata)
 
         image = plan.image or self._engine.config.default_image
-        image_tag = self._prepare_image(image)
+        image_tag = image
         image_id = sandbox_image.inspect_image_id(
             tag=image_tag,
             telemetry=self._engine.system.telemetry,
@@ -426,7 +396,7 @@ class Sandbox:
         )
         sandbox_bundle.write_bundle_config(
             bundle_dir=bundle_dir,
-            llm_base_url=self._llm_env_base_url("openai") or "",
+            llm_base_url="",
             provider="openai",
             sandbox_name=str(sandbox_id),
             status_port=self._find_free_port(),
@@ -442,6 +412,9 @@ class Sandbox:
         plan.work_dir_host = work_dir_host_path
         plan.process_cwd = "/work"
         self._process_cwd = plan.process_cwd
+        # The SDK's bare-image path writes `sh -lc exec sleep infinity` as
+        # the bundle init, so the canonical ignore rules are applicable.
+        self._default_ignore_process_rules = self._derive_init_ignore_rules(bundle_dir)
         plan.metadata.update(
             {
                 "sandbox_id": str(sandbox_id),
@@ -454,6 +427,7 @@ class Sandbox:
                 "sdk_image": image_tag,
                 "sdk_process_cwd": plan.process_cwd,
                 **self._network_launch_metadata(network_lease),
+                **self._host_inspector_launch_metadata(),
             }
         )
         return dict(plan.metadata)
@@ -475,8 +449,6 @@ class Sandbox:
     def _requires_network_namespace(self) -> bool:
         if self._network_requested is not None:
             return bool(self._network_requested)
-        if self._agent is not None and bool(getattr(self._agent, "requires_network_namespace", False)):
-            return True
         if (
             self._engine.runtime.name == "runc"
             and self._engine.config.enable_sandbox_network
@@ -495,6 +467,144 @@ class Sandbox:
             "bridge_ip": bridge_ip,
         }
 
+    def _merged_ignore_process_rules(self) -> list[dict[str, object]]:
+        merged: list[dict[str, object]] = []
+        for rule in self._default_ignore_process_rules:
+            merged.append(dict(rule))
+        for rule in self._agent_ignore_process_rules:
+            merged.append(dict(rule))
+        return merged
+
+    def _merged_ignored_path_prefixes(self) -> list[str]:
+        merged: list[str] = []
+        for source in (
+            self._default_ignored_path_prefixes,
+            self._agent_ignored_path_prefixes,
+        ):
+            for item in source:
+                if item and item not in merged:
+                    merged.append(item)
+        return merged
+
+    def _host_inspector_launch_metadata(self) -> dict[str, object]:
+        meta: dict[str, object] = {}
+        rules = self._merged_ignore_process_rules()
+        if rules:
+            meta["host_inspector_ignore_process_rules"] = rules
+        prefixes = self._merged_ignored_path_prefixes()
+        if prefixes:
+            meta["host_inspector_ignored_path_prefixes"] = prefixes
+        return meta
+
+    # Canonical idle-init patterns the Sandbox knows how to filter on its
+    # own. Anything not in this set is left untouched and the operator gets
+    # a warning — getting this wrong falsely (filtering a real workload
+    # whose argv happens to resemble these) would silently break checkpoint
+    # restore correctness, so we err on the conservative side and only match
+    # exact docker-compose-style idle commands.
+    _IDLE_INIT_PATTERNS: tuple[tuple[str, ...], ...] = (
+        ("/bin/sh", "-lc", "exec sleep infinity"),
+        ("sh", "-lc", "exec sleep infinity"),
+        ("/bin/sh", "-c", "sleep infinity"),
+        ("sh", "-c", "sleep infinity"),
+        ("/bin/sleep", "infinity"),
+        ("sleep", "infinity"),
+    )
+
+    @staticmethod
+    def _sleep_infinity_ignore_rules() -> list[dict[str, object]]:
+        """Rules that suppress the canonical `sleep infinity` idle init.
+
+        The shell-wrapped variants (`sh -c sleep infinity` /
+        `sh -lc exec sleep infinity`) have `"sleep infinity"` as one argv
+        element, so the joined-by-null cmdline contains the literal string
+        — the first rule catches both the pre-exec shell pid and any case
+        where the shell does NOT exec into sleep. The second rule catches
+        the sleep child (whether forked by `sh -c CMD` or produced by the
+        shell `exec`ing its only command), whose argv is `("sleep",
+        "infinity")` and therefore does not contain the literal phrase."""
+        return [
+            {
+                "cmdline_contains": ["sleep infinity"],
+                "scope": "process_only",
+            },
+            {
+                "executable_basename": "sleep",
+                "cmdline_contains": ["infinity"],
+                "scope": "process_only",
+            },
+        ]
+
+    def _derive_init_ignore_rules(self, bundle_dir: Path) -> list[dict[str, object]]:
+        """Auto-derive `_default_ignore_process_rules` from the bundle's
+        idle init `process.args`. Only the canonical `sleep infinity`
+        patterns generate rules — any other init command leaves the
+        defaults empty and surfaces a warning, because falsely filtering a
+        real workload would skip its checkpoints and break restore.
+        """
+        import json
+
+        config_path = bundle_dir / "config.json"
+        try:
+            cfg = json.loads(config_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
+        process = cfg.get("process") if isinstance(cfg, dict) else None
+        if not isinstance(process, dict):
+            return []
+        args = process.get("args")
+        if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+            return []
+        args_tuple = tuple(args)
+        if args_tuple in self._IDLE_INIT_PATTERNS:
+            return self._sleep_infinity_ignore_rules()
+        logger.warning(
+            "Sandbox %s init command %r is not the canonical `sleep infinity`; "
+            "the Sandbox will not auto-add host-inspector default ignore rules. "
+            "Tool calls dispatched via `runc exec` will continue to be tracked, "
+            "but the idle init pids may keep `process_changed=True` between "
+            "turns. Use `sleep infinity` as the bundle init command to silence "
+            "this warning.",
+            self._desired_name,
+            args,
+        )
+        return []
+
+    def add_host_inspector_filters(
+        self,
+        *,
+        ignore_process_rules: list[dict[str, object]] | None = None,
+        ignored_path_prefixes: list[str] | None = None,
+    ) -> None:
+        """Register agent-contributed host-inspector filters on this sandbox.
+
+        Replaces whatever agent-contributed filters were previously installed
+        (so rebinding an agent — or binding a different one — never compounds
+        the rule set). Sandbox-default rules derived from the bundle init and
+        any rules the caller passed to `Sandbox(...)` are not touched.
+
+        If the sandbox is already launched, the new merged filter set is
+        pushed to the host inspector via `/update_filters`, which updates
+        the daemon's record in place without resetting baseline pids or
+        accumulated dirty state.
+        """
+        self._agent_ignore_process_rules = [
+            dict(rule) for rule in (ignore_process_rules or [])
+        ]
+        self._agent_ignored_path_prefixes = [
+            str(item) for item in (ignored_path_prefixes or []) if str(item)
+        ]
+        if self._sandbox_id is None:
+            return
+        runtime = self._engine.runtime
+        if not hasattr(runtime, "update_host_inspector_filters"):
+            return
+        runtime.update_host_inspector_filters(
+            self._sandbox_id,
+            ignore_process_rules=self._merged_ignore_process_rules(),
+            ignored_path_prefixes=self._merged_ignored_path_prefixes(),
+        )
+
     def _bundle_process_cwd(self, bundle_dir: Path) -> str | None:
         import json
 
@@ -508,12 +618,6 @@ class Sandbox:
             return None
         cwd = process.get("cwd")
         return cwd if isinstance(cwd, str) and cwd else None
-
-    def _prepare_image(self, image: str) -> str:
-        prepare = getattr(self._agent, "prepare_image", None) if self._agent is not None else None
-        if callable(prepare):
-            return str(prepare(self._engine, image))
-        return image
 
     def _runc_bundle_root(self) -> Path:
         runtime = self._engine.runtime
@@ -530,7 +634,10 @@ class Sandbox:
         process = dict(cfg.get("process") or {})
         process["terminal"] = False
         process["cwd"] = "/work"
-        process["args"] = ["/bin/sh", "-lc", "exec tail -f /dev/null"]
+        # `sleep infinity` is the canonical SDK idle init. The Sandbox auto-
+        # derives host-inspector ignore rules from this exact pattern; do not
+        # change it without updating `_default_init_ignore_process_rules`.
+        process["args"] = ["/bin/sh", "-lc", "exec sleep infinity"]
         defaults_env = getattr(image_defaults, "environment", ()) if image_defaults is not None else ()
         env = self._merge_env_assignments(
             list(defaults_env),
@@ -626,19 +733,6 @@ class Sandbox:
         return self._engine
 
     @property
-    def llm_base_url(self) -> str | None:
-        """Per-sandbox interceptor URL. Agents that don't pick up env vars
-        can pass this to their LLM client constructor explicitly."""
-        if self._engine.interceptor_base_url is None:
-            return None
-        return self._engine.interceptor_base_url
-
-    @property
-    def openai_base_url(self) -> str | None:
-        base = self.llm_base_url
-        return None if base is None else f"{base}/v1"
-
-    @property
     def process_cwd(self) -> str:
         """Default working directory for commands that should behave like the
         sandbox's main service process."""
@@ -655,6 +749,10 @@ class Sandbox:
     @property
     def env(self) -> dict[str, str]:
         return dict(self._user_env)
+
+    @property
+    def has_network_namespace(self) -> bool:
+        return self._network_lease is not None
 
     # ------------------------------------------------------------------
     # Lifecycle ops
@@ -705,11 +803,6 @@ class Sandbox:
             # disk in the first cut; the label survives in the manifest's
             # metadata dict the system already populated.
             pass
-        if self._agent is not None:
-            try:
-                self._agent.on_restore  # touch to verify hook exists for resume parity
-            except AttributeError:
-                pass
         return str(ckpt)
 
     def restore(self, checkpoint_id: str | CheckpointId) -> None:
@@ -719,11 +812,6 @@ class Sandbox:
             raise RuntimeError(f"restore failed: status={result.status.value} message={result.message}")
         self._engine.repair_network_lease(self.sandbox_id)
         self._mark_inspector_running()
-        if self._agent is not None:
-            try:
-                self._agent.on_restore(self)
-            except Exception:
-                logger.exception("Agent on_restore hook raised")
 
     def fork(self, count: int = 1) -> list["Sandbox"]:
         """Clone this sandbox via checkpoint+restore (CRIU+ZFS). Each fork is
@@ -773,114 +861,17 @@ class Sandbox:
     # ------------------------------------------------------------------
 
     def _command_env(self, overrides: dict[str, str] | None) -> dict[str, object] | None:
-        """Build the env dict passed to `runtime.exec`, layering:
-        engine LLM env vars (if agent is bound) → sandbox.env (user) → call env."""
+        """Build the env dict passed to `runtime.exec`.
+
+        Sandbox only knows about sandbox-level env plus per-command overrides.
+        Agent-specific LLM env is supplied by `Agent.command_env(...)`.
+        """
         merged: dict[str, str] = {}
-        if self._agent is not None:
-            base_url = self._llm_env_base_url(self._agent.llm_protocol)
-        else:
-            base_url = None
-        if self._agent is not None and base_url:
-            for var in llm_env_vars_for(self._agent.llm_protocol):
-                merged[var] = base_url
-            # Plus the sandbox identity header info: agents that build their
-            # own HTTP requests can read this and set X-Agent-Sandbox-Id.
-            merged["AGENT_CR_SANDBOX_ID"] = str(self.sandbox_id)
         if self._user_env:
             merged.update(self._user_env)
         if overrides:
             merged.update(overrides)
         return dict(merged) if merged else None
-
-    def _submit_agent_task(self, task: str) -> Task:
-        agent = self._agent
-        if agent is None:
-            raise RuntimeError("no agent attached to this sandbox")
-        with self._agent_task_lock:
-            if self._current_task is not None and not self._current_task.done():
-                raise RuntimeError(
-                    "a task is already running on this sandbox; wait() or cancel() it first"
-                )
-            pool = self._engine.agent_pool
-            future = pool.submit(self._run_agent_blocking, agent, task)
-            handle = Task(future, description=task)
-            self._current_task = handle
-            return handle
-
-    def _run_agent_task_sync(self, task: str, *, timeout: float | None = None) -> TaskResult:
-        handle = self._submit_agent_task(task)
-        return handle.wait(timeout=timeout)
-
-    def _run_agent_blocking(self, agent: Agent, task: str) -> TaskResult:
-        prior_env: dict[str, str | None] = {}
-        env_vars = llm_env_vars_for(agent.llm_protocol)
-        base_url = self._llm_env_base_url(agent.llm_protocol)
-        try:
-            if base_url:
-                for var in env_vars:
-                    prior_env[var] = os.environ.get(var)
-                    os.environ[var] = base_url
-            result = agent.execute(self, task)
-            if result is None:
-                result = TaskResult()
-            elif not isinstance(result, TaskResult):
-                raise TypeError(
-                    f"agent.run must return TaskResult or None, got {type(result).__name__}"
-                )
-            extra = agent.collect_results(self)
-            if extra:
-                result.extra.update(extra)
-            return result
-        finally:
-            for var, prior in prior_env.items():
-                if prior is None:
-                    os.environ.pop(var, None)
-                else:
-                    os.environ[var] = prior
-
-    def _wait_agent_task(self, timeout: float | None = None) -> TaskResult | None:
-        with self._agent_task_lock:
-            handle = self._current_task
-        if handle is None:
-            return None
-        return handle.wait(timeout=timeout)
-
-    def _stop_agent_task(self) -> None:
-        agent = self._agent
-        if agent is not None:
-            agent.request_stop()
-        with self._agent_task_lock:
-            if self._current_task is not None:
-                self._current_task.cancel()
-
-    def _agent_status(self) -> dict[str, object]:
-        with self._agent_task_lock:
-            handle = self._current_task
-        if handle is None:
-            return {"state": "idle"}
-        if handle.done():
-            try:
-                result = handle.result
-                return {
-                    "state": "done",
-                    "exit_code": result.exit_code,
-                    "description": handle.description,
-                }
-            except Exception as exc:
-                return {
-                    "state": "failed",
-                    "error": str(exc),
-                    "description": handle.description,
-                }
-        return {"state": "running", "description": handle.description}
-
-    def _llm_env_base_url(self, protocol: str) -> str | None:
-        base = self.llm_base_url
-        if base is None:
-            return None
-        if protocol == "openai":
-            return f"{base}/v1"
-        return base
 
     def _host_rootfs_path(self) -> Path:
         runtime = self._engine.runtime

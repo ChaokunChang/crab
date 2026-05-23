@@ -132,17 +132,17 @@ def main() -> None:
                     engine=engine,
                     name=name,
                 )
+                # The Sandbox auto-derives `sleep infinity` ignore rules
+                # from the bundle's init command, and `agent.bind(...)`
+                # below pushes IFlowAgent's own filters via /update_filters.
+                # The user does not specify host-inspector rules manually.
                 agent.bind(sbx, llm_url=REPLAY_BASE_URL)
                 sandboxes.append((sbx, agent, row, name))
                 print(f"launched {name}: cwd={sbx.process_cwd}")
 
             with ThreadPoolExecutor(max_workers=2) as pool:
                 task_futures = {
-                    pool.submit(
-                        agent.run,
-                        _prompt(row),
-                        timeout=_timeout(row, "max_agent_timeout_sec", 900.0),
-                    ): name
+                    pool.submit(agent.run, _prompt(row)): name
                     for _, agent, row, name in sandboxes
                 }
                 for future in as_completed(task_futures):

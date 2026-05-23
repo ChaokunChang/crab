@@ -27,10 +27,9 @@ class MyAgent(Agent):
     def execute(self, sbx, task: str) -> TaskResult:
         """Execute a single task. Required.
 
-        Runs in the engine's worker pool (i.e. host-side). For in-sandbox
-        agents the body typically does one `sbx.commands.run(...)` driving
-        the agent CLI inside the sandbox. For on-host agents the body runs
-        its own loop.
+        Runs in the caller's thread. For in-sandbox agents the body typically
+        does one `sbx.commands.run(...)` driving the agent CLI inside the
+        sandbox. For on-host agents the body runs its own loop.
         """
 
     def on_restore(self, sbx):
@@ -62,6 +61,7 @@ class CodexAgent(Agent):
     def execute(self, sbx, task):
         result = sbx.commands.run(
             argv=["codex", "-p", task],
+            env=self.command_env(),
             check=False,
         )
         return TaskResult(
@@ -84,17 +84,15 @@ agent = CodexAgent().bind(sbx, llm_url="https://api.openai.com")
 print(agent.run("Fix the failing tests"))
 ```
 
-The engine sets `OPENAI_BASE_URL` inside the sandbox env to the
-interceptor's URL, so the codex CLI's outbound LLM traffic is tagged with
-this sandbox's id and forwarded to `https://api.openai.com`. No code in the
-agent has to know about Agent-CR.
+`self.command_env()` supplies `OPENAI_BASE_URL` and `AGENT_CR_SANDBOX_ID` to
+that one sandbox command, so the codex CLI's outbound LLM traffic is tagged
+with this sandbox's id and forwarded to `https://api.openai.com`.
 
 ## On-host agents
 
 For agents that orchestrate the sandbox from outside (think
 `terminus`/`mini-swe`-style tmux drivers), the `execute()` body itself is the
-LLM/tool loop. It executes in the engine's worker pool and issues many
-small `sbx.commands.run(...)` calls.
+LLM/tool loop and issues many small `sbx.commands.run(...)` calls.
 
 ```python
 import anthropic
@@ -110,11 +108,10 @@ class HostDrivenAgent(Agent):
         sbx.commands.run("tmux new-session -d -s work", check=True)
 
     def execute(self, sbx, task):
-        # The engine has already set ANTHROPIC_BASE_URL in the env of this
-        # worker thread, so the anthropic SDK picks up the interceptor URL
-        # automatically. The interceptor tags the request with this
-        # sandbox's id and forwards to whatever `llm_url` the bound Agent was
-        # bound with.
+        # Agent.run has set ANTHROPIC_BASE_URL in this process while execute()
+        # is running, so the anthropic SDK picks up the interceptor URL.
+        # The interceptor tags the request with this sandbox's id and forwards
+        # to the llm_url passed to bind().
         client = anthropic.Anthropic()
 
         history = [{"role": "user", "content": task}]
@@ -194,13 +191,13 @@ agent = resolve_agent("my_pkg.agents:MyAgent").bind(sbx)
 
 When `agent.install()` or `agent.execute()` is called:
 
-1. The engine guarantees the per-sandbox interceptor URL is set as
-   `sbx.llm_base_url`.
+1. The agent exposes the provider-specific interceptor URL as
+   `agent.llm_base_url`.
 2. It exports the right env vars (`ANTHROPIC_BASE_URL` /
-   `OPENAI_BASE_URL` / `*_API_BASE`) into the running thread's environment
-   so vendor SDKs pick them up.
-3. It propagates those env vars into `sbx.commands.run(...)` calls so
-   in-sandbox tools see the same URL.
+   `OPENAI_BASE_URL` / `*_API_BASE`) while `agent.run()` invokes
+   `agent.execute(...)` so vendor SDKs pick them up.
+3. `agent.command_env(...)` returns those values for in-sandbox CLIs that
+   need them in `sbx.commands.run(..., env=...)`.
 4. It stamps every outbound LLM call with `X-Agent-Sandbox-Id` so the
    per-sandbox forwarder routes to the right real upstream — the same
    header-and-IP pattern the benchmark harness uses to scale to many

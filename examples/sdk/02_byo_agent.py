@@ -25,7 +25,7 @@ class EchoAgent(Agent):
     def install(self, sbx: Sandbox) -> None:
         # No-op for this fake agent. Real agents would `sbx.commands.run(...)`
         # to install their CLI here.
-        print(f"[install] sandbox={sbx.sandbox_id} llm_base_url={sbx.llm_base_url}")
+        print(f"[install] sandbox={sbx.sandbox_id} llm_base_url={self.llm_base_url}")
 
     def execute(self, sbx: Sandbox, task: str) -> TaskResult:
         print(f"[execute] sandbox={sbx.sandbox_id} task={task!r}")

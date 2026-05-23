@@ -809,6 +809,67 @@ class RuncRuntime(Runtime):
             except Exception:
                 logger.exception("Failed to unregister sandbox %s from host inspector", sandbox_id)
 
+    def update_host_inspector_filters(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        ignore_process_rules: list[dict[str, object]] | None = None,
+        ignored_path_prefixes: list[str] | None = None,
+    ) -> None:
+        """Update the merged ignore filters for an already-launched sandbox.
+
+        The new values become the authoritative list on the SandboxDescription
+        (so a subsequent restore picks them up via `_register_with_host_inspector`)
+        and are also pushed to the live host inspector daemon via
+        `/update_filters`, which updates the daemon's record in place without
+        resetting baseline pids or accumulated dirty state.
+        """
+        with self._lock:
+            description = self._items.get(sandbox_id)
+        if description is None:
+            raise KeyError(sandbox_id)
+        rules = (
+            None
+            if ignore_process_rules is None
+            else [dict(rule) for rule in ignore_process_rules]
+        )
+        prefixes = (
+            None
+            if ignored_path_prefixes is None
+            else [str(item) for item in ignored_path_prefixes]
+        )
+        new_metadata = dict(description.metadata)
+        if rules is not None:
+            new_metadata["host_inspector_ignore_process_rules"] = rules
+        if prefixes is not None:
+            new_metadata["host_inspector_ignored_path_prefixes"] = prefixes
+        self._update_description(replace(description, metadata=new_metadata))
+        if self._host_inspector_client is None:
+            return
+        # Layer runtime defaults (e.g. `criu`) on top of the caller's
+        # process rules so restoring through `_register_with_host_inspector`
+        # later wouldn't silently weaken the filter set.
+        merged_rules: list[dict[str, object]] = [
+            dict(rule) for rule in _RUNTIME_DEFAULT_IGNORE_PROCESS_RULES
+        ]
+        if rules is not None:
+            merged_rules.extend(rules)
+        merged_prefixes = self._sandbox_ignored_path_prefixes(sandbox_id)
+        if prefixes is not None:
+            for item in prefixes:
+                if item and item not in merged_prefixes:
+                    merged_prefixes.append(item)
+        try:
+            self._host_inspector_client.update_filters(
+                sandbox_id,
+                ignore_process_rules=merged_rules,
+                ignored_path_prefixes=merged_prefixes,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to update host-inspector filters for sandbox %s", sandbox_id
+            )
+
     def describe(self, sandbox_id: SandboxId) -> SandboxDescription:
         with self._lock:
             current = self._items.get(sandbox_id)

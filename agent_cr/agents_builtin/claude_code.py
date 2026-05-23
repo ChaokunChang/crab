@@ -114,12 +114,11 @@ class ClaudeCodeAgent(Agent):
         argv.extend(["--model", self._model])
         argv.extend(self._extra_args)
         argv.extend(["-p", task])
-        # The interceptor env vars are already set in the engine's thread
-        # environment AND propagated by Sandbox._command_env into the
-        # sandbox exec. So claude inside the sandbox will read
-        # ANTHROPIC_BASE_URL from its env and route through the interceptor.
+        # Agent.command_env supplies ANTHROPIC_BASE_URL for the sandbox exec,
+        # so claude routes through the Agent-CR interceptor.
         result = sbx.commands.run(
             argv=argv,
+            env=self.command_env(),
             capture_output=True,
             check=False,
         )

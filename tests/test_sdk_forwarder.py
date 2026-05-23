@@ -131,6 +131,13 @@ class TestSdkLLMForwarderHTTP(unittest.TestCase):
         self.assertEqual(len(self.up_b.received), 1)
         self.assertEqual(self.up_b.received[0]["path"], "/v1/messages")
 
+    def test_openai_base_url_with_v1_does_not_duplicate_prefix(self) -> None:
+        self.forwarder.register("sbx-a", f"{self.up_a.url}/v1")
+        code, _ = self._post("sbx-a", "/v1/chat/completions", b'{"q":1}')
+        self.assertEqual(code, 200)
+        self.assertEqual(len(self.up_a.received), 1)
+        self.assertEqual(self.up_a.received[0]["path"], "/v1/chat/completions")
+
     def test_unknown_sandbox_returns_502(self) -> None:
         code, body = self._post("sbx-unknown", "/v1/messages", b'{"q":1}')
         self.assertEqual(code, 502)

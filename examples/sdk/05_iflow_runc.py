@@ -79,7 +79,7 @@ def main() -> None:
             sbx = Sandbox(engine=engine, name="sdk-iflow-demo")
             agent = IFlowAgent(timeout=180).bind(sbx, llm_url=llm_url)
             try:
-                result = agent.run("Say Done and do not call tools.", timeout=180)
+                result = agent.run("Say Done and do not call tools.")
                 print("task exit:", result.exit_code)
                 print("task output:", result.output.strip())
 

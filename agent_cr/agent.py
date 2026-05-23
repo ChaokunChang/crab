@@ -14,13 +14,12 @@ User-facing attachment is deliberately separate from sandbox construction:
     result = agent.run("Fix the failing tests")
 
 `run()` blocks until the agent invocation finishes and returns a `TaskResult`.
-Callers that explicitly want background execution can use `run_async()`.
 """
 from __future__ import annotations
 
 import importlib
+import os
 import threading
-from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, ClassVar, Literal
 
@@ -30,10 +29,8 @@ if TYPE_CHECKING:
 
 LLMProtocol = Literal["openai", "anthropic"]
 
-# Environment variables the engine injects into both the sandbox process and
-# the host-side agent run context. The agent does not need to know about these
-# explicitly — it just reads its protocol's standard env vars and gets the
-# interceptor URL.
+# Provider environment variables Agent-CR sets while an agent is running, or
+# returns from Agent.command_env(...) for in-sandbox CLI invocations.
 _OPENAI_ENV_VARS: tuple[str, ...] = ("OPENAI_BASE_URL", "OPENAI_API_BASE")
 _ANTHROPIC_ENV_VARS: tuple[str, ...] = ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_BASE")
 
@@ -60,46 +57,6 @@ class TaskResult:
     extra: dict[str, object] = field(default_factory=dict)
 
 
-class Task:
-    """Handle returned by `agent.run_async(...)`.
-
-    Mirrors a future plus a result. The agent's body runs in an engine-managed
-    worker thread; `.wait()` blocks until that thread returns.
-    """
-
-    def __init__(self, future: Future[TaskResult], description: str) -> None:
-        self._future = future
-        self._description = description
-        self._cancelled = threading.Event()
-
-    @property
-    def description(self) -> str:
-        return self._description
-
-    def done(self) -> bool:
-        return self._future.done()
-
-    def wait(self, timeout: float | None = None) -> TaskResult:
-        try:
-            return self._future.result(timeout=timeout)
-        except FutureTimeoutError:
-            raise TimeoutError(f"task timed out after {timeout}s")
-
-    @property
-    def result(self) -> TaskResult:
-        if not self._future.done():
-            raise RuntimeError("task is not finished; call .wait() first")
-        return self._future.result()
-
-    def cancel(self) -> None:
-        """Request cancellation. The agent's `request_stop()` is invoked; the
-        worker thread observes the flag on its next polling cycle."""
-        self._cancelled.set()
-
-    def cancellation_requested(self) -> bool:
-        return self._cancelled.is_set()
-
-
 class Agent:
     """Base class for user agents.
 
@@ -108,11 +65,11 @@ class Agent:
     restore so the agent can re-sync any in-memory state.
 
     The engine guarantees, before calling `install()` or `execute()`:
-      - `sbx.llm_base_url` is set to the interceptor URL for this sandbox.
+      - `self.llm_base_url` is set to the interceptor URL for this sandbox.
       - Each env var named in `llm_env_vars_for(self.llm_protocol)` is set in
-        both the sandbox's env and the process env of the engine worker that
-        invokes `execute()`. So agents using standard provider SDKs (anthropic,
-        openai) pick up the right base URL with zero code changes.
+        the process env while `run()` invokes `execute()`. Agents that execute
+        an in-sandbox CLI should pass `env=self.command_env(...)` to
+        `sbx.commands.run(...)`.
       - Outbound LLM calls carry an `X-Agent-Sandbox-Id` header that lets the
         interceptor route per-sandbox upstream URLs without IP magic.
     """
@@ -121,15 +78,22 @@ class Agent:
     llm_protocol: ClassVar[LLMProtocol] = "openai"
     version: ClassVar[str] = ""
 
-    # Profile metadata used by the engine. Builtin agents can override these
-    # to express their image / bundle requirements.
+    # Advisory metadata for templates/docs. Sandbox images are still selected
+    # by Sandbox(...), not by binding an agent.
     default_image: ClassVar[str | None] = None
-    """Default container image; falls back to a base ubuntu image if unset."""
+    """Suggested container image for this agent, if it has one."""
 
     requires_network_namespace: ClassVar[bool] = False
     """Whether this agent runs in-sandbox and needs a distinct network
     identity for multi-sandbox LLM routing. Host-side agents can leave this
     disabled and set the sandbox id header themselves."""
+
+    # Host-inspector filters this agent contributes when it binds to a
+    # sandbox. The Sandbox keeps its own default rules (idle init) and any
+    # user-supplied rules separate, so binding/rebinding only touches
+    # these. Default to empty tuples for agents that don't need filtering.
+    HOST_INSPECTOR_IGNORE_PROCESS_RULES: ClassVar[tuple[dict[str, object], ...]] = ()
+    HOST_INSPECTOR_IGNORED_PATH_PREFIXES: ClassVar[tuple[str, ...]] = ()
 
     def bind(
         self,
@@ -146,16 +110,61 @@ class Agent:
             agent = IFlowAgent().bind(sbx, llm_url="http://127.0.0.1:18080")
             result = agent.run(task)
         """
-        sbx.attach_agent(self, llm_url=llm_url, install=install)
+        if self.requires_network_namespace and not sbx.has_network_namespace:
+            raise RuntimeError(
+                "this agent requires a sandbox network namespace; create the "
+                "sandbox with network=True or use an Engine with sandbox networking enabled"
+            )
+        previous_bound = getattr(self, "_bound_sandbox", None)
+        previous_llm_url = getattr(self, "_llm_url", None)
+        self._bind_sandbox(sbx)
+        self._bind_llm_url(llm_url)
+        registered_upstream = False
+        try:
+            if self._llm_url:
+                sbx.engine.register_upstream(sbx.sandbox_id, self._llm_url)
+                registered_upstream = True
+            if install and not bool(getattr(self, "_installed", False)):
+                sbx._install_attached_agent(self)
+                self._installed = True
+            # Push this agent's host-inspector filters to the sandbox. This
+            # always REPLACES the previously installed agent-contributed
+            # filters (so rebinding the same agent or binding a different
+            # one never compounds the rule set), but leaves the sandbox's
+            # default and user-supplied filters alone.
+            sbx.add_host_inspector_filters(
+                ignore_process_rules=[
+                    dict(rule) for rule in type(self).HOST_INSPECTOR_IGNORE_PROCESS_RULES
+                ],
+                ignored_path_prefixes=list(type(self).HOST_INSPECTOR_IGNORED_PATH_PREFIXES),
+            )
+        except Exception:
+            if registered_upstream:
+                sbx.engine.unregister_upstream(sbx.sandbox_id)
+            if previous_bound is None:
+                try:
+                    delattr(self, "_bound_sandbox")
+                except AttributeError:
+                    pass
+            else:
+                self._bound_sandbox = previous_bound
+            self._llm_url = previous_llm_url
+            raise
         return self
 
-    def _set_bound_sandbox(self, sbx: "Sandbox") -> None:
+    def _bind_sandbox(self, sbx: "Sandbox") -> None:
         bound = getattr(self, "_bound_sandbox", None)
         if bound is not None and bound is not sbx:
             raise RuntimeError(
                 f"agent {type(self).__name__} is already bound to sandbox {bound.sandbox_id}"
             )
         self._bound_sandbox = sbx
+
+    def _bind_llm_url(self, llm_url: str | None) -> None:
+        if llm_url:
+            self._llm_url = llm_url.rstrip("/")
+        elif not hasattr(self, "_llm_url"):
+            self._llm_url = None
 
     @property
     def sandbox(self) -> "Sandbox":
@@ -164,36 +173,82 @@ class Agent:
             raise RuntimeError("agent is not bound to a sandbox; call agent.bind(sbx) first")
         return sbx
 
+    @property
+    def upstream_url(self) -> str | None:
+        """Real LLM/replay upstream URL registered for this agent."""
+        return getattr(self, "_llm_url", None)
+
+    @property
+    def llm_base_url(self) -> str | None:
+        """Provider base URL agents should use for intercepted LLM traffic."""
+        base = self.sandbox.engine.interceptor_base_url
+        if base is None:
+            return None
+        if self.llm_protocol == "openai":
+            return f"{base}/v1"
+        return base
+
+    @property
+    def openai_base_url(self) -> str | None:
+        base = self.sandbox.engine.interceptor_base_url
+        return None if base is None else f"{base}/v1"
+
+    def command_env(self, overrides: dict[str, str] | None = None) -> dict[str, str]:
+        """Environment values this agent wants injected into sandbox commands."""
+        env: dict[str, str] = {}
+        base_url = self.llm_base_url
+        if base_url:
+            for var in llm_env_vars_for(self.llm_protocol):
+                env[var] = base_url
+            env["AGENT_CR_SANDBOX_ID"] = str(self.sandbox.sandbox_id)
+        if overrides:
+            env.update(overrides)
+        return env
+
     def install(self, sbx: "Sandbox") -> None:
         """Run once when the agent is bound to a sandbox. Use this to
         install CLIs, copy assets, or warm caches. The default is a no-op."""
 
-    def run(self, task: str, *, timeout: float | None = None) -> TaskResult:
+    def run(self, task: str) -> TaskResult:
         """Execute one task synchronously and return its result."""
-        return self.sandbox._run_agent_task_sync(task, timeout=timeout)
-
-    def run_async(self, task: str) -> Task:
-        """Start one task in the engine worker pool and return a task handle.
-
-        The public SDK defaults to synchronous `run()` because the underlying
-        agent CLI invocation usually runs to completion. This method remains
-        for callers that intentionally want host-side concurrency.
-        """
-        return self.sandbox._submit_agent_task(task)
+        sbx = self.sandbox
+        prior_env: dict[str, str | None] = {}
+        env_vars = llm_env_vars_for(self.llm_protocol)
+        base_url = self.llm_base_url
+        try:
+            if base_url:
+                for var in env_vars:
+                    prior_env[var] = os.environ.get(var)
+                    os.environ[var] = base_url
+                prior_env["AGENT_CR_SANDBOX_ID"] = os.environ.get("AGENT_CR_SANDBOX_ID")
+                os.environ["AGENT_CR_SANDBOX_ID"] = str(sbx.sandbox_id)
+            result = self.execute(sbx, task)
+            if result is None:
+                result = TaskResult()
+            elif not isinstance(result, TaskResult):
+                raise TypeError(
+                    f"agent.execute must return TaskResult or None, got {type(result).__name__}"
+                )
+            extra = self.collect_results(sbx)
+            if extra:
+                result.extra.update(extra)
+            return result
+        finally:
+            for var, prior in prior_env.items():
+                if prior is None:
+                    os.environ.pop(var, None)
+                else:
+                    os.environ[var] = prior
 
     def stop(self) -> None:
         """Request cooperative cancellation of the current task, if any."""
-        self.sandbox._stop_agent_task()
-
-    def status(self) -> dict[str, object]:
-        """Return the current task status for this agent's sandbox."""
-        return self.sandbox._agent_status()
+        self.request_stop()
 
     def execute(self, sbx: "Sandbox", task: str) -> TaskResult:
         """Agent implementation hook. Required. Return a `TaskResult`.
 
-        The body of this method runs in the engine's process (i.e. on the
-        host). For in-sandbox agents, it typically does one
+        The body of this method runs where the caller invoked `agent.run()`.
+        For in-sandbox agents, it typically does one
         `sbx.commands.run(...)` that drives the agent CLI inside the sandbox
         until the task is finished. For on-host agents, it implements its
         own loop that issues many `sbx.commands.run(...)` calls.
@@ -291,7 +346,6 @@ def resolve_agent(spec: str | Agent | type[Agent]) -> Agent:
 __all__ = [
     "Agent",
     "LLMProtocol",
-    "Task",
     "TaskResult",
     "list_agents",
     "llm_env_vars_for",
