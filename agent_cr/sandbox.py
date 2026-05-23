@@ -18,9 +18,12 @@ many `agent.run()` invocations, manual `commands.run()` calls between them,
 and as many checkpoint/restore cycles as the user wants. The agent's
 `install()` runs once; each task is a fresh invocation in the same sandbox.
 
-Most users never interact with `Engine` directly — `Sandbox(...)` lazily
-boots an in-process engine via `agent_cr.engine.get_default_engine()`. The
-daemon mode (planned) swaps that default for a real connection.
+`Sandbox(...)` connects to the running Agent-CR daemon via
+`agent_cr.engine.get_default_engine()` (which calls `Engine.connect()`
+under the hood). Start the daemon once per host with
+`agentcr daemon start` (or `python -m agent_cr.daemon`); there is no
+in-process engine fallback. Sandbox lifecycle calls only affect
+sandboxes — the daemon stays running across SDK process exits.
 """
 from __future__ import annotations
 

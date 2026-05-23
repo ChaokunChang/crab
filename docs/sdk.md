@@ -155,31 +155,43 @@ provided.
 
 ### Engine
 
-The Engine is the runtime manager that owns the underlying runc/docker
-runtime, the checkpoint store, and the LLM interceptor. Most users do not
-touch it directly — `Sandbox(...)` lazily starts an in-process engine via
-`get_default_engine()`.
+The Engine is the runtime manager that owns the underlying runc/ZFS
+runtime, the checkpoint store, the host inspector, and the LLM
+interceptor. Agent-CR runs it as a **long-lived daemon** (the equivalent
+of `dockerd`); SDK callers connect to it. There is no in-process
+fallback.
 
-Operators who deploy Agent-CR on a host will eventually start the engine as
-a daemon and have `Sandbox(...)` connect to it. That mode is reserved
-(`Engine.connect()` raises today) and will land in a follow-up PR. The SDK
-shape is forward-compatible.
+Start the daemon once per host:
 
-```python
-from agent_cr import Engine, EngineConfig
-
-with Engine.start(EngineConfig(runtime="runc")) as engine:
-    sbx = Sandbox(engine=engine)
-    agent = ClaudeCodeAgent().bind(sbx, llm_url="...")
-    ...
-
-with Engine.start("examples/sdk/configs/iflow_replay_engine.runc.yaml") as engine:
-    sbx = Sandbox(engine=engine)
-    agent = IFlowAgent().bind(sbx, llm_url="http://127.0.0.1:18080")
-    ...
+```bash
+agentcr daemon start --config examples/sdk/configs/iflow_replay_engine.runc.yaml
 ```
 
-`EngineConfig` knobs:
+From the SDK process — `Sandbox(...)` connects automatically through
+`get_default_engine()`, which honors the default socket location (and
+`$AGENT_CR_DAEMON_SOCKET`). To pin a specific socket or hold the
+connection across multiple sandboxes, use `Engine.connect()` directly:
+
+```python
+from agent_cr import Engine, Sandbox
+
+with Engine.connect() as engine:
+    sbx = Sandbox(engine=engine, template=...)
+    agent = IFlowAgent().bind(sbx, llm_url="http://127.0.0.1:18080")
+    agent.run("...")
+    sbx.kill()
+```
+
+`sbx.kill()` and other lifecycle calls only affect sandboxes — they do
+not stop the daemon. The daemon outlives the SDK process; stop it with
+`agentcr daemon stop`.
+
+See [daemon.md](daemon.md) for the operator guide (config, socket
+path, CLI reference, and the v1 RPC surface).
+
+`EngineConfig` is read by the daemon on startup, not by SDK code.
+Operators pass it as `--config FILE` to `agentcr daemon start`. The
+config knobs are unchanged:
 
 | Field                  | Purpose                                                    |
 | ---------------------- | ---------------------------------------------------------- |
@@ -188,14 +200,7 @@ with Engine.start("examples/sdk/configs/iflow_replay_engine.runc.yaml") as engin
 | `interceptor_host/port`| Where the LLM interceptor binds. `0` picks a free port.    |
 | `enable_interceptor`   | Disable when no agents talk to an LLM.                     |
 | `telemetry_config`     | Optional JSONL telemetry sink for engine/runtime events.   |
-| `log_file/log_level`   | Optional SDK engine log file configuration.                |
-
-Telemetry, scheduler policy, and retention are sysadmin-side concerns and
-are not exposed as user-facing options. Operators tune them in
-`SchedulerConfig` / `TelemetryConfig` / `StorageConfig` passed to
-`EngineConfig` if needed. `EngineConfig.from_file(path)` and
-`Engine.start(path)` accept an engine-only YAML file for the in-process engine
-until daemon config lands.
+| `log_file/log_level`   | Optional engine log file configuration.                    |
 
 ## LLM interception
 

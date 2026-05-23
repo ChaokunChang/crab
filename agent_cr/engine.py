@@ -1,9 +1,19 @@
-"""Agent-CR Engine — the host-side runtime manager for the SDK.
+"""Agent-CR Engine — the host-side runtime manager.
 
-The Engine is what users would call a "daemon," conceptually similar to
-`dockerd`. In this first cut the Engine runs in-process when no daemon is
-available; `Engine.connect()` is reserved for the future daemon mode and
-raises `NotImplementedError` today.
+The Engine is the equivalent of `dockerd`: a long-running host service
+that owns runc state, ZFS datasets, the host inspector, the LLM
+interceptor and forwarder, and the network bridge. It is **always** run
+as a daemon process; the SDK never instantiates one in-process.
+
+Two entry points:
+  - `Engine.start(config)` — daemon-internal. The Agent-CR daemon
+    (`agent_cr.daemon.server`) calls this once at startup to bring the
+    Engine up inside its own process. SDK callers should not invoke
+    this directly.
+  - `Engine.connect(socket=...)` — what the SDK uses. Returns a
+    `RemoteEngine` proxy that translates each call into a request to
+    the running daemon. `get_default_engine()` is the most common
+    entry point.
 
 A single Engine owns:
   - the underlying `Runtime` (in-memory for testing, `RuncRuntime` for prod)
@@ -11,10 +21,9 @@ A single Engine owns:
   - the `AgentCRRequestInterceptorServer` (semantic-aware C/R via LLM traffic)
   - per-sandbox upstream URL bookkeeping
 
-Users typically don't touch the Engine. `Sandbox(...)` calls
-`get_default_engine()` which lazily starts an in-process engine. The
-sysadmin/cloud-operator path that starts a daemon will swap that default
-to a `connect()` instance once the daemon mode lands.
+Running two daemons (or mixing a daemon with another in-process Engine)
+on the same host is not supported — they would race on the same runtime
+paths, the host-inspector port, and the network bridge.
 """
 from __future__ import annotations
 
@@ -570,11 +579,18 @@ class EngineConfig:
 
 
 class Engine:
-    """In-process Agent-CR engine.
+    """Agent-CR Engine.
 
-    Use `Engine.start(config)` to construct; the engine context-manages
-    cleanly so `with Engine.start() as eng: ...` works. For SDK convenience,
-    `get_default_engine()` returns a lazily-started singleton.
+    Two surfaces:
+      - `Engine.connect(socket=...)` — what SDK callers use. Returns a
+        `RemoteEngine` proxy backed by a running Agent-CR daemon. Most
+        callers just use `get_default_engine()` which picks up the
+        default socket location.
+      - `Engine.start(config)` — daemon-internal. The
+        `agent_cr.daemon.server` module calls this once to bring up an
+        in-process Engine inside the daemon process. SDK callers should
+        not invoke it directly; doing so would start a second Engine
+        that races with the daemon on runc state, ZFS, and host paths.
     """
 
     def __init__(self, config: EngineConfig | str | os.PathLike[str] | Mapping[str, Any] | None = None) -> None:
@@ -610,17 +626,53 @@ class Engine:
 
     @classmethod
     def start(cls, config: EngineConfig | str | os.PathLike[str] | Mapping[str, Any] | None = None) -> "Engine":
+        """Daemon-internal: bring up the in-process Engine inside the daemon.
+
+        Called by `agent_cr.daemon.server.DaemonServer.start()`. SDK callers
+        should use `Engine.connect(...)` (or the higher-level
+        `get_default_engine()`) so the existing daemon stays the sole
+        owner of runtime resources. Calling `Engine.start()` from the
+        SDK process would create a second Engine that races with the
+        daemon on runc state, the ZFS pool, and the host-inspector port.
+        """
         engine = cls(config)
         engine._start()
         return engine
 
     @classmethod
-    def connect(cls, *_, **__) -> "Engine":
-        """Reserved for the future daemon mode. Raises today."""
-        raise NotImplementedError(
-            "Engine.connect() is not yet implemented; use Engine.start() for "
-            "in-process use. Daemon mode will land in a follow-up PR."
-        )
+    def connect(
+        cls,
+        socket: str | os.PathLike[str] | None = None,
+        *,
+        timeout_seconds: float = 30.0,
+    ) -> "Engine":
+        """Connect to a running Agent-CR daemon and return a `RemoteEngine`.
+
+        The returned object exposes the same attribute surface SDK code
+        already reads from a local Engine (`.runtime`, `.config`,
+        `.storage_root` and friends, `.register_upstream`, …) — it just
+        translates each call into one of the daemon's HTTP-over-Unix-socket
+        endpoints. Returned as `Engine` for static-typing convenience;
+        the runtime type is `agent_cr.remote_engine.RemoteEngine`.
+
+        `socket` defaults to `default_socket_path()` from
+        `agent_cr.daemon`. The daemon must already be running — start it
+        with `agentcr daemon start` (or `python -m agent_cr.daemon`)."""
+        from .daemon import DaemonClient
+        from .remote_engine import RemoteEngine
+
+        client = DaemonClient(socket, timeout_seconds=timeout_seconds)
+        try:
+            info = client.get_json("/info")
+        except FileNotFoundError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                f"failed to connect to Agent-CR daemon at {client.socket_path}: {exc}. "
+                "Is the daemon running? Start it with `agentcr daemon start` "
+                "(or `python -m agent_cr.daemon`)."
+            ) from exc
+        return RemoteEngine(client, info=info)  # type: ignore[return-value]
 
     def _start(self) -> None:
         with self._lock:
@@ -1307,9 +1359,10 @@ class Engine:
 
 
 # ---------------------------------------------------------------------------
-# Default in-process engine — used when the user calls `Sandbox(...)` without
-# explicitly providing one. Operators replace this with a connection to the
-# daemon by calling `set_default_engine()` once.
+# Default engine — used when the user calls `Sandbox(...)` without
+# explicitly providing one. Lazily connects to the running daemon.
+# Auto-starting the daemon is intentionally not supported (matches
+# docker's behaviour: the user is responsible for `agentcr daemon start`).
 # ---------------------------------------------------------------------------
 
 
@@ -1317,17 +1370,19 @@ _DEFAULT_ENGINE: Engine | None = None
 _DEFAULT_ENGINE_LOCK = threading.Lock()
 
 
-def get_default_engine(config: EngineConfig | str | os.PathLike[str] | Mapping[str, Any] | None = None) -> Engine:
-    """Return the process-wide default engine, lazily starting one if needed.
+def get_default_engine(socket: str | os.PathLike[str] | None = None) -> Engine:
+    """Return the process-wide default engine, lazily connecting to the
+    running Agent-CR daemon.
 
-    The first caller's `config` wins. Subsequent calls return the same Engine
-    regardless of their `config` argument. Use `set_default_engine` to replace
-    the default explicitly (e.g. from a daemon connection in the future).
-    """
+    Raises `FileNotFoundError` (or a `RuntimeError` describing the
+    daemon's error) if the daemon isn't reachable. There is no
+    in-process fallback — start the daemon with
+    `agentcr daemon start` (or `python -m agent_cr.daemon`) before
+    creating any `Sandbox`."""
     global _DEFAULT_ENGINE
     with _DEFAULT_ENGINE_LOCK:
         if _DEFAULT_ENGINE is None:
-            _DEFAULT_ENGINE = Engine.start(config)
+            _DEFAULT_ENGINE = Engine.connect(socket)
         return _DEFAULT_ENGINE
 
 
@@ -1342,13 +1397,20 @@ def set_default_engine(engine: Engine | None) -> Engine | None:
 
 
 def shutdown_default_engine() -> None:
-    """Stop and clear the default engine. Safe to call multiple times."""
+    """Drop the default engine handle. Safe to call multiple times.
+
+    This does **not** stop the daemon — the daemon's lifecycle is
+    independent of the SDK process and is managed via
+    `agentcr daemon stop` (or `POST /shutdown`)."""
     global _DEFAULT_ENGINE
     with _DEFAULT_ENGINE_LOCK:
         engine = _DEFAULT_ENGINE
         _DEFAULT_ENGINE = None
     if engine is not None:
-        engine.stop()
+        try:
+            engine.stop()
+        except Exception:
+            logger.debug("default engine stop failed", exc_info=True)
 
 
 __all__ = [

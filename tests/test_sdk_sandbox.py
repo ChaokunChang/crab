@@ -213,9 +213,13 @@ class TestEngineLifecycle(unittest.TestCase):
             self.assertTrue(engine.started)
         self.assertFalse(engine.started)
 
-    def test_engine_connect_raises(self) -> None:
-        with self.assertRaises(NotImplementedError):
-            Engine.connect()
+    def test_engine_connect_requires_running_daemon(self) -> None:
+        # `Engine.connect()` returns a `RemoteEngine` proxy when a daemon
+        # is reachable; if not, it raises `FileNotFoundError` (or a
+        # similar OSError) with a hint pointing at `agentcr daemon start`.
+        # The test environment has no daemon at the default socket.
+        with self.assertRaises((FileNotFoundError, ConnectionRefusedError, OSError)):
+            Engine.connect("/nonexistent/agentcr.sock")
 
     def test_engine_disables_interceptor(self) -> None:
         engine = Engine.start(EngineConfig(runtime="docker", enable_interceptor=False))

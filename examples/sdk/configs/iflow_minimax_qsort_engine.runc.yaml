@@ -1,6 +1,7 @@
-# Engine-only SDK config for the real MiniMax + iFlow qsort example.
-# The example owns the agent, task, and LLM endpoint; this file only configures
-# the local in-process Agent-CR engine.
+# Engine config for the iFlow + MiniMax qsort example.
+# Loaded by the daemon: `agentcr daemon start --config <this file>`.
+# The example owns the agent, task, and LLM endpoint; this file only
+# configures the Agent-CR engine inside the daemon.
 
 runtime: runc
 run_id: sdk-iflow-minimax-qsort-runc
@@ -53,7 +54,11 @@ scheduler:
   max_process_chain_length: 16
 
 host_inspector:
-  launch_mode: in_process
+  launch_mode: process
+  host: 127.0.0.1
+  port: 0
+  log_level: DEBUG
+  log_file: /root/workspace/agent-cr/logs/sdk/iflow-minimax-qsort-runc/host-inspector.log
 
 runc:
   command_timeout_seconds: 120.0
