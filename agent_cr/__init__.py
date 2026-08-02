@@ -93,7 +93,40 @@ from .workers import (
     DefaultRWorker,
 )
 
+# User-facing SDK surface. Sandbox owns sandbox lifecycle; Agent instances are
+# bound to an existing sandbox with `agent.bind(sbx, llm_url=...)`.
+from .agent import (
+    Agent,
+    TaskResult,
+    list_agents,
+    register_agent,
+    resolve_agent,
+)
+from .engine import (
+    Engine,
+    EngineConfig,
+    get_default_engine,
+    set_default_engine,
+    shutdown_default_engine,
+)
+from .sandbox import Sandbox
+
+# Eager import so the side-effect registrations land before the user
+# references any name from this module.
+from . import agents_builtin as _agents_builtin  # noqa: F401
+
 __all__ = [
+    "Agent",
+    "Engine",
+    "EngineConfig",
+    "Sandbox",
+    "TaskResult",
+    "get_default_engine",
+    "list_agents",
+    "register_agent",
+    "resolve_agent",
+    "set_default_engine",
+    "shutdown_default_engine",
     "AgentCRSystem",
     "ArtifactKind",
     "ArtifactPayload",

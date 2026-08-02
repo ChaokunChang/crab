@@ -301,6 +301,81 @@ class HostInspectorDaemon:
         self._sync_bpf_ignored_pids(set())
         return {"sandbox_id": sandbox_id, "unregistered": True}
 
+    def update_filters(
+        self,
+        sandbox_id: str,
+        *,
+        ignore_process_rules: object | None = None,
+        ignored_path_prefixes: object | None = None,
+    ) -> dict[str, object]:
+        """Update an already-registered sandbox's ignore rules in place.
+
+        Unlike `register`, this does NOT reset baseline_pids, last_reset_at,
+        live_dirty_entries, or the process/filesystem-changed cached signals
+        — only the filter sets and any derived tracked/ignored partitions
+        are recomputed against the *current* cgroup pid set. Existing
+        baseline pids that move from tracked → ignored under the new rules
+        are also dropped from `baseline_pids`, so the next status call's
+        `tracked_pids != baseline_pids` comparison stays sound.
+        """
+        parsed_ignore_rules = parse_process_ignore_rules(ignore_process_rules)
+        parsed_path_prefixes = _parse_ignored_path_prefixes(ignored_path_prefixes)
+        sandbox_lock = self._sandbox_lock(sandbox_id)
+        with sandbox_lock:
+            with self._records_lock:
+                record = self._records.get(sandbox_id)
+                if record is None:
+                    raise KeyError(sandbox_id)
+            resolved = self._resolver.resolve(record.runtime, record.object_id)
+            all_current_pids = list_cgroup_pids(resolved.cgroup_path)
+            tracked_pids, ignored_pids, fs_ignored_pids = self._split_pids(
+                all_current_pids, parsed_ignore_rules
+            )
+            # Drop any baseline entries that are now ignored under the new
+            # rules; otherwise `tracked_pids != baseline_pids` would latch
+            # process_changed=True forever on the next status() call.
+            new_baseline = {pid for pid in record.baseline_pids if pid not in ignored_pids}
+            updated = replace(
+                record,
+                ignore_process_rules=parsed_ignore_rules,
+                ignored_path_prefixes=parsed_path_prefixes,
+                tracked_pids=tracked_pids,
+                ignored_pids=ignored_pids,
+                fs_ignored_pids=fs_ignored_pids,
+                current_pids=tracked_pids,
+                baseline_pids=new_baseline,
+            )
+            with self._records_lock:
+                self._records[sandbox_id] = updated
+            response = self._record_to_response(updated)
+        # Push the new filters to the C helper (same flow as register).
+        if hasattr(self._fs_monitor, "set_ignored_path_prefixes"):
+            try:
+                self._fs_monitor.set_ignored_path_prefixes(sandbox_id, parsed_path_prefixes)
+            except Exception:
+                logger.exception(
+                    "Failed to push ignored_path_prefixes to fs helper sandbox=%s",
+                    sandbox_id,
+                )
+        if hasattr(self._fs_monitor, "set_ignore_process_rules"):
+            try:
+                self._fs_monitor.set_ignore_process_rules(sandbox_id, parsed_ignore_rules)
+            except Exception:
+                logger.exception(
+                    "Failed to push ignore_process_rules to fs helper sandbox=%s",
+                    sandbox_id,
+                )
+        self._sync_bpf_ignored_pids(fs_ignored_pids)
+        logger.debug(
+            "update_filters sandbox=%s rules=%d prefixes=%d new_tracked=%d new_ignored=%d",
+            sandbox_id,
+            len(parsed_ignore_rules),
+            len(parsed_path_prefixes),
+            len(tracked_pids),
+            len(ignored_pids),
+        )
+        return response
+
     def status(self, sandbox_id: str) -> dict[str, object]:
         # Drain in-flight BPF events before reading state. Under load the
         # kernel→helper→daemon pipeline lags by several seconds, so without
@@ -1369,6 +1444,16 @@ class HostInspectorServer:
                         result = daemon.unregister(str(payload["sandbox_id"]))
                         logger.debug(f"host-inspector: unregister {payload=} {result=}")
                         self._write_json(HTTPStatus.OK, {"ok": True, **result})
+                        return
+                    if self.path == "/update_filters":
+                        payload = self._read_json()
+                        result = daemon.update_filters(
+                            sandbox_id=str(payload["sandbox_id"]),
+                            ignore_process_rules=payload.get("ignore_process_rules"),
+                            ignored_path_prefixes=payload.get("ignored_path_prefixes"),
+                        )
+                        logger.debug(f"host-inspector: update_filters {payload=} {result=}")
+                        self._write_json(HTTPStatus.OK, {"ok": True, "status": result})
                         return
                     self._write_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
                 except KeyError as exc:
