@@ -2,11 +2,12 @@
 
 Before running, start the daemon in another terminal:
 
-    crab daemon start --foreground
+    sudo crab daemon start --foreground --config /etc/crab/config.yaml
 
 Then run this script:
 
-    PYTHONPATH=. python3 examples/sdk/01_basic_sandbox.py
+    sudo --preserve-env=PYTHONPATH PYTHONPATH=. \
+      python3 examples/sdk/01_basic_sandbox.py
 """
 from __future__ import annotations
 

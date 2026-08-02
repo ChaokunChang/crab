@@ -43,24 +43,25 @@ That's the whole contract.
 
 ## In-sandbox agents
 
-This is the common case: the agent is installed in the sandbox and its CLI
-self-drives the LLM/tool loop inside.
+This is the common case: an agent CLI in the sandbox drives its own LLM/tool
+loop. The example assumes your image already contains a `my-agent` executable;
+replace its command-line arguments with those of the agent you integrate.
 
 ```python
-import shlex
 from crab import Agent, TaskResult, register_agent
 
 
-class CodexAgent(Agent):
-    name = "codex"
+class MyCliAgent(Agent):
+    name = "my-cli-agent"
     llm_protocol = "openai"
+    requires_network_namespace = True
 
     def install(self, sbx):
-        sbx.commands.run("pipx install codex-cli", check=True)
+        sbx.commands.run("command -v my-agent >/dev/null", check=True)
 
     def execute(self, sbx, task):
         result = sbx.commands.run(
-            argv=["codex", "-p", task],
+            argv=["my-agent", "--prompt", task],
             env=self.command_env(),
             check=False,
         )
@@ -71,22 +72,27 @@ class CodexAgent(Agent):
         )
 
 
-register_agent("codex", CodexAgent)
+register_agent("my-cli-agent", MyCliAgent)
 ```
 
 User-side:
 
 ```python
-from crab import Sandbox
+from crab import Engine, Sandbox
 
-sbx = Sandbox(image="ubuntu:22.04")
-agent = CodexAgent().bind(sbx, llm_url="https://api.openai.com")
-print(agent.run("Fix the failing tests"))
+with Engine.connect() as engine:
+    sbx = Sandbox(image="my-agent-image:latest", network=True, engine=engine)
+    try:
+        agent = MyCliAgent().bind(sbx, llm_url="https://api.example.com/v1")
+        print(agent.run("Fix the failing tests"))
+    finally:
+        sbx.kill()
 ```
 
 `self.command_env()` supplies `OPENAI_BASE_URL` and `CRAB_SANDBOX_ID` to
-that one sandbox command, so the codex CLI's outbound LLM traffic is tagged
-with this sandbox's id and forwarded to `https://api.openai.com`.
+that sandbox command. With a Crab-managed network namespace, the interceptor
+attributes traffic using the sandbox network lease and forwards it to the
+registered upstream.
 
 ## On-host agents
 
@@ -95,6 +101,8 @@ For agents that orchestrate the sandbox from outside (think
 LLM/tool loop and issues many small `sbx.commands.run(...)` calls.
 
 ```python
+import os
+
 import anthropic
 from crab import Agent, TaskResult
 
@@ -110,14 +118,17 @@ class HostDrivenAgent(Agent):
     def execute(self, sbx, task):
         # Agent.run has set ANTHROPIC_BASE_URL in this process while execute()
         # is running, so the anthropic SDK picks up the interceptor URL.
-        # The interceptor tags the request with this sandbox's id and forwards
-        # to the llm_url passed to bind().
-        client = anthropic.Anthropic()
+        # A host-driven client must attach the sandbox id itself.
+        client = anthropic.Anthropic(
+            default_headers={
+                "X-Agent-Sandbox-Id": str(sbx.sandbox_id),
+            }
+        )
 
         history = [{"role": "user", "content": task}]
         for step in range(20):
             response = client.messages.create(
-                model="claude-opus-4-6",
+                model=os.environ["ANTHROPIC_MODEL"],
                 max_tokens=4096,
                 messages=history,
             )
@@ -150,18 +161,26 @@ class HostDrivenAgent(Agent):
 User-side is identical:
 
 ```python
-sbx = Sandbox(image="ubuntu:22.04")
-agent = HostDrivenAgent().bind(sbx, llm_url="https://api.anthropic.com")
-agent.run("Set up a Postgres container and run the migration")
+from crab import Engine, Sandbox
+
+with Engine.connect() as engine:
+    sbx = Sandbox(image="ubuntu:22.04", engine=engine)
+    try:
+        agent = HostDrivenAgent().bind(sbx, llm_url="https://api.anthropic.com")
+        agent.run("Set up the project and run the migration")
+    finally:
+        sbx.kill()
 ```
 
-The user doesn't know or care whether the agent runs in-sandbox or on-host.
+Host-driven clients must add `X-Agent-Sandbox-Id` themselves. Setting
+`CRAB_SANDBOX_ID` does not automatically modify arbitrary HTTP clients.
 
 ## Multi-task lifecycle
 
 Both styles support multiple sequential tasks on the same sandbox. The
-agent's in-sandbox state (sessions, history, files in `/work`) persists
-between tasks because the sandbox is not torn down between `run()` calls.
+agent's in-sandbox state persists between tasks because the sandbox is not
+torn down between `run()` calls. If `/work` is a host bind mount, its files
+also persist, but they are outside checkpoint rollback.
 
 ```python
 sbx = Sandbox(image="ubuntu:22.04")
@@ -179,11 +198,11 @@ Three ways to point the SDK at your agent:
 # Instance — what you'd write in a quick experiment.
 agent = MyAgent().bind(sbx)
 
-# Registered name — best when you want CLI parity (e.g. `crab run --agent foo`).
+# Registered name — useful when application configuration selects an agent.
 register_agent("my-agent", MyAgent)
 agent = resolve_agent("my-agent").bind(sbx)
 
-# Import path — like Harbor's --agent-import-path. Useful for plugin layouts.
+# Import path — useful for plugin-style application layouts.
 agent = resolve_agent("my_pkg.agents:MyAgent").bind(sbx)
 ```
 
@@ -198,12 +217,14 @@ When `agent.install()` or `agent.execute()` is called:
    `agent.execute(...)` so vendor SDKs pick them up.
 3. `agent.command_env(...)` returns those values for in-sandbox CLIs that
    need them in `sbx.commands.run(..., env=...)`.
-4. It stamps every outbound LLM call with `X-Agent-Sandbox-Id` so the
-   per-sandbox forwarder routes to the right real upstream — the same
-   header-and-IP pattern the benchmark harness uses to scale to many
-   parallel sandboxes through one interceptor.
+4. For networked in-sandbox agents, it attributes requests from the sandbox
+   network lease. Host-driven agents must send `X-Agent-Sandbox-Id` explicitly
+   so the per-sandbox forwarder can select the registered upstream.
 5. It captures the request through the C/R scheduler — so checkpoints can
    be taken at semantically meaningful turn boundaries without you wiring
    anything.
 
-You do not have to think about any of this.
+The daemon config must enable both the interceptor and sandbox networking for
+in-sandbox agents that declare `requires_network_namespace = True`. The default
+no-key smoke-test config intentionally disables them; see
+[Configuration](configuration-reference.md#network-and-llm-interception).

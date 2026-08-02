@@ -125,14 +125,8 @@ CRAB_RUN_PERF=1 python3 -m unittest \
 
 ## Cleanup
 
-Remove the container:
+Remove the container and all files created inside it:
 
 ```bash
 docker rm -f "$CONTAINER_ID"
-```
-
-Remove common test artifacts if needed:
-
-```bash
-docker exec "$CONTAINER_ID" sh -lc 'rm -rf /tmp/hi-* /root/hi-* /workspace/hi-*'
 ```

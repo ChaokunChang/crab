@@ -169,15 +169,19 @@ Manifest resolution is important because restore may depend on artifacts from ea
 2. `_handle_recovery_event(...)` tries to choose a checkpoint via `_select_recovery_checkpoint(...)`.
 3. If a checkpoint is found, the system restores it.
 4. If restore succeeds, the recovery record is marked `restored`.
-5. If restore fails and a `relaunch_handler` exists, the handler is invoked and the record is marked `relaunched`.
-6. If no checkpoint is usable and no relaunch handler exists, the record is marked `no_checkpoint`.
+5. If restore fails, the error remains visible by default. Relaunch fallback is
+   used only when both a `relaunch_handler` exists and
+   `relaunch_on_restore_failure=True`.
+6. If no checkpoint is usable, the record is marked `no_checkpoint` unless
+   the same explicit relaunch fallback is enabled.
 
 ### Preemption recovery
 
 1. `notify_preemption(...)` stores preemption metadata in the current snapshot and enqueues a `preemption` event.
 2. `_handle_recovery_event(...)` first attempts a checkpoint using the configured preemption policy.
 3. If that checkpoint succeeds, the new checkpoint is restored.
-4. If it does not, recovery falls back to checkpoint selection and then to relaunch behavior just like fault recovery.
+4. If it does not, recovery falls back to checkpoint selection and then uses
+   the same opt-in relaunch behavior as fault recovery.
 5. The temporary preemption metadata is cleared at the end of handling.
 
 ## Checkpoint Selection And Response Release
@@ -205,49 +209,11 @@ Checkpoint manifests include runtime metadata, artifact references, and an integ
 
 ## Benchmark Harness
 
-The real-host benchmarks share `RealHostScenarioHarness` in [benchmarks/real_host_scenario_base.py](../benchmarks/real_host_scenario_base.py).
+The research harness remains under `benchmarks/` and wires the same scheduler,
+executor, runtime, inspector, and storage components with experiment-specific
+policies. It is not part of the public sandbox API or the one-command install
+path.
 
-That harness:
-
-- Builds the simulated agent image
-- Creates or reuses a benchmark ZFS pool
-- Prepares sandbox bundles and rootfs state before launch
-- Reuses shared rootfs base datasets and clones ZFS snapshots into sandbox datasets when benchmark rootfs reuse is enabled
-- Launches `runc` sandboxes through an explicit phased pipeline
-- Runs an interceptor server in front of the benchmark LLM router over HTTP on `localhost`
-- Wires `CrabSystem` with policy-specific retention and recovery settings
-- Exposes helpers for checkpoint, restore, fault injection, preemption injection, and checkpoint cloning for tree-search fan-out
-
-The benchmark LLM router can run in either:
-
-- `process` mode, which is the default for benchmarks and keeps router threads out of the main benchmark process
-- `thread` mode, which is mainly useful for tests and debugging
-
-The harness manages router state through `BenchmarkLLMRouterClient` and the router's control endpoints:
-
-- `POST /control/register`
-- `POST /control/unregister`
-- `POST /control/reset`
-- `POST /control/restore`
-- `GET /control/state`
-
-The router process entrypoint is `python -m integrations.llm_services.router`.
-
-The benchmark runner now coordinates three phases across the whole run:
-
-1. `setup`
-2. `run`
-3. `verification`
-
-By default, `run` does not begin until all sandboxes finish `setup`, and `verification` does not begin until all sandboxes finish `run`. When `phase_merging.setup_and_run` is enabled, eligible per-sandbox flows can pipeline setup directly into run so each sandbox starts run work immediately after its own setup completes. The verification barrier remains unchanged. By default, merged setup/run scheduling still uses separate setup and run executor pools. Setting `phase_merging.setup_and_run_executor_pool: shared` switches merged flows to a single executor pool that runs one combined `setup+run` task per sandbox.
-
-At the `run → verification` handoff, the harness calls `CRScheduler.deactivate_sandbox(sandbox_id)` before submitting the verify exec. `query_checkpoint(...)` short-circuits for deactivated sandboxes and returns a no-op `leave_running=True` decision, so a concurrent verifier cannot race a scheduler pause/checkpoint. This is a terminal flag — once a sandbox is deactivated for the run it does not reactivate.
-
-The main benchmark entrypoints and configuration surface are:
-
-- [benchmarks/run.py](../benchmarks/run.py)
-- [benchmarks/config.py](../benchmarks/config.py)
-- [benchmarks/scenarios/fault.py](../benchmarks/scenarios/fault.py)
-- [benchmarks/scenarios/spot.py](../benchmarks/scenarios/spot.py)
-- [benchmarks/scenarios/tree.py](../benchmarks/scenarios/tree.py)
-- [benchmarks/scenarios/e2e.py](../benchmarks/scenarios/e2e.py)
+Run-specific benchmark analyses and configuration catalogs have been moved to
+[`legacy/docs/`](../legacy/docs/). They may explain why a mechanism exists,
+but they should not be treated as current operator guidance.

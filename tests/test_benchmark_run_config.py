@@ -1816,7 +1816,7 @@ class BenchmarkRunDispatchTests(unittest.TestCase):
 
     def test_example_yaml_files_load(self) -> None:
         examples_root = Path(__file__).resolve().parents[1] / "benchmarks" / "examples"
-        examples = sorted(examples_root.glob("*/*.yaml"))
+        examples = sorted(examples_root.rglob("*.yaml"))
         self.assertTrue(examples)
         for path in examples:
             with self.subTest(path=path.name):

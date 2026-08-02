@@ -1,38 +1,37 @@
 # Crab documentation
 
-Start with these documents if you want to run Crab:
+## Start here
 
-- [Installation](installation.md): supported host, installer behavior, ZFS
-  pool options, and dependency checks.
-- [Getting started](getting-started.md): launch a sandbox, create and inspect
-  checkpoints, mutate state, and restore.
-- [SDK](sdk.md): create sandboxes and attach agents from Python.
-- [Bring your own agent](byo-agent.md): implement the small `Agent` contract.
-- [Daemon and CLI](daemon.md): socket, lifecycle, CLI commands, and current
-  operational limitations.
-- [Configuration reference](configuration-reference.md): scheduler, executor,
-  retention, runtime, and telemetry settings.
+- [Installation](installation.md): supported Ubuntu hosts, dependency setup,
+  ZFS pool safety, and troubleshooting.
+- [Getting started](getting-started.md): a no-API-key process and filesystem
+  rollback walkthrough.
+- [Daemon and CLI](daemon.md): daemon ownership, commands, cleanup behavior,
+  and current operational limits.
+- [Configuration](configuration-reference.md): the supported daemon YAML
+  surface and the difference between smoke-test and agent-oriented configs.
 
-Agent examples:
+## Build with Crab
 
-- [iFlow replay](sdk-iflow-replay.md): run a recorded iFlow trace without a
-  live model API key.
-- [Claude Code replay internals](claude-code-integration.md): implementation
-  and benchmark-specific integration decisions.
-- [Agent integration notes](agent-integration-notes.md): checkpoint-safe agent
-  process and I/O patterns learned from integrations.
+- [Python SDK](sdk.md): create sandboxes, run commands, inspect checkpoints,
+  and restore state.
+- [Bring your own agent](byo-agent.md): implement the `Agent` contract and
+  route in-sandbox or host-driven LLM traffic correctly.
+- [iFlow trace replay](sdk-iflow-replay.md): replay a real recorded workflow
+  without a model API key.
 
-Architecture and operator internals:
+## Internals
 
-- [Architecture](architecture.md)
-- [Telemetry](telemetry.md)
-- [Replay cadence handling](replay-cadence-handling.md)
-- [Lazy restore safety contract](lazy-restore-safety-contract.md)
+- [Architecture](architecture.md): scheduler, executor, runtime, storage,
+  interception, and recovery flows.
+- [Telemetry](telemetry.md): JSONL records, correlation keys, and metric
+  interpretation.
+- [Agent integration notes](agent-integration-notes.md): restore-safe process,
+  mount, and file-descriptor patterns for integration authors.
+- [Host inspector](../crab/host_inspector/README.md): direct inspector testing
+  and its process/filesystem signal matrix.
 
-Research and benchmark notes:
-
-- [Speculative execution benchmark](speculative-execution-benchmark.md)
-- [Incremental fork/restore analysis](incremental-fork-restore-analysis.md)
-
-The research notes document experiments and implementation decisions. They are
-not required for the v0 installation or the manual checkpoint/restore flow.
+Historical experiment reports, PR design notes, and the old exhaustive mixed
+benchmark configuration catalog live in [`legacy/docs/`](../legacy/docs/).
+They are retained for archaeology and research reproducibility, not as current
+user instructions.

@@ -1,5 +1,10 @@
 # Container Checkpoint/Restore Benchmark
 
+> Archived prototype: these scripts predate the current Crab daemon, SDK, and
+> installer. They are not part of the supported v0 workflow. Start with the
+> [current documentation](../docs/README.md); see [archived documentation](docs/README.md)
+> for other historical design and experiment notes.
+
 This repository benchmarks checkpoint/restore latency for a stateful Python workload using:
 
 - Docker checkpoint/restore

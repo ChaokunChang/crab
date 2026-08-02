@@ -1,10 +1,12 @@
 # Crab
 
+English | [简体中文](README.zh-CN.md)
+
 Crab gives AI-agent sandboxes recoverable savepoints. It observes agent turns,
 decides whether process state, filesystem state, or both need to be saved, and
 coordinates checkpoint/restore with the host runtime.
 
-Crab is currently a Linux technical preview. The v0 backend uses:
+Crab is currently a v0 version for technical preview. The v0 backend uses:
 
 - `runc` to run sandboxes;
 - CRIU to checkpoint and restore process state;
@@ -94,6 +96,10 @@ iFlow profiles. See the [SDK guide](docs/sdk.md),
 [bring-your-own-agent guide](docs/byo-agent.md), and
 [iFlow trace replay example](docs/sdk-iflow-replay.md).
 
+The installed smoke-test config disables sandbox networking and LLM
+interception. Agent integrations that make in-sandbox LLM calls must use an
+agent-oriented config; see [Configuration](docs/configuration-reference.md).
+
 ## What is included in a checkpoint?
 
 The v0 full checkpoint covers process state and the sandbox's ZFS-backed root
@@ -133,6 +139,9 @@ reference, architecture, agent integration, and research/benchmark notes.
 The research design and evaluation are described in the paper:
 [Crab: A Semantics-Aware Checkpoint/Restore Runtime for Agent Sandboxes](https://arxiv.org/abs/2604.28138).
 
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup,
+tests, documentation expectations, and change hygiene.
+
 ## Development
 
 Install the Python package from the repository and run the dependency-light
@@ -152,3 +161,7 @@ Real-host tests additionally require the dependencies installed by
 `scripts/install-ubuntu.sh`. The historical benchmark suite also has optional
 SWE-bench dependencies. Benchmark datasets and recorded traces are not part of
 the normal installation path.
+
+## License
+
+Crab is released under the [MIT License](LICENSE).

@@ -7,11 +7,24 @@ name = "crab"
 version = "0.1.0"
 description = "Fault-tolerant agent execution via process and filesystem checkpointing."
 readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.11"
 authors = [{ name = "Crab contributors" }]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+]
 dependencies = [
     "PyYAML>=6.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/open-agent-infra/crab"
+Repository = "https://github.com/open-agent-infra/crab.git"
+Documentation = "https://github.com/open-agent-infra/crab/tree/main/docs"
+Issues = "https://github.com/open-agent-infra/crab/issues"
+Paper = "https://arxiv.org/abs/2604.28138"
 
 [project.scripts]
 # Operator CLI — talks to the daemon over the Unix-domain socket.
