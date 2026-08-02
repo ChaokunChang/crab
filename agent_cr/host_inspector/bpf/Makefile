@@ -1,11 +1,7 @@
 ARCH := x86
-LIBBPF_HDR := /usr/src/linux-headers-$(shell uname -r)/tools/bpf/resolve_btfids/libbpf/include
-BPF_CFLAGS := -O2 -g -target bpf -D__TARGET_ARCH_$(ARCH) -I$(LIBBPF_HDR) -I/usr/include/$(shell uname -m)-linux-gnu
-CFLAGS := -O2 -g -Wall -Wextra -I$(LIBBPF_HDR) -I/usr/include/$(shell uname -m)-linux-gnu
-LIBBPF_SO := $(firstword $(wildcard /usr/lib/x86_64-linux-gnu/libbpf.so.* /lib/x86_64-linux-gnu/libbpf.so.*))
-LIBELF_SO := $(firstword $(wildcard /usr/lib/x86_64-linux-gnu/libelf.so.* /lib/x86_64-linux-gnu/libelf.so.*))
-LIBZ_SO := $(firstword $(wildcard /usr/lib/x86_64-linux-gnu/libz.so.* /lib/x86_64-linux-gnu/libz.so.*))
-LDFLAGS := $(LIBBPF_SO) $(LIBELF_SO) $(LIBZ_SO) -pthread
+BPF_CFLAGS := -O2 -g -target bpf -D__TARGET_ARCH_$(ARCH) -I/usr/include/$(shell uname -m)-linux-gnu
+CFLAGS := -O2 -g -Wall -Wextra $(shell pkg-config --cflags libbpf) -I/usr/include/$(shell uname -m)-linux-gnu
+LDFLAGS := $(shell pkg-config --libs libbpf) -lelf -lz -pthread
 
 .PHONY: all clean
 

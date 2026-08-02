@@ -1,0 +1,83 @@
+# Crab v0 local-host configuration.
+#
+# This profile intentionally targets the fully featured Linux backend:
+# runc + CRIU for process state, ZFS for filesystem state, and the real
+# host-inspector subprocess for change detection. Run scripts/install-ubuntu.sh
+# to install this file at /etc/crab/config.yaml and prepare the `crab` zpool.
+
+runtime: runc
+run_id: crab-local
+default_image: ubuntu:22.04
+max_workers: 2
+
+# Never let the public quick start guess which existing pool to use. The
+# installer creates a dedicated file-backed `crab` pool by default and rewrites
+# this prefix when --zpool is supplied.
+zfs_dataset_prefix: crab/sandboxes
+
+storage_planes:
+  runtime_root: /var/lib/crab/runtime
+  storage_root: /var/lib/crab/checkpoints
+  agent_state_root: /var/lib/crab/agents
+  work_dir_host_root: /var/lib/crab/work
+  image_cache_root: /var/lib/crab/images
+
+# The no-key smoke test does not require a sandbox network or LLM proxy.
+# Agent-specific examples can enable these in their own config.
+network:
+  enable_sandbox_network: false
+
+interceptor:
+  enabled: false
+
+host_inspector:
+  launch_mode: process
+  host: 127.0.0.1
+  port: 0
+  log_level: INFO
+  log_file: /var/lib/crab/logs/host-inspector.log
+
+executor:
+  max_workers: 2
+  checkpoint_workers: 1
+  restore_workers: 1
+  coordination_workers: 1
+  composite_step_workers: 2
+  checkpoint_queue_size: 128
+  max_retries: 0
+
+scheduler:
+  min_checkpoint_interval_seconds: 0.0
+  force_checkpoint_after_seconds: 0.0
+  require_change_signal: true
+  checkpoint_full_baseline_on_first_checkpoint: true
+  prefer_checkpoint_during_llm_request: true
+  require_llm_request_for_checkpoint: false
+  inspect_without_pause: false
+  incremental_process_enabled: false
+
+runc:
+  command_timeout_seconds: 120.0
+  zfs_prepare_timeout_seconds: 300.0
+  checkpoint:
+    tcp_established: true
+    shell_job: true
+    tcp_skip_in_flight: true
+    ext_unix_sk: true
+  restore:
+    detach: true
+    tcp_established: true
+    shell_job: true
+    ext_unix_sk: true
+    lazy_pages: false
+
+telemetry:
+  output: /var/lib/crab/logs/telemetry.jsonl
+  detail_level: basic
+  capture_command_output: false
+  keep_in_memory_copy: false
+
+logging:
+  file: /var/lib/crab/logs/engine.log
+  level: info
+  file_mode: append
