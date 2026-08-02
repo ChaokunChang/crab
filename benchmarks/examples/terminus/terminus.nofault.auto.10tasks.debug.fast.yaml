@@ -3,7 +3,7 @@ mode: auto
 provider: openai
 agent: terminus
 llm_service: terminus_trace_replay
-task_dataset: /root/workspace/crab/results/datasets/terminus_replay.jsonl
+task_dataset: ../../../results/datasets/terminus_replay.jsonl
 sandboxes: 10
 max_workers: 10
 phase_workers:
@@ -33,11 +33,11 @@ llm_server:
 host_inspector:
   launch_mode: process
 iterations: 1
-output: /root/workspace/crab/logs/terminus/nofault.auto.10tasks.debug.fast.csv
-log_file: /root/workspace/crab/logs/terminus/nofault.auto.10tasks.debug.fast.log
+output: ../../../logs/terminus/nofault.auto.10tasks.debug.fast.csv
+log_file: ../../../logs/terminus/nofault.auto.10tasks.debug.fast.log
 log_file_mode: write
 telemetry:
-  output: /root/workspace/crab/logs/terminus/nofault.auto.10tasks.debug.fast.telemetry.jsonl
+  output: ../../../logs/terminus/nofault.auto.10tasks.debug.fast.telemetry.jsonl
   file_mode: write
   detail_level: detailed
   capture_command_output: false
@@ -51,7 +51,7 @@ telemetry:
   serializer: auto
   report:
     enabled: true
-    output_dir: /root/workspace/crab/logs/terminus/nofault.auto.10tasks.debug.fast.report
+    output_dir: ../../../logs/terminus/nofault.auto.10tasks.debug.fast.report
     top_k: 50
     log_scale_charts: false
     export_svg: true
@@ -62,7 +62,7 @@ monitoring:
   include_sandboxes: true
 zpool_name: zfspool
 reuse_zpool: true
-benchmark_root: /root/workspace/crab/data/crab/results
+benchmark_root: ../../../data/crab/results
 log_level: debug
 scenario_options:
   injection_rate: 0.0

@@ -1815,7 +1815,8 @@ class BenchmarkRunDispatchTests(unittest.TestCase):
         self.assertNotIn("spec-1-spec-24", joined)
 
     def test_example_yaml_files_load(self) -> None:
-        examples = sorted((Path("/root/workspace/crab/benchmarks/examples")).glob("*.yaml"))
+        examples_root = Path(__file__).resolve().parents[1] / "benchmarks" / "examples"
+        examples = sorted(examples_root.glob("*/*.yaml"))
         self.assertTrue(examples)
         for path in examples:
             with self.subTest(path=path.name):

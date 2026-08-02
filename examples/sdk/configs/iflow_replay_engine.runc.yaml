@@ -28,15 +28,15 @@ forwarder:
 
 # Benchmark YAML says zpool_name: crab-300. The SDK engine takes the more
 # direct runtime-manager form: a dataset prefix under that pool.
-zfs_dataset_prefix: crab-300/crab-sdk-iflow-replay
+zfs_dataset_prefix: crab/iflow-replay
 
 # Keep SDK engine data out of /tmp so successful runs leave inspectable state.
 storage_planes:
-  runtime_root: /root/workspace/crab/data/crab/sdk/iflow-replay-runc/runtime
-  storage_root: /root/workspace/crab/data/crab/sdk/iflow-replay-runc/storage
-  agent_state_root: /root/workspace/crab/data/crab/sdk/iflow-replay-runc/agent-state
-  work_dir_host_root: /root/workspace/crab/data/crab/sdk/iflow-replay-runc/work
-  image_cache_root: /root/workspace/crab/data/crab/sdk/iflow-replay-runc/image-cache
+  runtime_root: /var/lib/crab/examples/iflow-replay/runtime
+  storage_root: /var/lib/crab/examples/iflow-replay/checkpoints
+  agent_state_root: /var/lib/crab/examples/iflow-replay/agent-state
+  work_dir_host_root: /var/lib/crab/examples/iflow-replay/work
+  image_cache_root: /var/lib/crab/examples/iflow-replay/image-cache
 
 executor:
   max_workers: 2
@@ -68,7 +68,7 @@ host_inspector:
   host: 127.0.0.1
   port: 0
   log_level: DEBUG
-  log_file: /root/workspace/crab/logs/sdk/iflow-replay-runc/host-inspector.log
+  log_file: /var/lib/crab/examples/iflow-replay/logs/host-inspector.log
 
 runc:
   command_timeout_seconds: 120.0
@@ -86,7 +86,7 @@ runc:
     lazy_pages: false
 
 telemetry:
-  output: /root/workspace/crab/logs/sdk/iflow-replay-runc/engine.telemetry.jsonl
+  output: /var/lib/crab/examples/iflow-replay/logs/telemetry.jsonl
   detail_level: detailed
   capture_command_output: false
   max_text_attribute_bytes: 2048
@@ -99,6 +99,6 @@ telemetry:
   serializer: auto
 
 logging:
-  file: /root/workspace/crab/logs/sdk/iflow-replay-runc/engine.log
+  file: /var/lib/crab/examples/iflow-replay/logs/engine.log
   level: debug
   file_mode: write

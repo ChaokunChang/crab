@@ -3,7 +3,7 @@ mode: auto
 provider: openai
 agent: mini_swe
 llm_service: mini_swe_spec_trace_replay
-task_dataset: /root/workspace/crab/results/datasets/swebench_miniswe_replay.jsonl
+task_dataset: ../../../results/datasets/swebench_miniswe_replay.jsonl
 sandboxes: 128
 sandbox_resource_limits:
   cpus: 4
@@ -44,11 +44,11 @@ host_inspector:
   log_level: INFO
   log_file: true
 iterations: 0
-output: /root/workspace/crab/logs/mini_swe/spec.auto.128tasks.csv
-log_file: /root/workspace/crab/logs/mini_swe/spec.auto.128tasks.log
+output: ../../../logs/mini_swe/spec.auto.128tasks.csv
+log_file: ../../../logs/mini_swe/spec.auto.128tasks.log
 log_file_mode: write
 telemetry:
-  output: /root/workspace/crab/logs/mini_swe/spec.auto.128tasks.telemetry.jsonl
+  output: ../../../logs/mini_swe/spec.auto.128tasks.telemetry.jsonl
   file_mode: write
   detail_level: detailed
   capture_command_output: false
@@ -62,7 +62,7 @@ telemetry:
   serializer: auto
   report:
     enabled: true
-    output_dir: /root/workspace/crab/logs/mini_swe/spec.auto.128tasks.report
+    output_dir: ../../../logs/mini_swe/spec.auto.128tasks.report
     top_k: 50
     log_scale_charts: false
     export_svg: true
@@ -73,7 +73,7 @@ monitoring:
   include_sandboxes: true
 zpool_name: crabbench-300
 reuse_zpool: true
-benchmark_root: /root/workspace/crab/data/crab/results
+benchmark_root: ../../../data/crab/results
 log_level: info
 max_agent_timeout_scale: 4.0
 runtime_command_timeout_seconds: 300

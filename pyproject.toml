@@ -27,6 +27,8 @@ crabd = "crab.daemon.server:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["crab*", "integrations*", "benchmarks*"]
+exclude = ["integrations.sandboxes.iflow.cache.prepared-runtimes*"]
 
 [tool.setuptools.package-data]
 "crab" = ["host_inspector/bpf/*"]
+"integrations.sandboxes.iflow" = ["Dockerfile", "cache/*.tar.xz", "cache/*.tgz"]

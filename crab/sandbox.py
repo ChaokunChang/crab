@@ -190,6 +190,8 @@ class _CheckpointsNamespace:
                     "checkpoint_id": str(manifest.checkpoint_id),
                     "created_at": manifest.created_at.isoformat() if hasattr(manifest, "created_at") else None,
                     "label": md.get(_LABEL_METADATA_KEY),
+                    "has_process": bool(getattr(manifest, "process_artifacts", None)),
+                    "has_filesystem": bool(getattr(manifest, "filesystem_artifacts", None)),
                     "metadata": md,
                 }
             )

@@ -4,7 +4,7 @@ This document records the current Claude Code integration in `crab`, the decisio
 
 See also:
 
-- [agent-integration-notes.md](/root/workspace/crab/docs/agent-integration-notes.md) for the more general checkpoint/restore lessons that came out of the Claude integration work.
+- [agent-integration-notes.md](agent-integration-notes.md) for the more general checkpoint/restore lessons that came out of the Claude integration work.
 
 ## Overview
 
@@ -97,8 +97,8 @@ This makes the behavior explicit in YAML instead of inferring it from fault-inje
 
 Claude does not have a special verifier. Claude and `iflow` both go through the same shared benchmark verification path in:
 
-- [core.py](/root/workspace/crab/benchmarks/core.py)
-- [real_host_scenario_base.py](/root/workspace/crab/benchmarks/real_host_scenario_base.py)
+- [core.py](../benchmarks/core.py)
+- [real_host_scenario_base.py](../benchmarks/real_host_scenario_base.py)
 
 At a high level, verification is still simple:
 
@@ -119,9 +119,8 @@ Why the bootstrap exists:
   - `uv run pytest ...`
 - so the verifier has to make sure that a usable `uv` and Python test environment exist inside the sandbox before the task-authored verifier script runs
 
-Concrete example:
-
-- [run-tests.sh](/root/workspace/crab/results/original-tasks/torch-tensor-parallelism/run-tests.sh)
+The concrete Terminal-Bench task assets used for this experiment are external
+datasets and are not distributed in this repository.
 
 Decision:
 
@@ -142,8 +141,8 @@ Why `iflow` may have felt simpler:
 
 Implemented in:
 
-- [claude_code.py](/root/workspace/crab/integrations/agents/claude_code.py)
-- [harness.py](/root/workspace/crab/integrations/sandboxes/claude_code/harness.py)
+- [claude_code.py](../integrations/agents/claude_code.py)
+- [harness.py](../integrations/sandboxes/claude_code/harness.py)
 
 Key behaviors:
 
@@ -159,8 +158,8 @@ Key behaviors:
 
 Implemented in:
 
-- [request_classification.py](/root/workspace/crab/integrations/llm_services/claude_code_trace_replay/request_classification.py)
-- [service.py](/root/workspace/crab/integrations/llm_services/claude_code_trace_replay/service.py)
+- [request_classification.py](../integrations/llm_services/claude_code_trace_replay/request_classification.py)
+- [service.py](../integrations/llm_services/claude_code_trace_replay/service.py)
 
 Key behaviors:
 
@@ -225,9 +224,9 @@ Claude Code replay now uses the same request taxonomy in the live interceptor pa
 
 Implemented in:
 
-- [interceptor.py](/root/workspace/crab/crab/interceptor.py)
-- [system.py](/root/workspace/crab/crab/system.py)
-- [real_host_scenario_base.py](/root/workspace/crab/benchmarks/real_host_scenario_base.py)
+- [interceptor.py](../crab/interceptor.py)
+- [system.py](../crab/system.py)
+- [real_host_scenario_base.py](../benchmarks/real_host_scenario_base.py)
 
 Behavior:
 
@@ -242,9 +241,9 @@ This split matters because the replayable benchmark dataset records main-loop pr
 
 Implemented across:
 
-- [real_host_scenario_base.py](/root/workspace/crab/benchmarks/real_host_scenario_base.py)
-- [fault.py](/root/workspace/crab/benchmarks/scenarios/fault.py)
-- [runc.py](/root/workspace/crab/crab/runtime/runc.py)
+- [real_host_scenario_base.py](../benchmarks/real_host_scenario_base.py)
+- [fault.py](../benchmarks/scenarios/fault.py)
+- [runc.py](../crab/runtime/runc.py)
 
 Key fixes:
 
@@ -285,13 +284,13 @@ Why this is the right split:
 - wrapper-level stdio is low-value compared with successful restore
 - this matches the safer pattern already used by `iflow`
 
-This fix is documented more generally in [agent-integration-notes.md](/root/workspace/crab/docs/agent-integration-notes.md).
+This fix is documented more generally in [agent-integration-notes.md](agent-integration-notes.md).
 
 ### Dataset generation
 
 Implemented in:
 
-- [generate_claude_code_replay_dataset.py](/root/workspace/crab/benchmarks/generate_claude_code_replay_dataset.py)
+- [generate_claude_code_replay_dataset.py](../benchmarks/generate_claude_code_replay_dataset.py)
 
 Behavior:
 

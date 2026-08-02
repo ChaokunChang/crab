@@ -205,7 +205,7 @@ Checkpoint manifests include runtime metadata, artifact references, and an integ
 
 ## Benchmark Harness
 
-The real-host benchmarks share `RealHostScenarioHarness` in [benchmarks/real_host_scenario_base.py](/root/workspace/crab/benchmarks/real_host_scenario_base.py).
+The real-host benchmarks share `RealHostScenarioHarness` in [benchmarks/real_host_scenario_base.py](../benchmarks/real_host_scenario_base.py).
 
 That harness:
 
@@ -245,9 +245,9 @@ At the `run → verification` handoff, the harness calls `CRScheduler.deactivate
 
 The main benchmark entrypoints and configuration surface are:
 
-- [benchmarks/run.py](/root/workspace/crab/benchmarks/run.py)
-- [benchmarks/config.py](/root/workspace/crab/benchmarks/config.py)
-- [benchmarks/scenarios/fault.py](/root/workspace/crab/benchmarks/scenarios/fault.py)
-- [benchmarks/scenarios/spot.py](/root/workspace/crab/benchmarks/scenarios/spot.py)
-- [benchmarks/scenarios/tree.py](/root/workspace/crab/benchmarks/scenarios/tree.py)
-- [benchmarks/scenarios/e2e.py](/root/workspace/crab/benchmarks/scenarios/e2e.py)
+- [benchmarks/run.py](../benchmarks/run.py)
+- [benchmarks/config.py](../benchmarks/config.py)
+- [benchmarks/scenarios/fault.py](../benchmarks/scenarios/fault.py)
+- [benchmarks/scenarios/spot.py](../benchmarks/scenarios/spot.py)
+- [benchmarks/scenarios/tree.py](../benchmarks/scenarios/tree.py)
+- [benchmarks/scenarios/e2e.py](../benchmarks/scenarios/e2e.py)

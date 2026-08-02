@@ -249,27 +249,24 @@ client = anthropic.Anthropic(base_url=agent.llm_base_url)
 
 ## Running the examples
 
-The repo has no `setup.py`, so run examples from the repo root with
-`PYTHONPATH` pointing at it:
+Install Crab, start the daemon, then run examples from the repository root:
 
 ```bash
-cd /root/workspace/acr-deploy/crab
-PYTHONPATH=. python3 examples/sdk/02_byo_agent.py
+sudo ./scripts/install-ubuntu.sh
+sudo crab daemon start --config /etc/crab/config.yaml
+sudo --preserve-env=PYTHONPATH PYTHONPATH=. \
+  python3 examples/sdk/01_basic_sandbox.py
 ```
 
-The `02_byo_agent.py` example runs against the in-memory runtime and
-exercises the full SDK shape (install, run, follow-up task). The
-`05_iflow_runc.py` example runs a real `runc` sandbox, invokes iFlow through
-the SDK, and verifies checkpoint/restore. The
-`06_iflow_replay_dataset_runc.py` example runs the first two iFlow replay
-dataset rows as two concurrent runc sandboxes and verifies each task with
-`/tests/run-tests.sh`; it expects the existing benchmark LLM router to be
-running as an external replay service. See
-[sdk-iflow-replay.md](sdk-iflow-replay.md).
+`01_basic_sandbox.py` is the smallest SDK launch example.
+`02_iflow_replay.py` runs a real recorded iFlow workflow without a model API
+key; it takes the matching Terminal-Bench task directory and trace as explicit
+arguments. `03_iflow_minimax_qsort.py` demonstrates a live model integration.
+See [sdk-iflow-replay.md](sdk-iflow-replay.md) for the replay service and
+daemon commands.
 
 ## Known limitations (first cut)
 
-- `Engine.connect()` is reserved; daemon mode lands in a follow-up.
 - `Sandbox.fork()` is reserved; the underlying CRIU+ZFS machinery exists
   but its integration with the SDK launch path needs follow-up wiring.
 - Bare-image launch via `Sandbox(image="ubuntu:22.04")` now prepares an OCI

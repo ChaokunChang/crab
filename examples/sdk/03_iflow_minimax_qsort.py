@@ -20,9 +20,19 @@ from crab.agents_builtin.iflow import IFlowAgent
 
 
 API_BASE = "https://api.minimax.chat/v1"
-API_KEY_FILE = Path(os.environ.get("MINIMAX_API_KEY_FILE", "/root/workspace/agent-os/.minimax"))
+API_KEY_FILE = Path(
+    os.environ.get(
+        "MINIMAX_API_KEY_FILE",
+        str(Path.home() / ".config" / "crab" / "minimax-api-key"),
+    )
+)
 MODEL = "MiniMax-M2.7"
-WORK_DIR = Path("/root/workspace/crab/data/crab/sdk/iflow-minimax-qsort-runc/work/qsort-demo")
+WORK_DIR = Path(
+    os.environ.get(
+        "CRAB_MINIMAX_WORK_DIR",
+        "/var/lib/crab/examples/iflow-minimax-qsort/work/qsort-demo",
+    )
+)
 
 TASK = """\
 Create a directory /work/qsort.

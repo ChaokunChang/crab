@@ -32,6 +32,7 @@ logs.old
 test.png
 tmp/
 .crab/
+build/
 data
 results
 logs

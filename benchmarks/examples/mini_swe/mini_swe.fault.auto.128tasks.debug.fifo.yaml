@@ -3,7 +3,7 @@ mode: auto
 provider: openai
 agent: mini_swe
 llm_service: mini_swe_trace_replay
-task_dataset: /root/workspace/crab/results/datasets/swebench_miniswe_replay.jsonl
+task_dataset: ../../../results/datasets/swebench_miniswe_replay.jsonl
 sandboxes: 128
 max_workers: 32
 phase_workers:
@@ -37,11 +37,11 @@ llm_server:
 host_inspector:
   launch_mode: process
 iterations: 10
-output: /root/workspace/crab/logs/mini_swe/fault.auto.128tasks.debug.fifo.1.csv
-log_file: /root/workspace/crab/logs/mini_swe/fault.auto.128tasks.debug.fifo.1.log
+output: ../../../logs/mini_swe/fault.auto.128tasks.debug.fifo.1.csv
+log_file: ../../../logs/mini_swe/fault.auto.128tasks.debug.fifo.1.log
 log_file_mode: write
 telemetry:
-  output: /root/workspace/crab/logs/mini_swe/fault.auto.128tasks.debug.fifo.1.telemetry.jsonl
+  output: ../../../logs/mini_swe/fault.auto.128tasks.debug.fifo.1.telemetry.jsonl
   file_mode: write
   detail_level: detailed
   capture_command_output: false
@@ -55,7 +55,7 @@ telemetry:
   serializer: auto
   report:
     enabled: true
-    output_dir: /root/workspace/crab/logs/mini_swe/fault.auto.128tasks.debug.fifo.1.report
+    output_dir: ../../../logs/mini_swe/fault.auto.128tasks.debug.fifo.1.report
     top_k: 50
     log_scale_charts: false
     export_svg: true
@@ -66,7 +66,7 @@ monitoring:
   include_sandboxes: true
 zpool_name: zfspool
 reuse_zpool: true
-benchmark_root: /root/workspace/crab/data/crab/results
+benchmark_root: ../../../data/crab/results
 log_level: info
 scenario_options:
   injection_rate: 0.0

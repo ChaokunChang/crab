@@ -22,14 +22,14 @@ forwarder:
   host: 127.0.0.1
   port: 0
 
-zfs_dataset_prefix: crab-300/crab-sdk-iflow-minimax-qsort
+zfs_dataset_prefix: crab/iflow-minimax-qsort
 
 storage_planes:
-  runtime_root: /root/workspace/crab/data/crab/sdk/iflow-minimax-qsort-runc/runtime
-  storage_root: /root/workspace/crab/data/crab/sdk/iflow-minimax-qsort-runc/storage
-  agent_state_root: /root/workspace/crab/data/crab/sdk/iflow-minimax-qsort-runc/agent-state
-  work_dir_host_root: /root/workspace/crab/data/crab/sdk/iflow-minimax-qsort-runc/work
-  image_cache_root: /root/workspace/crab/data/crab/sdk/iflow-minimax-qsort-runc/image-cache
+  runtime_root: /var/lib/crab/examples/iflow-minimax-qsort/runtime
+  storage_root: /var/lib/crab/examples/iflow-minimax-qsort/checkpoints
+  agent_state_root: /var/lib/crab/examples/iflow-minimax-qsort/agent-state
+  work_dir_host_root: /var/lib/crab/examples/iflow-minimax-qsort/work
+  image_cache_root: /var/lib/crab/examples/iflow-minimax-qsort/image-cache
 
 executor:
   max_workers: 1
@@ -58,7 +58,7 @@ host_inspector:
   host: 127.0.0.1
   port: 0
   log_level: DEBUG
-  log_file: /root/workspace/crab/logs/sdk/iflow-minimax-qsort-runc/host-inspector.log
+  log_file: /var/lib/crab/examples/iflow-minimax-qsort/logs/host-inspector.log
 
 runc:
   command_timeout_seconds: 120.0
@@ -76,7 +76,7 @@ runc:
     lazy_pages: false
 
 telemetry:
-  output: /root/workspace/crab/logs/sdk/iflow-minimax-qsort-runc/engine.telemetry.jsonl
+  output: /var/lib/crab/examples/iflow-minimax-qsort/logs/telemetry.jsonl
   detail_level: detailed
   capture_command_output: false
   max_text_attribute_bytes: 2048
@@ -89,6 +89,6 @@ telemetry:
   serializer: auto
 
 logging:
-  file: /root/workspace/crab/logs/sdk/iflow-minimax-qsort-runc/engine.log
+  file: /var/lib/crab/examples/iflow-minimax-qsort/logs/engine.log
   level: debug
   file_mode: write

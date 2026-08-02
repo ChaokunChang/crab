@@ -3,7 +3,7 @@ mode: auto
 provider: openai
 agent: terminus
 llm_service: terminus_spec_trace_replay
-task_dataset: /root/workspace/crab/results/datasets/terminus_replay_tool_dominated_short.jsonl
+task_dataset: ../../../results/datasets/terminus_replay_tool_dominated_short.jsonl
 sandboxes: 10
 max_workers: 10
 phase_workers:
@@ -36,11 +36,11 @@ llm_server:
 host_inspector:
   launch_mode: process
 iterations: 0
-output: /root/workspace/crab/logs/terminus/spec.auto.tooldom_short.csv
-log_file: /root/workspace/crab/logs/terminus/spec.auto.tooldom_short.log
+output: ../../../logs/terminus/spec.auto.tooldom_short.csv
+log_file: ../../../logs/terminus/spec.auto.tooldom_short.log
 log_file_mode: write
 telemetry:
-  output: /root/workspace/crab/logs/terminus/spec.auto.tooldom_short.telemetry.jsonl
+  output: ../../../logs/terminus/spec.auto.tooldom_short.telemetry.jsonl
   file_mode: write
   detail_level: detailed
   capture_command_output: false
@@ -54,7 +54,7 @@ telemetry:
   serializer: auto
   report:
     enabled: true
-    output_dir: /root/workspace/crab/logs/terminus/spec.auto.tooldom_short.report
+    output_dir: ../../../logs/terminus/spec.auto.tooldom_short.report
     top_k: 50
     log_scale_charts: false
     export_svg: true
@@ -65,7 +65,7 @@ monitoring:
   include_sandboxes: true
 zpool_name: zfspool
 reuse_zpool: true
-benchmark_root: /root/workspace/crab/data/crab/results
+benchmark_root: ../../../data/crab/results
 log_level: info
 max_agent_timeout_scale: 2.0
 scenario_options:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -1520,7 +1521,12 @@ class IFlowTraceReplayTests(unittest.TestCase):
 
 
 class TestHashCollisionRealTraces(unittest.TestCase):
-    RESULTS_DIR = Path("/root/workspace/crab/results/2026-02-24__20-20-40_passed")
+    RESULTS_DIR = Path(
+        os.environ.get(
+            "CRAB_IFLOW_TRACES_ROOT",
+            Path(__file__).resolve().parents[1] / "results" / "iflow-traces",
+        )
+    )
     ALLOWED_PARSE_ERROR_TRACE_NAMES = {
         "vulnerable-secret.1-of-1.2026-02-24__20-20-40",
     }
@@ -1530,7 +1536,10 @@ class TestHashCollisionRealTraces(unittest.TestCase):
 
     def test_no_hash_collisions_in_real_traces(self) -> None:
         trace_files = self._find_trace_files()
-        self.assertGreater(len(trace_files), 0, "No trace files found")
+        if not trace_files:
+            self.skipTest(
+                "No real traces found; set CRAB_IFLOW_TRACES_ROOT to run this optional corpus test"
+            )
 
         parse_errors: list[tuple[Path, str]] = []
         collisions: list[dict] = []

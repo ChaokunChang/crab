@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import copy
 import fcntl
 import json
+import posixpath
 import re
 import shutil
 import subprocess
@@ -10,9 +12,20 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from crab.contracts import TelemetrySink
-from crab.telemetry import NoopTelemetrySink
+if TYPE_CHECKING:
+    from crab.contracts import TelemetrySink
+
+
+def _telemetry_sink(telemetry: TelemetrySink | None) -> TelemetrySink:
+    if telemetry is not None:
+        return telemetry
+    # Keep this module importable while ``crab`` is still initializing. The
+    # built-in iFlow agent imports the image helpers from crab.__init__.
+    from crab.telemetry import NoopTelemetrySink
+
+    return NoopTelemetrySink()
 
 
 @dataclass(frozen=True)
@@ -22,6 +35,38 @@ class ImageRuntimeDefaults:
     user: str | None = None
     entrypoint: tuple[str, ...] = ()
     command: tuple[str, ...] = ()
+
+
+def container_rootfs_tar_filter(member: tarfile.TarInfo, destination: str | Path) -> tarfile.TarInfo | None:
+    """Reject path escapes while preserving container rootfs metadata.
+
+    Docker root filesystems legitimately contain absolute link targets because
+    those links are interpreted inside the container root. Python 3.14's
+    default ``data`` filter rejects them and also strips ownership, sticky
+    bits, and group/world write bits. Those metadata are part of a container
+    image's runtime semantics (for example, ``/tmp`` must remain ``01777``).
+    Rewrite absolute link targets inside the rootfs, then use Python's ``tar``
+    filter to reject absolute/member traversal without altering OCI metadata.
+    """
+
+    if member.issym() and posixpath.isabs(member.linkname):
+        member = copy.copy(member)
+        link_target = member.linkname.lstrip("/")
+        link_parent = posixpath.dirname(member.name.lstrip("/")) or "."
+        member.linkname = posixpath.relpath(link_target, start=link_parent)
+    elif member.islnk() and posixpath.isabs(member.linkname):
+        member = copy.copy(member)
+        member.linkname = member.linkname.lstrip("/")
+    filtered = tarfile.tar_filter(member, destination)
+    if filtered is None:
+        return None
+    filtered = copy.copy(filtered)
+    filtered.mode = member.mode
+    filtered.uid = member.uid
+    filtered.gid = member.gid
+    filtered.uname = member.uname
+    filtered.gname = member.gname
+    return filtered
 
 
 def docker_tag_component(raw: str) -> str:
@@ -40,7 +85,7 @@ def image_exists(*, tag: str) -> bool:
 
 
 def inspect_image_id(*, tag: str, telemetry: TelemetrySink | None = None) -> str:
-    sink = telemetry or NoopTelemetrySink()
+    sink = _telemetry_sink(telemetry)
     started = time.perf_counter()
     raw_output = subprocess.run(
         ["docker", "image", "inspect", tag, "--format", "{{.Id}}"],
@@ -65,7 +110,7 @@ def inspect_image_runtime_defaults(
     cache_root: Path | None = None,
     telemetry: TelemetrySink | None = None,
 ) -> ImageRuntimeDefaults:
-    sink = telemetry or NoopTelemetrySink()
+    sink = _telemetry_sink(telemetry)
     image_id = inspect_image_id(tag=tag, telemetry=sink)
     cache_dir = None if cache_root is None else cache_root / image_id
     cache_path = None if cache_dir is None else cache_dir / "runtime_defaults.json"
@@ -134,7 +179,7 @@ def build_image(
     telemetry: TelemetrySink | None = None,
     skip_if_exists: bool = True,
 ) -> None:
-    sink = telemetry or NoopTelemetrySink()
+    sink = _telemetry_sink(telemetry)
     if skip_if_exists and image_exists(tag=tag):
         sink.emit_event("image.build_cache_hit", {"tag": tag, "build_context": str(build_context)})
         sink.emit_metric("image.build_ms", 0.0, {"tag": tag, "cache_hit": True})
@@ -156,7 +201,7 @@ def export_image_rootfs(
     cache_root: Path | None = None,
     telemetry: TelemetrySink | None = None,
 ) -> Path:
-    sink = telemetry or NoopTelemetrySink()
+    sink = _telemetry_sink(telemetry)
     image_id = inspect_image_id(tag=tag, telemetry=sink)
     resolved_output_dir = output_dir if cache_root is None else cache_root / image_id
     rootfs_dir = resolved_output_dir / "rootfs"
@@ -192,7 +237,7 @@ def export_image_rootfs(
                 subprocess.run(["docker", "export", container_id], check=True, stdout=fh)
             staging_rootfs_dir.mkdir(parents=True, exist_ok=True)
             with tarfile.open(tar_path) as tf:
-                tf.extractall(staging_rootfs_dir)
+                tf.extractall(staging_rootfs_dir, filter=container_rootfs_tar_filter)
             backup_dir = resolved_output_dir / "rootfs.previous"
             try:
                 if backup_dir.exists():

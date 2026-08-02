@@ -3,7 +3,7 @@ mode: auto
 provider: openai
 agent: iflow
 llm_service: iflow_trace_replay
-task_dataset: /root/workspace/crab/results/datasets/termnius_iflow_replay_128tasks_light_medium.jsonl
+task_dataset: ../../../results/datasets/termnius_iflow_replay_128tasks_light_medium.jsonl
 sandboxes: 5
 max_workers: 64
 phase_workers:
@@ -37,11 +37,11 @@ llm_server:
 host_inspector:
   launch_mode: process
 iterations: 10
-output: /root/workspace/crab/logs/iflow/tree.auto.5tasks.debug.reactivecsv
-log_file: /root/workspace/crab/logs/iflow/tree.auto.5tasks.debug.reactivelog
+output: ../../../logs/iflow/tree.auto.5tasks.debug.reactivecsv
+log_file: ../../../logs/iflow/tree.auto.5tasks.debug.reactivelog
 log_file_mode: write
 telemetry:
-  output: /root/workspace/crab/logs/iflow/tree.auto.5tasks.debug.reactivetelemetry.jsonl
+  output: ../../../logs/iflow/tree.auto.5tasks.debug.reactivetelemetry.jsonl
   file_mode: write
   detail_level: detailed
   capture_command_output: false
@@ -55,7 +55,7 @@ telemetry:
   serializer: auto
   report:
     enabled: true
-    output_dir: /root/workspace/crab/logs/iflow/tree.auto.5tasks.debug.reactivereport
+    output_dir: ../../../logs/iflow/tree.auto.5tasks.debug.reactivereport
     top_k: 50
     log_scale_charts: false
     export_svg: true
@@ -66,13 +66,13 @@ monitoring:
   include_sandboxes: true
 zpool_name: zfspool
 reuse_zpool: true
-# benchmark_root: /root/workspace/crab/data/crab/results
-benchmark_root: /mnt/data2
+# benchmark_root: ../../../data/crab/results
+benchmark_root: ../../../results/benchmark-runs
 # zpool_size: 150G
 # zpool_name: crabbench-150
-# zpool_image: /root/workspace/crab/data/crab/results/zpool/crabbench-150.zpool.img
+# zpool_image: ../../../data/crab/results/zpool/crabbench-150.zpool.img
 # reuse_zpool: true
-# benchmark_root: /root/workspace/crab/data/crab/results
+# benchmark_root: ../../../data/crab/results
 log_level: debug
 scenario_options:
   injection_rate: 0.0

@@ -2,7 +2,27 @@
 set -Eeuo pipefail
 
 usage() {
-  command sed -n '2,38p' "$0" | command sed 's/^# \{0,1\}//'
+  command cat <<'EOF'
+Install Crab's full Linux v0 stack on Ubuntu x86-64.
+
+Usage:
+  sudo ./scripts/install-ubuntu.sh [options]
+
+Options:
+  --zpool NAME       Dedicated ZFS pool name (default: crab)
+  --zpool-file PATH  Sparse backing file for a new pool
+                     (default: /var/lib/crab/crab.zpool)
+  --zpool-size SIZE  Sparse backing file size (default: 32G)
+  --config PATH      Installed config path (default: /etc/crab/config.yaml)
+  --skip-packages    Do not run apt; only verify/build/install/configure
+  --no-create-pool   Require --zpool to name an existing pool
+  -h, --help         Show this help
+
+Safety:
+  The script never selects an arbitrary existing pool and never repartitions
+  a disk. When the requested pool does not exist, it creates a sparse-file
+  pool at --zpool-file. An existing unimported backing file is never reused.
+EOF
 }
 
 # Install Crab's full Linux v0 stack on Ubuntu x86-64.

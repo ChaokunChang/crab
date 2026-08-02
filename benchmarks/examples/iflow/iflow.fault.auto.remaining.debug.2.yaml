@@ -3,14 +3,14 @@ mode: auto
 provider: openai
 agent: iflow
 llm_service: iflow_trace_replay
-task_dataset: /root/workspace/crab/results/datasets/termnius_iflow_replay_remaining.jsonl
+task_dataset: ../../../results/datasets/termnius_iflow_replay_remaining.jsonl
 sandboxes: 6
 iterations: 5
 output: ../../logs/iflow.fault.auto.remaining.debug.2.csv
 log_file: ../../logs/iflow.fault.auto.remaining.debug.2.log
 zpool_size: 64G
 zpool_name: crabbench-remainig-debug-2
-zpool_image: /root/workspace/crab/data/crab/results/zpool/crabbench-remainig-debug-2.zpool.img
+zpool_image: ../../../data/crab/results/zpool/crabbench-remainig-debug-2.zpool.img
 reuse_zpool: true
 log_level: debug
 scenario_options:

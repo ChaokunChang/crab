@@ -73,9 +73,13 @@ Terminal 3 — run any SDK script. `Sandbox(...)` will connect to the
 running daemon automatically:
 
 ```bash
-CRAB_REPLAY_BASE_URL=http://127.0.0.1:18080 \
-  PYTHONPATH=. python3 examples/sdk/06_iflow_replay_dataset_runc.py
+sudo --preserve-env=PYTHONPATH PYTHONPATH=. \
+  python3 examples/sdk/01_basic_sandbox.py
 ```
+
+For the no-API-key iFlow workflow, start its replay router and pass the task
+assets and trace to `examples/sdk/02_iflow_replay.py`; see
+[sdk-iflow-replay.md](sdk-iflow-replay.md).
 
 Stop the daemon when done:
 

@@ -21,17 +21,20 @@ The proxy itself is intentionally thin:
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Mapping
 
 from .contracts import Runtime
 from .daemon import DaemonClient
-from .ids import SandboxId
-from .models import SandboxDescription, SandboxExecResult, SandboxRuntimeState
+from .ids import CheckpointId, SandboxId
+from .models import JobStatus, SandboxDescription, SandboxExecResult, SandboxRuntimeState
 from .telemetry import NoopTelemetrySink
 
 if TYPE_CHECKING:
@@ -67,25 +70,89 @@ class _LocalInspectorShim:
         return None
 
 
-class _SystemShim:
-    """`Engine.system`-shaped object exposing only what the SDK reads."""
+class _RemoteStorageShim:
+    """Checkpoint storage facade backed by the daemon's public routes."""
 
-    def __init__(self) -> None:
+    def __init__(self, client: DaemonClient) -> None:
+        self._client = client
+        self._entries: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def list_checkpoints(self, sandbox_id: SandboxId) -> list[CheckpointId]:
+        response = self._client.get_json(f"/sandboxes/{sandbox_id}/checkpoints")
+        entries = list(response.get("checkpoints") or [])
+        checkpoint_ids: list[CheckpointId] = []
+        for entry in entries:
+            checkpoint_id = CheckpointId(str(entry["checkpoint_id"]))
+            checkpoint_ids.append(checkpoint_id)
+            self._entries[(str(sandbox_id), str(checkpoint_id))] = dict(entry)
+        return checkpoint_ids
+
+    def get_manifest(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId):
+        key = (str(sandbox_id), str(checkpoint_id))
+        if key not in self._entries:
+            self.list_checkpoints(sandbox_id)
+        entry = self._entries.get(key)
+        if entry is None:
+            raise KeyError(f"checkpoint not found: {checkpoint_id}")
+        created_at = entry.get("created_at")
+        return SimpleNamespace(
+            checkpoint_id=checkpoint_id,
+            created_at=(datetime.fromisoformat(str(created_at)) if created_at else None),
+            process_artifacts=([True] if entry.get("has_process") else []),
+            filesystem_artifacts=([True] if entry.get("has_filesystem") else []),
+            metadata={"label": entry.get("label")} if entry.get("label") else {},
+        )
+
+    def delete_checkpoint(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+        *,
+        cascade: bool = False,
+    ) -> None:
+        payload = {"cascade": True} if cascade else None
+        self._client._request_json(
+            "DELETE",
+            f"/sandboxes/{sandbox_id}/checkpoints/{checkpoint_id}",
+            body=None if payload is None else json.dumps(payload).encode("utf-8"),
+        )
+        self._entries.pop((str(sandbox_id), str(checkpoint_id)), None)
+
+
+class _SystemShim:
+    """`Engine.system`-shaped facade for SDK checkpoint operations."""
+
+    def __init__(self, client: DaemonClient) -> None:
+        self._client = client
         self.telemetry = NoopTelemetrySink()
         self.inspector = _LocalInspectorShim()
+        self.storage = _RemoteStorageShim(client)
 
-    def checkpoint_once(self, *_, **__):
-        raise NotImplementedError(
-            "Manual checkpoint/restore from the SDK is not implemented in "
-            "daemon mode v1. Automatic checkpointing driven by the LLM "
-            "interceptor continues to work."
+    def checkpoint_once(self, sandbox_id: SandboxId, *, leave_running: bool = True):
+        response = self._client.post_json(
+            f"/sandboxes/{sandbox_id}/checkpoints",
+            {"leave_running": bool(leave_running)},
+            timeout_seconds=300.0,
+        )
+        checkpoint_id_raw = response.get("checkpoint_id")
+        checkpoint_id = CheckpointId(str(checkpoint_id_raw)) if checkpoint_id_raw else None
+        status = JobStatus(str(response.get("status") or JobStatus.SUCCEEDED.value))
+        manifest = None if checkpoint_id is None else SimpleNamespace(checkpoint_id=checkpoint_id)
+        return SimpleNamespace(
+            checkpoint_id=checkpoint_id,
+            manifest=manifest,
+            status=status,
+            message="",
         )
 
-    def restore_once(self, *_, **__):
-        raise NotImplementedError(
-            "Manual checkpoint/restore from the SDK is not implemented in "
-            "daemon mode v1."
+    def restore_once(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId):
+        response = self._client.post_json(
+            f"/sandboxes/{sandbox_id}/checkpoints/{checkpoint_id}/restore",
+            {},
+            timeout_seconds=300.0,
         )
+        status = JobStatus(str(response.get("status") or JobStatus.SUCCEEDED.value))
+        return SimpleNamespace(status=status, message="")
 
 
 class _ConfigShim:
@@ -313,7 +380,7 @@ class RemoteEngine:
         self._client = client
         self._info = dict(info)
         self._runtime = RuntimeProxy(client, name=str(info.get("runtime") or "runc"))
-        self._system = _SystemShim()
+        self._system = _SystemShim(client)
         self._config = _ConfigShim(info)
         self._sandboxes_lock = threading.Lock()
         self._sandboxes: "dict[SandboxId, Sandbox]" = {}

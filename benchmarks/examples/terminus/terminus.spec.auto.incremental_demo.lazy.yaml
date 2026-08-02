@@ -9,7 +9,7 @@ llm_service: terminus_spec_trace_replay
 # via userfaultfd while the process is already running. For spec where
 # many forks are discarded after the oracle decision, this also avoids
 # loading pages that are never touched.
-task_dataset: /root/workspace/crab/results/datasets/terminus_replay_spec_friendly.incremental_demo.jsonl
+task_dataset: ../../../results/datasets/terminus_replay_spec_friendly.incremental_demo.jsonl
 sandboxes: 8
 sandbox_resource_limits:
   cpus: 4
@@ -51,12 +51,12 @@ llm_server:
 host_inspector:
   launch_mode: process
 iterations: 0
-output: /root/workspace/crab/logs/terminus/spec.auto.incremental_demo.lazy.csv
-log_file: /root/workspace/crab/logs/terminus/spec.auto.incremental_demo.lazy.log
+output: ../../../logs/terminus/spec.auto.incremental_demo.lazy.csv
+log_file: ../../../logs/terminus/spec.auto.incremental_demo.lazy.log
 log_file_mode: write
 log_level: info
 telemetry:
-  output: /root/workspace/crab/logs/terminus/spec.auto.incremental_demo.lazy.telemetry.jsonl
+  output: ../../../logs/terminus/spec.auto.incremental_demo.lazy.telemetry.jsonl
   file_mode: write
   detail_level: detailed
   capture_command_output: false
@@ -70,7 +70,7 @@ telemetry:
   serializer: auto
   report:
     enabled: true
-    output_dir: /root/workspace/crab/logs/terminus/spec.auto.incremental_demo.lazy.report
+    output_dir: ../../../logs/terminus/spec.auto.incremental_demo.lazy.report
     top_k: 50
     log_scale_charts: false
     export_svg: true
@@ -81,7 +81,7 @@ monitoring:
   include_sandboxes: true
 zpool_name: crabbench-300
 reuse_zpool: true
-benchmark_root: /root/workspace/crab/data/crab/results
+benchmark_root: ../../../data/crab/results
 max_agent_timeout_scale: 4.0
 max_test_timeout_scale_overrides:
   pytorch-model-cli: 4.0

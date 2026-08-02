@@ -105,8 +105,8 @@ When `enable_fork_reuse` is `false`, the same funnel still renders from telemetr
 
 Checked-in examples:
 
-- [mini_swe.spec.auto.10tasks.debug.yaml](/root/workspace/crab/benchmarks/examples/mini_swe/mini_swe.spec.auto.10tasks.debug.yaml)
-- [terminus.spec.auto.10tasks.debug.yaml](/root/workspace/crab/benchmarks/examples/terminus/terminus.spec.auto.10tasks.debug.yaml)
+- [mini_swe.spec.auto.10tasks.debug.yaml](../benchmarks/examples/mini_swe/mini_swe.spec.auto.10tasks.debug.yaml)
+- [terminus.spec.auto.10tasks.debug.yaml](../benchmarks/examples/terminus/terminus.spec.auto.10tasks.debug.yaml)
 
 Minimal shape (mini_swe variant; for `terminus`, swap `agent` and `llm_service`):
 
@@ -117,7 +117,7 @@ provider: openai
 agent: mini_swe                       # or: terminus
 llm_service: mini_swe_spec_trace_replay  # or: terminus_spec_trace_replay
 iterations: 0
-task_dataset: /root/workspace/crab/results/datasets/...
+task_dataset: ../results/datasets/...
 scenario_options:
   acceptance_rate: 0.5
   draft_response_delay_scaling_factor: 0.5
@@ -254,7 +254,7 @@ Speculative execution is critical-path-bound by fork prep latency. The agent rac
 
 ### Headline results
 
-8-task subset of `terminus_replay_spec_friendly`, 8 sandboxes, `incremental_process_enabled=true` baseline. Configs in [`benchmarks/examples/terminus/terminus.spec.auto.incremental_demo.{baseline,chain_sharing,prefork,lazy,b_plus_d,all_opts}.yaml`](/root/workspace/crab/benchmarks/examples/terminus). Comparison helper: [`benchmarks/examples/terminus/incremental_demo_compare.py`](/root/workspace/crab/benchmarks/examples/terminus/incremental_demo_compare.py).
+8-task subset of `terminus_replay_spec_friendly`, 8 sandboxes, `incremental_process_enabled=true` baseline. Configs in [`benchmarks/examples/terminus/terminus.spec.auto.incremental_demo.{baseline,chain_sharing,prefork,lazy,b_plus_d,all_opts}.yaml`](../benchmarks/examples/terminus). Comparison helper: [`benchmarks/examples/terminus/incremental_demo_compare.py`](../benchmarks/examples/terminus/incremental_demo_compare.py).
 
 | variant | mean | p95 | p99 | max | wall-clock | spec_accept_rate | success |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -335,13 +335,6 @@ Event delivery is still asynchronous — kernel tracepoint → BPF ring buffer �
 
 ## Evaluation Sweep
 
-The tracked evaluation sweep now uses:
-
-- [spec.0.0.yaml](/root/workspace/crab/benchmarks/evaluation/spec.0.0.yaml)
-- [spec.0.1.yaml](/root/workspace/crab/benchmarks/evaluation/spec.0.1.yaml)
-- [spec.0.2.yaml](/root/workspace/crab/benchmarks/evaluation/spec.0.2.yaml)
-- [spec.0.3.yaml](/root/workspace/crab/benchmarks/evaluation/spec.0.3.yaml)
-- [spec.0.4.yaml](/root/workspace/crab/benchmarks/evaluation/spec.0.4.yaml)
-- [spec.0.5.yaml](/root/workspace/crab/benchmarks/evaluation/spec.0.5.yaml)
-
-Those files sweep `acceptance_rate` from `0.0` to `0.5` while keeping the draft delay scaling fixed at `0.5`.
+The research sweep used six generated configs that varied `acceptance_rate`
+from `0.0` to `0.5` while keeping the draft delay scaling fixed at `0.5`.
+Those run-specific configs are not part of the public v0 repository.

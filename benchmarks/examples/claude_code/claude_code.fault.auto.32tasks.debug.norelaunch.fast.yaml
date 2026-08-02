@@ -3,7 +3,7 @@ mode: auto
 provider: openai
 agent: claude_code
 llm_service: claude_code_trace_replay
-task_dataset: /root/workspace/crab/results/datasets/claude_code_replay_benchmark_with_duplicates_lightweight.jsonl
+task_dataset: ../../../results/datasets/claude_code_replay_benchmark_with_duplicates_lightweight.jsonl
 sandboxes: 32
 max_workers: 32
 phase_workers:
@@ -37,11 +37,11 @@ llm_server:
 host_inspector:
   launch_mode: process
 iterations: 10
-output: /root/workspace/crab/logs/claude_code/fault.auto.32tasks.norelaunch.fast.debug.csv
-log_file: /root/workspace/crab/logs/claude_code/fault.auto.32tasks.norelaunch.fast.debug.log
+output: ../../../logs/claude_code/fault.auto.32tasks.norelaunch.fast.debug.csv
+log_file: ../../../logs/claude_code/fault.auto.32tasks.norelaunch.fast.debug.log
 log_file_mode: write
 telemetry:
-  output: /root/workspace/crab/logs/claude_code/fault.auto.32tasks.norelaunch.fast.debug.telemetry.jsonl
+  output: ../../../logs/claude_code/fault.auto.32tasks.norelaunch.fast.debug.telemetry.jsonl
   detail_level: detailed
   capture_command_output: false
   max_text_attribute_bytes: 2048
@@ -54,7 +54,7 @@ telemetry:
   serializer: auto
   report:
     enabled: true
-    output_dir: /root/workspace/crab/logs/claude_code/fault.auto.32tasks.norelaunch.fast.debug.report
+    output_dir: ../../../logs/claude_code/fault.auto.32tasks.norelaunch.fast.debug.report
     top_k: 50
     log_scale_charts: false
     export_svg: true
@@ -65,11 +65,11 @@ monitoring:
   include_sandboxes: true
 zpool_size: 300G
 zpool_name: crabbench-300
-zpool_image: /root/workspace/crab/data/crab/results/zpool/crabbench-300.zpool.img
+zpool_image: ../../../data/crab/results/zpool/crabbench-300.zpool.img
 reuse_zpool: true
 runtime_command_timeout_seconds: 300
 runtime_zfs_prepare_timeout_seconds: 900
-benchmark_root: /root/workspace/crab/data/crab/results
+benchmark_root: ../../../data/crab/results
 log_level: debug
 scenario_options:
   injection_rate: 0.0

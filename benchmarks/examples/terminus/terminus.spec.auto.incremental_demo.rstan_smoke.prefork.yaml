@@ -6,7 +6,7 @@ llm_service: terminus_spec_trace_replay
 # Ablation: only Phase A (background pre-fork) enabled. Compare against
 # baseline to isolate the effect of speculatively warming the fork cache
 # in advance of the next ensure_fork() call.
-task_dataset: /root/workspace/crab/results/datasets/terminus_replay_spec_friendly.rstan_only.jsonl
+task_dataset: ../../../results/datasets/terminus_replay_spec_friendly.rstan_only.jsonl
 sandboxes: 1
 sandbox_resource_limits:
   cpus: 4
@@ -48,12 +48,12 @@ llm_server:
 host_inspector:
   launch_mode: process
 iterations: 0
-output: /root/workspace/crab/logs/terminus/spec.auto.incremental_demo.rstan_smoke.prefork.csv
-log_file: /root/workspace/crab/logs/terminus/spec.auto.incremental_demo.rstan_smoke.prefork.log
+output: ../../../logs/terminus/spec.auto.incremental_demo.rstan_smoke.prefork.csv
+log_file: ../../../logs/terminus/spec.auto.incremental_demo.rstan_smoke.prefork.log
 log_file_mode: write
 log_level: info
 telemetry:
-  output: /root/workspace/crab/logs/terminus/spec.auto.incremental_demo.rstan_smoke.prefork.telemetry.jsonl
+  output: ../../../logs/terminus/spec.auto.incremental_demo.rstan_smoke.prefork.telemetry.jsonl
   file_mode: write
   detail_level: detailed
   capture_command_output: false
@@ -67,7 +67,7 @@ telemetry:
   serializer: auto
   report:
     enabled: true
-    output_dir: /root/workspace/crab/logs/terminus/spec.auto.incremental_demo.rstan_smoke.prefork.report
+    output_dir: ../../../logs/terminus/spec.auto.incremental_demo.rstan_smoke.prefork.report
     top_k: 50
     log_scale_charts: false
     export_svg: true
@@ -78,7 +78,7 @@ monitoring:
   include_sandboxes: true
 zpool_name: crabbench-300
 reuse_zpool: true
-benchmark_root: /root/workspace/crab/data/crab/results
+benchmark_root: ../../../data/crab/results
 max_agent_timeout_scale: 4.0
 max_test_timeout_scale_overrides:
   pytorch-model-cli: 4.0

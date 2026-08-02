@@ -3,7 +3,7 @@ mode: auto
 provider: openai
 agent: claude_code
 llm_service: claude_code_trace_replay
-task_dataset: /root/workspace/crab/results/datasets/claude_code_replay_benchmark_first2.jsonl
+task_dataset: ../../../results/datasets/claude_code_replay_benchmark_first2.jsonl
 sandboxes: 2
 max_workers: 2
 phase_workers:
@@ -30,11 +30,11 @@ llm_server:
 host_inspector:
   launch_mode: process
 iterations: 2
-output: /root/workspace/crab/logs/claude_code/fault.auto.2tasks.debug.csv
-log_file: /root/workspace/crab/logs/claude_code/fault.auto.2tasks.debug.log
+output: ../../../logs/claude_code/fault.auto.2tasks.debug.csv
+log_file: ../../../logs/claude_code/fault.auto.2tasks.debug.log
 log_file_mode: write
 telemetry:
-  output: /root/workspace/crab/logs/claude_code/fault.auto.2tasks.debug.telemetry.jsonl
+  output: ../../../logs/claude_code/fault.auto.2tasks.debug.telemetry.jsonl
   detail_level: detailed
   capture_command_output: false
   max_text_attribute_bytes: 2048
@@ -47,7 +47,7 @@ telemetry:
   serializer: auto
   report:
     enabled: true
-    output_dir: /root/workspace/crab/logs/claude_code/fault.auto.2tasks.debug.report
+    output_dir: ../../../logs/claude_code/fault.auto.2tasks.debug.report
     top_k: 50
     log_scale_charts: false
     export_svg: true
@@ -58,7 +58,7 @@ monitoring:
   include_sandboxes: true
 zpool_name: zfspool
 reuse_zpool: true
-benchmark_root: /root/workspace/crab/data/crab/results
+benchmark_root: ../../../data/crab/results
 log_level: info
 scenario_options:
   injection_rate: 0.0

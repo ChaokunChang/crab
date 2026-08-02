@@ -7,7 +7,7 @@ llm_service: terminus_trace_replay
 # large memory footprint — the workloads where CRIU incremental dumps are
 # expected to pay off most. See companion incremental.yaml for the enabled
 # variant; these two files differ only in scheduler.incremental_process_enabled.
-task_dataset: /root/workspace/crab/results/datasets/terminus_replay_spec_friendly.incremental_demo.jsonl
+task_dataset: ../../../results/datasets/terminus_replay_spec_friendly.incremental_demo.jsonl
 sandboxes: 8
 sandbox_resource_limits:
   cpus: 4
@@ -48,12 +48,12 @@ llm_server:
 host_inspector:
   launch_mode: process
 iterations: 1
-output: /root/workspace/crab/logs/terminus/nofault.auto.incremental_demo.baseline.csv
-log_file: /root/workspace/crab/logs/terminus/nofault.auto.incremental_demo.baseline.log
+output: ../../../logs/terminus/nofault.auto.incremental_demo.baseline.csv
+log_file: ../../../logs/terminus/nofault.auto.incremental_demo.baseline.log
 log_file_mode: write
 log_level: info
 telemetry:
-  output: /root/workspace/crab/logs/terminus/nofault.auto.incremental_demo.baseline.telemetry.jsonl
+  output: ../../../logs/terminus/nofault.auto.incremental_demo.baseline.telemetry.jsonl
   file_mode: write
   detail_level: detailed
   capture_command_output: false
@@ -67,7 +67,7 @@ telemetry:
   serializer: auto
   report:
     enabled: true
-    output_dir: /root/workspace/crab/logs/terminus/nofault.auto.incremental_demo.baseline.report
+    output_dir: ../../../logs/terminus/nofault.auto.incremental_demo.baseline.report
     top_k: 50
     log_scale_charts: false
     export_svg: true
@@ -78,7 +78,7 @@ monitoring:
   include_sandboxes: true
 zpool_name: crabbench-300
 reuse_zpool: true
-benchmark_root: /root/workspace/crab/data/crab/results
+benchmark_root: ../../../data/crab/results
 max_agent_timeout_scale: 4.0
 max_test_timeout_scale_overrides:
   pytorch-model-cli: 4.0

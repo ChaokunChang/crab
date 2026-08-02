@@ -174,7 +174,7 @@ python3 -m benchmarks.run --config benchmarks/examples/debug/<your>.yaml
 The last line of stdout prints the run directory:
 
 ```
-artificats replicated to %s /root/workspace/crab/data/crab/results/<TIMESTAMP>
+artifacts replicated to %s <benchmark_root>/<TIMESTAMP>
 ```
 
 Inside that directory:
