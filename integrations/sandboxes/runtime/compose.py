@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from agent_cr.contracts import TelemetrySink
-from agent_cr.telemetry import NoopTelemetrySink
+from crab.contracts import TelemetrySink
+from crab.telemetry import NoopTelemetrySink
 
 from integrations.sandboxes.runtime.bundle import merge_environment_defaults, resolve_process_user_from_rootfs
 from integrations.sandboxes.runtime.image import (
@@ -98,7 +98,7 @@ def compose_build_tag(
     fingerprint.update(service_name.encode("utf-8"))
     fingerprint.update(json.dumps(build_spec, sort_keys=True).encode("utf-8"))
     service_component = docker_tag_component(service_name)
-    return f"agent-cr-compose-{service_component}:{fingerprint.hexdigest()[:12]}"
+    return f"crab-compose-{service_component}:{fingerprint.hexdigest()[:12]}"
 
 
 def resolve_compose_image_ref(

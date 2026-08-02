@@ -26,7 +26,7 @@ class TelemetryAnalysisTests(unittest.TestCase):
         )
 
     def test_analyze_telemetry_file_prefers_primary_run_and_canonical_metrics(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_telemetry_analysis_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_telemetry_analysis_") as tmp:
             path = Path(tmp) / "telemetry.jsonl"
             records = [
                 {
@@ -120,7 +120,7 @@ class TelemetryAnalysisTests(unittest.TestCase):
                 {
                     "timestamp": "2026-03-23T01:00:05+08:00",
                     "kind": "metric",
-                    "name": "llm.agentcr_delay_ms",
+                    "name": "llm.crab_delay_ms",
                     "value": 30.0,
                     "attributes": {
                         "run_id": "run-a",
@@ -161,7 +161,7 @@ class TelemetryAnalysisTests(unittest.TestCase):
             self.assertEqual(analysis.distinct_requests, 1)
 
     def test_generate_report_bundle_writes_expected_outputs(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_telemetry_report_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_telemetry_report_") as tmp:
             root = Path(tmp)
             telemetry_path = root / "telemetry.jsonl"
             telemetry_path.write_text(
@@ -343,7 +343,7 @@ class TelemetryAnalysisTests(unittest.TestCase):
             self.assertIn("Hidden Reject Cost", html)
 
     def test_spec_draft_gate_waits_are_split_from_primary_overhead_report(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_telemetry_spec_draft_overhead_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_telemetry_spec_draft_overhead_") as tmp:
             root = Path(tmp)
             path = root / "telemetry.jsonl"
 
@@ -396,9 +396,9 @@ class TelemetryAnalysisTests(unittest.TestCase):
                     "req-plain",
                     None,
                 ),
-                _metric("2026-03-23T01:00:07+08:00", "llm.agentcr_delay_ms", 30.0, "req-oracle", "oracle"),
-                _metric("2026-03-23T01:00:08+08:00", "llm.agentcr_delay_ms", 300.0, "req-draft", "draft"),
-                _metric("2026-03-23T01:00:09+08:00", "llm.agentcr_delay_ms", 40.0, "req-plain", None),
+                _metric("2026-03-23T01:00:07+08:00", "llm.crab_delay_ms", 30.0, "req-oracle", "oracle"),
+                _metric("2026-03-23T01:00:08+08:00", "llm.crab_delay_ms", 300.0, "req-draft", "draft"),
+                _metric("2026-03-23T01:00:09+08:00", "llm.crab_delay_ms", 40.0, "req-plain", None),
             ]
             path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
 
@@ -411,8 +411,8 @@ class TelemetryAnalysisTests(unittest.TestCase):
             self.assertAlmostEqual(overhead_by_name["llm.gate_wait_ms"].mean_ms, 15.0)
             self.assertEqual(overhead_by_name["interceptor.response_gate.wait.duration_ms"].count, 2)
             self.assertAlmostEqual(overhead_by_name["interceptor.response_gate.wait.duration_ms"].mean_ms, 16.0)
-            self.assertEqual(overhead_by_name["llm.agentcr_delay_ms"].count, 2)
-            self.assertAlmostEqual(overhead_by_name["llm.agentcr_delay_ms"].mean_ms, 35.0)
+            self.assertEqual(overhead_by_name["llm.crab_delay_ms"].count, 2)
+            self.assertAlmostEqual(overhead_by_name["llm.crab_delay_ms"].mean_ms, 35.0)
             self.assertEqual(len(analysis.overhead_analysis.time_series["llm.gate_wait_ms"]), 2)
 
             self.assertIsNotNone(analysis.spec_draft_overhead_analysis)
@@ -422,8 +422,8 @@ class TelemetryAnalysisTests(unittest.TestCase):
             self.assertAlmostEqual(draft_by_name["llm.gate_wait_ms"].mean_ms, 100.0)
             self.assertEqual(draft_by_name["interceptor.response_gate.wait.duration_ms"].count, 1)
             self.assertAlmostEqual(draft_by_name["interceptor.response_gate.wait.duration_ms"].mean_ms, 110.0)
-            self.assertEqual(draft_by_name["llm.agentcr_delay_ms"].count, 1)
-            self.assertAlmostEqual(draft_by_name["llm.agentcr_delay_ms"].mean_ms, 300.0)
+            self.assertEqual(draft_by_name["llm.crab_delay_ms"].count, 1)
+            self.assertAlmostEqual(draft_by_name["llm.crab_delay_ms"].mean_ms, 300.0)
             self.assertEqual(len(analysis.spec_draft_overhead_analysis.time_series["llm.gate_wait_ms"]), 1)
 
             operation_by_name = {item.metric_name: item for item in analysis.operation_summaries}
@@ -441,7 +441,7 @@ class TelemetryAnalysisTests(unittest.TestCase):
             self.assertIn("100.000000", spec_csv)
 
     def test_task_summaries_merge_speculative_sandboxes_by_inferred_task_run_id(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_telemetry_spec_merge_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_telemetry_spec_merge_") as tmp:
             path = Path(tmp) / "telemetry.jsonl"
             records = [
                 {
@@ -500,7 +500,7 @@ class TelemetryAnalysisTests(unittest.TestCase):
             self.assertAlmostEqual(summary.metrics["benchmark.task.duration_ms"], 120.0)
 
     def test_task_summaries_prefer_explicit_task_run_id_when_present(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_telemetry_task_run_id_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_telemetry_task_run_id_") as tmp:
             path = Path(tmp) / "telemetry.jsonl"
             records = [
                 {
@@ -545,7 +545,7 @@ class TelemetryAnalysisTests(unittest.TestCase):
             self.assertAlmostEqual(summary.metrics["benchmark.spec.saved_ms"], 10.0)
 
     def test_render_report_shortens_long_sandbox_membership_but_keeps_lineage_section(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_telemetry_task_run_lineage_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_telemetry_task_run_lineage_") as tmp:
             root = Path(tmp)
             path = root / "telemetry.jsonl"
             records = []
@@ -582,7 +582,7 @@ class TelemetryAnalysisTests(unittest.TestCase):
             self.assertIn("spec-0,astropy__astropy-13453,20,", lineage_csv)
 
     def test_turn_analysis_reconstructs_request_response_and_action_timings(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_telemetry_turn_analysis_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_telemetry_turn_analysis_") as tmp:
             root = Path(tmp)
             path = root / "telemetry.jsonl"
             records = [
@@ -703,7 +703,7 @@ class TelemetryAnalysisTests(unittest.TestCase):
             self.assertTrue((root / "report" / "turn_pure_llm_time_cdf.svg").exists())
 
     def test_detailed_analysis_is_limited_to_run_phase_when_phase_markers_exist(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_telemetry_run_scope_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_telemetry_run_scope_") as tmp:
             root = Path(tmp)
             path = root / "telemetry.jsonl"
             records = [
@@ -910,7 +910,7 @@ class TelemetryAnalysisTests(unittest.TestCase):
 
 
     def test_exclude_failed_tasks_filters_sandboxes_with_zero_success_ratio(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_telemetry_filter_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_telemetry_filter_") as tmp:
             path = Path(tmp) / "telemetry.jsonl"
             records = [
                 # Sandbox sbx-1 succeeds (success_ratio=1.0)
@@ -1046,7 +1046,7 @@ class TelemetryAnalysisTests(unittest.TestCase):
             self.assertAlmostEqual(task1.metrics["benchmark.task.duration_ms"], 100.0)
 
     def test_exclude_failed_tasks_report_bundle_includes_exclusion_info(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_telemetry_filter_report_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_telemetry_filter_report_") as tmp:
             root = Path(tmp)
             path = root / "telemetry.jsonl"
             records = [
@@ -1118,7 +1118,7 @@ class TelemetryAnalysisTests(unittest.TestCase):
             self.assertEqual(len(summary["excluded_sandbox_task_pairs"]), 1)
 
     def test_restore_and_summary_tables_are_reported_per_sandbox(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_telemetry_sandbox_summary_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_telemetry_sandbox_summary_") as tmp:
             root = Path(tmp)
             path = root / "telemetry.jsonl"
             records = [
@@ -1301,7 +1301,7 @@ class TelemetryAnalysisTests(unittest.TestCase):
             self.assertIn("Task-Run Sandboxes", html)
 
     def test_checkpoint_restore_and_resource_analysis_are_reported(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_telemetry_deep_report_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_telemetry_deep_report_") as tmp:
             root = Path(tmp)
             path = root / "telemetry.jsonl"
             records = [
@@ -1585,7 +1585,7 @@ class TelemetryAnalysisTests(unittest.TestCase):
                 {
                     "timestamp": "2026-03-23T01:00:25+08:00",
                     "kind": "metric",
-                    "name": "llm.agentcr_delay_ms",
+                    "name": "llm.crab_delay_ms",
                     "value": 30.0,
                     "attributes": {
                         "run_id": "run-a",
@@ -1598,7 +1598,7 @@ class TelemetryAnalysisTests(unittest.TestCase):
                 {
                     "timestamp": "2026-03-23T01:00:55+08:00",
                     "kind": "metric",
-                    "name": "llm.agentcr_delay_ms",
+                    "name": "llm.crab_delay_ms",
                     "value": 50.0,
                     "attributes": {
                         "run_id": "run-a",
@@ -1668,10 +1668,10 @@ class TelemetryAnalysisTests(unittest.TestCase):
             overhead_by_name = {item.metric_name: item for item in analysis.overhead_analysis.metrics}
             self.assertAlmostEqual(overhead_by_name["llm.gate_wait_ms"].mean_ms, 16.0)
             self.assertAlmostEqual(overhead_by_name["llm.gate_wait_ms"].p50_ms, 16.0)
-            self.assertAlmostEqual(overhead_by_name["llm.agentcr_delay_ms"].mean_ms, 40.0)
-            self.assertAlmostEqual(overhead_by_name["llm.agentcr_delay_ms"].p50_ms, 40.0)
+            self.assertAlmostEqual(overhead_by_name["llm.crab_delay_ms"].mean_ms, 40.0)
+            self.assertAlmostEqual(overhead_by_name["llm.crab_delay_ms"].p50_ms, 40.0)
             self.assertEqual(len(analysis.overhead_analysis.time_series["llm.gate_wait_ms"]), 2)
-            self.assertEqual(len(analysis.overhead_analysis.time_series["llm.agentcr_delay_ms"]), 2)
+            self.assertEqual(len(analysis.overhead_analysis.time_series["llm.crab_delay_ms"]), 2)
             self.assertEqual(
                 max(point.active_estimated_io_bytes for point in analysis.checkpoint_analysis.load_over_time),
                 1792.0,
@@ -1702,7 +1702,7 @@ class TelemetryAnalysisTests(unittest.TestCase):
             self.assertIn("P25 (ms)", html)
             self.assertIn("P50 (ms)", html)
             self.assertIn("llm.gate_wait", html)
-            self.assertIn("llm.agentcr_delay", html)
+            self.assertIn("llm.crab_delay", html)
             self.assertIn("Window-Aggregated Overhead Over Time", html)
             self.assertIn("Process Checkpoint Latency Over Time", html)
             self.assertIn("Filesystem Restore Latency Over Time", html)
@@ -1729,14 +1729,14 @@ class TelemetryAnalysisTests(unittest.TestCase):
             self.assertIn("active filesystem jobs", checkpoint_load_svg)
             overhead_svg = (root / "report" / "overhead_latency.svg").read_text(encoding="utf-8")
             self.assertIn("llm.gate_wait", overhead_svg)
-            self.assertIn("llm.agentcr_delay", overhead_svg)
+            self.assertIn("llm.crab_delay", overhead_svg)
             restore_load_svg = (root / "report" / "restore_load_jobs.svg").read_text(encoding="utf-8")
             self.assertIn("active process jobs", restore_load_svg)
 
 
     def test_checkpoint_skip_and_fail_are_split(self) -> None:
         """Verify that succeeded, skipped, and failed checkpoints are counted separately."""
-        with tempfile.TemporaryDirectory(prefix="agent_cr_telemetry_skip_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_telemetry_skip_") as tmp:
             root = Path(tmp)
             path = root / "telemetry.jsonl"
             base_ts = "2026-03-23T01:00:0"

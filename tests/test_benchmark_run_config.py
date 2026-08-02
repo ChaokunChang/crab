@@ -1133,7 +1133,7 @@ class BenchmarkRunDispatchTests(unittest.TestCase):
     def test_run_benchmark_config_leaves_tmpdir_backed_benchmark_root_alone(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            benchmark_run_root = root / "agent_cr_scenario_bench_tmpdir"
+            benchmark_run_root = root / "crab_scenario_bench_tmpdir"
             benchmark_run_root.mkdir(parents=True, exist_ok=True)
 
             class _HarnessContext:
@@ -1815,7 +1815,7 @@ class BenchmarkRunDispatchTests(unittest.TestCase):
         self.assertNotIn("spec-1-spec-24", joined)
 
     def test_example_yaml_files_load(self) -> None:
-        examples = sorted((Path("/root/workspace/agent-cr/benchmarks/examples")).glob("*.yaml"))
+        examples = sorted((Path("/root/workspace/crab/benchmarks/examples")).glob("*.yaml"))
         self.assertTrue(examples)
         for path in examples:
             with self.subTest(path=path.name):

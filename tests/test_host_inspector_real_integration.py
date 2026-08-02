@@ -14,9 +14,9 @@ import unittest
 import urllib.request
 from pathlib import Path
 
-from agent_cr import (
-    AgentCRRequestInterceptorServer,
-    AgentCRSystem,
+from crab import (
+    CrabRequestInterceptorServer,
+    CrabSystem,
     AdapterFileSystemCWorker,
     AdapterFileSystemRWorker,
     AdapterProcessCWorker,
@@ -41,10 +41,10 @@ from agent_cr import (
     StorageConfig,
     TelemetryRequestInterceptorHook,
 )
-from agent_cr.host_inspector.fs_helper import LibbpfFilesystemMonitor
-from agent_cr.host_inspector.runtime_resolver import RuntimeResolver
-from agent_cr.host_inspector.server import HostInspectorDaemon, HostInspectorServer
-from agent_cr.models import JobStatus, utc_now
+from crab.host_inspector.fs_helper import LibbpfFilesystemMonitor
+from crab.host_inspector.runtime_resolver import RuntimeResolver
+from crab.host_inspector.server import HostInspectorDaemon, HostInspectorServer
+from crab.models import JobStatus, utc_now
 from integrations.llm_services.simulated.service import serve
 from integrations.sandboxes.runtime.image import build_image, export_image_rootfs
 from integrations.sandboxes.simulated import DOCKERFILE_PATH as SIMULATED_DOCKERFILE_PATH
@@ -83,7 +83,7 @@ def _wait_for(predicate, *, timeout_s: float = 20.0, interval_s: float = 0.2) ->
 
 
 def _helper_binary() -> Path:
-    return Path(__file__).resolve().parents[1] / "agent_cr" / "host_inspector" / "bpf" / "fs_monitor"
+    return Path(__file__).resolve().parents[1] / "crab" / "host_inspector" / "bpf" / "fs_monitor"
 
 
 def _ensure_helper_built() -> Path:
@@ -302,7 +302,7 @@ class HostInspectorRealIntegrationTests(unittest.TestCase):
             self.skipTest("agent-sandbox-bench:latest image not available")
 
         helper_path = _ensure_helper_built()
-        container_name = f"agent-cr-watch-{int(time.time())}"
+        container_name = f"crab-watch-{int(time.time())}"
         sandbox_id = SandboxId("watch-sbx")
         server = HostInspectorServer(
             host="127.0.0.1",
@@ -354,7 +354,7 @@ class HostInspectorRealIntegrationTests(unittest.TestCase):
             [
                 "python3",
                 "-m",
-                "agent_cr.host_inspector.watch",
+                "crab.host_inspector.watch",
                 "--base-url",
                 f"http://127.0.0.1:{server.port}",
                 "--interval",
@@ -378,7 +378,7 @@ class HostInspectorRealIntegrationTests(unittest.TestCase):
 
     def test_real_docker_command_matrix_for_process_and_filesystem_changes(self) -> None:
         _, client, _, container_name, sandbox_id = self._start_docker_host_inspector_fixture(
-            name_prefix="agent-cr-matrix",
+            name_prefix="crab-matrix",
             sandbox_name="matrix-sbx",
             process_poll_interval_s=0.1,
         )
@@ -520,11 +520,11 @@ class HostInspectorRealIntegrationTests(unittest.TestCase):
                 self.assertTrue(status["is_running"], f"container should still be running after {case['name']}")
 
     def test_real_docker_remote_inspect_latency(self) -> None:
-        if os.environ.get("AGENT_CR_RUN_PERF") != "1":
-            self.skipTest("set AGENT_CR_RUN_PERF=1 to run host inspector perf test")
+        if os.environ.get("CRAB_RUN_PERF") != "1":
+            self.skipTest("set CRAB_RUN_PERF=1 to run host inspector perf test")
 
         _, client, inspector, container_name, sandbox_id = self._start_docker_host_inspector_fixture(
-            name_prefix="agent-cr-perf",
+            name_prefix="crab-perf",
             sandbox_name="perf-sbx",
             process_poll_interval_s=0.1,
         )
@@ -568,7 +568,7 @@ class HostInspectorRealIntegrationTests(unittest.TestCase):
 
     def test_real_docker_process_changed_is_evaluated_at_query_time(self) -> None:
         _, client, _, container_name, sandbox_id = self._start_docker_host_inspector_fixture(
-            name_prefix="agent-cr-proc-now",
+            name_prefix="crab-proc-now",
             sandbox_name="proc-now-sbx",
             process_poll_interval_s=0.1,
         )
@@ -644,13 +644,13 @@ class HostInspectorRealIntegrationTests(unittest.TestCase):
             self.skipTest("root plus docker/runc/criu/zfs required")
 
         helper_path = _ensure_helper_built()
-        tmpdir = tempfile.TemporaryDirectory(prefix="agent_cr_remote_real_it_")
+        tmpdir = tempfile.TemporaryDirectory(prefix="crab_remote_real_it_")
         self.addCleanup(tmpdir.cleanup)
         root = Path(tmpdir.name)
         sandbox_id = SandboxId("sbx-real-remote")
-        pool_name = f"agentcrremote{int(time.time())}"
+        pool_name = f"crabremote{int(time.time())}"
         provider = "openai"
-        image_tag = f"agent-cr-simulated-agent-remote:{int(time.time())}"
+        image_tag = f"crab-simulated-agent-remote:{int(time.time())}"
         executor: CRExecutor | None = None
 
         llm_server = serve(host="127.0.0.1", port=0, response_delay_ms=250)
@@ -708,7 +708,7 @@ class HostInspectorRealIntegrationTests(unittest.TestCase):
                     stderr=subprocess.DEVNULL,
                 )
             )
-            subprocess.run(["zfs", "create", f"{pool_name}/agent-cr"], check=True)
+            subprocess.run(["zfs", "create", f"{pool_name}/crab"], check=True)
 
             bundle_dir.mkdir(parents=True, exist_ok=True)
             subprocess.run(["runc", "spec"], cwd=bundle_dir, check=True)
@@ -722,7 +722,7 @@ class HostInspectorRealIntegrationTests(unittest.TestCase):
                     state_root=runtime_state_root,
                     bundle_root=root / "bundles",
                     checkpoint_root=checkpoint_root,
-                    zfs_dataset_prefix=f"{pool_name}/agent-cr",
+                    zfs_dataset_prefix=f"{pool_name}/crab",
                 )
             )
             storage = LocalCheckpointManager(StorageConfig(root_dir=storage_root))
@@ -747,7 +747,7 @@ class HostInspectorRealIntegrationTests(unittest.TestCase):
                     state_root=runtime_state_root,
                     bundle_root=root / "bundles",
                     metadata_root=sandbox_metadata_root,
-                    zfs_dataset_prefix=f"{pool_name}/agent-cr",
+                    zfs_dataset_prefix=f"{pool_name}/crab",
                 ),
             )
             scheduler = CRScheduler(
@@ -763,7 +763,7 @@ class HostInspectorRealIntegrationTests(unittest.TestCase):
                 InMemorySchedulerStateStore(),
                 telemetry,
             )
-            system = AgentCRSystem(
+            system = CrabSystem(
                 scheduler=scheduler,
                 executor=executor,
                 storage=storage,
@@ -773,7 +773,7 @@ class HostInspectorRealIntegrationTests(unittest.TestCase):
                 request_state_store=request_state_store,
             )
             hook = CompositeRequestInterceptorHook([TelemetryRequestInterceptorHook(telemetry)])
-            interceptor = AgentCRRequestInterceptorServer(
+            interceptor = CrabRequestInterceptorServer(
                 upstream_url=f"http://127.0.0.1:{llm_server.server_address[1]}",
                 request_state_store=request_state_store,
                 hook=hook,
@@ -791,7 +791,7 @@ class HostInspectorRealIntegrationTests(unittest.TestCase):
                 llm_base_url=f"http://127.0.0.1:{interceptor.port}/v1",
                 provider=provider,
                 status_port=status_port,
-                cgroup_path=f"agent-cr-tests/{pool_name}/{sandbox_id}",
+                cgroup_path=f"crab-tests/{pool_name}/{sandbox_id}",
                 sandbox_id=sandbox_id,
             )
 
@@ -905,13 +905,13 @@ class HostInspectorRealIntegrationTests(unittest.TestCase):
                 stderr=subprocess.DEVNULL,
             )
             subprocess.run(
-                ["zfs", "destroy", "-r", f"{pool_name}/agent-cr/{sandbox_id}"],
+                ["zfs", "destroy", "-r", f"{pool_name}/crab/{sandbox_id}"],
                 check=False,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
             subprocess.run(
-                ["zfs", "destroy", "-r", f"{pool_name}/agent-cr"],
+                ["zfs", "destroy", "-r", f"{pool_name}/crab"],
                 check=False,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -957,7 +957,7 @@ class HostInspectorRealIntegrationTests(unittest.TestCase):
         cfg["process"]["env"] = [
             "PATH=/usr/local/bin:/usr/bin:/bin",
             "PYTHONUNBUFFERED=1",
-            f"AGENT_CR_LLM_BASE_URL={llm_base_url}",
+            f"CRAB_LLM_BASE_URL={llm_base_url}",
             f"STATUS_PORT={status_port}",
             "POLL_INTERVAL_S=0.2",
             "AGENT_WORK_DIR=/work",

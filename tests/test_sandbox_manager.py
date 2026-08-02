@@ -6,8 +6,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_cr import InMemoryTelemetrySink, RuncRuntime, RuncRuntimePaths, SandboxId
-from agent_cr.runtime import CommandRunner
+from crab import InMemoryTelemetrySink, RuncRuntime, RuncRuntimePaths, SandboxId
+from crab.runtime import CommandRunner
 
 RuncSandboxManager = RuncRuntime
 RuncSandboxManagerPaths = RuncRuntimePaths
@@ -160,7 +160,7 @@ class FlakyHostInspectorClient(FakeHostInspectorClient):
 
 class SandboxManagerTests(unittest.TestCase):
     def test_runc_prepare_launch_moves_rootfs_materialization_out_of_launch(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_sandbox_mgr_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_sandbox_mgr_") as tmp:
             root = Path(tmp)
             runner = FakeCommandRunner()
             manager = RuncSandboxManager(
@@ -169,7 +169,7 @@ class SandboxManagerTests(unittest.TestCase):
                     state_root=root / "state",
                     bundle_root=root / "bundles",
                     metadata_root=root / "metadata",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
             rootfs_source = root / "source-file.txt"
@@ -187,12 +187,12 @@ class SandboxManagerTests(unittest.TestCase):
             self.assertEqual(
                 runner.commands,
                 [
-                    ("zfs", "destroy", "-r", "pool/agent-cr/sbx-test"),
-                    ("zfs", "create", "-o", f"mountpoint={root / 'bundles' / 'sbx-test' / 'rootfs'}", "pool/agent-cr/sbx-test"),
+                    ("zfs", "destroy", "-r", "pool/crab/sbx-test"),
+                    ("zfs", "create", "-o", f"mountpoint={root / 'bundles' / 'sbx-test' / 'rootfs'}", "pool/crab/sbx-test"),
                 ],
             )
-            self.assertTrue(bool(metadata.get("_agent_cr_runtime_prepared")))
-            self.assertEqual(metadata["zfs_dataset"], "pool/agent-cr/sbx-test")
+            self.assertTrue(bool(metadata.get("_crab_runtime_prepared")))
+            self.assertEqual(metadata["zfs_dataset"], "pool/crab/sbx-test")
             self.assertEqual(metadata["rootfs_path"], str(root / "bundles" / "sbx-test" / "rootfs"))
             self.assertTrue((root / "bundles" / "sbx-test" / "rootfs" / "work").is_dir())
             self.assertEqual(
@@ -213,7 +213,7 @@ class SandboxManagerTests(unittest.TestCase):
             )
 
     def test_runc_prepare_launch_can_reuse_existing_rootfs_dataset(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_sandbox_mgr_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_sandbox_mgr_") as tmp:
             root = Path(tmp)
             runner = FakeCommandRunner()
             manager = RuncSandboxManager(
@@ -222,16 +222,16 @@ class SandboxManagerTests(unittest.TestCase):
                     state_root=root / "state",
                     bundle_root=root / "bundles",
                     metadata_root=root / "metadata",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
             rootfs_path = root / "bundles" / "sbx-test" / "rootfs"
             rootfs_path.mkdir(parents=True, exist_ok=True)
-            runner.datasets.add("pool/agent-cr/sbx-test")
+            runner.datasets.add("pool/crab/sbx-test")
             metadata = {
                 "sandbox_id": "sbx-test",
                 "bundle_path": str(root / "bundles" / "sbx-test"),
-                "_agent_cr_runtime_reuse_existing_rootfs": True,
+                "_crab_runtime_reuse_existing_rootfs": True,
             }
 
             sandbox_id = manager.prepare_launch("runc", metadata)
@@ -240,15 +240,15 @@ class SandboxManagerTests(unittest.TestCase):
             self.assertEqual(
                 runner.commands,
                 [
-                    ("zfs", "list", "-H", "-o", "name", "pool/agent-cr/sbx-test"),
+                    ("zfs", "list", "-H", "-o", "name", "pool/crab/sbx-test"),
                 ],
             )
-            self.assertTrue(bool(metadata.get("_agent_cr_runtime_prepared")))
-            self.assertEqual(metadata["zfs_dataset"], "pool/agent-cr/sbx-test")
+            self.assertTrue(bool(metadata.get("_crab_runtime_prepared")))
+            self.assertEqual(metadata["zfs_dataset"], "pool/crab/sbx-test")
             self.assertEqual(metadata["rootfs_path"], str(rootfs_path))
 
     def test_runc_prepare_launch_clones_shared_rootfs_base_when_key_present(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_sandbox_mgr_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_sandbox_mgr_") as tmp:
             root = Path(tmp)
             runner = FakeCommandRunner()
             manager = RuncSandboxManager(
@@ -257,7 +257,7 @@ class SandboxManagerTests(unittest.TestCase):
                     state_root=root / "state",
                     bundle_root=root / "bundles",
                     metadata_root=root / "metadata",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
             rootfs_source = root / "source-file.txt"
@@ -274,11 +274,11 @@ class SandboxManagerTests(unittest.TestCase):
             manager.prepare_launch("runc", metadata)
 
             self.assertIn(
-                ("zfs", "create", "-o", "mountpoint=/tmp/agent-cr-rootfs-cache/pool_agent-cr/persistent/compose-cache-key", "pool/agent-cr-cache-compose-cache-key"),
+                ("zfs", "create", "-o", "mountpoint=/tmp/crab-rootfs-cache/pool_crab/persistent/compose-cache-key", "pool/crab-cache-compose-cache-key"),
                 runner.commands,
             )
             self.assertIn(
-                ("zfs", "clone", "-o", f"mountpoint={root / 'bundles' / 'sbx-shared-a' / 'rootfs'}", "pool/agent-cr-cache-compose-cache-key@base", "pool/agent-cr/sbx-shared-a"),
+                ("zfs", "clone", "-o", f"mountpoint={root / 'bundles' / 'sbx-shared-a' / 'rootfs'}", "pool/crab-cache-compose-cache-key@base", "pool/crab/sbx-shared-a"),
                 runner.commands,
             )
             self.assertEqual(
@@ -299,15 +299,15 @@ class SandboxManagerTests(unittest.TestCase):
             manager.prepare_launch("runc", metadata_b)
 
             self.assertIn(
-                ("zfs", "list", "-H", "-o", "name", "pool/agent-cr-cache-compose-cache-key"),
+                ("zfs", "list", "-H", "-o", "name", "pool/crab-cache-compose-cache-key"),
                 runner.commands,
             )
             self.assertIn(
-                ("zfs", "list", "-H", "-o", "name", "pool/agent-cr-cache-compose-cache-key@base"),
+                ("zfs", "list", "-H", "-o", "name", "pool/crab-cache-compose-cache-key@base"),
                 runner.commands,
             )
             self.assertNotIn(
-                ("zfs", "create", "-o", "mountpoint=/tmp/agent-cr-rootfs-cache/pool_agent-cr/persistent/compose-cache-key", "pool/agent-cr-cache-compose-cache-key"),
+                ("zfs", "create", "-o", "mountpoint=/tmp/crab-rootfs-cache/pool_crab/persistent/compose-cache-key", "pool/crab-cache-compose-cache-key"),
                 runner.commands,
             )
             self.assertEqual(
@@ -316,7 +316,7 @@ class SandboxManagerTests(unittest.TestCase):
             )
 
     def test_runc_prepare_launch_emits_prepare_phase_telemetry(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_sandbox_mgr_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_sandbox_mgr_") as tmp:
             root = Path(tmp)
             runner = FakeCommandRunner()
             telemetry = InMemoryTelemetrySink()
@@ -327,7 +327,7 @@ class SandboxManagerTests(unittest.TestCase):
                     state_root=root / "state",
                     bundle_root=root / "bundles",
                     metadata_root=root / "metadata",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
             rootfs_source = root / "source-file.txt"
@@ -351,7 +351,7 @@ class SandboxManagerTests(unittest.TestCase):
         self.assertIn("sandbox.rootfs_materialize.duration_ms", metric_names)
 
     def test_runc_sandbox_manager_lifecycle(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_sandbox_mgr_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_sandbox_mgr_") as tmp:
             root = Path(tmp)
             runner = FakeCommandRunner()
             host_inspector = FakeHostInspectorClient()
@@ -362,7 +362,7 @@ class SandboxManagerTests(unittest.TestCase):
                     state_root=root / "state",
                     bundle_root=root / "bundles",
                     metadata_root=root / "metadata",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
 
@@ -394,20 +394,20 @@ class SandboxManagerTests(unittest.TestCase):
             self.assertEqual(
                 runner.commands,
                 [
-                    ("zfs", "destroy", "-r", "pool/agent-cr/sbx-test"),
-                    ("zfs", "create", "-o", f"mountpoint={root / 'bundles' / 'sbx-test' / 'rootfs'}", "pool/agent-cr/sbx-test"),
+                    ("zfs", "destroy", "-r", "pool/crab/sbx-test"),
+                    ("zfs", "create", "-o", f"mountpoint={root / 'bundles' / 'sbx-test' / 'rootfs'}", "pool/crab/sbx-test"),
                     ("runc", "--root", str(root / "state"), "create", "--bundle", str(root / "bundles" / "sbx-test"), "sbx-test"),
                     ("runc", "--root", str(root / "state"), "start", "sbx-test"),
                     ("runc", "--root", str(root / "state"), "pause", "sbx-test"),
                     ("runc", "--root", str(root / "state"), "resume", "sbx-test"),
                     ("runc", "--root", str(root / "state"), "kill", "sbx-test", "TERM"),
                     ("runc", "--root", str(root / "state"), "delete", "-f", "sbx-test"),
-                    ("zfs", "destroy", "-r", "pool/agent-cr/sbx-test"),
+                    ("zfs", "destroy", "-r", "pool/crab/sbx-test"),
                 ],
             )
 
     def test_runc_pause_logs_expected_non_running_state_as_benign(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_sandbox_mgr_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_sandbox_mgr_") as tmp:
             root = Path(tmp)
             runner = PauseNotRunningCommandRunner()
             host_inspector = FakeHostInspectorClient()
@@ -418,7 +418,7 @@ class SandboxManagerTests(unittest.TestCase):
                     state_root=root / "state",
                     bundle_root=root / "bundles",
                     metadata_root=root / "metadata",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
             sandbox_id = manager.launch(
@@ -429,7 +429,7 @@ class SandboxManagerTests(unittest.TestCase):
                 },
             )
 
-            with self.assertLogs("agent_cr.runtime.runc", level="INFO") as captured:
+            with self.assertLogs("crab.runtime.runc", level="INFO") as captured:
                 with self.assertRaises(RuntimeError):
                     manager.pause(sandbox_id)
 
@@ -438,7 +438,7 @@ class SandboxManagerTests(unittest.TestCase):
         self.assertNotIn("Runtime command failed rc=1", joined)
 
     def test_runc_sandbox_manager_registers_restored_sandbox_with_host_inspector(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_sandbox_mgr_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_sandbox_mgr_") as tmp:
             root = Path(tmp)
             runner = FakeCommandRunner()
             host_inspector = FakeHostInspectorClient()
@@ -449,7 +449,7 @@ class SandboxManagerTests(unittest.TestCase):
                     state_root=root / "state",
                     bundle_root=root / "bundles",
                     metadata_root=root / "metadata",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
 
@@ -480,7 +480,7 @@ class SandboxManagerTests(unittest.TestCase):
             )
 
     def test_runc_sandbox_manager_retries_host_inspector_registration(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_sandbox_mgr_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_sandbox_mgr_") as tmp:
             root = Path(tmp)
             runner = FakeCommandRunner()
             host_inspector = FlakyHostInspectorClient(failures_before_success=2)
@@ -491,11 +491,11 @@ class SandboxManagerTests(unittest.TestCase):
                     state_root=root / "state",
                     bundle_root=root / "bundles",
                     metadata_root=root / "metadata",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
 
-            with patch("agent_cr.runtime.runc.time.sleep") as sleep:
+            with patch("crab.runtime.runc.time.sleep") as sleep:
                 sandbox_id = manager.launch(
                     "runc",
                     {
@@ -516,7 +516,7 @@ class SandboxManagerTests(unittest.TestCase):
             self.assertEqual(sleep.call_count, 2)
 
     def test_runc_resume_treats_not_paused_as_benign_when_container_is_already_running(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_sandbox_mgr_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_sandbox_mgr_") as tmp:
             root = Path(tmp)
             runner = ResumeRaceCommandRunner(state_status_after_resume="running")
             manager = RuncSandboxManager(
@@ -525,7 +525,7 @@ class SandboxManagerTests(unittest.TestCase):
                     state_root=root / "state",
                     bundle_root=root / "bundles",
                     metadata_root=root / "metadata",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
 
@@ -546,7 +546,7 @@ class SandboxManagerTests(unittest.TestCase):
             )
 
     def test_runc_resume_treats_not_paused_as_benign_when_container_is_already_stopped(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_sandbox_mgr_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_sandbox_mgr_") as tmp:
             root = Path(tmp)
             runner = ResumeRaceCommandRunner(state_status_after_resume="stopped")
             manager = RuncSandboxManager(
@@ -555,7 +555,7 @@ class SandboxManagerTests(unittest.TestCase):
                     state_root=root / "state",
                     bundle_root=root / "bundles",
                     metadata_root=root / "metadata",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
 

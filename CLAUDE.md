@@ -21,7 +21,7 @@ Never run Full test suite, it is very slow, and there are some known issues.
 ### Benchmarks
 ```bash
 # Microbenchmark
-python3 benchmarks/bench_agent_cr_micro.py --iters 1000 --storage-iters 200 --executor-jobs 64
+python3 benchmarks/bench_crab_micro.py --iters 1000 --storage-iters 200 --executor-jobs 64
 
 # YAML-driven scenarios
 python3 -m benchmarks.run --config benchmarks/examples/e2e.manual.yaml
@@ -32,11 +32,11 @@ python3 -m benchmarks.run --config benchmarks/examples/tree.auto.yaml
 
 ## Architecture
 
-`agent-cr` is a Python library for fault-tolerant agent execution via process and filesystem checkpointing. It coordinates CRIU (process snapshots), runc (container runtime), and ZFS (filesystem snapshots) to checkpoint and restore agent sandboxes.
+`crab` is a Python library for fault-tolerant agent execution via process and filesystem checkpointing. It coordinates CRIU (process snapshots), runc (container runtime), and ZFS (filesystem snapshots) to checkpoint and restore agent sandboxes.
 
-### Core System (`agent_cr/`)
+### Core System (`crab/`)
 
-`AgentCRSystem` (`system.py`) is the top-level orchestrator. It composes:
+`CrabSystem` (`system.py`) is the top-level orchestrator. It composes:
 
 - **`CRScheduler`** (`scheduler.py`) — decides *when* to checkpoint based on policy (FaultTolerance, SpotPreemption, TreeSearch, Default)
 - **`CRExecutor`** (`executor.py`) — executes checkpoint/restore jobs via worker threads
@@ -82,10 +82,10 @@ reuse_zpool: bool   # keep ZFS pool across runs
 - **`llm_services/`**: `SimulatedLLMService`, `ManualLLMService`, plus trace-replay services for iflow / mini_swe / claude_code / terminus and spec-replay services for mini_swe / terminus
 - **`sandboxes/`**: runtime launcher, network setup, Docker Compose integration
 
-### Key Data Models (`agent_cr/models.py`)
+### Key Data Models (`crab/models.py`)
 
 `CheckpointManifest`, `RestoreJob`, `SandboxSnapshot`, `CheckpointResult` — the core data structures passed between components.
 
-### Configuration (`agent_cr/config.py`)
+### Configuration (`crab/config.py`)
 
 `SchedulerConfig`, `ExecutorConfig`, `StorageConfig`, `TelemetryConfig` — dataclasses configuring each subsystem.

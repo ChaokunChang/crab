@@ -2,7 +2,7 @@
 
 Before running, start the daemon in another terminal:
 
-    agentcr daemon start --foreground \\
+    crab daemon start --foreground \\
       --config examples/sdk/configs/iflow_minimax_qsort_engine.runc.yaml
 
 Then run this script (the API key file path can be overridden with
@@ -15,14 +15,14 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from agent_cr import Engine, Sandbox
-from agent_cr.agents_builtin.iflow import IFlowAgent
+from crab import Engine, Sandbox
+from crab.agents_builtin.iflow import IFlowAgent
 
 
 API_BASE = "https://api.minimax.chat/v1"
 API_KEY_FILE = Path(os.environ.get("MINIMAX_API_KEY_FILE", "/root/workspace/agent-os/.minimax"))
 MODEL = "MiniMax-M2.7"
-WORK_DIR = Path("/root/workspace/agent-cr/data/agent_cr/sdk/iflow-minimax-qsort-runc/work/qsort-demo")
+WORK_DIR = Path("/root/workspace/crab/data/crab/sdk/iflow-minimax-qsort-runc/work/qsort-demo")
 
 TASK = """\
 Create a directory /work/qsort.
@@ -37,7 +37,7 @@ Do not install packages and do not add prose to the files.
 
 
 def main() -> None:
-    os.environ["AGENT_CR_IFLOW_API_KEY"] = API_KEY_FILE.read_text().strip()
+    os.environ["CRAB_IFLOW_API_KEY"] = API_KEY_FILE.read_text().strip()
     WORK_DIR.mkdir(parents=True, exist_ok=True)
 
     with Engine.connect() as engine:

@@ -1,12 +1,12 @@
 # Configuration Reference
 
-This document catalogs all configuration parameters used by agent-cr, organized by subsystem. Each entry lists the parameter name, default value, how to specify it, and where it is consumed.
+This document catalogs all configuration parameters used by crab, organized by subsystem. Each entry lists the parameter name, default value, how to specify it, and where it is consumed.
 
 ---
 
 ## 1. Scheduler Configuration (`SchedulerConfig`)
 
-Defined in `agent_cr/config.py`. Passed to `CRScheduler` (and its policies) via `build_default_system()` or direct construction.
+Defined in `crab/config.py`. Passed to `CRScheduler` (and its policies) via `build_default_system()` or direct construction.
 
 | Parameter | Type | Default | Description | Used by |
 |---|---|---|---|---|
@@ -26,14 +26,14 @@ Defined in `agent_cr/config.py`. Passed to `CRScheduler` (and its policies) via 
 
 ## 2. Executor Configuration (`ExecutorConfig`)
 
-Defined in `agent_cr/config.py`. Controls the checkpoint/restore job executor thread pool.
+Defined in `crab/config.py`. Controls the checkpoint/restore job executor thread pool.
 
 | Parameter | Type | Default | Description | Used by |
 |---|---|---|---|---|
 | `max_workers` | `int` | `4` | Legacy fallback worker count used when `checkpoint_workers` and/or `restore_workers` are omitted. Must be ≥ 1. | `ExecutorConfig.resolved_checkpoint_workers`, `ExecutorConfig.resolved_restore_workers` in `config.py` |
 | `checkpoint_workers` | `int \| None` | `None` | Dedicated checkpoint worker count. When `None`, falls back to `max_workers`. Must be ≥ 1 when provided. | `CRExecutor.__init__()` in `executor.py` |
 | `restore_workers` | `int \| None` | `None` | Dedicated restore worker count. When `None`, falls back to `max_workers`. Must be ≥ 1 when provided. | `CRExecutor.__init__()` in `executor.py` |
-| `coordination_workers` | `int \| None` | `None` | Worker count for `AgentCRSystem` live-request coordination. When omitted, resolves to `min(8, resolved_checkpoint_workers)`. | `AgentCRSystem.start()` in `system.py` |
+| `coordination_workers` | `int \| None` | `None` | Worker count for `CrabSystem` live-request coordination. When omitted, resolves to `min(8, resolved_checkpoint_workers)`. | `CrabSystem.start()` in `system.py` |
 | `composite_step_workers` | `int \| None` | `None` | Shared worker count for parallel process/filesystem checkpoint sub-steps. When omitted, resolves to `max(2, min(2 * resolved_checkpoint_workers, 16))`. | `DefaultCWorker.__init__()` in `workers/composite.py` |
 | `max_checkpoint_queue_size` | `int` | `10000` | Maximum number of pending checkpoint jobs admitted before new submissions are rejected. Must be ≥ 1. | `CRExecutor.__init__()` in `executor.py` |
 | `checkpoint_scheduling_policy` | `"fifo" \| "reactive"` | `"fifo"` | Queue discipline for checkpoint jobs. `fifo` preserves the historical submission order. `reactive` uses normal/urgent queues and promotes live-request checkpoints once their response has already returned. | `CRExecutor.submit_checkpoint()`, `CRExecutor.notify_live_response_ready()` in `executor.py` |
@@ -47,7 +47,7 @@ Defined in `agent_cr/config.py`. Controls the checkpoint/restore job executor th
 
 ## 3. Storage Configuration (`StorageConfig`)
 
-Defined in `agent_cr/config.py`. Configures the local checkpoint storage layout.
+Defined in `crab/config.py`. Configures the local checkpoint storage layout.
 
 | Parameter | Type | Default | Description | Used by |
 |---|---|---|---|---|
@@ -61,7 +61,7 @@ Defined in `agent_cr/config.py`. Configures the local checkpoint storage layout.
 
 ## 4. Telemetry Configuration (`TelemetryConfig`)
 
-Defined in `agent_cr/config.py`. Controls the telemetry subsystem.
+Defined in `crab/config.py`. Controls the telemetry subsystem.
 
 | Parameter | Type | Default | Description | Used by |
 |---|---|---|---|---|
@@ -86,15 +86,15 @@ Defined in `agent_cr/config.py`. Controls the telemetry subsystem.
 
 ### 5a. Runtime Paths (`RuncRuntimePaths`)
 
-Defined in `agent_cr/runtime/runc.py`. Filesystem paths for the runc runtime.
+Defined in `crab/runtime/runc.py`. Filesystem paths for the runc runtime.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `state_root` | `Path` | `/run/agent-cr/runc` | Root for runc state directory (`--root` flag). |
-| `bundle_root` | `Path` | `/var/lib/agent-cr/bundles` | Root directory for sandbox OCI bundles. |
-| `checkpoint_root` | `Path` | `/var/lib/agent-cr/checkpoints` | Root directory for CRIU checkpoint images. |
-| `metadata_root` | `Path` | `/var/lib/agent-cr/sandbox-metadata` | Root directory for persisted sandbox description JSON files. |
-| `zfs_dataset_prefix` | `str` | `"agentcr/sandboxes"` | ZFS dataset prefix for sandbox filesystems. |
+| `state_root` | `Path` | `/run/crab/runc` | Root for runc state directory (`--root` flag). |
+| `bundle_root` | `Path` | `/var/lib/crab/bundles` | Root directory for sandbox OCI bundles. |
+| `checkpoint_root` | `Path` | `/var/lib/crab/checkpoints` | Root directory for CRIU checkpoint images. |
+| `metadata_root` | `Path` | `/var/lib/crab/sandbox-metadata` | Root directory for persisted sandbox description JSON files. |
+| `zfs_dataset_prefix` | `str` | `"crab/sandboxes"` | ZFS dataset prefix for sandbox filesystems. |
 
 **How to specify:** Pass a `RuncRuntimePaths` to `RuncRuntime(paths=...)`.
 
@@ -129,7 +129,7 @@ Defined in `agent_cr/runtime/runc.py`. Filesystem paths for the runc runtime.
 
 ## 6. Request Interceptor Server Configuration
 
-Defined in `agent_cr/interceptor.py` via `AgentCRRequestInterceptorServer.__init__()`.
+Defined in `crab/interceptor.py` via `CrabRequestInterceptorServer.__init__()`.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -139,7 +139,7 @@ Defined in `agent_cr/interceptor.py` via `AgentCRRequestInterceptorServer.__init
 | `upstream_timeout_seconds` | `float` | `3600.0` | Timeout (seconds) for forwarding requests to the upstream LLM service. |
 | `max_workers` | `int \| None` | `None` | Maximum worker threads for the interceptor HTTP server. The server now uses a bounded pooled HTTP worker model instead of unbounded request threads. |
 
-**How to specify:** Constructor arguments to `AgentCRRequestInterceptorServer(...)`.
+**How to specify:** Constructor arguments to `CrabRequestInterceptorServer(...)`.
 
 ---
 
@@ -147,7 +147,7 @@ Defined in `agent_cr/interceptor.py` via `AgentCRRequestInterceptorServer.__init
 
 ### 7a. Host Inspector Daemon (`HostInspectorDaemon`)
 
-Defined in `agent_cr/host_inspector/server.py`.
+Defined in `crab/host_inspector/server.py`.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -161,7 +161,7 @@ Defined in `agent_cr/host_inspector/server.py`.
 | `port` | `int` | `0` | Port to bind. `0` selects an ephemeral port. |
 | `max_workers` | `int \| None` | `None` | Maximum worker threads for the host-inspector HTTP server. |
 
-### 7c. Host Inspector CLI (`agent_cr/host_inspector/__main__.py` and `server.py:main()`)
+### 7c. Host Inspector CLI (`crab/host_inspector/__main__.py` and `server.py:main()`)
 
 | CLI Flag | Default | Description |
 |---|---|---|
@@ -175,14 +175,14 @@ Defined in `agent_cr/host_inspector/server.py`.
 
 ### 7d. Host Inspector Service Client (`HostInspectorServiceClient`)
 
-Defined in `agent_cr/remote_inspector.py`.
+Defined in `crab/remote_inspector.py`.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `base_url` | `str` | *(required)* | Base URL of the host inspector HTTP service. |
 | `timeout_s` | `float` | `5.0` | HTTP request timeout for inspector API calls. |
 
-### 7e. Host Inspector Watch CLI (`agent_cr/host_inspector/watch.py`)
+### 7e. Host Inspector Watch CLI (`crab/host_inspector/watch.py`)
 
 | CLI Flag | Default | Description |
 |---|---|---|
@@ -192,9 +192,9 @@ Defined in `agent_cr/remote_inspector.py`.
 
 ---
 
-## 8. AgentCRSystem Configuration
+## 8. CrabSystem Configuration
 
-Defined in `agent_cr/system.py`. Constructor parameters on the `AgentCRSystem` dataclass.
+Defined in `crab/system.py`. Constructor parameters on the `CrabSystem` dataclass.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -214,7 +214,7 @@ Defined in `agent_cr/system.py`. Constructor parameters on the `AgentCRSystem` d
 
 ## 9. Checkpoint Retention Policies
 
-Defined in `agent_cr/storage/policies.py`. These wrap a `CheckpointManager` delegate.
+Defined in `crab/storage/policies.py`. These wrap a `CheckpointManager` delegate.
 
 | Policy Class | Behavior |
 |---|---|
@@ -263,15 +263,15 @@ Defined in `benchmarks/config.py`. Loaded from YAML via `load_config()`.
 | `log_file` | `path \| null` | `null` | Path for log file. |
 | `log_file_mode` | `str` | `"append"` | Log file open mode: `append` or `write`. |
 | `log_level` | `str` | `"info"` | Python log level: `debug`, `info`, `warning`, `error`, `critical`. |
-| `benchmark_root_home` | `path \| null` | `null` | Parent directory for benchmark run data. Falls back to `AGENTCR_BENCH_DIR` env var, then a temp directory. |
-| `benchmark_run_name` | `str \| null` | `null` | Directory name for this run under `benchmark_root_home`. Defaults to a timestamp such as `20260416_010203` when a benchmark root home is used. Requires `benchmark_root_home`, `benchmark_root`, or `AGENTCR_BENCH_DIR`. |
+| `benchmark_root_home` | `path \| null` | `null` | Parent directory for benchmark run data. Falls back to `CRAB_BENCH_DIR` env var, then a temp directory. |
+| `benchmark_run_name` | `str \| null` | `null` | Directory name for this run under `benchmark_root_home`. Defaults to a timestamp such as `20260416_010203` when a benchmark root home is used. Requires `benchmark_root_home`, `benchmark_root`, or `CRAB_BENCH_DIR`. |
 | `benchmark_root` | `path \| null` | `null` | Deprecated alias for `benchmark_root_home`, kept for older configs. |
 | `clear_benchmark_root_after_run` | `bool` | `false` | Delete the resolved per-run benchmark directory after postprocessing completes. Tempdir-backed benchmark roots keep their existing automatic cleanup behavior. |
 | `storage_planes` | `mapping` | `{}` | Optional benchmark storage-plane overrides for runtime state, checkpoint storage, and agent host directories. |
 | `llm_service_options` | `mapping` | `{}` | Mapping merged into each task record's `llm_service_config`. Dataset-level values still take precedence. |
 | `max_agent_timeout_scale` | `float` | `1.0` | Multiplies dataset-provided `task_config.options.max_agent_timeout_sec` values before task launch. Missing dataset values stay unset. |
 | `max_test_timeout_scale` | `float` | `1.0` | Multiplies dataset-provided `task_config.options.max_test_timeout_sec` values before task launch. Missing dataset values stay unset. |
-| `relaunch_on_restore_failure` | `bool` | `false` | Opt-in fallback to `relaunch_handler` when a recovery restore fails or no restorable checkpoint exists. With the default `false`, the recovery record is marked `failed` / `no_checkpoint` and the relaunch handler is not invoked, so latent bugs in checkpoint capture or restore plumbing surface loudly instead of being masked. Threaded through to `AgentCRSystem.relaunch_on_restore_failure`. |
+| `relaunch_on_restore_failure` | `bool` | `false` | Opt-in fallback to `relaunch_handler` when a recovery restore fails or no restorable checkpoint exists. With the default `false`, the recovery record is marked `failed` / `no_checkpoint` and the relaunch handler is not invoked, so latent bugs in checkpoint capture or restore plumbing surface loudly instead of being masked. Threaded through to `CrabSystem.relaunch_on_restore_failure`. |
 
 When `output`, `log_file`, `telemetry.output`, or `telemetry.report.output_dir` are configured outside the resolved benchmark run root, the runner keeps writing those configured paths and also copies each existing artifact by basename into `<benchmark_root_home>/<benchmark_run_name>/` after the run.
 
@@ -295,7 +295,7 @@ Standalone telemetry reports are generated by the report CLI in `benchmarks/tele
 | `zpool_name` | `str \| null` | `null` | Explicit ZFS pool name. Auto-generated if `null`. |
 | `zpool_image` | `path \| null` | `null` | Path to the ZFS pool image file. |
 | `reuse_zpool` | `bool` | `false` | If `true`, keep the ZFS pool across benchmark runs. |
-| `image_cache_root` | `path \| null` | `null` | Cache directory for Docker images. Default: `.cache/agent-cr/images`. |
+| `image_cache_root` | `path \| null` | `null` | Cache directory for Docker images. Default: `.cache/crab/images`. |
 | `transfer_delay_ms` | `float` | `0.0` | Simulated transfer delay (ms) applied as `recovery_delay_seconds` during auto-recovery. |
 | `work_dir_host_root` | `path \| null` | `null` | Host-side working directory root for sandboxes. |
 | `executor` | `mapping` | `{}` | Benchmark-only executor overrides. Resolves to `ExecutorConfig` using the benchmark's effective worker count as the fallback. |
@@ -528,7 +528,7 @@ Additional `spec` scenario constraints:
 
 ## 12. Benchmark Microbenchmark CLI
 
-Defined in `benchmarks/bench_agent_cr_micro.py`.
+Defined in `benchmarks/bench_crab_micro.py`.
 
 | CLI Flag | Default | Description |
 |---|---|---|
@@ -547,13 +547,13 @@ Defined in `integrations/sandboxes/runtime/network.py`.
 | Configuration | Default | Description |
 |---|---|---|
 | Benchmark network CIDR | `10.250.0.0/24` (auto-selected from `10.250.0.0/16`) | A /24 network is selected that doesn't conflict with existing host routes. |
-| `AGENT_CR_BENCHMARK_NETWORK_CIDR` env var | *(none)* | Override the benchmark network CIDR explicitly. Must be a /24 IPv4 network. |
+| `CRAB_BENCHMARK_NETWORK_CIDR` env var | *(none)* | Override the benchmark network CIDR explicitly. Must be a /24 IPv4 network. |
 
 ---
 
 ## 14. Runtime Resolver Configuration
 
-Defined in `agent_cr/host_inspector/runtime_resolver.py`.
+Defined in `crab/host_inspector/runtime_resolver.py`.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -567,8 +567,8 @@ Defined in `agent_cr/host_inspector/runtime_resolver.py`.
 
 | Variable | Used in | Description |
 |---|---|---|
-| `AGENTCR_BENCH_DIR` | `benchmarks/real_host_scenario_base.py` | Override the benchmark data root directory. Set to `tmpdir` or `tmp` to use a temp directory. |
-| `AGENT_CR_BENCHMARK_NETWORK_CIDR` | `integrations/sandboxes/runtime/network.py` | Explicit /24 network CIDR for benchmark sandbox networking. |
+| `CRAB_BENCH_DIR` | `benchmarks/real_host_scenario_base.py` | Override the benchmark data root directory. Set to `tmpdir` or `tmp` to use a temp directory. |
+| `CRAB_BENCHMARK_NETWORK_CIDR` | `integrations/sandboxes/runtime/network.py` | Explicit /24 network CIDR for benchmark sandbox networking. |
 
 ---
 
@@ -606,5 +606,5 @@ These are not configurations themselves but determine how `SchedulerConfig` valu
 | Benchmark | `iterations` (e2e) | 5 |
 | Benchmark | `iterations` (tree) | 1 |
 | Simulated LLM | `response_delay_ms` | 500 ms (CLI) / 0 (programmatic) |
-| Runc Paths | `state_root` | `/run/agent-cr/runc` |
-| Runc Paths | `zfs_dataset_prefix` | `agentcr/sandboxes` |
+| Runc Paths | `state_root` | `/run/crab/runc` |
+| Runc Paths | `zfs_dataset_prefix` | `crab/sandboxes` |

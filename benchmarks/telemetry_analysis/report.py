@@ -67,7 +67,7 @@ def _metric_figure_key(metric_name: str) -> str:
 _OVERHEAD_METRIC_LABELS = {
     "llm.gate_wait_ms": "llm.gate_wait",
     "interceptor.response_gate.wait.duration_ms": "interceptor.response_gate.wait",
-    "llm.agentcr_delay_ms": "llm.agentcr_delay",
+    "llm.crab_delay_ms": "llm.crab_delay",
 }
 
 _TURN_METRIC_LABELS = {
@@ -1747,7 +1747,7 @@ def render_report_html(
 <body>
   <main>
     <section>
-      <h1>Agent-CR Telemetry Report</h1>
+      <h1>Crab Telemetry Report</h1>
       <p>This report is generated from the JSONL telemetry stream using a streaming analyzer. It is intended for performance analysis, bottleneck diagnosis, long-tail latency inspection, checkpoint/restore characterization, and resource-usage analysis.</p>
       {summary_table}
     </section>
@@ -2493,7 +2493,7 @@ def generate_report_bundle(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Analyze and visualize Agent-CR telemetry JSONL")
+    parser = argparse.ArgumentParser(description="Analyze and visualize Crab telemetry JSONL")
     parser.add_argument("--input", type=Path, required=True, help="Telemetry JSONL path")
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory for report artifacts")
     parser.add_argument("--run-id", default=None, help="Optional run_id filter; defaults to dominant run in file")

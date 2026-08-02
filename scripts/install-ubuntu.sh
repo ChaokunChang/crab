@@ -150,14 +150,14 @@ else
 fi
 
 log "Building the eBPF host inspector"
-make -C "${REPO_ROOT}/agent_cr/host_inspector/bpf" clean all
+make -C "${REPO_ROOT}/crab/host_inspector/bpf" clean all
 
 log "Installing Crab into /opt/crab/venv"
 python3 -m venv /opt/crab/venv
 /opt/crab/venv/bin/python -m pip install --upgrade pip setuptools wheel
 /opt/crab/venv/bin/python -m pip install "${REPO_ROOT}"
-ln -sfn /opt/crab/venv/bin/agentcr /usr/local/bin/agentcr
-ln -sfn /opt/crab/venv/bin/agentcrd /usr/local/bin/agentcrd
+ln -sfn /opt/crab/venv/bin/crab /usr/local/bin/crab
+ln -sfn /opt/crab/venv/bin/crabd /usr/local/bin/crabd
 
 log "Installing ${CONFIG_PATH}"
 config_tmp=$(mktemp)

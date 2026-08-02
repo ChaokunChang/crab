@@ -12,8 +12,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from agent_cr.contracts import TelemetrySink
-from agent_cr.telemetry import NoopTelemetrySink, start_operation
+from crab.contracts import TelemetrySink
+from crab.telemetry import NoopTelemetrySink, start_operation
 
 DEFAULT_CACHE_DIR = Path(__file__).resolve().parent / "cache"
 REQUIRED_CACHE_FILES = (
@@ -21,8 +21,8 @@ REQUIRED_CACHE_FILES = (
     "iflow-ai-iflow-cli-for-roll-0-4-4-v4.tgz",
 )
 _PREPARED_RUNTIME_CACHE_DIRNAME = "prepared-runtimes"
-_PREPARED_RUNTIME_METADATA_FILENAME = ".agent-cr-iflow-runtime.json"
-IFLOW_WRAPPER_ARG = "--agent-cr-iflow-wrapper"
+_PREPARED_RUNTIME_METADATA_FILENAME = ".crab-iflow-runtime.json"
+IFLOW_WRAPPER_ARG = "--crab-iflow-wrapper"
 RUNTIME_MOUNT_PATH = "/opt/iflow-runtime"
 IFLOW_HOME_MOUNT_PATH = "/root/.iflow"
 NPM_HOME_MOUNT_PATH = "/root/.npm"
@@ -84,7 +84,7 @@ class PreparedIFlowState:
 
 
 def cache_dir_from_env() -> Path:
-    return Path(os.environ.get("AGENT_CR_IFLOW_CACHE_DIR", str(DEFAULT_CACHE_DIR)))
+    return Path(os.environ.get("CRAB_IFLOW_CACHE_DIR", str(DEFAULT_CACHE_DIR)))
 
 
 def required_cache_paths(cache_dir: Path | None = None) -> dict[str, Path]:
@@ -380,7 +380,7 @@ def prepare_iflow_state(
     resolved_max_session_turns = (
         int(max_session_turns)
         if max_session_turns is not None
-        else int(os.environ.get("AGENT_CR_IFLOW_MAX_SESSION_TURNS", "32"))
+        else int(os.environ.get("CRAB_IFLOW_MAX_SESSION_TURNS", "32"))
     )
     operation = start_operation(
         sink,
@@ -409,7 +409,7 @@ def prepare_iflow_state(
             json.dumps(
                 {
                     "selectedAuthType": "openai-compatible",
-                    "apiKey": os.environ.get("AGENT_CR_IFLOW_API_KEY", "sk-agent-cr-iflow"),
+                    "apiKey": os.environ.get("CRAB_IFLOW_API_KEY", "sk-crab-iflow"),
                     "baseUrl": base_url,
                     "modelName": model_name,
                     "bootAnimationShown": True,

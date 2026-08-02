@@ -14,7 +14,7 @@ import urllib.request
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from agent_cr.sdk_llm_forwarder import SdkLLMForwarder, serve_sdk_llm_forwarder
+from crab.sdk_llm_forwarder import SdkLLMForwarder, serve_sdk_llm_forwarder
 
 
 class _LoggingUpstream:

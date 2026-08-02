@@ -15,7 +15,7 @@ import json
 import statistics
 from pathlib import Path
 
-LOG_ROOT = Path("/root/workspace/agent-cr/logs/terminus")
+LOG_ROOT = Path("/root/workspace/crab/logs/terminus")
 
 VARIANTS = [
     ("baseline", "spec.auto.incremental_demo.baseline"),

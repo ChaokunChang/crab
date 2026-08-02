@@ -4,7 +4,7 @@ import socket
 import threading
 import unittest
 
-from agent_cr.http_utils import ThreadLocalHttpClient
+from crab.http_utils import ThreadLocalHttpClient
 
 
 class ThreadLocalHttpClientTests(unittest.TestCase):

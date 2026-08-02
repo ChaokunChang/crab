@@ -18,7 +18,7 @@ _DEFAULT_MAXIMAL_DELAY_MS = 1_000_000_000.0
 _IFLOW_SYSTEM_PROMPT_SENTINEL = "<iflow-system-prompt>"
 _IFLOW_CONTEXT_SENTINEL = "<iflow-context-bootstrap>"
 _IFLOW_CONTEXT_ACK_SENTINEL = "<iflow-context-ack>"
-_DUMMY_TOOL_RESPONSE_MODEL = "agent-cr-iflow-trace-replay"
+_DUMMY_TOOL_RESPONSE_MODEL = "crab-iflow-trace-replay"
 _DUMMY_TOOL_COMMAND = 'sh -lc "echo hello world >> /dev/null"'
 _VOLATILE_TEXT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
@@ -300,7 +300,7 @@ def _dummy_value_for_schema(*, name: str, schema: dict[str, Any]) -> object:
     if normalized_name in {"url", "uri"}:
         return "http://127.0.0.1/"
     if normalized_name in {"content", "text", "body", "message", "note", "line", "query"}:
-        return "agent-cr replay noop"
+        return "crab replay noop"
     value_type = schema.get("type")
     if value_type == "boolean":
         return False

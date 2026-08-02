@@ -3,7 +3,7 @@ mode: auto
 provider: openai
 agent: claude_code
 llm_service: claude_code_trace_replay
-task_dataset: /root/workspace/agent-cr/results/datasets/claude_code_replay_benchmark_first1.jsonl
+task_dataset: /root/workspace/crab/results/datasets/claude_code_replay_benchmark_first1.jsonl
 sandboxes: 1
 max_workers: 1
 phase_workers:
@@ -30,11 +30,11 @@ llm_server:
 host_inspector:
   launch_mode: process
 iterations: 1
-output: /root/workspace/agent-cr/logs/claude_code/nofault.auto.1task.debug.csv
-log_file: /root/workspace/agent-cr/logs/claude_code/nofault.auto.1task.debug.log
+output: /root/workspace/crab/logs/claude_code/nofault.auto.1task.debug.csv
+log_file: /root/workspace/crab/logs/claude_code/nofault.auto.1task.debug.log
 log_file_mode: write
 telemetry:
-  output: /root/workspace/agent-cr/logs/claude_code/nofault.auto.1task.debug.telemetry.jsonl
+  output: /root/workspace/crab/logs/claude_code/nofault.auto.1task.debug.telemetry.jsonl
   detail_level: detailed
   capture_command_output: false
   max_text_attribute_bytes: 2048
@@ -54,7 +54,7 @@ monitoring:
   include_sandboxes: true
 zpool_name: zfspool
 reuse_zpool: true
-benchmark_root: /root/workspace/agent-cr/data/agent_cr/results
+benchmark_root: /root/workspace/crab/data/crab/results
 log_level: debug
 scenario_options:
   injection_rate: 0.0

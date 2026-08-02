@@ -196,7 +196,7 @@ def grade_verification_log(
     test_spec = make_test_spec(instance, arch=_DEFAULT_ARCH)
     prediction = {
         KEY_INSTANCE_ID: instance_id,
-        KEY_PREDICTION: "agent-cr-mini-swe-replay",
+        KEY_PREDICTION: "crab-mini-swe-replay",
     }
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".log", delete=False) as handle:
         handle.write(log_text)

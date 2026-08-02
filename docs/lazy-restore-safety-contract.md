@@ -120,7 +120,7 @@ easier to detect.
 
 Two construction sites consume the predicate:
 
-- `agent_cr/system.py::build_default_system` — passes
+- `crab/system.py::build_default_system` — passes
   `runtime_impl.runtime_image_path_in_use` to `LocalCheckpointManager`
   when constructing the default storage. If the caller supplies their
   own checkpoint manager (e.g., a retention wrapper around a custom

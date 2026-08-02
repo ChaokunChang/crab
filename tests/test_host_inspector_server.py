@@ -6,12 +6,12 @@ import subprocess
 import unittest
 from unittest.mock import Mock, patch
 
-from agent_cr import HostInspectorServiceClient, SandboxId
-from agent_cr.host_inspector.fs_helper import LibbpfFilesystemMonitor, _EventWorkerPool
-from agent_cr.host_inspector.process_filter import ProcessIdentity
-from agent_cr.host_inspector.protocol import HelperEvent
-from agent_cr.host_inspector.runtime_resolver import ResolvedSandbox
-from agent_cr.host_inspector.server import HostInspectorDaemon, HostInspectorServer
+from crab import HostInspectorServiceClient, SandboxId
+from crab.host_inspector.fs_helper import LibbpfFilesystemMonitor, _EventWorkerPool
+from crab.host_inspector.process_filter import ProcessIdentity
+from crab.host_inspector.protocol import HelperEvent
+from crab.host_inspector.runtime_resolver import ResolvedSandbox
+from crab.host_inspector.server import HostInspectorDaemon, HostInspectorServer
 
 
 class FakeResolver:
@@ -170,8 +170,8 @@ class HostInspectorServerTests(unittest.TestCase):
         self.assertFalse(registered["status"]["filesystem_changed"])
         self.assertEqual(fs_monitor.upserts, [("sbx-1", 6869)])
 
-        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111, 222}), patch(
-            "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+        with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111, 222}), patch(
+            "crab.host_inspector.server.reset_soft_dirty_for_pids",
             return_value={111, 222},
         ):
             reset = {"status": daemon.reset("sbx-1")}
@@ -189,10 +189,10 @@ class HostInspectorServerTests(unittest.TestCase):
                 device=1,
             )
         )
-        with patch("agent_cr.host_inspector.server.os.lstat"), patch(
-            "agent_cr.host_inspector.server.list_cgroup_pids",
+        with patch("crab.host_inspector.server.os.lstat"), patch(
+            "crab.host_inspector.server.list_cgroup_pids",
             return_value={111, 222},
-        ), patch("agent_cr.host_inspector.server.dirty_pids", return_value=set()):
+        ), patch("crab.host_inspector.server.dirty_pids", return_value=set()):
             status = {"status": daemon.status("sbx-1")}
         self.assertFalse(status["status"]["process_changed"])
         self.assertTrue(status["status"]["filesystem_changed"])
@@ -206,15 +206,15 @@ class HostInspectorServerTests(unittest.TestCase):
         fs_monitor = FakeFilesystemMonitor()
         daemon = HostInspectorDaemon(resolver=resolver, fs_monitor=fs_monitor, process_poll_interval_s=0.05)
 
-        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
-            "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+        with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "crab.host_inspector.server.reset_soft_dirty_for_pids",
             return_value={111},
         ):
             daemon.register("sbx-1", "docker", "container-1")
             daemon.reset("sbx-1")
 
-        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
-            "agent_cr.host_inspector.server.dirty_pids",
+        with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "crab.host_inspector.server.dirty_pids",
             return_value={111},
         ):
             status = daemon.status("sbx-1")
@@ -226,15 +226,15 @@ class HostInspectorServerTests(unittest.TestCase):
         fs_monitor = FakeFilesystemMonitor()
         daemon = HostInspectorDaemon(resolver=resolver, fs_monitor=fs_monitor, process_poll_interval_s=0.05)
 
-        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
-            "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+        with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "crab.host_inspector.server.reset_soft_dirty_for_pids",
             return_value={111},
         ):
             daemon.register("sbx-1", "docker", "container-1")
             daemon.reset("sbx-1")
 
-        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
-            "agent_cr.host_inspector.server.dirty_pids",
+        with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "crab.host_inspector.server.dirty_pids",
             return_value=set(),
         ):
             status = daemon.status("sbx-1")
@@ -246,15 +246,15 @@ class HostInspectorServerTests(unittest.TestCase):
         fs_monitor = FakeFilesystemMonitor()
         daemon = HostInspectorDaemon(resolver=resolver, fs_monitor=fs_monitor, process_poll_interval_s=0.05)
 
-        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
-            "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+        with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "crab.host_inspector.server.reset_soft_dirty_for_pids",
             return_value={111},
         ):
             daemon.register("sbx-1", "docker", "container-1")
             daemon.reset("sbx-1")
 
-        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111, 222}), patch(
-            "agent_cr.host_inspector.server.dirty_pids",
+        with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111, 222}), patch(
+            "crab.host_inspector.server.dirty_pids",
             return_value=set(),
         ):
             status = daemon.status("sbx-1")
@@ -267,8 +267,8 @@ class HostInspectorServerTests(unittest.TestCase):
         daemon = HostInspectorDaemon(resolver=resolver, fs_monitor=fs_monitor, process_poll_interval_s=60.0)
         daemon.register("sbx-1", "docker", "container-1")
 
-        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
-            "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+        with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "crab.host_inspector.server.reset_soft_dirty_for_pids",
             return_value={111},
         ):
             daemon.reset("sbx-1")
@@ -290,8 +290,8 @@ class HostInspectorServerTests(unittest.TestCase):
                 daemon = HostInspectorDaemon(resolver=resolver, fs_monitor=fs_monitor, process_poll_interval_s=60.0)
                 daemon.register("sbx-1", "docker", "container-1")
 
-                with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
-                    "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+                with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+                    "crab.host_inspector.server.reset_soft_dirty_for_pids",
                     return_value={111},
                 ):
                     daemon.reset("sbx-1")
@@ -320,8 +320,8 @@ class HostInspectorServerTests(unittest.TestCase):
         daemon = HostInspectorDaemon(resolver=resolver, fs_monitor=fs_monitor, process_poll_interval_s=60.0)
         daemon.register("sbx-1", "docker", "container-1")
 
-        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
-            "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+        with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "crab.host_inspector.server.reset_soft_dirty_for_pids",
             return_value={111},
         ):
             daemon.reset("sbx-1")
@@ -345,8 +345,8 @@ class HostInspectorServerTests(unittest.TestCase):
         daemon = HostInspectorDaemon(resolver=resolver, fs_monitor=fs_monitor, process_poll_interval_s=60.0)
         daemon.register("sbx-1", "docker", "container-1")
 
-        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
-            "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+        with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "crab.host_inspector.server.reset_soft_dirty_for_pids",
             return_value={111},
         ):
             daemon.reset("sbx-1")
@@ -361,8 +361,8 @@ class HostInspectorServerTests(unittest.TestCase):
         daemon = HostInspectorDaemon(resolver=resolver, fs_monitor=fs_monitor, process_poll_interval_s=60.0)
         daemon.register("sbx-1", "docker", "container-1")
 
-        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
-            "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+        with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "crab.host_inspector.server.reset_soft_dirty_for_pids",
             return_value={111},
         ):
             daemon.reset("sbx-1")
@@ -386,8 +386,8 @@ class HostInspectorServerTests(unittest.TestCase):
         daemon = HostInspectorDaemon(resolver=resolver, fs_monitor=fs_monitor, process_poll_interval_s=60.0)
         daemon.register("sbx-1", "docker", "container-1")
 
-        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
-            "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+        with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "crab.host_inspector.server.reset_soft_dirty_for_pids",
             return_value={111},
         ):
             daemon.reset("sbx-1")
@@ -415,8 +415,8 @@ class HostInspectorServerTests(unittest.TestCase):
         daemon = HostInspectorDaemon(resolver=resolver, fs_monitor=fs_monitor, process_poll_interval_s=60.0)
         daemon.register("sbx-1", "docker", "container-1")
 
-        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
-            "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+        with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "crab.host_inspector.server.reset_soft_dirty_for_pids",
             return_value={111},
         ):
             daemon.reset("sbx-1")
@@ -433,7 +433,7 @@ class HostInspectorServerTests(unittest.TestCase):
                 device=1,
             )
         )
-        with patch("agent_cr.host_inspector.server.os.lstat"):
+        with patch("crab.host_inspector.server.os.lstat"):
             status = daemon.status("sbx-1")
         self.assertTrue(status["filesystem_changed"])
         self.assertEqual(status["metadata"]["live_dirty_entries"][0]["path"], "/work/1.txt")
@@ -444,8 +444,8 @@ class HostInspectorServerTests(unittest.TestCase):
         daemon = HostInspectorDaemon(resolver=resolver, fs_monitor=fs_monitor, process_poll_interval_s=60.0)
         daemon.register("sbx-1", "docker", "container-1")
 
-        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
-            "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+        with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "crab.host_inspector.server.reset_soft_dirty_for_pids",
             return_value={111},
         ):
             daemon.reset("sbx-1")
@@ -461,8 +461,8 @@ class HostInspectorServerTests(unittest.TestCase):
         daemon = HostInspectorDaemon(resolver=resolver, fs_monitor=fs_monitor, process_poll_interval_s=60.0)
         daemon.register("sbx-1", "docker", "container-1")
 
-        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
-            "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+        with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "crab.host_inspector.server.reset_soft_dirty_for_pids",
             return_value={111},
         ):
             daemon.reset("sbx-1")
@@ -499,8 +499,8 @@ class HostInspectorServerTests(unittest.TestCase):
         daemon = HostInspectorDaemon(resolver=resolver, fs_monitor=fs_monitor, process_poll_interval_s=60.0)
         daemon.register("sbx-1", "docker", "container-1")
 
-        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
-            "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+        with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "crab.host_inspector.server.reset_soft_dirty_for_pids",
             return_value={111},
         ):
             daemon.reset("sbx-1")
@@ -521,8 +521,8 @@ class HostInspectorServerTests(unittest.TestCase):
         daemon = HostInspectorDaemon(resolver=resolver, fs_monitor=fs_monitor, process_poll_interval_s=60.0)
         daemon.register("sbx-1", "docker", "container-1")
 
-        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
-            "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+        with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "crab.host_inspector.server.reset_soft_dirty_for_pids",
             return_value={111},
         ):
             daemon.reset("sbx-1")
@@ -537,8 +537,8 @@ class HostInspectorServerTests(unittest.TestCase):
                 path="/tmp/short-lived.tmp",
             )
         )
-        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
-            "agent_cr.host_inspector.server.dirty_pids",
+        with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "crab.host_inspector.server.dirty_pids",
             return_value=set(),
         ):
             status = daemon.status("sbx-1")
@@ -552,7 +552,7 @@ class HostInspectorServerTests(unittest.TestCase):
         rules = [{"executable_basename": "node", "cmdline_contains": ["iflow"]}]
 
         with patch(
-            "agent_cr.host_inspector.process_filter.read_process_identity",
+            "crab.host_inspector.process_filter.read_process_identity",
             side_effect=[
                 ProcessIdentity(pid=111, executable_path="/opt/iflow-runtime/node/bin/node", executable_basename="node", cmdline=("node", "iflow")),
                 ProcessIdentity(pid=222, executable_path="/bin/sh", executable_basename="sh", cmdline=("sh", "-lc", "sleep 1")),
@@ -561,11 +561,11 @@ class HostInspectorServerTests(unittest.TestCase):
                 ProcessIdentity(pid=111, executable_path="/opt/iflow-runtime/node/bin/node", executable_basename="node", cmdline=("node", "iflow")),
                 ProcessIdentity(pid=222, executable_path="/bin/sh", executable_basename="sh", cmdline=("sh", "-lc", "sleep 1")),
             ],
-        ), patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111, 222}), patch(
-            "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+        ), patch("crab.host_inspector.server.list_cgroup_pids", return_value={111, 222}), patch(
+            "crab.host_inspector.server.reset_soft_dirty_for_pids",
             return_value={222},
         ), patch(
-            "agent_cr.host_inspector.server.dirty_pids",
+            "crab.host_inspector.server.dirty_pids",
             return_value=set(),
         ):
             daemon.register("sbx-1", "docker", "container-1", ignore_process_rules=rules)
@@ -584,22 +584,22 @@ class HostInspectorServerTests(unittest.TestCase):
         rules = [{"executable_basename": "node", "cmdline_contains": ["iflow"]}]
 
         with patch(
-            "agent_cr.host_inspector.process_filter.read_process_identity",
+            "crab.host_inspector.process_filter.read_process_identity",
             return_value=ProcessIdentity(
                 pid=111,
                 executable_path="/opt/iflow-runtime/node/bin/node",
                 executable_basename="node",
                 cmdline=("node", "iflow"),
             ),
-        ), patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
-            "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+        ), patch("crab.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "crab.host_inspector.server.reset_soft_dirty_for_pids",
             return_value=set(),
         ):
             daemon.register("sbx-1", "docker", "container-1", ignore_process_rules=rules)
             daemon.reset("sbx-1")
 
         with patch(
-            "agent_cr.host_inspector.process_filter.read_process_identity",
+            "crab.host_inspector.process_filter.read_process_identity",
             return_value=ProcessIdentity(
                 pid=111,
                 executable_path="/opt/iflow-runtime/node/bin/node",
@@ -629,7 +629,7 @@ class HostInspectorServerTests(unittest.TestCase):
         rules = [{"executable_basename": "node", "cmdline_contains": ["iflow"]}]
 
         with patch(
-            "agent_cr.host_inspector.process_filter.read_process_identity",
+            "crab.host_inspector.process_filter.read_process_identity",
             side_effect=[
                 ProcessIdentity(pid=111, executable_path="/opt/iflow-runtime/node/bin/node", executable_basename="node", cmdline=("node", "iflow")),
                 ProcessIdentity(pid=222, executable_path="/bin/sh", executable_basename="sh", cmdline=("sh", "-lc", "echo hi")),
@@ -638,11 +638,11 @@ class HostInspectorServerTests(unittest.TestCase):
                 ProcessIdentity(pid=111, executable_path="/opt/iflow-runtime/node/bin/node", executable_basename="node", cmdline=("node", "iflow")),
                 ProcessIdentity(pid=222, executable_path="/bin/sh", executable_basename="sh", cmdline=("sh", "-lc", "echo hi")),
             ],
-        ), patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111, 222}), patch(
-            "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+        ), patch("crab.host_inspector.server.list_cgroup_pids", return_value={111, 222}), patch(
+            "crab.host_inspector.server.reset_soft_dirty_for_pids",
             return_value={222},
         ), patch(
-            "agent_cr.host_inspector.server.dirty_pids",
+            "crab.host_inspector.server.dirty_pids",
             return_value={222},
         ):
             daemon.register("sbx-1", "docker", "container-1", ignore_process_rules=rules)
@@ -687,16 +687,16 @@ class HostInspectorServerTests(unittest.TestCase):
             return {333: ancestors_333, 444: ancestors_444}.get(pid, frozenset())
 
         with patch(
-            "agent_cr.host_inspector.process_filter.read_process_identity",
+            "crab.host_inspector.process_filter.read_process_identity",
             side_effect=fake_identity,
         ), patch(
-            "agent_cr.host_inspector.process_filter.read_ancestor_basenames",
+            "crab.host_inspector.process_filter.read_ancestor_basenames",
             side_effect=fake_ancestors,
-        ), patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={333, 444}), patch(
-            "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+        ), patch("crab.host_inspector.server.list_cgroup_pids", return_value={333, 444}), patch(
+            "crab.host_inspector.server.reset_soft_dirty_for_pids",
             return_value={444},
         ), patch(
-            "agent_cr.host_inspector.server.dirty_pids",
+            "crab.host_inspector.server.dirty_pids",
             # Even if PID 333 were dirty, it must not surface — but mock
             # confirms only tracked pids are queried.
             return_value=set(),
@@ -715,16 +715,16 @@ class HostInspectorServerTests(unittest.TestCase):
         self.assertFalse(status["process_changed"])
         # The fs-event handler must NOT drop events from the process-only pid.
         # Verified directly via pid_matches_ignore_rules with fs_only=True:
-        from agent_cr.host_inspector.process_filter import (
+        from crab.host_inspector.process_filter import (
             pid_matches_ignore_rules,
             parse_process_ignore_rules,
         )
         parsed = parse_process_ignore_rules(rules)
         with patch(
-            "agent_cr.host_inspector.process_filter.read_process_identity",
+            "crab.host_inspector.process_filter.read_process_identity",
             side_effect=fake_identity,
         ), patch(
-            "agent_cr.host_inspector.process_filter.read_ancestor_basenames",
+            "crab.host_inspector.process_filter.read_ancestor_basenames",
             side_effect=fake_ancestors,
         ):
             self.assertTrue(pid_matches_ignore_rules(333, parsed))            # tracked-side: matched
@@ -735,13 +735,13 @@ class HostInspectorServerTests(unittest.TestCase):
         `tmux`) MUST still match in the fs-event path so the existing
         ignore-everywhere semantics are preserved.
         """
-        from agent_cr.host_inspector.process_filter import (
+        from crab.host_inspector.process_filter import (
             pid_matches_ignore_rules,
             parse_process_ignore_rules,
         )
         rules = parse_process_ignore_rules([{"executable_basename": "sleep"}])
         with patch(
-            "agent_cr.host_inspector.process_filter.read_process_identity",
+            "crab.host_inspector.process_filter.read_process_identity",
             return_value=ProcessIdentity(pid=555, executable_path="/bin/sleep", executable_basename="sleep", cmdline=("sleep", "infinity")),
         ):
             self.assertTrue(pid_matches_ignore_rules(555, rules))
@@ -773,13 +773,13 @@ class HostInspectorServerTests(unittest.TestCase):
             cmdline=("sleep", "infinity"),
         )
         with patch(
-            "agent_cr.host_inspector.process_filter.read_process_identity",
+            "crab.host_inspector.process_filter.read_process_identity",
             return_value=identity,
         ), patch(
-            "agent_cr.host_inspector.server.list_cgroup_pids",
+            "crab.host_inspector.server.list_cgroup_pids",
             return_value={111},
         ), patch(
-            "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+            "crab.host_inspector.server.reset_soft_dirty_for_pids",
             return_value=set(),
         ):
             daemon.register("sbx-1", "docker", "container-1", ignore_process_rules=rules)
@@ -788,13 +788,13 @@ class HostInspectorServerTests(unittest.TestCase):
         # Sanity: with the rule active, the entire cgroup is in
         # ignored_pids and tracked_pids is empty — exactly fault-7.
         with patch(
-            "agent_cr.host_inspector.process_filter.read_process_identity",
+            "crab.host_inspector.process_filter.read_process_identity",
             return_value=identity,
         ), patch(
-            "agent_cr.host_inspector.server.list_cgroup_pids",
+            "crab.host_inspector.server.list_cgroup_pids",
             return_value={111},
         ), patch(
-            "agent_cr.host_inspector.server.dirty_pids",
+            "crab.host_inspector.server.dirty_pids",
             return_value=set(),
         ):
             pre_status = daemon.status("sbx-1")
@@ -806,7 +806,7 @@ class HostInspectorServerTests(unittest.TestCase):
         # event lands on path_secondary; sleep (pid 111, ignored) has
         # libc.so.6 mmap'd.
         with patch(
-            "agent_cr.host_inspector.server.path_invalidates_mmap",
+            "crab.host_inspector.server.path_invalidates_mmap",
             return_value="/usr/lib/x86_64-linux-gnu/libc.so.6",
         ):
             daemon._handle_fs_event(
@@ -819,13 +819,13 @@ class HostInspectorServerTests(unittest.TestCase):
             )
 
         with patch(
-            "agent_cr.host_inspector.process_filter.read_process_identity",
+            "crab.host_inspector.process_filter.read_process_identity",
             return_value=identity,
         ), patch(
-            "agent_cr.host_inspector.server.list_cgroup_pids",
+            "crab.host_inspector.server.list_cgroup_pids",
             return_value={111},
         ), patch(
-            "agent_cr.host_inspector.server.dirty_pids",
+            "crab.host_inspector.server.dirty_pids",
             return_value=set(),
         ):
             status = daemon.status("sbx-1")
@@ -850,29 +850,29 @@ class HostInspectorServerTests(unittest.TestCase):
             pid=111, executable_path="/usr/bin/sleep", executable_basename="sleep", cmdline=("sleep", "infinity"),
         )
         with patch(
-            "agent_cr.host_inspector.process_filter.read_process_identity",
+            "crab.host_inspector.process_filter.read_process_identity",
             return_value=identity,
         ), patch(
-            "agent_cr.host_inspector.server.list_cgroup_pids",
+            "crab.host_inspector.server.list_cgroup_pids",
             return_value={111},
         ), patch(
-            "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+            "crab.host_inspector.server.reset_soft_dirty_for_pids",
             return_value=set(),
         ):
             daemon.register("sbx-1", "docker", "container-1", ignore_process_rules=rules)
             daemon.reset("sbx-1")
 
         with patch(
-            "agent_cr.host_inspector.process_filter.read_process_identity",
+            "crab.host_inspector.process_filter.read_process_identity",
             return_value=identity,
         ), patch(
-            "agent_cr.host_inspector.server.list_cgroup_pids",
+            "crab.host_inspector.server.list_cgroup_pids",
             return_value={111},
         ), patch(
-            "agent_cr.host_inspector.server.dirty_pids",
+            "crab.host_inspector.server.dirty_pids",
             return_value=set(),
         ), patch(
-            "agent_cr.host_inspector.server.all_deleted_mmap_paths",
+            "crab.host_inspector.server.all_deleted_mmap_paths",
             return_value={"/usr/lib/x86_64-linux-gnu/libc.so.6"},
         ) as scan:
             status = daemon.status("sbx-1")
@@ -891,11 +891,11 @@ class HostInspectorServerTests(unittest.TestCase):
         fs_monitor = FakeFilesystemMonitor()
         daemon = HostInspectorDaemon(resolver=resolver, fs_monitor=fs_monitor, process_poll_interval_s=60.0)
 
-        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
-            "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+        with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "crab.host_inspector.server.reset_soft_dirty_for_pids",
             return_value={111},
         ), patch(
-            "agent_cr.host_inspector.server.all_deleted_mmap_paths",
+            "crab.host_inspector.server.all_deleted_mmap_paths",
             return_value={"/usr/lib/x86_64-linux-gnu/libc.so.6"},
         ):
             daemon.register("sbx-1", "docker", "container-1")
@@ -912,7 +912,7 @@ class HostInspectorServerTests(unittest.TestCase):
         # event for an already-acknowledged path must NOT set
         # mmap_invalidated again.
         with patch(
-            "agent_cr.host_inspector.server.path_invalidates_mmap",
+            "crab.host_inspector.server.path_invalidates_mmap",
             return_value="/usr/lib/x86_64-linux-gnu/libc.so.6",
         ):
             daemon._handle_fs_event(
@@ -927,11 +927,11 @@ class HostInspectorServerTests(unittest.TestCase):
             self.assertFalse(daemon._records["sbx-1"].mmap_invalidated)
 
         # And status() with the same kernel-truth scan does not re-fire either.
-        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
-            "agent_cr.host_inspector.server.dirty_pids",
+        with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "crab.host_inspector.server.dirty_pids",
             return_value=set(),
         ), patch(
-            "agent_cr.host_inspector.server.all_deleted_mmap_paths",
+            "crab.host_inspector.server.all_deleted_mmap_paths",
             return_value={"/usr/lib/x86_64-linux-gnu/libc.so.6"},
         ):
             status = daemon.status("sbx-1")
@@ -946,11 +946,11 @@ class HostInspectorServerTests(unittest.TestCase):
         fs_monitor = FakeFilesystemMonitor()
         daemon = HostInspectorDaemon(resolver=resolver, fs_monitor=fs_monitor, process_poll_interval_s=60.0)
 
-        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
-            "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+        with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "crab.host_inspector.server.reset_soft_dirty_for_pids",
             return_value={111},
         ), patch(
-            "agent_cr.host_inspector.server.all_deleted_mmap_paths",
+            "crab.host_inspector.server.all_deleted_mmap_paths",
             return_value={"/usr/lib/x86_64-linux-gnu/libc.so.6"},
         ):
             daemon.register("sbx-1", "docker", "container-1")
@@ -959,8 +959,8 @@ class HostInspectorServerTests(unittest.TestCase):
         # Now an fs-only reset (e.g. after an fs-only checkpoint).
         # all_deleted_mmap_paths is intentionally NOT patched here — the
         # daemon must not call it for fs-only resets.
-        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
-            "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+        with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "crab.host_inspector.server.reset_soft_dirty_for_pids",
             return_value={111},
         ):
             daemon.reset("sbx-1", captures_process=False)
@@ -979,22 +979,22 @@ class HostInspectorServerTests(unittest.TestCase):
         fs_monitor = FakeFilesystemMonitor()
         daemon = HostInspectorDaemon(resolver=resolver, fs_monitor=fs_monitor, process_poll_interval_s=60.0)
 
-        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
-            "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+        with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "crab.host_inspector.server.reset_soft_dirty_for_pids",
             return_value={111},
         ), patch(
-            "agent_cr.host_inspector.server.all_deleted_mmap_paths",
+            "crab.host_inspector.server.all_deleted_mmap_paths",
             return_value={"/usr/lib/x86_64-linux-gnu/libc.so.6"},
         ):
             daemon.register("sbx-1", "docker", "container-1")
             daemon.reset("sbx-1", captures_process=True)
 
         # status() finds a NEW deleted path that wasn't in the baseline.
-        with patch("agent_cr.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
-            "agent_cr.host_inspector.server.dirty_pids",
+        with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "crab.host_inspector.server.dirty_pids",
             return_value=set(),
         ), patch(
-            "agent_cr.host_inspector.server.all_deleted_mmap_paths",
+            "crab.host_inspector.server.all_deleted_mmap_paths",
             return_value={
                 "/usr/lib/x86_64-linux-gnu/libc.so.6",
                 "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
@@ -1011,7 +1011,7 @@ class HostInspectorServerTests(unittest.TestCase):
         cost behind the `fs_monitor.sync(timeout_s=5.0)` barrier missing
         its budget on tmux pane workloads.
         """
-        from agent_cr.host_inspector.process_filter import (
+        from crab.host_inspector.process_filter import (
             PidIdentityCache,
             classify_pid_against_rules,
             parse_process_ignore_rules,
@@ -1027,7 +1027,7 @@ class HostInspectorServerTests(unittest.TestCase):
         cache = PidIdentityCache(max_entries=8, ttl_s=60.0)
 
         with patch(
-            "agent_cr.host_inspector.process_filter.read_process_identity",
+            "crab.host_inspector.process_filter.read_process_identity",
             return_value=identity,
         ) as identity_mock:
             for _ in range(100):
@@ -1044,7 +1044,7 @@ class HostInspectorServerTests(unittest.TestCase):
         (4M PID space) — the small TTL trades that vanishing failure mode
         against the per-event syscall amortization.
         """
-        from agent_cr.host_inspector.process_filter import (
+        from crab.host_inspector.process_filter import (
             PidIdentityCache,
             classify_pid_against_rules,
             parse_process_ignore_rules,
@@ -1060,7 +1060,7 @@ class HostInspectorServerTests(unittest.TestCase):
         cache = PidIdentityCache(max_entries=8, ttl_s=0.0)
 
         with patch(
-            "agent_cr.host_inspector.process_filter.read_process_identity",
+            "crab.host_inspector.process_filter.read_process_identity",
             return_value=identity,
         ) as identity_mock:
             for _ in range(3):
@@ -1075,7 +1075,7 @@ class HostInspectorServerTests(unittest.TestCase):
         rules coexist, while still guaranteeing ancestor data when a
         rule actually needs it.
         """
-        from agent_cr.host_inspector.process_filter import (
+        from crab.host_inspector.process_filter import (
             PidIdentityCache,
             classify_pid_against_rules,
             parse_process_ignore_rules,
@@ -1094,10 +1094,10 @@ class HostInspectorServerTests(unittest.TestCase):
         plain_rules = parse_process_ignore_rules([{"executable_basename": "sleep"}])
 
         with patch(
-            "agent_cr.host_inspector.process_filter.read_process_identity",
+            "crab.host_inspector.process_filter.read_process_identity",
             return_value=identity,
         ) as identity_mock, patch(
-            "agent_cr.host_inspector.process_filter.read_ancestor_basenames",
+            "crab.host_inspector.process_filter.read_ancestor_basenames",
             return_value=frozenset({"tmux", "bash"}),
         ) as ancestors_mock:
             classify_pid_against_rules(42, plain_rules, cache=cache)
@@ -1117,14 +1117,14 @@ class HostInspectorServerTests(unittest.TestCase):
         daemon = HostInspectorDaemon(resolver=resolver, fs_monitor=fs_monitor, process_poll_interval_s=60.0)
         rules = [{"executable_basename": "node", "cmdline_contains": ["iflow"]}]
 
-        with patch("agent_cr.host_inspector.process_filter.read_process_identity", return_value=None), patch(
-            "agent_cr.host_inspector.server.list_cgroup_pids",
+        with patch("crab.host_inspector.process_filter.read_process_identity", return_value=None), patch(
+            "crab.host_inspector.server.list_cgroup_pids",
             return_value={111},
         ), patch(
-            "agent_cr.host_inspector.server.reset_soft_dirty_for_pids",
+            "crab.host_inspector.server.reset_soft_dirty_for_pids",
             return_value={111},
         ), patch(
-            "agent_cr.host_inspector.server.dirty_pids",
+            "crab.host_inspector.server.dirty_pids",
             return_value={111},
         ):
             daemon.register("sbx-1", "docker", "container-1", ignore_process_rules=rules)
@@ -1142,7 +1142,7 @@ class LibbpfMonitorIgnoreRuleWireTests(unittest.TestCase):
         delivering fs events. Confirm the wire encoding drops them
         before they hit the helper, even though the daemon hands the
         full rule set down."""
-        from agent_cr.host_inspector.process_filter import (
+        from crab.host_inspector.process_filter import (
             ProcessIgnoreRule,
             SCOPE_ALL,
             SCOPE_PROCESS_ONLY,
@@ -1185,7 +1185,7 @@ class MmapPathCacheTests(unittest.TestCase):
         20260429_063012 showed worker stalls with target_depth < 5K).
         With the cache, one read per pid covers an entire TTL window
         of misses."""
-        from agent_cr.host_inspector.process_monitor import MmapPathCache, path_invalidates_mmap
+        from crab.host_inspector.process_monitor import MmapPathCache, path_invalidates_mmap
 
         call_count = [0]
 
@@ -1193,7 +1193,7 @@ class MmapPathCacheTests(unittest.TestCase):
             call_count[0] += 1
             return {"/usr/lib/libc.so.6"}
 
-        with patch("agent_cr.host_inspector.process_monitor.parse_mapped_paths", side_effect=fake_parse):
+        with patch("crab.host_inspector.process_monitor.parse_mapped_paths", side_effect=fake_parse):
             cache = MmapPathCache(ttl_s=10.0)
             # 50 events against 3 pids, NONE matching — pre-cache,
             # this would have done 150 /proc/<pid>/maps reads. With
@@ -1208,7 +1208,7 @@ class MmapPathCacheTests(unittest.TestCase):
     def test_cache_expires_after_ttl(self) -> None:
         """Stale mappings shouldn't pin forever — TTL ensures we
         eventually re-read so dlopen/exec changes get picked up."""
-        from agent_cr.host_inspector.process_monitor import MmapPathCache
+        from crab.host_inspector.process_monitor import MmapPathCache
 
         call_count = [0]
 
@@ -1216,7 +1216,7 @@ class MmapPathCacheTests(unittest.TestCase):
             call_count[0] += 1
             return {"/usr/lib/libc.so.6"}
 
-        with patch("agent_cr.host_inspector.process_monitor.parse_mapped_paths", side_effect=fake_parse):
+        with patch("crab.host_inspector.process_monitor.parse_mapped_paths", side_effect=fake_parse):
             cache = MmapPathCache(ttl_s=0.01)
             cache.get(100)
             cache.get(100)
@@ -1247,7 +1247,7 @@ class IgnoreRulePushTests(unittest.TestCase):
             {"executable_basename": "bash", "scope": "process_only"},
         ]
         with patch(
-            "agent_cr.host_inspector.server.list_cgroup_pids",
+            "crab.host_inspector.server.list_cgroup_pids",
             return_value=[111],
         ):
             daemon.register("sbx-1", "docker", "container-1", ignore_process_rules=rules_in)

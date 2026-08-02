@@ -4,8 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent_cr import RuncRuntime, RuncRuntimePaths, SandboxId
-from agent_cr.runtime.base import CommandResult, CommandRunner
+from crab import RuncRuntime, RuncRuntimePaths, SandboxId
+from crab.runtime.base import CommandResult, CommandRunner
 
 
 class _DeleteRetryRunner(CommandRunner):
@@ -67,7 +67,7 @@ class _RecordingRunner(CommandRunner):
 
 class RuncRuntimeDeleteTests(unittest.TestCase):
     def test_delete_runtime_kills_and_retries_when_init_is_still_running(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_runc_delete_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_runc_delete_") as tmp:
             root = Path(tmp)
             runner = _DeleteRetryRunner()
             runtime = RuncRuntime(
@@ -76,7 +76,7 @@ class RuncRuntimeDeleteTests(unittest.TestCase):
                     state_root=root / "state",
                     bundle_root=root / "bundles",
                     metadata_root=root / "metadata",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
 
@@ -101,7 +101,7 @@ class RuncRuntimeDeleteTests(unittest.TestCase):
             self.assertEqual(runtime.describe(SandboxId("sbx-test")).status, "stopped")
 
     def test_promote_filesystem_dataset_promotes_clone_dataset(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_runc_delete_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_runc_delete_") as tmp:
             root = Path(tmp)
             runner = _RecordingRunner()
             runtime = RuncRuntime(
@@ -110,20 +110,20 @@ class RuncRuntimeDeleteTests(unittest.TestCase):
                     state_root=root / "state",
                     bundle_root=root / "bundles",
                     metadata_root=root / "metadata",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
 
             runtime.promote_filesystem_dataset(SandboxId("sbx-fork"))
 
-            self.assertEqual(runner.commands[-1], ("zfs", "promote", "pool/agent-cr/sbx-fork"))
+            self.assertEqual(runner.commands[-1], ("zfs", "promote", "pool/crab/sbx-fork"))
 
     def test_promote_filesystem_dataset_ignores_non_clone_datasets(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_runc_delete_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_runc_delete_") as tmp:
             root = Path(tmp)
-            command = ("zfs", "promote", "pool/agent-cr/sbx-fork")
+            command = ("zfs", "promote", "pool/crab/sbx-fork")
             runner = _RecordingRunner(
-                stderr_by_command={command: "cannot promote 'pool/agent-cr/sbx-fork': not a cloned filesystem"}
+                stderr_by_command={command: "cannot promote 'pool/crab/sbx-fork': not a cloned filesystem"}
             )
             runtime = RuncRuntime(
                 command_runner=runner,
@@ -131,7 +131,7 @@ class RuncRuntimeDeleteTests(unittest.TestCase):
                     state_root=root / "state",
                     bundle_root=root / "bundles",
                     metadata_root=root / "metadata",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
 
@@ -140,10 +140,10 @@ class RuncRuntimeDeleteTests(unittest.TestCase):
             self.assertEqual(runner.commands[-1], command)
 
     def test_promote_filesystem_dataset_retries_after_conflicting_snapshot(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_runc_delete_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_runc_delete_") as tmp:
             root = Path(tmp)
-            promote_command = ("zfs", "promote", "pool/agent-cr/sbx-fork")
-            destroy_snapshot_command = ("zfs", "destroy", "pool/agent-cr/sbx-fork@ckpt-1")
+            promote_command = ("zfs", "promote", "pool/crab/sbx-fork")
+            destroy_snapshot_command = ("zfs", "destroy", "pool/crab/sbx-fork@ckpt-1")
             runner = _RecordingRunner(
                 results_by_command={
                     promote_command: [
@@ -152,8 +152,8 @@ class RuncRuntimeDeleteTests(unittest.TestCase):
                             returncode=1,
                             stdout="",
                             stderr=(
-                                "cannot promote 'pool/agent-cr/sbx-fork': conflicting snapshot 'ckpt-1' "
-                                "from parent 'pool/agent-cr/sbx-parent@ckpt-1'"
+                                "cannot promote 'pool/crab/sbx-fork': conflicting snapshot 'ckpt-1' "
+                                "from parent 'pool/crab/sbx-parent@ckpt-1'"
                             ),
                         ),
                         CommandResult(
@@ -179,7 +179,7 @@ class RuncRuntimeDeleteTests(unittest.TestCase):
                     state_root=root / "state",
                     bundle_root=root / "bundles",
                     metadata_root=root / "metadata",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
 

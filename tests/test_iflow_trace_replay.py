@@ -931,7 +931,7 @@ class IFlowTraceReplayTests(unittest.TestCase):
                             "content": (
                                 "Today's date is Thursday, March 19, 2026. "
                                 "See http://10.250.0.1:35871/v1 and request "
-                                "923e4567-e89b-12d3-a456-426614174999 from /tmp/agent_cr_scenario_bench_qc7nbuio/log.txt."
+                                "923e4567-e89b-12d3-a456-426614174999 from /tmp/crab_scenario_bench_qc7nbuio/log.txt."
                             ),
                         }
                     ],
@@ -1520,7 +1520,7 @@ class IFlowTraceReplayTests(unittest.TestCase):
 
 
 class TestHashCollisionRealTraces(unittest.TestCase):
-    RESULTS_DIR = Path("/root/workspace/agent-cr/results/2026-02-24__20-20-40_passed")
+    RESULTS_DIR = Path("/root/workspace/crab/results/2026-02-24__20-20-40_passed")
     ALLOWED_PARSE_ERROR_TRACE_NAMES = {
         "vulnerable-secret.1-of-1.2026-02-24__20-20-40",
     }

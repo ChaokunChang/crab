@@ -22,17 +22,17 @@ from integrations.sandboxes.runtime.bundle import merge_environment_defaults
 
 logger = logging.getLogger(__name__)
 
-IFLOW_WRAPPER_ARG = "--agent-cr-iflow-wrapper"
+IFLOW_WRAPPER_ARG = "--crab-iflow-wrapper"
 _IFLOW_INLINE_WRAPPER = """
 const fs = require("fs");
 const { spawn } = require("child_process");
 
-const entrypoint = process.env.AGENT_CR_IFLOW_ENTRYPOINT;
-const task = process.env.AGENT_CR_IFLOW_TASK || "";
-const donePath = process.env.AGENT_CR_IFLOW_DONE_PATH;
-const exitPath = process.env.AGENT_CR_IFLOW_EXIT_PATH;
-const taskCwd = process.env.AGENT_CR_IFLOW_CWD || "/work";
-const keepAliveAfterTask = /^(1|true|yes)$/i.test(process.env.AGENT_CR_IFLOW_KEEPALIVE_AFTER_TASK || "");
+const entrypoint = process.env.CRAB_IFLOW_ENTRYPOINT;
+const task = process.env.CRAB_IFLOW_TASK || "";
+const donePath = process.env.CRAB_IFLOW_DONE_PATH;
+const exitPath = process.env.CRAB_IFLOW_EXIT_PATH;
+const taskCwd = process.env.CRAB_IFLOW_CWD || "/work";
+const keepAliveAfterTask = /^(1|true|yes)$/i.test(process.env.CRAB_IFLOW_KEEPALIVE_AFTER_TASK || "");
 
 let settled = false;
 
@@ -152,9 +152,9 @@ class IFlowAgent(BaseAgent):
         prepared_state = prepare_iflow_state(
             work_root=sandbox_root,
             base_url=self.llm_base_url,
-            model_name=str(os.environ.get("AGENT_CR_IFLOW_MODEL_NAME", "agent-cr-iflow-scripted")),
+            model_name=str(os.environ.get("CRAB_IFLOW_MODEL_NAME", "crab-iflow-scripted")),
             max_session_turns=int(
-                os.environ.get("AGENT_CR_IFLOW_BENCHMARK_MAX_SESSION_TURNS", str(self.DEFAULT_MAX_SESSION_TURNS))
+                os.environ.get("CRAB_IFLOW_BENCHMARK_MAX_SESSION_TURNS", str(self.DEFAULT_MAX_SESSION_TURNS))
             ),
             telemetry=self.telemetry,
             sandbox_id=str(self.sandbox.sandbox_id),
@@ -248,12 +248,12 @@ class IFlowAgent(BaseAgent):
                 [
                     "export HOME=/root",
                     "export IFLOW_NON_INTERACTIVE=true",
-                    f"export AGENT_CR_IFLOW_ENTRYPOINT={shlex.quote(entrypoint)}",
-                    f"export AGENT_CR_IFLOW_TASK={escaped_task}",
-                    f"export AGENT_CR_IFLOW_CWD={shlex.quote(compose_cwd)}",
-                    "export AGENT_CR_IFLOW_KEEPALIVE_AFTER_TASK=true",
-                    f"export AGENT_CR_IFLOW_DONE_PATH={shlex.quote(marker_mount_paths['done'])}",
-                    f"export AGENT_CR_IFLOW_EXIT_PATH={shlex.quote(marker_mount_paths['exit'])}",
+                    f"export CRAB_IFLOW_ENTRYPOINT={shlex.quote(entrypoint)}",
+                    f"export CRAB_IFLOW_TASK={escaped_task}",
+                    f"export CRAB_IFLOW_CWD={shlex.quote(compose_cwd)}",
+                    "export CRAB_IFLOW_KEEPALIVE_AFTER_TASK=true",
+                    f"export CRAB_IFLOW_DONE_PATH={shlex.quote(marker_mount_paths['done'])}",
+                    f"export CRAB_IFLOW_EXIT_PATH={shlex.quote(marker_mount_paths['exit'])}",
                     f"cd {shlex.quote(compose_cwd)}",
                     *_INSTALL_AGENT_SETUP_COMMANDS,
                     (
@@ -284,11 +284,11 @@ class IFlowAgent(BaseAgent):
                 [
                     "export HOME=/root",
                     "export IFLOW_NON_INTERACTIVE=true",
-                    f"export AGENT_CR_IFLOW_ENTRYPOINT={shlex.quote(entrypoint)}",
-                    f"export AGENT_CR_IFLOW_TASK={escaped_task}",
-                    "export AGENT_CR_IFLOW_CWD=/work",
-                    f"export AGENT_CR_IFLOW_DONE_PATH={shlex.quote(marker_mount_paths['done'])}",
-                    f"export AGENT_CR_IFLOW_EXIT_PATH={shlex.quote(marker_mount_paths['exit'])}",
+                    f"export CRAB_IFLOW_ENTRYPOINT={shlex.quote(entrypoint)}",
+                    f"export CRAB_IFLOW_TASK={escaped_task}",
+                    "export CRAB_IFLOW_CWD=/work",
+                    f"export CRAB_IFLOW_DONE_PATH={shlex.quote(marker_mount_paths['done'])}",
+                    f"export CRAB_IFLOW_EXIT_PATH={shlex.quote(marker_mount_paths['exit'])}",
                     "cd /work",
                     *_INSTALL_AGENT_SETUP_COMMANDS,
                     (

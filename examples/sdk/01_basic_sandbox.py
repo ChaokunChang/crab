@@ -1,8 +1,8 @@
-"""Minimal Agent-CR SDK demo: launch a sandbox, run a command, clean up.
+"""Minimal Crab SDK demo: launch a sandbox, run a command, clean up.
 
 Before running, start the daemon in another terminal:
 
-    agentcr daemon start --foreground
+    crab daemon start --foreground
 
 Then run this script:
 
@@ -10,7 +10,7 @@ Then run this script:
 """
 from __future__ import annotations
 
-from agent_cr import Engine, Sandbox
+from crab import Engine, Sandbox
 
 
 def main() -> None:

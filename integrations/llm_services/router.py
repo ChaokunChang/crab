@@ -9,10 +9,10 @@ from typing import Any, Protocol
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
 
-from agent_cr import TelemetryConfig
-from agent_cr.http_utils import HttpStatusError, PooledHTTPServer, ThreadLocalHttpClient
-from agent_cr.json_codec import get_json_codec
-from agent_cr.telemetry import (
+from crab import TelemetryConfig
+from crab.http_utils import HttpStatusError, PooledHTTPServer, ThreadLocalHttpClient
+from crab.json_codec import get_json_codec
+from crab.telemetry import (
     DEFAULT_TELEMETRY_BATCH_MAX_RECORDS,
     DEFAULT_TELEMETRY_FLUSH_INTERVAL_MS,
     DEFAULT_TELEMETRY_OVERFLOW_POLICY,
@@ -341,7 +341,7 @@ class BenchmarkLLMRouter:
     def handle_request(self, *, path: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
         sandbox_id = _sandbox_id_from_request(headers, payload)
         service = self.resolve_service(sandbox_id)
-        request_id = headers.get("X-AgentCR-Request-Id", "").strip()
+        request_id = headers.get("X-Crab-Request-Id", "").strip()
         attributes = {
             "component": "llm_service",
             "request_id": request_id,

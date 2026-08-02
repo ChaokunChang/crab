@@ -3,7 +3,7 @@ mode: auto
 provider: openai
 agent: terminus
 llm_service: terminus_spec_trace_replay
-task_dataset: /root/workspace/agent-cr/results/datasets/terminus_replay_compcert_only.jsonl
+task_dataset: /root/workspace/crab/results/datasets/terminus_replay_compcert_only.jsonl
 sandboxes: 1
 max_workers: 1
 phase_workers:
@@ -36,11 +36,11 @@ llm_server:
 host_inspector:
   launch_mode: process
 iterations: 0
-output: /root/workspace/agent-cr/logs/terminus/spec.auto.compcert.smoke.csv
-log_file: /root/workspace/agent-cr/logs/terminus/spec.auto.compcert.smoke.log
+output: /root/workspace/crab/logs/terminus/spec.auto.compcert.smoke.csv
+log_file: /root/workspace/crab/logs/terminus/spec.auto.compcert.smoke.log
 log_file_mode: write
 telemetry:
-  output: /root/workspace/agent-cr/logs/terminus/spec.auto.compcert.smoke.telemetry.jsonl
+  output: /root/workspace/crab/logs/terminus/spec.auto.compcert.smoke.telemetry.jsonl
   file_mode: write
   detail_level: detailed
   capture_command_output: false
@@ -54,7 +54,7 @@ telemetry:
   serializer: auto
   report:
     enabled: true
-    output_dir: /root/workspace/agent-cr/logs/terminus/spec.auto.compcert.smoke.report
+    output_dir: /root/workspace/crab/logs/terminus/spec.auto.compcert.smoke.report
     top_k: 50
     log_scale_charts: false
     export_svg: true
@@ -65,7 +65,7 @@ monitoring:
   include_sandboxes: true
 zpool_name: zfspool
 reuse_zpool: true
-benchmark_root: /root/workspace/agent-cr/data/agent_cr/results
+benchmark_root: /root/workspace/crab/data/crab/results
 log_level: debug
 max_agent_timeout_scale: 2.0
 scenario_options:

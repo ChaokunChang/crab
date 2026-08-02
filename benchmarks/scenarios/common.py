@@ -5,8 +5,8 @@ import math
 import random
 import time
 
-from agent_cr import CheckpointId
-from agent_cr.models import SchedulerCheckpointDecision
+from crab import CheckpointId
+from crab.models import SchedulerCheckpointDecision
 from integrations.agents import SandboxHandle, TaskConfig
 
 from benchmarks.config import BenchmarkConfig

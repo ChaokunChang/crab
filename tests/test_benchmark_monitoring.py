@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from agent_cr import InMemoryTelemetrySink, SandboxId
+from crab import InMemoryTelemetrySink, SandboxId
 from benchmarks.monitoring import resource
 
 
@@ -31,7 +31,7 @@ class BenchmarkMonitoringTests(unittest.TestCase):
         self.assertEqual(tx_bytes, 400)
 
     def test_sample_once_emits_host_and_sandbox_metrics(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_monitoring_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_monitoring_") as tmp:
             root = Path(tmp)
             bundle_dir = root / "bundle"
             bundle_dir.mkdir(parents=True, exist_ok=True)
@@ -108,7 +108,7 @@ class BenchmarkMonitoringTests(unittest.TestCase):
             runtime.inspect_runtime.assert_not_called()
 
     def test_sample_once_gracefully_handles_missing_sandbox_proc_files(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_monitoring_missing_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_monitoring_missing_") as tmp:
             root = Path(tmp)
             bundle_dir = root / "bundle"
             bundle_dir.mkdir(parents=True, exist_ok=True)
@@ -149,7 +149,7 @@ class BenchmarkMonitoringTests(unittest.TestCase):
             self.assertNotIn("resource.sandbox.network.tx_bytes", metric_names)
 
     def test_sample_once_falls_back_to_runtime_pid_cgroup_when_bundle_cgroup_is_unreadable(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_monitoring_fallback_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_monitoring_fallback_") as tmp:
             root = Path(tmp)
             bundle_dir = root / "bundle"
             bundle_dir.mkdir(parents=True, exist_ok=True)

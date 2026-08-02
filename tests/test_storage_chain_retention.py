@@ -5,11 +5,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent_cr.config import StorageConfig
-from agent_cr.ids import CheckpointId, SandboxId
-from agent_cr.models import CheckpointManifest, MANIFEST_SCHEMA_VERSION, utc_now
-from agent_cr.storage.local import LocalCheckpointManager
-from agent_cr.storage.policies import LatestOnlyCheckpointManager
+from crab.config import StorageConfig
+from crab.ids import CheckpointId, SandboxId
+from crab.models import CheckpointManifest, MANIFEST_SCHEMA_VERSION, utc_now
+from crab.storage.local import LocalCheckpointManager
+from crab.storage.policies import LatestOnlyCheckpointManager
 
 
 def _manifest(
@@ -20,7 +20,7 @@ def _manifest(
     kind: str = "full",
     has_process_artifacts: bool = True,
 ) -> CheckpointManifest:
-    from agent_cr.models import ArtifactKind, ArtifactReference
+    from crab.models import ArtifactKind, ArtifactReference
 
     process_artifacts = []
     if has_process_artifacts:

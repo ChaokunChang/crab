@@ -1,15 +1,15 @@
-"""Run iFlow against a replayed LLM trace inside an Agent-CR sandbox.
+"""Run iFlow against a replayed LLM trace inside an Crab sandbox.
 
 Setup (three terminals):
 
     # terminal 1 — daemon
-    agentcr daemon start --foreground \\
+    crab daemon start --foreground \\
       --config examples/sdk/configs/iflow_replay_engine.runc.yaml
 
     # terminal 2 — replay router (provides /v1/chat/completions from a trace)
     PYTHONPATH=. python3 -m integrations.llm_services.router \\
       --host 127.0.0.1 --port 18080 \\
-      --telemetry-jsonl /tmp/agentcr-iflow-router.telemetry.jsonl
+      --telemetry-jsonl /tmp/crab-iflow-router.telemetry.jsonl
 
     # terminal 3 — this script
     PYTHONPATH=. python3 examples/sdk/02_iflow_replay.py
@@ -19,13 +19,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from agent_cr import Engine, Sandbox
-from agent_cr.agents_builtin.iflow import IFlowAgent
-from agent_cr.templates import DockerComposeTemplate
+from crab import Engine, Sandbox
+from crab.agents_builtin.iflow import IFlowAgent
+from crab.templates import DockerComposeTemplate
 from integrations.llm_services.router import BenchmarkLLMRouterClient
 
 
-DATASET = Path("/root/workspace/agent-cr/results/datasets/termnius_iflow_replay_128tasks_light.jsonl")
+DATASET = Path("/root/workspace/crab/results/datasets/termnius_iflow_replay_128tasks_light.jsonl")
 ROW_INDEX = 1  # crack-7z-hash — a multi-turn task with shell + write_file calls.
 REPLAY_URL = "http://127.0.0.1:18080"
 

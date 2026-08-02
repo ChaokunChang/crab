@@ -9,9 +9,9 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-from agent_cr import (
-    AgentCRRequestInterceptor,
-    AgentCRRequestInterceptorServer,
+from crab import (
+    CrabRequestInterceptor,
+    CrabRequestInterceptorServer,
     CompositeRequestInterceptorHook,
     InMemoryRequestStateStore,
     InMemoryTelemetrySink,
@@ -22,7 +22,7 @@ from agent_cr import (
     TelemetryRequestInterceptorHook,
     build_default_system,
 )
-from agent_cr.models import utc_now
+from crab.models import utc_now
 from integrations.llm_services.simulated.service import SimulatedLLMState, handle_request
 
 
@@ -43,7 +43,7 @@ class SlowRecordingTelemetrySink(InMemoryTelemetrySink):
 
 class InterceptorTests(unittest.TestCase):
     def test_build_default_system_disables_restore_validation_by_default_and_allows_opt_in(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_interceptor_builder_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_interceptor_builder_") as tmp:
             default_system = build_default_system(
                 storage_root=tmp,
                 runtime="docker",
@@ -157,7 +157,7 @@ class InterceptorTests(unittest.TestCase):
         telemetry = InMemoryTelemetrySink()
         hook = CompositeRequestInterceptorHook([TelemetryRequestInterceptorHook(telemetry)])
         llm_state = SimulatedLLMState()
-        interceptor = AgentCRRequestInterceptor(
+        interceptor = CrabRequestInterceptor(
             upstream_transport=lambda path, headers, body: (
                 200,
                 [("Content-Type", "application/json")],
@@ -212,7 +212,7 @@ class InterceptorTests(unittest.TestCase):
         response_gate_registry.enable()
         callback_event = threading.Event()
         callback_calls: list[tuple[SandboxId, str, int | None]] = []
-        interceptor = AgentCRRequestInterceptor(
+        interceptor = CrabRequestInterceptor(
             upstream_transport=lambda path, headers, body: (
                 200,
                 [("Content-Type", "application/json")],
@@ -289,7 +289,7 @@ class InterceptorTests(unittest.TestCase):
                 ).encode("utf-8"),
             )
 
-        interceptor = AgentCRRequestInterceptor(
+        interceptor = CrabRequestInterceptor(
             upstream_transport=_upstream_transport,
             request_state_store=request_state_store,
             sandbox_id_resolver=lambda client_host, headers, body: "fork-1" if client_host == "10.250.0.8" else None,
@@ -308,17 +308,17 @@ class InterceptorTests(unittest.TestCase):
         self.assertEqual(request_state_store.get(SandboxId("source-1")).total_llm_requests, 0)
         self.assertEqual(forwarded_headers["X-Agent-Sandbox-Id"], "fork-1")
         self.assertEqual(forwarded_headers["X-Request-Id"], "req-1")
-        self.assertEqual(forwarded_headers["X-AgentCR-Request-Id"], "req-1")
+        self.assertEqual(forwarded_headers["X-Crab-Request-Id"], "req-1")
 
     def test_interceptor_notifies_system_scheduler(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_interceptor_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_interceptor_") as tmp:
             system = build_default_system(
                 storage_root=tmp,
                 runtime="docker",
                 storage_config=StorageConfig(root_dir=Path(tmp)),
             )
 
-            interceptor = AgentCRRequestInterceptor(
+            interceptor = CrabRequestInterceptor(
                 upstream_transport=lambda path, headers, body: (
                     200,
                     [("Content-Type", "application/json")],
@@ -361,7 +361,7 @@ class InterceptorTests(unittest.TestCase):
 
     def test_interceptor_rejects_request_when_sandbox_identity_is_missing(self) -> None:
         request_state_store = InMemoryRequestStateStore()
-        interceptor = AgentCRRequestInterceptor(
+        interceptor = CrabRequestInterceptor(
             upstream_transport=lambda path, headers, body: (
                 200,
                 [("Content-Type", "application/json")],
@@ -392,7 +392,7 @@ class InterceptorTests(unittest.TestCase):
 
     def test_interceptor_resolver_maps_distinct_client_hosts_to_distinct_sandboxes(self) -> None:
         request_state_store = InMemoryRequestStateStore()
-        interceptor = AgentCRRequestInterceptor(
+        interceptor = CrabRequestInterceptor(
             upstream_transport=lambda path, headers, body: (
                 200,
                 [("Content-Type", "application/json")],
@@ -434,7 +434,7 @@ class InterceptorTests(unittest.TestCase):
         self.assertEqual(request_state_store.get(SandboxId("sbx-iflow-b")).total_llm_requests, 1)
 
     def test_interceptor_waits_for_system_checkpoint_flow(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_interceptor_system_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_interceptor_system_") as tmp:
             system = build_default_system(
                 storage_root=tmp,
                 runtime="docker",
@@ -453,7 +453,7 @@ class InterceptorTests(unittest.TestCase):
             )
             system.start()
 
-            interceptor = AgentCRRequestInterceptor(
+            interceptor = CrabRequestInterceptor(
                 upstream_transport=lambda path, headers, body: (
                     200,
                     [("Content-Type", "application/json")],
@@ -498,7 +498,7 @@ class InterceptorTests(unittest.TestCase):
         request_state_store = InMemoryRequestStateStore()
         response_gate_registry = SandboxResponseGateRegistry()
         response_gate_registry.enable()
-        interceptor = AgentCRRequestInterceptor(
+        interceptor = CrabRequestInterceptor(
             upstream_transport=lambda path, headers, body: (
                 200,
                 [("Content-Type", "application/json")],
@@ -561,7 +561,7 @@ class InterceptorTests(unittest.TestCase):
         request_state_store = InMemoryRequestStateStore()
         response_gate_registry = SandboxResponseGateRegistry()
         response_gate_registry.enable()
-        interceptor = AgentCRRequestInterceptor(
+        interceptor = CrabRequestInterceptor(
             upstream_transport=lambda path, headers, body: (200, [("Content-Type", "application/json")], b"{}"),
             request_state_store=request_state_store,
             response_gate_registry=response_gate_registry,
@@ -626,7 +626,7 @@ class InterceptorTests(unittest.TestCase):
         response_gate_registry = SandboxResponseGateRegistry()
         response_gate_registry.enable()
         telemetry = SlowRecordingTelemetrySink()
-        interceptor = AgentCRRequestInterceptor(
+        interceptor = CrabRequestInterceptor(
             upstream_transport=lambda path, headers, body: (200, [("Content-Type", "application/json")], b"{}"),
             request_state_store=request_state_store,
             response_gate_registry=response_gate_registry,
@@ -670,17 +670,17 @@ class InterceptorTests(unittest.TestCase):
         }
         gate_wait = metric_map["llm.gate_wait_ms"]
         gate_operation = metric_map["interceptor.response_gate.wait.duration_ms"]
-        agentcr_delay = metric_map["llm.agentcr_delay_ms"]
+        crab_delay = metric_map["llm.crab_delay_ms"]
 
         self.assertLess(abs(gate_operation - gate_wait), 25.0)
-        self.assertLess(abs(agentcr_delay - gate_wait), 25.0)
+        self.assertLess(abs(crab_delay - gate_wait), 25.0)
         metric_attrs = {
             name: attributes
             for name, _value, attributes in telemetry.metrics
             if attributes.get("request_id") == "req-metrics"
         }
         self.assertEqual(metric_attrs["llm.gate_wait_ms"]["request_group_role"], "oracle")
-        self.assertEqual(metric_attrs["llm.agentcr_delay_ms"]["request_group_role"], "oracle")
+        self.assertEqual(metric_attrs["llm.crab_delay_ms"]["request_group_role"], "oracle")
         self.assertEqual(metric_attrs["interceptor.response_gate.wait.duration_ms"]["request_group_role"], "oracle")
 
     def test_anthropic_count_tokens_request_bypasses_response_gate(self) -> None:
@@ -688,7 +688,7 @@ class InterceptorTests(unittest.TestCase):
         response_gate_registry = SandboxResponseGateRegistry()
         response_gate_registry.enable()
         telemetry = InMemoryTelemetrySink()
-        interceptor = AgentCRRequestInterceptor(
+        interceptor = CrabRequestInterceptor(
             upstream_transport=lambda path, headers, body: (
                 200,
                 [("Content-Type", "application/json")],
@@ -730,7 +730,7 @@ class InterceptorTests(unittest.TestCase):
         response_gate_registry = SandboxResponseGateRegistry()
         response_gate_registry.enable()
         telemetry = InMemoryTelemetrySink()
-        interceptor = AgentCRRequestInterceptor(
+        interceptor = CrabRequestInterceptor(
             upstream_transport=lambda path, headers, body: (
                 200,
                 [("Content-Type", "text/event-stream")],
@@ -781,7 +781,7 @@ class InterceptorTests(unittest.TestCase):
         response_gate_registry = SandboxResponseGateRegistry()
         response_gate_registry.enable()
         telemetry = InMemoryTelemetrySink()
-        interceptor = AgentCRRequestInterceptor(
+        interceptor = CrabRequestInterceptor(
             upstream_transport=lambda path, headers, body: (
                 200,
                 [("Content-Type", "text/event-stream")],
@@ -849,7 +849,7 @@ class InterceptorTests(unittest.TestCase):
         self.assertGreater(metric_map["llm.gate_wait_ms"], 0.0)
 
     def test_interceptor_server_healthz_returns_json(self) -> None:
-        server = AgentCRRequestInterceptorServer(
+        server = CrabRequestInterceptorServer(
             upstream_url="http://127.0.0.1:9999",
             request_state_store=InMemoryRequestStateStore(),
             port=0,
@@ -891,7 +891,7 @@ class InterceptorTests(unittest.TestCase):
         self.addCleanup(upstream.server_close)
         self.addCleanup(upstream_thread.join, 5.0)
 
-        server = AgentCRRequestInterceptorServer(
+        server = CrabRequestInterceptorServer(
             upstream_url=f"http://127.0.0.1:{upstream.server_address[1]}",
             request_state_store=InMemoryRequestStateStore(),
             port=0,
@@ -912,7 +912,7 @@ class InterceptorTests(unittest.TestCase):
         self.assertEqual(payload["input_tokens"], 7)
         self.assertEqual(captured_paths, ["/v1/messages/count_tokens"])
     def test_interceptor_server_stop_closes_upstream_connections_before_server_close(self) -> None:
-        server = AgentCRRequestInterceptorServer(
+        server = CrabRequestInterceptorServer(
             upstream_url="http://127.0.0.1:9999",
             request_state_store=InMemoryRequestStateStore(),
             port=0,

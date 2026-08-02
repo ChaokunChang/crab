@@ -7,8 +7,8 @@ from concurrent.futures import wait as concurrent_wait
 from dataclasses import dataclass, field
 from typing import Any
 
-from agent_cr import CheckpointId, CheckpointManifest, SandboxId
-from agent_cr.models import utc_now
+from crab import CheckpointId, CheckpointManifest, SandboxId
+from crab.models import utc_now
 from benchmarks.real_host_scenario_base import _SpeculativeSandboxController
 
 

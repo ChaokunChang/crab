@@ -26,9 +26,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from agent_cr import (
-    AgentCRRequestInterceptorServer,
-    AgentCRSystem,
+from crab import (
+    CrabRequestInterceptorServer,
+    CrabSystem,
     AdapterFileSystemCWorker,
     AdapterFileSystemRWorker,
     AdapterProcessCWorker,
@@ -67,12 +67,12 @@ from agent_cr import (
     JobId,
     build_configured_telemetry_sink,
 )
-from agent_cr.models import ArtifactPayload, FailureCode, JobStatus, RestoreResult, utc_now
-from agent_cr.telemetry import start_operation
-from agent_cr.workers.composite import resolve_restore_manifest
-from agent_cr.host_inspector.fs_helper import LibbpfFilesystemMonitor
-from agent_cr.host_inspector.runtime_resolver import RuntimeResolver
-from agent_cr.host_inspector.server import HostInspectorDaemon, HostInspectorServer
+from crab.models import ArtifactPayload, FailureCode, JobStatus, RestoreResult, utc_now
+from crab.telemetry import start_operation
+from crab.workers.composite import resolve_restore_manifest
+from crab.host_inspector.fs_helper import LibbpfFilesystemMonitor
+from crab.host_inspector.runtime_resolver import RuntimeResolver
+from crab.host_inspector.server import HostInspectorDaemon, HostInspectorServer
 from integrations.agents import BaseAgent, SandboxHandle, TaskConfig, TaskDescription, build_agent_registry
 from integrations.llm_services import (
     BenchmarkLLMRouterClient,
@@ -97,7 +97,7 @@ logger = logging.getLogger(__name__)
 
 _HOST_INSPECTOR_HOST = "127.0.0.1"
 _HOST_INSPECTOR_PORT = 9782
-_DEFAULT_IMAGE_CACHE_ROOT = ROOT / ".cache" / "agent-cr" / "images"
+_DEFAULT_IMAGE_CACHE_ROOT = ROOT / ".cache" / "crab" / "images"
 _SHARED_ROOTFS_KEY_METADATA_KEY = "shared_rootfs_key"
 _SHARED_ROOTFS_PERSIST_METADATA_KEY = "shared_rootfs_persist"
 _TERMNIUS_PROCESS_CAPABILITIES = [
@@ -328,7 +328,7 @@ class _SpeculativeSandboxController:
         if self._background_prefork_enabled:
             self._prefork_executor = ThreadPoolExecutor(
                 max_workers=1,
-                thread_name_prefix=f"agent-cr-prefork-{self._fork_name_root}",
+                thread_name_prefix=f"crab-prefork-{self._fork_name_root}",
             )
         self._prefork_future: Future[None] | None = None
         self._prefork_in_flight = False
@@ -774,7 +774,7 @@ def _create_lightweight_venv(destination: str, python: str) -> int:
     site_packages = _venv_site_packages(destination, python)
     bin_dir.mkdir(parents=True, exist_ok=True)
     site_packages.mkdir(parents=True, exist_ok=True)
-    (venv_root / ".agent_cr_fake_venv").write_text("", encoding="utf-8")
+    (venv_root / ".crab_fake_venv").write_text("", encoding="utf-8")
     python_wrapper = (
         "#!/bin/sh\\n"
         f'PYTHONPATH="{site_packages}:${{PYTHONPATH:-}}" exec "{python}" "$@"\\n'
@@ -881,7 +881,7 @@ def _run_python(args: list[str]) -> int:
 
 def _using_fake_venv() -> bool:
     venv_root = os.environ.get("VIRTUAL_ENV")
-    return bool(venv_root and (Path(venv_root) / ".agent_cr_fake_venv").exists())
+    return bool(venv_root and (Path(venv_root) / ".crab_fake_venv").exists())
 
 
 def _run_command(args: list[str]) -> int:
@@ -907,7 +907,7 @@ def _run_pytest_fallback(args: list[str]) -> int:
     for index, test_file in enumerate(test_files):
         module_path = Path(test_file).resolve()
         spec = importlib.util.spec_from_file_location(
-            f"agent_cr_pytest_fallback_{index}",
+            f"crab_pytest_fallback_{index}",
             module_path,
         )
         if spec is None or spec.loader is None:
@@ -969,7 +969,7 @@ if __name__ == "__main__":
         return (
             """
 set -euo pipefail
-shim_bin="$HOME/.local/agent-cr-verification/bin"
+shim_bin="$HOME/.local/crab-verification/bin"
 wait_for_apt_lock() {
   while pgrep -x apt-get >/dev/null 2>&1 || pgrep -x apt >/dev/null 2>&1 || pgrep -x dpkg >/dev/null 2>&1; do
     sleep 1
@@ -993,7 +993,7 @@ export PATH="$shim_bin:$PATH"
 cat > "$shim_bin/apt-get" <<'EOF'
 #!/bin/sh
 REAL_APT_GET=/usr/bin/apt-get
-APT_UPDATE_MARKER=/var/lib/agent-cr-verification/apt-update.ok
+APT_UPDATE_MARKER=/var/lib/crab-verification/apt-update.ok
 first_cmd=""
 for arg in "$@"; do
   case "$arg" in
@@ -1074,16 +1074,16 @@ if [ "$need_python_packages" -eq 1 ]; then
 fi
 install -d -m 755 "$HOME/.local/bin"
 cat > "$HOME/.local/bin/env" <<'EOF'
-export PATH="$HOME/.local/agent-cr-verification/bin:$HOME/.local/bin:$PATH"
+export PATH="$HOME/.local/crab-verification/bin:$HOME/.local/bin:$PATH"
 EOF
 if [ ! -x "$HOME/.local/bin/uv" ]; then
 cat > "$HOME/.local/bin/uv" <<'EOF'
 #!/usr/bin/env python3
-__AGENT_CR_VERIFICATION_UV_PYTHON_SHIM__
+__CRAB_VERIFICATION_UV_PYTHON_SHIM__
 EOF
 chmod 755 "$HOME/.local/bin/uv"
 fi
-""".replace("__AGENT_CR_VERIFICATION_UV_PYTHON_SHIM__", python_shim).strip()
+""".replace("__CRAB_VERIFICATION_UV_PYTHON_SHIM__", python_shim).strip()
         )
 
     @staticmethod
@@ -1281,8 +1281,8 @@ PY
         self.runtime: RuncRuntime | None = None
         self.storage: CheckpointManager | None = None
         self.executor: CRExecutor | None = None
-        self.system: AgentCRSystem | None = None
-        self.interceptor: AgentCRRequestInterceptorServer | None = None
+        self.system: CrabSystem | None = None
+        self.interceptor: CrabRequestInterceptorServer | None = None
         self.interceptor_hook = CompositeRequestInterceptorHook()
         self.llm_server = None
         self.llm_thread: threading.Thread | None = None
@@ -1454,14 +1454,14 @@ PY
     def _resolve_benchmark_run_root(self) -> tuple[Path, bool]:
         benchmark_root_home = self.configured_benchmark_root_home
         if benchmark_root_home is None:
-            bench_dir = os.environ.get("AGENTCR_BENCH_DIR", None)
+            bench_dir = os.environ.get("CRAB_BENCH_DIR", None)
             if bench_dir and bench_dir.lower() not in ["tmpdir", "tmp"]:
                 benchmark_root_home = Path(bench_dir).expanduser().resolve()
         if benchmark_root_home is None:
             if self.configured_benchmark_run_name is not None:
                 raise ValueError(
                     "benchmark_run_name requires benchmark_root_home, benchmark_root, "
-                    "or AGENTCR_BENCH_DIR"
+                    "or CRAB_BENCH_DIR"
                 )
             if self._tmpdir is None:
                 raise RuntimeError("temporary benchmark root has not been initialized")
@@ -1477,10 +1477,10 @@ PY
             self.network_manager.network_cidr,
             self.network_manager.bridge_ip,
         )
-        self._tmpdir = tempfile.TemporaryDirectory(prefix="agent_cr_scenario_bench_")
+        self._tmpdir = tempfile.TemporaryDirectory(prefix="crab_scenario_bench_")
         self.root, self.uses_temporary_root = self._resolve_benchmark_run_root()
         unique_suffix = uuid.uuid4().hex[:10]
-        self.pool_name = self.configured_zpool_name or f"agentcrbench{unique_suffix}"
+        self.pool_name = self.configured_zpool_name or f"crabbench{unique_suffix}"
         zpool_image_path = self.configured_zpool_image or (self.root / "zpool.img")
         self.runtime_root = self._resolve_runtime_plane_root(zpool_image_path=zpool_image_path)
         self.runtime_state_root = self.runtime_root / "runtime-state"
@@ -1524,7 +1524,7 @@ PY
                 bundle_root=self.runtime_bundle_root,
                 checkpoint_root=self.runtime_checkpoint_root,
                 metadata_root=self.runtime_metadata_root,
-                zfs_dataset_prefix=f"{self.pool_name}/agent-cr",
+                zfs_dataset_prefix=f"{self.pool_name}/crab",
             ),
             options=RuncRuntimeOptions(
                 command_timeout_seconds=self.runtime_command_timeout_seconds,
@@ -1566,7 +1566,7 @@ PY
             ),
             self.telemetry,
         )
-        self.system = AgentCRSystem(
+        self.system = CrabSystem(
             scheduler=CRScheduler(
                 self.scheduler_config,
                 self.inspector,
@@ -1612,7 +1612,7 @@ PY
             )
             self._resource_monitor.start()
         self.interceptor_hook.add_hook(TelemetryRequestInterceptorHook(self.telemetry))
-        self.interceptor = AgentCRRequestInterceptorServer(
+        self.interceptor = CrabRequestInterceptorServer(
             upstream_url=self.llm_server_base_url,
             request_state_store=self.request_state_store,
             hook=self.interceptor_hook,
@@ -1731,7 +1731,7 @@ PY
         def _destroy_benchmark_dataset() -> None:
             if not self.pool_name:
                 return
-            dataset = f"{self.pool_name}/agent-cr"
+            dataset = f"{self.pool_name}/crab"
             subprocess.run(
                 ["zfs", "destroy", "-r", dataset],
                 check=False,
@@ -1823,7 +1823,7 @@ PY
         command = [
             sys.executable,
             "-m",
-            "agent_cr.host_inspector.server",
+            "crab.host_inspector.server",
             "--host",
             _HOST_INSPECTOR_HOST,
             "--port",
@@ -2064,7 +2064,7 @@ PY
 
     def _ensure_zpool(self) -> None:
         assert self.root is not None
-        dataset = f"{self.pool_name}/agent-cr"
+        dataset = f"{self.pool_name}/crab"
         zpool_image_path = self.configured_zpool_image or (self.root / "zpool.img")
         self._zpool_image_path = zpool_image_path
         if self.reuse_zpool:
@@ -2190,7 +2190,7 @@ PY
         raise ValueError(f"unsupported benchmark agent type for sandbox image: {agent_type}")
 
     def _sandbox_image_tag(self, agent_type: str) -> str:
-        return f"agent-cr-{sandbox_image.docker_tag_component(agent_type)}-bench:workspace"
+        return f"crab-{sandbox_image.docker_tag_component(agent_type)}-bench:workspace"
 
     def ensure_sandbox_image(self, agent_type: str) -> AgentSandboxImage:
         with self._sandbox_image_lock:
@@ -3091,8 +3091,8 @@ PY
             "T_BENCH_CONTAINER_AGENT_LOGS_PATH": "/agent-logs",
             "T_BENCH_TASK_LOGS_PATH": str(task_logs_path),
             "T_BENCH_TASK_AGENT_LOGS_PATH": str(task_agent_logs_path),
-            "T_BENCH_TASK_DOCKER_CLIENT_CONTAINER_NAME": f"agent-cr-{image_component}",
-            "T_BENCH_TASK_DOCKER_CLIENT_IMAGE_NAME": f"agent-cr-termnius-{image_component}",
+            "T_BENCH_TASK_DOCKER_CLIENT_CONTAINER_NAME": f"crab-{image_component}",
+            "T_BENCH_TASK_DOCKER_CLIENT_IMAGE_NAME": f"crab-termnius-{image_component}",
             "T_BENCH_TEST_DIR": "/tests",
         }
 
@@ -3745,7 +3745,7 @@ PY
         )
         self._delete_runtime(sandbox.sandbox_id)
         if preserve_filesystem_state:
-            metadata["_agent_cr_runtime_reuse_existing_rootfs"] = True
+            metadata["_crab_runtime_reuse_existing_rootfs"] = True
         else:
             self._destroy_filesystem_dataset(sandbox.sandbox_id)
         self.runtime.launch("runc", metadata)
@@ -4206,7 +4206,7 @@ PY
             provider=self.provider,
             sandbox_name=str(target.sandbox_id),
             status_port=source.status_port,
-            cgroup_path=f"agent-cr-bench/{self.pool_name}/{target.sandbox_id}",
+            cgroup_path=f"crab-bench/{self.pool_name}/{target.sandbox_id}",
             work_dir_host_path=work_dir_host_path,
             network_namespace_path=None if network_lease is None else network_lease.namespace_path,
             image_defaults=None if sandbox_image is None else sandbox_image.image_defaults,
@@ -4330,7 +4330,7 @@ PY
     def _dataset_name_for(self, sandbox_id: SandboxId) -> str:
         if self.runtime is not None and hasattr(self.runtime, "dataset_name_for"):
             return self.runtime.dataset_name_for(sandbox_id)
-        return f"{self.pool_name}/agent-cr/{sandbox_id}"
+        return f"{self.pool_name}/crab/{sandbox_id}"
 
     def _clone_filesystem_snapshot(
         self,
@@ -4341,7 +4341,7 @@ PY
         target_rootfs_path: Path,
     ) -> str:
         if self.runtime is None or not hasattr(self.runtime, "clone_filesystem_snapshot"):
-            return f"{self.pool_name}/agent-cr/{target_sandbox_id}"
+            return f"{self.pool_name}/crab/{target_sandbox_id}"
         return self.runtime.clone_filesystem_snapshot(
             source_sandbox_id,
             checkpoint_id,
@@ -4786,10 +4786,10 @@ else
   # (ignores IP SANs) and never falls back to CN when any DNS SAN is present.
   # To satisfy both old and new stacks we omit DNS SAN entries entirely so old
   # urllib3 falls back to CN="127.0.0.1" while modern stacks match IP SAN.
-  CERT=/tmp/agent-cr-httpbin-v2.crt
-  KEY=/tmp/agent-cr-httpbin-v2.key
+  CERT=/tmp/crab-httpbin-v2.crt
+  KEY=/tmp/crab-httpbin-v2.key
   if [ ! -s "$CERT" ] || [ ! -s "$KEY" ]; then
-    "$BASE_PY" - <<'PYCERT' >/tmp/agent-cr-httpbin-cert.log 2>&1 || true
+    "$BASE_PY" - <<'PYCERT' >/tmp/crab-httpbin-cert.log 2>&1 || true
 import datetime, ipaddress
 from cryptography import x509
 from cryptography.x509.oid import NameOID
@@ -4808,14 +4808,14 @@ cert = (x509.CertificateBuilder()
         x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
     ]), critical=False)
     .sign(key, hashes.SHA256()))
-open("/tmp/agent-cr-httpbin-v2.key","wb").write(key.private_bytes(
+open("/tmp/crab-httpbin-v2.key","wb").write(key.private_bytes(
     serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL,
     serialization.NoEncryption()))
-open("/tmp/agent-cr-httpbin-v2.crt","wb").write(cert.public_bytes(serialization.Encoding.PEM))
+open("/tmp/crab-httpbin-v2.crt","wb").write(cert.public_bytes(serialization.Encoding.PEM))
 PYCERT
   fi
   if [ -s "$CERT" ] && [ -s "$KEY" ]; then
-    setsid "$BASE_PY" - >/tmp/agent-cr-httpbin.log 2>&1 <<PYRUN &
+    setsid "$BASE_PY" - >/tmp/crab-httpbin.log 2>&1 <<PYRUN &
 import threading, ssl
 from httpbin import app
 from werkzeug.serving import make_server
@@ -4843,8 +4843,8 @@ PYRUN
       if [ -x "$TESTBED_PY" ]; then
         CA_BUNDLE=$("$TESTBED_PY" -c 'import requests; print(requests.certs.where())' 2>/dev/null || echo "")
         if [ -n "$CA_BUNDLE" ] && [ -f "$CA_BUNDLE" ]; then
-          if ! grep -q "agent-cr-httpbin" "$CA_BUNDLE" 2>/dev/null; then
-            printf '\n# agent-cr-httpbin self-signed\n' >> "$CA_BUNDLE"
+          if ! grep -q "crab-httpbin" "$CA_BUNDLE" 2>/dev/null; then
+            printf '\n# crab-httpbin self-signed\n' >> "$CA_BUNDLE"
             cat "$CERT" >> "$CA_BUNDLE"
           fi
           export REQUESTS_CA_BUNDLE="$CA_BUNDLE"
@@ -4855,12 +4855,12 @@ PYRUN
       trap 'kill -9 $HTTPBIN_PID 2>/dev/null || true' EXIT
     else
       echo "psf_requests_httpbin: FAIL http=$up_http https=$up_https pid=$HTTPBIN_PID"
-      tail -40 /tmp/agent-cr-httpbin.log 2>/dev/null || true
+      tail -40 /tmp/crab-httpbin.log 2>/dev/null || true
       kill -9 $HTTPBIN_PID 2>/dev/null || true
     fi
   else
     echo "psf_requests_httpbin: FAIL to generate cert"
-    cat /tmp/agent-cr-httpbin-cert.log 2>/dev/null || true
+    cat /tmp/crab-httpbin-cert.log 2>/dev/null || true
   fi
 fi
 set +e
@@ -4903,7 +4903,7 @@ exit $rc
             env={
                 "TEST_DIR": "/tests",
                 "PATH": (
-                    "/root/.local/agent-cr-verification/bin:/root/.local/bin:"
+                    "/root/.local/crab-verification/bin:/root/.local/bin:"
                     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
                 ),
                 "OMP_NUM_THREADS": thread_cap,
@@ -5290,10 +5290,10 @@ exit $rc
         _ = source_sandbox_id
         bundle_root = self._effective_runtime_bundle_root()
         data = json.loads(payload.decode("utf-8"))
-        target_snapshot = f"{self.pool_name}/agent-cr/{target_sandbox_id}@{checkpoint_id}"
+        target_snapshot = f"{self.pool_name}/crab/{target_sandbox_id}@{checkpoint_id}"
         filesystem = data.get("filesystem", {})
         if isinstance(filesystem, dict):
-            filesystem["dataset"] = f"{self.pool_name}/agent-cr/{target_sandbox_id}"
+            filesystem["dataset"] = f"{self.pool_name}/crab/{target_sandbox_id}"
             filesystem["snapshot"] = target_snapshot
             filesystem["mountpoint"] = str(bundle_root / str(target_sandbox_id) / "rootfs")
         status = data.get("status", {})
@@ -5302,7 +5302,7 @@ exit $rc
             if isinstance(metadata, dict):
                 metadata["sandbox_id"] = str(target_sandbox_id)
                 metadata["checkpoint_id"] = str(checkpoint_id)
-                metadata["dataset"] = f"{self.pool_name}/agent-cr/{target_sandbox_id}"
+                metadata["dataset"] = f"{self.pool_name}/crab/{target_sandbox_id}"
                 metadata["snapshot"] = target_snapshot
                 metadata["mountpoint"] = str(bundle_root / str(target_sandbox_id) / "rootfs")
         data["sandbox_id"] = str(target_sandbox_id)

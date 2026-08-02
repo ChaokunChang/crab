@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from agent_cr import SandboxId
+from crab import SandboxId
 
 if TYPE_CHECKING:
     from .base import BaseAgent, TaskConfig, TaskDescription

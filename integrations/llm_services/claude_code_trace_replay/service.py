@@ -1000,7 +1000,7 @@ def _normalize_runtime_specific_file_content(*, file_path: str | None, content: 
 
 
 def _wrap_replay_apt_command(command: str) -> str:
-    if "agent_cr_retry_apt_command" in command:
+    if "crab_retry_apt_command" in command:
         return command
     wrapped = _shell_quote(command)
     return (
@@ -1008,7 +1008,7 @@ def _wrap_replay_apt_command(command: str) -> str:
         "while pgrep -x apt-get >/dev/null 2>&1 || pgrep -x apt >/dev/null 2>&1 || pgrep -x dpkg >/dev/null 2>&1; "
         "do sleep 1; done; "
         "}; "
-        "agent_cr_retry_apt_command() { "
+        "crab_retry_apt_command() { "
         "attempts=0; "
         "while true; do "
         "wait_for_apt_lock; "
@@ -1020,7 +1020,7 @@ def _wrap_replay_apt_command(command: str) -> str:
         "sleep \"$attempts\"; "
         "done; "
         "}; "
-        f"agent_cr_retry_apt_command {wrapped}"
+        f"crab_retry_apt_command {wrapped}"
     )
 
 
@@ -1061,7 +1061,7 @@ def _mark_detached_background_tools(turns: list[dict[str, Any]]) -> None:
             recorded_task_id = _recorded_background_task_id(tool)
             if recorded_task_id is not None and recorded_task_id in controlled_ids:
                 continue
-            tool["agent_cr_detach_background"] = True
+            tool["crab_detach_background"] = True
 
 
 def _iter_tool_result_blocks(payload: dict[str, Any]) -> list[tuple[str | None, str]]:
@@ -1152,18 +1152,18 @@ def _detached_background_log_path(tool: dict[str, Any]) -> str:
         allow_placeholder=True,
     ) or uuid.uuid4().hex[:12]
     safe_tool_use_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", tool_use_id)[:64] or "task"
-    return f"/tmp/agent-cr-bg-{safe_tool_use_id}.log"
+    return f"/tmp/crab-bg-{safe_tool_use_id}.log"
 
 
 def _detach_background_bash_command(command: str, *, tool: dict[str, Any]) -> str:
     log_path = _detached_background_log_path(tool)
     return (
-        f"agent_cr_bg_log={_shell_quote(log_path)}; "
+        f"crab_bg_log={_shell_quote(log_path)}; "
         f"nohup setsid /bin/bash -lc {_shell_quote(command)} "
-        '> "$agent_cr_bg_log" 2>&1 < /dev/null & '
-        'agent_cr_bg_pid=$!; '
+        '> "$crab_bg_log" 2>&1 < /dev/null & '
+        'crab_bg_pid=$!; '
         'printf "Command detached into sandbox with PID: %s. Output is being written to: %s\\n" '
-        '"$agent_cr_bg_pid" "$agent_cr_bg_log"'
+        '"$crab_bg_pid" "$crab_bg_log"'
     )
 
 
@@ -1521,7 +1521,7 @@ def _tool_to_replay_spec(
         run_in_background = args.get("run_in_background")
         if isinstance(run_in_background, bool):
             bash_input["run_in_background"] = run_in_background
-        if bool(tool.get("agent_cr_detach_background")):
+        if bool(tool.get("crab_detach_background")):
             bash_input["command"] = _detach_background_bash_command(normalized_command, tool=tool)
             bash_input["run_in_background"] = False
         return ("Bash", bash_input)

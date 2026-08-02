@@ -52,7 +52,7 @@ there).
 ### 1. Pick a `task_id` and a base image
 
 Choose a unique `task_id` (it ends up in the Docker image name as
-`agent-cr-termnius-<task_id>`). Pick a small base image — usually
+`crab-termnius-<task_id>`). Pick a small base image — usually
 `ghcr.io/laude-institute/t-bench/ubuntu-24-04:20250624`, already
 cached on every benchmark host — and add only what your trajectory
 actually needs.
@@ -174,7 +174,7 @@ python3 -m benchmarks.run --config benchmarks/examples/debug/<your>.yaml
 The last line of stdout prints the run directory:
 
 ```
-artificats replicated to %s /root/workspace/agent-cr/data/agent_cr/results/<TIMESTAMP>
+artificats replicated to %s /root/workspace/crab/data/crab/results/<TIMESTAMP>
 ```
 
 Inside that directory:

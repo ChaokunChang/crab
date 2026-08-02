@@ -3,15 +3,15 @@ from __future__ import annotations
 import unittest
 from datetime import timedelta
 
-from agent_cr import (
+from crab import (
     FaultToleranceCheckpointingPolicy,
     SandboxId,
     SchedulerConfig,
     SpotPreemptionCheckpointingPolicy,
     TreeSearchCheckpointingPolicy,
 )
-from agent_cr.models import SandboxSnapshot, utc_now
-from agent_cr.scheduler import CheckpointingPolicy
+from crab.models import SandboxSnapshot, utc_now
+from crab.scheduler import CheckpointingPolicy
 
 
 class PolicyTests(unittest.TestCase):

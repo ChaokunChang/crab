@@ -3,7 +3,7 @@ mode: auto
 provider: openai
 agent: claude_code
 llm_service: claude_code_trace_replay
-task_dataset: /root/workspace/agent-cr/results/datasets/claude_code_replay_benchmark.jsonl
+task_dataset: /root/workspace/crab/results/datasets/claude_code_replay_benchmark.jsonl
 sandboxes: 51
 max_workers: 52
 phase_workers:
@@ -31,11 +31,11 @@ llm_server:
 host_inspector:
   launch_mode: process
 iterations: 10
-output: /root/workspace/agent-cr/logs/claude_code/fault.auto.51tasks.norelaunch.debug.1.csv
-log_file: /root/workspace/agent-cr/logs/claude_code/fault.auto.51tasks.norelaunch.debug.1.log
+output: /root/workspace/crab/logs/claude_code/fault.auto.51tasks.norelaunch.debug.1.csv
+log_file: /root/workspace/crab/logs/claude_code/fault.auto.51tasks.norelaunch.debug.1.log
 log_file_mode: write
 telemetry:
-  output: /root/workspace/agent-cr/logs/claude_code/fault.auto.51tasks.norelaunch.debug.1.telemetry.jsonl
+  output: /root/workspace/crab/logs/claude_code/fault.auto.51tasks.norelaunch.debug.1.telemetry.jsonl
   detail_level: detailed
   capture_command_output: false
   max_text_attribute_bytes: 2048
@@ -48,7 +48,7 @@ telemetry:
   serializer: auto
   report:
     enabled: true
-    output_dir: /root/workspace/agent-cr/logs/claude_code/fault.auto.51tasks.norelaunch.debug.1.report
+    output_dir: /root/workspace/crab/logs/claude_code/fault.auto.51tasks.norelaunch.debug.1.report
     top_k: 50
     log_scale_charts: false
     export_svg: true
@@ -58,12 +58,12 @@ monitoring:
   include_host: true
   include_sandboxes: true
 zpool_size: 300G
-zpool_name: agentcrbench-300
-zpool_image: /root/workspace/agent-cr/data/agent_cr/results/zpool/agentcrbench-300.zpool.img
+zpool_name: crabbench-300
+zpool_image: /root/workspace/crab/data/crab/results/zpool/crabbench-300.zpool.img
 reuse_zpool: true
 runtime_command_timeout_seconds: 180
 runtime_zfs_prepare_timeout_seconds: 600
-benchmark_root: /root/workspace/agent-cr/data/agent_cr/results
+benchmark_root: /root/workspace/crab/data/crab/results
 log_level: debug
 scenario_options:
   injection_rate: 0.0

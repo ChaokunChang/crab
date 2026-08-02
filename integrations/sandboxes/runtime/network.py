@@ -10,7 +10,7 @@ import subprocess
 import threading
 import uuid
 
-from agent_cr import SandboxId
+from crab import SandboxId
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +132,7 @@ class BenchmarkNetworkManager:
             if expected_sandboxes is None
             else max(1, int(expected_sandboxes))
         )
-        configured_cidr = os.environ.get("AGENT_CR_BENCHMARK_NETWORK_CIDR", "").strip()
+        configured_cidr = os.environ.get("CRAB_BENCHMARK_NETWORK_CIDR", "").strip()
         if configured_cidr:
             network = ipaddress.ip_network(configured_cidr, strict=False)
             if not isinstance(network, ipaddress.IPv4Network):

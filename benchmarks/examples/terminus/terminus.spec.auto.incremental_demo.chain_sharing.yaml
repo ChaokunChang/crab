@@ -6,7 +6,7 @@ llm_service: terminus_spec_trace_replay
 # Ablation: only Phase B (chain-ancestor sharing) enabled. Compare against
 # baseline to isolate the effect of replacing per-fork ancestor copytree
 # with runtime-side symlinks + chain pinning.
-task_dataset: /root/workspace/agent-cr/results/datasets/terminus_replay_spec_friendly.incremental_demo.jsonl
+task_dataset: /root/workspace/crab/results/datasets/terminus_replay_spec_friendly.incremental_demo.jsonl
 sandboxes: 8
 sandbox_resource_limits:
   cpus: 4
@@ -48,12 +48,12 @@ llm_server:
 host_inspector:
   launch_mode: process
 iterations: 0
-output: /root/workspace/agent-cr/logs/terminus/spec.auto.incremental_demo.chain_sharing.csv
-log_file: /root/workspace/agent-cr/logs/terminus/spec.auto.incremental_demo.chain_sharing.log
+output: /root/workspace/crab/logs/terminus/spec.auto.incremental_demo.chain_sharing.csv
+log_file: /root/workspace/crab/logs/terminus/spec.auto.incremental_demo.chain_sharing.log
 log_file_mode: write
 log_level: info
 telemetry:
-  output: /root/workspace/agent-cr/logs/terminus/spec.auto.incremental_demo.chain_sharing.telemetry.jsonl
+  output: /root/workspace/crab/logs/terminus/spec.auto.incremental_demo.chain_sharing.telemetry.jsonl
   file_mode: write
   detail_level: detailed
   capture_command_output: false
@@ -67,7 +67,7 @@ telemetry:
   serializer: auto
   report:
     enabled: true
-    output_dir: /root/workspace/agent-cr/logs/terminus/spec.auto.incremental_demo.chain_sharing.report
+    output_dir: /root/workspace/crab/logs/terminus/spec.auto.incremental_demo.chain_sharing.report
     top_k: 50
     log_scale_charts: false
     export_svg: true
@@ -76,9 +76,9 @@ monitoring:
   sample_interval_ms: 5000
   include_host: true
   include_sandboxes: true
-zpool_name: agentcrbench-300
+zpool_name: crabbench-300
 reuse_zpool: true
-benchmark_root: /root/workspace/agent-cr/data/agent_cr/results
+benchmark_root: /root/workspace/crab/data/crab/results
 max_agent_timeout_scale: 4.0
 max_test_timeout_scale_overrides:
   pytorch-model-cli: 4.0

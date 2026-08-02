@@ -4,13 +4,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent_cr import JobId, RestoreJob, SandboxId, SandboxSnapshot, SchedulerConfig, StorageConfig, build_default_system
-from agent_cr.models import JobStatus, utc_now
+from crab import JobId, RestoreJob, SandboxId, SandboxSnapshot, SchedulerConfig, StorageConfig, build_default_system
+from crab.models import JobStatus, utc_now
 
 
 class SimulatedE2ETests(unittest.TestCase):
     def test_checkpoint_restore_flow_with_scheduler_and_telemetry(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_e2e_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_e2e_") as tmp:
             system = build_default_system(
                 storage_root=tmp,
                 runtime="docker",

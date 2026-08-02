@@ -5,12 +5,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_cr import RuncRuntime, RuncRuntimePaths, SandboxExecResult, SandboxId, SandboxRuntimeState
+from crab import RuncRuntime, RuncRuntimePaths, SandboxExecResult, SandboxId, SandboxRuntimeState
 
 
 class RuncRuntimeResilientExecTests(unittest.TestCase):
     def _runtime(self) -> RuncRuntime:
-        tmp = tempfile.TemporaryDirectory(prefix="agent_cr_runc_resilient_")
+        tmp = tempfile.TemporaryDirectory(prefix="crab_runc_resilient_")
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
         return RuncRuntime(
@@ -19,7 +19,7 @@ class RuncRuntimeResilientExecTests(unittest.TestCase):
                 bundle_root=root / "bundles",
                 checkpoint_root=root / "checkpoints",
                 metadata_root=root / "metadata",
-                zfs_dataset_prefix="pool/agent-cr",
+                zfs_dataset_prefix="pool/crab",
             )
         )
 
@@ -39,7 +39,7 @@ class RuncRuntimeResilientExecTests(unittest.TestCase):
                     SandboxRuntimeState(sandbox_id=sandbox_id, runtime_name="runc", status="running", pid=123),
                 ],
             ),
-            patch("agent_cr.runtime.runc.time.sleep", return_value=None),
+            patch("crab.runtime.runc.time.sleep", return_value=None),
         ):
             result = runtime.resilient_exec(
                 sandbox_id,
@@ -89,8 +89,8 @@ class RuncRuntimeResilientExecTests(unittest.TestCase):
                 "inspect_runtime",
                 return_value=SandboxRuntimeState(sandbox_id=sandbox_id, runtime_name="runc", status="missing", pid=None),
             ),
-            patch("agent_cr.runtime.runc.time.monotonic", side_effect=[0.0, 1.1]),
-            patch("agent_cr.runtime.runc.time.sleep", return_value=None),
+            patch("crab.runtime.runc.time.monotonic", side_effect=[0.0, 1.1]),
+            patch("crab.runtime.runc.time.sleep", return_value=None),
         ):
             with self.assertRaisesRegex(RuntimeError, "timed out waiting for sandbox"):
                 runtime._wait_for_runtime_running(sandbox_id, timeout_s=1.0)

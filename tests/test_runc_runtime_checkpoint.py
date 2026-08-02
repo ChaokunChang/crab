@@ -4,9 +4,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent_cr import RuncRestoreOptions, RuncRuntime, RuncRuntimePaths, SandboxId
-from agent_cr.ids import CheckpointId
-from agent_cr.runtime.base import CommandResult, CommandRunner
+from crab import RuncRestoreOptions, RuncRuntime, RuncRuntimePaths, SandboxId
+from crab.ids import CheckpointId
+from crab.runtime.base import CommandResult, CommandRunner
 
 
 class _CapturingRunner(CommandRunner):
@@ -39,7 +39,7 @@ class RuncCheckpointCommandTests(unittest.TestCase):
                 bundle_root=root / "bundles",
                 checkpoint_root=root / "checkpoints",
                 metadata_root=root / "metadata",
-                zfs_dataset_prefix="pool/agent-cr",
+                zfs_dataset_prefix="pool/crab",
             ),
         )
         runtime.launch(
@@ -197,7 +197,7 @@ class RuncCheckpointCommandTests(unittest.TestCase):
                     bundle_root=root / "bundles",
                     checkpoint_root=root / "checkpoints",
                     metadata_root=root / "metadata",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
                 restore_options=RuncRestoreOptions(lazy_pages=True),
             )
@@ -249,7 +249,7 @@ class RuncCheckpointCommandTests(unittest.TestCase):
         # Spawn a benign sleep PID into the daemon registry by hand,
         # exercise both directions of path containment, then reap and
         # confirm the registry empties out.
-        from agent_cr.runtime.runc import _LazyPagesDaemonHandle
+        from crab.runtime.runc import _LazyPagesDaemonHandle
 
         runner = _CapturingRunner()
         with tempfile.TemporaryDirectory() as raw:

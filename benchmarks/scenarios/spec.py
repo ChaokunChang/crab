@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 
-from agent_cr import FaultToleranceCheckpointingPolicy, LatestOnlyCheckpointManager, SchedulerConfig
+from crab import FaultToleranceCheckpointingPolicy, LatestOnlyCheckpointManager, SchedulerConfig
 
 from benchmarks.config import BenchmarkConfig
 from benchmarks.scenarios import HarnessSettings, ScenarioDefinition

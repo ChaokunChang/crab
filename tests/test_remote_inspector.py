@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timezone
 
-from agent_cr import HostInspectorServiceClient, RemoteSandboxInspector, SandboxId, SandboxSnapshot
+from crab import HostInspectorServiceClient, RemoteSandboxInspector, SandboxId, SandboxSnapshot
 
 
 class RecordingServiceClient(HostInspectorServiceClient):

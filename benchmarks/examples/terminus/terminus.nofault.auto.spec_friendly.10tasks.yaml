@@ -3,7 +3,7 @@ mode: auto
 provider: openai
 agent: terminus
 llm_service: terminus_trace_replay
-task_dataset: /root/workspace/agent-cr/results/datasets/terminus_replay_spec_friendly.jsonl
+task_dataset: /root/workspace/crab/results/datasets/terminus_replay_spec_friendly.jsonl
 sandboxes: 10
 sandbox_resource_limits:
   cpus: 4
@@ -42,11 +42,11 @@ llm_server:
 host_inspector:
   launch_mode: process
 iterations: 1
-output: /root/workspace/agent-cr/logs/terminus/nofault.auto.spec_friendly.10tasks.csv
-log_file: /root/workspace/agent-cr/logs/terminus/nofault.auto.spec_friendly.10tasks.log
+output: /root/workspace/crab/logs/terminus/nofault.auto.spec_friendly.10tasks.csv
+log_file: /root/workspace/crab/logs/terminus/nofault.auto.spec_friendly.10tasks.log
 log_file_mode: write
 telemetry:
-  output: /root/workspace/agent-cr/logs/terminus/nofault.auto.spec_friendly.10tasks.telemetry.jsonl
+  output: /root/workspace/crab/logs/terminus/nofault.auto.spec_friendly.10tasks.telemetry.jsonl
   file_mode: write
   detail_level: detailed
   capture_command_output: false
@@ -60,7 +60,7 @@ telemetry:
   serializer: auto
   report:
     enabled: true
-    output_dir: /root/workspace/agent-cr/logs/terminus/nofault.auto.spec_friendly.10tasks.report
+    output_dir: /root/workspace/crab/logs/terminus/nofault.auto.spec_friendly.10tasks.report
     top_k: 50
     log_scale_charts: false
     export_svg: true
@@ -69,9 +69,9 @@ monitoring:
   sample_interval_ms: 1000
   include_host: true
   include_sandboxes: true
-zpool_name: agentcrbench-300
+zpool_name: crabbench-300
 reuse_zpool: true
-benchmark_root: /root/workspace/agent-cr/data/agent_cr/results
+benchmark_root: /root/workspace/crab/data/crab/results
 log_level: info
 max_agent_timeout_scale: 2.0
 scenario_options:

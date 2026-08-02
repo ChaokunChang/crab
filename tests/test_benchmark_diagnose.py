@@ -243,10 +243,10 @@ class BenchmarkDiagnoseTests(unittest.TestCase):
             textwrap.dedent(
                 f"""\
                 2026-03-23 21:00:00,000 INFO benchmarks.real_host_scenario_base: runc --root {actual_root}/runtime-state state fault-54
-                2026-03-23 21:32:10,000 INFO agent_cr.scheduler: Scheduler selected checkpoint for sandbox fault-54 reason=llm_request_window_available observed_process_changed=False observed_filesystem_changed=False checkpoint_process=True checkpoint_filesystem=True leave_running=True
-                2026-03-23 21:32:20,000 INFO agent_cr.executor: Finished checkpoint job job-1 for sandbox fault-54 with status=succeeded checkpoint=ckpt-1
+                2026-03-23 21:32:10,000 INFO crab.scheduler: Scheduler selected checkpoint for sandbox fault-54 reason=llm_request_window_available observed_process_changed=False observed_filesystem_changed=False checkpoint_process=True checkpoint_filesystem=True leave_running=True
+                2026-03-23 21:32:20,000 INFO crab.executor: Finished checkpoint job job-1 for sandbox fault-54 with status=succeeded checkpoint=ckpt-1
                 2026-03-23 21:32:25,000 INFO benchmarks.real_host_scenario_base: Benchmark notifying fault sandbox=fault-54 reason=fault
-                2026-03-23 21:32:35,000 INFO agent_cr.system: Recovery restore succeeded sandbox=fault-54 checkpoint=ckpt-1
+                2026-03-23 21:32:35,000 INFO crab.system: Recovery restore succeeded sandbox=fault-54 checkpoint=ckpt-1
                 2026-03-23 21:32:40,000 INFO benchmarks.real_host_scenario_base: Completed run-tests.sh sandbox=fault-54 exit_code=1 command=/bin/bash -lc 'bash /tests/run-tests.sh'
                 2026-03-23 21:32:40,100 WARNING benchmarks.real_host_scenario_base: run-tests stderr sandbox=fault-54
                 E: Version '1.2.3' for 'curl' was not found

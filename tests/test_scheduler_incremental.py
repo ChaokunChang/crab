@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import unittest
 
-from agent_cr import SchedulerConfig
-from agent_cr.ids import CheckpointId, SandboxId
-from agent_cr.models import SchedulerCheckpointDecision
-from agent_cr.scheduler import (
+from crab import SchedulerConfig
+from crab.ids import CheckpointId, SandboxId
+from crab.models import SchedulerCheckpointDecision
+from crab.scheduler import (
     InMemorySchedulerStateStore,
     _resolve_incremental_process,
 )

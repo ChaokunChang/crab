@@ -6,13 +6,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_cr import InMemoryTelemetrySink
+from crab import InMemoryTelemetrySink
 from integrations.sandboxes.iflow.harness import prepare_iflow_runtime, prepare_iflow_state
 
 
 class IFlowHarnessTests(unittest.TestCase):
     def test_prepare_iflow_runtime_reuses_shared_runtime_cache(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_iflow_runtime_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_iflow_runtime_") as tmp:
             root = Path(tmp)
             cache_dir = root / "cache"
             cache_dir.mkdir(parents=True, exist_ok=True)
@@ -76,7 +76,7 @@ class IFlowHarnessTests(unittest.TestCase):
         self.assertIn("iflow.runtime.cache_lock_wait_ms", metric_names)
 
     def test_prepare_iflow_state_keeps_writable_state_per_sandbox(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_iflow_state_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_iflow_state_") as tmp:
             root = Path(tmp)
             telemetry = InMemoryTelemetrySink()
 

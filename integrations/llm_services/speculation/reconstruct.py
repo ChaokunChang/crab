@@ -452,4 +452,4 @@ _SYNTH_CALL_ID_COUNTER = [0]
 
 def _synthesize_call_id() -> str:
     _SYNTH_CALL_ID_COUNTER[0] += 1
-    return f"agent_cr_synth_{_SYNTH_CALL_ID_COUNTER[0]}"
+    return f"crab_synth_{_SYNTH_CALL_ID_COUNTER[0]}"

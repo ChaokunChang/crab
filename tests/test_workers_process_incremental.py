@@ -4,10 +4,10 @@ import json
 import unittest
 from datetime import datetime, timezone
 
-from agent_cr.ids import CheckpointId, JobId, SandboxId
-from agent_cr.models import CheckpointJob, RuntimeCapabilities
-from agent_cr.runtime.in_memory import InMemoryRuntime
-from agent_cr.workers.process import AdapterProcessCWorker
+from crab.ids import CheckpointId, JobId, SandboxId
+from crab.models import CheckpointJob, RuntimeCapabilities
+from crab.runtime.in_memory import InMemoryRuntime
+from crab.workers.process import AdapterProcessCWorker
 
 
 class _IncrementalStubRuntime(InMemoryRuntime):

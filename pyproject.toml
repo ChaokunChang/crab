@@ -3,12 +3,12 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "agent-cr"
+name = "crab"
 version = "0.1.0"
 description = "Fault-tolerant agent execution via process and filesystem checkpointing."
 readme = "README.md"
 requires-python = ">=3.11"
-authors = [{ name = "Agent-CR contributors" }]
+authors = [{ name = "Crab contributors" }]
 dependencies = [
     "PyYAML>=6.0",
 ]
@@ -16,17 +16,17 @@ dependencies = [
 [project.scripts]
 # Operator CLI — talks to the daemon over the Unix-domain socket.
 # Subcommands: daemon start/stop/status, info, sandbox run/ls/rm/exec/stop/pause/resume,
-# checkpoint create/ls/rm/restore. See `agentcr --help`.
-agentcr = "agent_cr.cli:main"
+# checkpoint create/ls/rm/restore. See `crab --help`.
+crab = "crab.cli:main"
 
-# Daemon entry point. Equivalent to `python -m agent_cr.daemon`.
+# Daemon entry point. Equivalent to `python -m crab.daemon`.
 # Typically wrapped by a systemd unit; for development, prefer
-# `agentcr daemon start [--foreground]`.
-agentcrd = "agent_cr.daemon.server:main"
+# `crab daemon start [--foreground]`.
+crabd = "crab.daemon.server:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["agent_cr*", "integrations*", "benchmarks*"]
+include = ["crab*", "integrations*", "benchmarks*"]
 
 [tool.setuptools.package-data]
-"agent_cr" = ["host_inspector/bpf/*"]
+"crab" = ["host_inspector/bpf/*"]

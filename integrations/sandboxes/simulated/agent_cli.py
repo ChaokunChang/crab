@@ -389,7 +389,7 @@ def main() -> None:
 
     runtime = AgentRuntime(
         provider=args.provider,
-        llm_base_url=os.environ["AGENT_CR_LLM_BASE_URL"],
+        llm_base_url=os.environ["CRAB_LLM_BASE_URL"],
         sandbox_id=os.environ.get("AGENT_SANDBOX_ID", "sandbox-unknown"),
         work_dir=Path(os.environ.get("AGENT_WORK_DIR", "/work")),
         poll_interval_s=float(os.environ.get("POLL_INTERVAL_S", "0.2")),

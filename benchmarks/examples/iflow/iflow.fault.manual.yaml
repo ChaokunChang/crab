@@ -3,7 +3,7 @@ mode: manual
 provider: openai
 agent: iflow
 llm_service: iflow_trace_replay
-task_dataset: /root/workspace/agent-cr/results/datasets/termnius_iflow_replay.jsonl
+task_dataset: /root/workspace/crab/results/datasets/termnius_iflow_replay.jsonl
 sandboxes: 3
 iterations: 5
 output: ../../logs/tmp/iflow.fault.manual.csv

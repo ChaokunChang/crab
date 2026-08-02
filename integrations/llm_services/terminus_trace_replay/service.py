@@ -107,7 +107,7 @@ def _trace_model_name(payload: dict[str, Any]) -> str:
         name = agent.get("model_name")
         if isinstance(name, str) and name.strip():
             return name.strip()
-    return "agent-cr-terminus-trace-replay"
+    return "crab-terminus-trace-replay"
 
 
 def parse_replay_trace(trace_path: Path) -> ParsedTerminusTrace:

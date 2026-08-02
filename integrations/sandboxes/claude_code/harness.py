@@ -10,8 +10,8 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from agent_cr.contracts import TelemetrySink
-from agent_cr.telemetry import NoopTelemetrySink, start_operation
+from crab.contracts import TelemetrySink
+from crab.telemetry import NoopTelemetrySink, start_operation
 
 DEFAULT_CLAUDE_CODE_VERSIONS_DIR = Path("/root/.local/share/claude/versions")
 DEFAULT_CACHE_DIR = Path(__file__).resolve().parent / "cache"
@@ -20,7 +20,7 @@ RUNTIME_MOUNT_PATH = "/opt/claude-code-runtime"
 LOGS_MOUNT_PATH = "/opt/claude-code-logs"
 CLAUDE_HOME_ROOT_MOUNT_PATH = "/opt/claude-code-home"
 CLAUDE_HOME_MOUNT_PATH = f"{CLAUDE_HOME_ROOT_MOUNT_PATH}/.claude"
-CLAUDE_CODE_WRAPPER_ARG = "--agent-cr-claude-code-wrapper"
+CLAUDE_CODE_WRAPPER_ARG = "--crab-claude-code-wrapper"
 
 _IO_URING_SECCOMP = {
     "defaultAction": "SCMP_ACT_ALLOW",
@@ -72,7 +72,7 @@ class PreparedClaudeCodeState:
 
 
 def cache_dir_from_env() -> Path:
-    return Path(os.environ.get("AGENT_CR_CLAUDE_CODE_CACHE_DIR", str(DEFAULT_CACHE_DIR)))
+    return Path(os.environ.get("CRAB_CLAUDE_CODE_CACHE_DIR", str(DEFAULT_CACHE_DIR)))
 
 
 def _runtime_prepare_attributes(
@@ -117,19 +117,19 @@ def _state_prepare_attributes(
 
 
 def _claude_versions_dir() -> Path:
-    raw_value = os.environ.get("AGENT_CR_CLAUDE_CODE_VERSIONS_DIR")
+    raw_value = os.environ.get("CRAB_CLAUDE_CODE_VERSIONS_DIR")
     if raw_value:
         return Path(raw_value).expanduser().resolve()
     return DEFAULT_CLAUDE_CODE_VERSIONS_DIR.expanduser().resolve()
 
 
 def _requested_version_from_env() -> str | None:
-    raw_value = os.environ.get("AGENT_CR_CLAUDE_CODE_VERSION", "").strip()
+    raw_value = os.environ.get("CRAB_CLAUDE_CODE_VERSION", "").strip()
     return raw_value or None
 
 
 def _binary_url_template() -> str | None:
-    raw_value = os.environ.get("AGENT_CR_CLAUDE_CODE_BINARY_URL_TEMPLATE", "").strip()
+    raw_value = os.environ.get("CRAB_CLAUDE_CODE_BINARY_URL_TEMPLATE", "").strip()
     return raw_value or None
 
 
@@ -157,7 +157,7 @@ def _download_version_binary(version: str, *, destination: Path) -> None:
     if url_template is None:
         raise FileNotFoundError(
             f"Claude Code binary version {version} is missing at {destination}. "
-            "Set AGENT_CR_CLAUDE_CODE_BINARY_URL_TEMPLATE or preinstall the versioned binary."
+            "Set CRAB_CLAUDE_CODE_BINARY_URL_TEMPLATE or preinstall the versioned binary."
         )
     url = url_template.format(version=version)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -198,19 +198,19 @@ def _resolve_fallback_binary() -> tuple[Path, str | None, str]:
         if resolved.is_file():
             return resolved, _infer_version_from_path(resolved), "fallback_path_binary"
     raise FileNotFoundError(
-        "Claude Code binary not found. Set AGENT_CR_CLAUDE_CODE_BINARY, "
-        "AGENT_CR_CLAUDE_CODE_VERSION plus AGENT_CR_CLAUDE_CODE_BINARY_URL_TEMPLATE, "
+        "Claude Code binary not found. Set CRAB_CLAUDE_CODE_BINARY, "
+        "CRAB_CLAUDE_CODE_VERSION plus CRAB_CLAUDE_CODE_BINARY_URL_TEMPLATE, "
         "or preinstall a version under ~/.local/share/claude/versions/."
     )
 
 
 def _resolve_claude_code_binary(*, requested_version: str | None = None) -> tuple[Path, str | None, str]:
-    env_path = os.environ.get("AGENT_CR_CLAUDE_CODE_BINARY", "").strip()
+    env_path = os.environ.get("CRAB_CLAUDE_CODE_BINARY", "").strip()
     if env_path:
         path = Path(env_path).expanduser().resolve()
         if path.is_file():
             return path, _infer_version_from_path(path), "explicit_binary"
-        raise FileNotFoundError(f"AGENT_CR_CLAUDE_CODE_BINARY={env_path} does not exist")
+        raise FileNotFoundError(f"CRAB_CLAUDE_CODE_BINARY={env_path} does not exist")
 
     resolved_version = _requested_version_from_env() or (requested_version.strip() if requested_version else None)
     if resolved_version:

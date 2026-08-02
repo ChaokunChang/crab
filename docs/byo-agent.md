@@ -1,6 +1,6 @@
 # Bring Your Own Agent
 
-This guide shows how to integrate a custom agent into Agent-CR through the
+This guide shows how to integrate a custom agent into Crab through the
 SDK. The minimal contract is intentionally small — you declare which LLM
 protocol your agent speaks and provide `install()` + `execute()` methods.
 
@@ -9,7 +9,7 @@ For the broader SDK surface, see [sdk.md](sdk.md).
 ## The contract
 
 ```python
-from agent_cr import Agent, TaskResult
+from crab import Agent, TaskResult
 
 class MyAgent(Agent):
     name = "my-agent"            # used for logs and registry lookup
@@ -48,7 +48,7 @@ self-drives the LLM/tool loop inside.
 
 ```python
 import shlex
-from agent_cr import Agent, TaskResult, register_agent
+from crab import Agent, TaskResult, register_agent
 
 
 class CodexAgent(Agent):
@@ -77,14 +77,14 @@ register_agent("codex", CodexAgent)
 User-side:
 
 ```python
-from agent_cr import Sandbox
+from crab import Sandbox
 
 sbx = Sandbox(image="ubuntu:22.04")
 agent = CodexAgent().bind(sbx, llm_url="https://api.openai.com")
 print(agent.run("Fix the failing tests"))
 ```
 
-`self.command_env()` supplies `OPENAI_BASE_URL` and `AGENT_CR_SANDBOX_ID` to
+`self.command_env()` supplies `OPENAI_BASE_URL` and `CRAB_SANDBOX_ID` to
 that one sandbox command, so the codex CLI's outbound LLM traffic is tagged
 with this sandbox's id and forwarded to `https://api.openai.com`.
 
@@ -96,7 +96,7 @@ LLM/tool loop and issues many small `sbx.commands.run(...)` calls.
 
 ```python
 import anthropic
-from agent_cr import Agent, TaskResult
+from crab import Agent, TaskResult
 
 
 class HostDrivenAgent(Agent):
@@ -179,7 +179,7 @@ Three ways to point the SDK at your agent:
 # Instance — what you'd write in a quick experiment.
 agent = MyAgent().bind(sbx)
 
-# Registered name — best when you want CLI parity (e.g. `agentcr run --agent foo`).
+# Registered name — best when you want CLI parity (e.g. `crab run --agent foo`).
 register_agent("my-agent", MyAgent)
 agent = resolve_agent("my-agent").bind(sbx)
 

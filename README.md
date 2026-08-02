@@ -1,6 +1,6 @@
-# Agent-CR
+# Crab
 
-`agent_cr` is a Python library for checkpointing and restoring agent sandboxes.
+`crab` is a Python library for checkpointing and restoring agent sandboxes.
 
 The codebase currently supports two practical modes:
 
@@ -9,7 +9,7 @@ The codebase currently supports two practical modes:
 
 ## What The Library Provides
 
-- `AgentCRSystem` as the top-level coordinator for checkpointing, manual restore, and recovery.
+- `CrabSystem` as the top-level coordinator for checkpointing, manual restore, and recovery.
 - `build_default_system(...)` for assembling the default in-process scheduler, executor, storage, telemetry, request tracking, and sandbox manager.
 - `CRScheduler` plus policy implementations for:
   - Default checkpointing
@@ -27,8 +27,8 @@ The codebase currently supports two practical modes:
   - `LocalCheckpointManager`
   - retention wrappers `KeepAllCheckpointManager`, `LatestOnlyCheckpointManager`, and `DeleteAfterRestoreCheckpointManager`
 - Request interception and tracking:
-  - `AgentCRRequestInterceptor`
-  - `AgentCRRequestInterceptorServer`
+  - `CrabRequestInterceptor`
+  - `CrabRequestInterceptorServer`
   - `InMemoryRequestStateStore`
   - `SandboxResponseGateRegistry`
 - Inspectors and telemetry:
@@ -36,19 +36,19 @@ The codebase currently supports two practical modes:
   - `RequestAwareSandboxInspector`
   - `InMemoryTelemetrySink`
 
-For Host inspector manual usage and real Docker validation, See `agent_cr/host_inspector/README.md`.
+For Host inspector manual usage and real Docker validation, See `crab/host_inspector/README.md`.
 
 ## Main Entry Point
 
 ```python
 from pathlib import Path
 
-from agent_cr import SchedulerConfig, StorageConfig, build_default_system
+from crab import SchedulerConfig, StorageConfig, build_default_system
 
 system = build_default_system(
-    storage_root=Path("tmp/agent-cr"),
+    storage_root=Path("tmp/crab"),
     runtime="docker",  # or "runc"
-    storage_config=StorageConfig(root_dir=Path("tmp/agent-cr")),
+    storage_config=StorageConfig(root_dir=Path("tmp/crab")),
     scheduler_config=SchedulerConfig(
         min_checkpoint_interval_seconds=0.0,
         force_checkpoint_after_seconds=0.0,
@@ -67,7 +67,7 @@ The default builder creates:
 - `InMemoryRequestStateStore`
 - `InMemoryTelemetrySink` by default
 
-Use direct `AgentCRSystem(...)` construction when you need custom runtime paths, real-host wiring, retention wrappers, or a non-default scheduler policy.
+Use direct `CrabSystem(...)` construction when you need custom runtime paths, real-host wiring, retention wrappers, or a non-default scheduler policy.
 
 Two core tuning knobs changed recently:
 
@@ -94,13 +94,13 @@ Telemetry stays JSONL-based and is designed to be lightweight by default.
 ```python
 from pathlib import Path
 
-from agent_cr import TelemetryConfig, build_default_system
+from crab import TelemetryConfig, build_default_system
 
 system = build_default_system(
-    storage_root=Path("tmp/agent-cr"),
+    storage_root=Path("tmp/crab"),
     telemetry_config=TelemetryConfig(
         enabled=True,
-        jsonl_path=Path("tmp/agent-cr/telemetry.jsonl"),
+        jsonl_path=Path("tmp/crab/telemetry.jsonl"),
         keep_in_memory_copy=False,
         detail_level="basic",  # or "detailed"
         capture_command_output=False,
@@ -185,14 +185,14 @@ A self-contained example pair lives at `benchmarks/examples/terminus/terminus.no
 
 ### Relaunch Fallback Toggle
 
-`AgentCRSystem.relaunch_on_restore_failure` is `False` by default.
+`CrabSystem.relaunch_on_restore_failure` is `False` by default.
 
 - When `False` (the default): a recovery restore failure surfaces as a hard error in the recovery record (`status="failed"`) and `relaunch_handler` is not invoked. The same applies when no restorable checkpoint is available: status becomes `"no_checkpoint"`.
 - When `True`: recovery falls back to `relaunch_handler` after a restore failure (or when no checkpoint exists), which preserves the previous availability behavior.
 
 The relaunch path is intentionally off by default because it can mask real bugs — a corrupt checkpoint, a broken restore plumbing change, or a misconfigured baseline policy all silently degrade to "relaunched" otherwise. Pair this default with `scheduler.checkpoint_full_baseline_on_first_checkpoint=true` to make every recovery use a complete checkpoint and treat any restore failure as a regression to investigate.
 
-The benchmark harness exposes the same opt-in via the top-level `relaunch_on_restore_failure: true | false` YAML field, threaded through to the underlying `AgentCRSystem`.
+The benchmark harness exposes the same opt-in via the top-level `relaunch_on_restore_failure: true | false` YAML field, threaded through to the underlying `CrabSystem`.
 
 ### Restore Validation Toggle
 
@@ -237,7 +237,7 @@ That same request-generation metadata is also stored in live-request checkpoints
 
 ## Repository Layout
 
-- `agent_cr/`: library code
+- `crab/`: library code
 - `tests/`: unit and integration tests
 - `benchmarks/`: real-host and microbenchmark entrypoints
 - `integrations/`: benchmark agents, LLM services, and sandbox integrations
@@ -263,7 +263,7 @@ python3 -m unittest tests.test_system_integration tests.test_interceptor -v
 Microbench:
 
 ```bash
-python3 benchmarks/bench_agent_cr_micro.py --iters 1000 --storage-iters 200 --executor-jobs 64
+python3 benchmarks/bench_crab_micro.py --iters 1000 --storage-iters 200 --executor-jobs 64
 ```
 
 Sandboxed simulated-agent benchmark:
@@ -284,7 +284,7 @@ python3 -m benchmarks.run --config benchmarks/examples/terminus/terminus.fault.a
 python3 -m benchmarks.run --config benchmarks/examples/terminus/terminus.spec.auto.10tasks.debug.yaml
 ```
 
-Authoring a custom one-task debug smoke (a hand-crafted trajectory + minimal sandbox, useful for verifying a specific inspector signal, scheduler decision, or checkpoint chain shape on a controlled workload) — see [`benchmarks/examples/debug/README.md`](/root/workspace/agent-cr/benchmarks/examples/debug/README.md). The `bg-server-state` files in that directory are a worked example.
+Authoring a custom one-task debug smoke (a hand-crafted trajectory + minimal sandbox, useful for verifying a specific inspector signal, scheduler decision, or checkpoint chain shape on a controlled workload) — see [`benchmarks/examples/debug/README.md`](/root/workspace/crab/benchmarks/examples/debug/README.md). The `bg-server-state` files in that directory are a worked example.
 
 Each benchmark run is now driven by a YAML config. The top-level fields are:
 
@@ -349,9 +349,9 @@ benchmark_root_home: logs/tmp/benchmark-runs
 benchmark_run_name: null  # defaults to a timestamp such as 20260416_010203
 clear_benchmark_root_after_run: false
 storage_planes:
-  runtime_root: /mnt/agent-cr-runtime
-  storage_root: /mnt/agent-cr-runtime/storage
-  agent_host_root: /mnt/agent-cr-runtime/agents
+  runtime_root: /mnt/crab-runtime
+  storage_root: /mnt/crab-runtime/storage
+  agent_host_root: /mnt/crab-runtime/agents
 runtime_command_timeout_seconds: 60.0
 runtime_zfs_prepare_timeout_seconds: 300.0
 telemetry_output: logs/tmp/out.telemetry.jsonl  # legacy top-level form, still supported
@@ -380,7 +380,7 @@ monitoring:
   include_host: true
   include_sandboxes: true
 zpool_size: 10G
-zpool_name: agentcrbench-cache
+zpool_name: crabbench-cache
 zpool_image: logs/tmp/bench.zpool.img
 reuse_zpool: false
 image_cache_root: logs/tmp/image-cache
@@ -413,10 +413,10 @@ For the speculative-execution scenario (`scenario: spec`):
   - `scenario_options.enable_fork_chain_sharing` (Phase B) — replaces per-fork `shutil.copytree` of every chain ancestor's CRIU image with relative symlinks (`Runtime.link_ancestor_pre_dump`) and pin-refcounts the chain (`Storage.pin_chain`) so retention can't prune ancestors mid-fork. On promote, the fork inlines its borrowed bytes before the source is destroyed. **Recommended default-on**: cleanest single optimization, ~−40 % mean fork latency and ~−3 % wall-clock with no observed cost.
   - `scenario_options.enable_lazy_restore` (Phase D) — plumbs `runc restore --lazy-pages` and spawns the `criu lazy-pages` daemon ahead of restore; pages stream in via userfaultfd. Requires runc 1.3+ with `--lazy-pages` support, CRIU 4.x, and kernel userfaultfd (`unprivileged_userfaultfd=1` or root + `CAP_SYS_PTRACE`). **Recommended default-on** for spec scenarios when the platform supports it: −19 % mean fork latency at −1.5 % wall-clock.
   - `scenario_options.enable_background_prefork` (Phase A) — speculatively warms a fork after each successful checkpoint via a dedicated executor; `ensure_fork()` returns from cache. Pair with `prefork_max_concurrent_global` (recommended `2`) and `prefork_min_interval_seconds` (recommended `2.0`) to keep background warming from saturating disk I/O. **Opt-in only**: even with the throttle, A's I/O contention costs ~+8 % wall-clock on the 8-task spec subset and a single-sandbox smoke confirms the cost is intrinsic (+17 % wall-clock with one sandbox), not from cross-sandbox queueing. Use when per-turn `fork_restore_ms` jitter matters more than aggregate wall-clock; skip when the workload is I/O-bound on its own or wall-clock is the optimization target.
-- A self-contained 6-variant comparison set lives at [`benchmarks/examples/terminus/terminus.spec.auto.incremental_demo.{baseline,chain_sharing,prefork,lazy,b_plus_d,all_opts}.yaml`](/root/workspace/agent-cr/benchmarks/examples/terminus) with helper [`incremental_demo_compare.py`](/root/workspace/agent-cr/benchmarks/examples/terminus/incremental_demo_compare.py). On the 8-task subset, B+D combined cuts `fork_restore_ms` mean by 18 %; all_opts (B+A+D throttled) cuts p99 from 2.85 s to 724 ms at +5.7 % wall-clock cost.
-- [docs/speculative-execution-benchmark.md](/root/workspace/agent-cr/docs/speculative-execution-benchmark.md) documents the execution model, telemetry, fork-prep optimizations, and tracked example/evaluation configs.
-- [docs/incremental-fork-restore-analysis.md](/root/workspace/agent-cr/docs/incremental-fork-restore-analysis.md) walks through the 6-variant benchmark in detail: per-task wall-clock decomposition, single-sandbox smoke confirmation, why each optimization succeeds or fails, and when to enable which.
-- [docs/lazy-restore-safety-contract.md](/root/workspace/agent-cr/docs/lazy-restore-safety-contract.md) describes the runtime-side safety pin that makes `enable_lazy_restore` safe to enable independent of `enable_fork_chain_sharing`. Active `criu lazy-pages` daemons are tracked in `RuncRuntime`, and `LocalCheckpointManager` consults `Runtime.runtime_image_path_in_use` before `shutil.rmtree`-ing a runtime checkpoint dir — without that pin, a `LatestOnlyCheckpointManager` prune mid-fault would `SIGBUS` the restored process.
+- A self-contained 6-variant comparison set lives at [`benchmarks/examples/terminus/terminus.spec.auto.incremental_demo.{baseline,chain_sharing,prefork,lazy,b_plus_d,all_opts}.yaml`](/root/workspace/crab/benchmarks/examples/terminus) with helper [`incremental_demo_compare.py`](/root/workspace/crab/benchmarks/examples/terminus/incremental_demo_compare.py). On the 8-task subset, B+D combined cuts `fork_restore_ms` mean by 18 %; all_opts (B+A+D throttled) cuts p99 from 2.85 s to 724 ms at +5.7 % wall-clock cost.
+- [docs/speculative-execution-benchmark.md](/root/workspace/crab/docs/speculative-execution-benchmark.md) documents the execution model, telemetry, fork-prep optimizations, and tracked example/evaluation configs.
+- [docs/incremental-fork-restore-analysis.md](/root/workspace/crab/docs/incremental-fork-restore-analysis.md) walks through the 6-variant benchmark in detail: per-task wall-clock decomposition, single-sandbox smoke confirmation, why each optimization succeeds or fails, and when to enable which.
+- [docs/lazy-restore-safety-contract.md](/root/workspace/crab/docs/lazy-restore-safety-contract.md) describes the runtime-side safety pin that makes `enable_lazy_restore` safe to enable independent of `enable_fork_chain_sharing`. Active `criu lazy-pages` daemons are tracked in `RuncRuntime`, and `LocalCheckpointManager` consults `Runtime.runtime_image_path_in_use` before `shutil.rmtree`-ing a runtime checkpoint dir — without that pin, a `LatestOnlyCheckpointManager` prune mid-fault would `SIGBUS` the restored process.
 
 Benchmark runs now use a three-phase pipeline:
 
@@ -452,7 +452,7 @@ This fully sets up all 100 sandboxes first, then starts the run phase with at mo
 
 `rootfs_reuse.enabled` defaults to `true`. In real-host ZFS-backed benchmarks, the harness now materializes a shared base rootfs per normalized recipe, snapshots it once, and clones that snapshot for each sandbox instead of copying a full rootfs into every sandbox dataset. For compose-backed tasks, the recipe is anchored by `docker_compose_file`, `service_name`, `agent_type`, and normalized rootfs materialization inputs. When `reuse_zpool: true`, compose-backed shared rootfs bases persist in the reused pool across benchmark runs; otherwise reuse is limited to the current benchmark run.
 
-The benchmark YAML also exposes run-phase tuning for the core Agent-CR system:
+The benchmark YAML also exposes run-phase tuning for the core Crab system:
 
 - `executor.checkpoint_workers` and `executor.restore_workers` split checkpoint and restore concurrency. If omitted, both inherit the benchmark's effective `max_workers`.
 - `executor.coordination_workers` bounds live-request coordination threads, and `executor.composite_step_workers` bounds the shared worker pool used for parallel process/filesystem checkpoint sub-steps.
@@ -523,7 +523,7 @@ Logging notes:
 - Default `log_file_mode: append` preserves existing log history.
 - Use `log_file_mode: write` when you want each benchmark run to start with a fresh log file.
 - `verification.enabled` defaults to `true`. Set it to `false` to skip the benchmark verification phase and omit verification fields from output rows.
-- `benchmark_root_home` is the parent directory for benchmark runs. `benchmark_run_name` is the run directory under that parent; when omitted, it defaults to a timestamp such as `20260416_010203`. The stale `benchmark_root` key is still accepted as an alias for `benchmark_root_home`. If no home is configured, benchmarks use a temporary directory; an explicit `benchmark_run_name` requires a home from config or `AGENTCR_BENCH_DIR`. `AGENTCR_BENCH_DIR` is still accepted as a fallback for older workflows.
+- `benchmark_root_home` is the parent directory for benchmark runs. `benchmark_run_name` is the run directory under that parent; when omitted, it defaults to a timestamp such as `20260416_010203`. The stale `benchmark_root` key is still accepted as an alias for `benchmark_root_home`. If no home is configured, benchmarks use a temporary directory; an explicit `benchmark_run_name` requires a home from config or `CRAB_BENCH_DIR`. `CRAB_BENCH_DIR` is still accepted as a fallback for older workflows.
 - `clear_benchmark_root_after_run` defaults to `false`. When enabled, the runner deletes the resolved per-run benchmark directory after postprocessing completes. Tempdir-backed runs keep their existing automatic cleanup behavior.
 - The resolved benchmark run root is still the benchmark artifact root and the default home for runtime bundles, runtime checkpoint images, sandbox metadata, checkpoint storage, exported image rootfs, and agent host state. Use `storage_planes` only when you want to move some of that hot write traffic elsewhere.
 - `output`, `log_file`, `telemetry.output`, and `telemetry.report.output_dir` still write to their configured paths. After the run, existing files/directories are also copied by basename into the resolved benchmark run root.
@@ -559,7 +559,7 @@ Logging notes:
 - `llm_response_time` is the observed interceptor-side latency for a request, while `pure_llm_time` is the underlying `llm.service.request` duration from the LLM service itself.
 - `zpool_size` controls the backing file size for ephemeral benchmark zpools.
 - `reuse_zpool: true` keeps the zpool across runs instead of recreating it every time.
-- When reusing a pool, set both `zpool_name` and `zpool_image` to stable values. Each run still destroys and recreates the `pool/agent-cr` dataset so the benchmark starts clean, but compose-backed shared rootfs cache datasets created by `rootfs_reuse.enabled: true` are reused until the pool itself is destroyed.
+- When reusing a pool, set both `zpool_name` and `zpool_image` to stable values. Each run still destroys and recreates the `pool/crab` dataset so the benchmark starts clean, but compose-backed shared rootfs cache datasets created by `rootfs_reuse.enabled: true` are reused until the pool itself is destroyed.
 
 ### LLM Service Options
 
@@ -604,4 +604,4 @@ python3 -m benchmarks.run --config benchmarks/examples/tree.auto.yaml
 python3 -m benchmarks.run --config benchmarks/examples/mini_swe/mini_swe.spec.auto.10tasks.debug.yaml
 ```
 
-The real-host benchmarks allocate temporary runtime state, create a ZFS pool, build the simulated agent image, and launch `runc` sandboxes through the shared harness in [benchmarks/real_host_scenario_base.py](/root/workspace/agent-cr/benchmarks/real_host_scenario_base.py).
+The real-host benchmarks allocate temporary runtime state, create a ZFS pool, build the simulated agent image, and launch `runc` sandboxes through the shared harness in [benchmarks/real_host_scenario_base.py](/root/workspace/crab/benchmarks/real_host_scenario_base.py).

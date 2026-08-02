@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from agent_cr import SandboxId, TelemetrySink
+from crab import SandboxId, TelemetrySink
 
 logger = logging.getLogger(__name__)
 

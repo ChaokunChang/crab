@@ -42,7 +42,7 @@ done
 
 [[ ${EUID} -eq 0 ]] || die "run this smoke test with sudo"
 [[ -f ${CONFIG_PATH} ]] || die "config not found: ${CONFIG_PATH}"
-command -v agentcr >/dev/null 2>&1 || die "agentcr is not on PATH"
+command -v crab >/dev/null 2>&1 || die "crab is not on PATH"
 
 started_daemon=0
 sandbox_id=
@@ -50,47 +50,47 @@ sandbox_id=
 cleanup() {
   rc=$?
   if [[ -n ${sandbox_id} ]] && ((KEEP == 0)); then
-    agentcr sandbox rm "${sandbox_id}" >/dev/null 2>&1 || true
+    crab sandbox rm "${sandbox_id}" >/dev/null 2>&1 || true
   fi
   if ((started_daemon == 1)); then
-    agentcr daemon stop >/dev/null 2>&1 || true
+    crab daemon stop >/dev/null 2>&1 || true
   fi
   exit "${rc}"
 }
 trap cleanup EXIT INT TERM
 
-if ! agentcr daemon status >/dev/null 2>&1; then
+if ! crab daemon status >/dev/null 2>&1; then
   echo "==> Starting Crab daemon"
-  agentcr daemon start --config "${CONFIG_PATH}"
+  crab daemon start --config "${CONFIG_PATH}"
   started_daemon=1
 fi
 
 echo "==> Launching sandbox from ${IMAGE}"
-sandbox_id=$(agentcr sandbox run --detach --name "crab-smoke-$$" "${IMAGE}")
+sandbox_id=$(crab sandbox run --detach --name "crab-smoke-$$" "${IMAGE}")
 
 echo "==> Creating filesystem and process state"
-agentcr sandbox exec "${sandbox_id}" -- sh -lc \
+crab sandbox exec "${sandbox_id}" -- sh -lc \
   'echo before > /root/crab-state.txt; nohup sh -c "while :; do sleep 1; done" >/root/crab-worker.log 2>&1 & echo $! >/root/crab-worker.pid'
-before_pid=$(agentcr sandbox exec "${sandbox_id}" -- cat /root/crab-worker.pid)
+before_pid=$(crab sandbox exec "${sandbox_id}" -- cat /root/crab-worker.pid)
 
 echo "==> Taking full checkpoint"
-checkpoint_id=$(agentcr checkpoint create "${sandbox_id}")
+checkpoint_id=$(crab checkpoint create "${sandbox_id}")
 [[ -n ${checkpoint_id} ]] || die "checkpoint command returned an empty id"
 
 echo "==> Mutating state after ${checkpoint_id}"
-agentcr sandbox exec "${sandbox_id}" -- sh -lc \
+crab sandbox exec "${sandbox_id}" -- sh -lc \
   'echo after > /root/crab-state.txt; kill "$(cat /root/crab-worker.pid)"; echo replaced >/root/post-checkpoint.txt'
 
 echo "==> Restoring ${checkpoint_id}"
-agentcr restore "${sandbox_id}" "${checkpoint_id}" >/dev/null
+crab restore "${sandbox_id}" "${checkpoint_id}" >/dev/null
 
-restored_value=$(agentcr sandbox exec "${sandbox_id}" -- cat /root/crab-state.txt)
-restored_pid=$(agentcr sandbox exec "${sandbox_id}" -- cat /root/crab-worker.pid)
-agentcr sandbox exec "${sandbox_id}" -- kill -0 "${restored_pid}"
+restored_value=$(crab sandbox exec "${sandbox_id}" -- cat /root/crab-state.txt)
+restored_pid=$(crab sandbox exec "${sandbox_id}" -- cat /root/crab-worker.pid)
+crab sandbox exec "${sandbox_id}" -- kill -0 "${restored_pid}"
 
 [[ ${restored_value} = before ]] || die "expected file value 'before', got ${restored_value@Q}"
 [[ ${restored_pid} = "${before_pid}" ]] || die "expected restored pid ${before_pid}, got ${restored_pid}"
-if agentcr sandbox exec "${sandbox_id}" -- test -e /root/post-checkpoint.txt; then
+if crab sandbox exec "${sandbox_id}" -- test -e /root/post-checkpoint.txt; then
   die "post-checkpoint file still exists after restore"
 fi
 
@@ -99,5 +99,5 @@ echo "PASS: filesystem content and the background process were restored."
 echo "  sandbox:   ${sandbox_id}"
 echo "  checkpoint: ${checkpoint_id}"
 if ((KEEP == 1)); then
-  echo "  kept sandbox; remove it with: agentcr sandbox rm ${sandbox_id}"
+  echo "  kept sandbox; remove it with: crab sandbox rm ${sandbox_id}"
 fi

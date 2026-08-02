@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 
-from agent_cr import SchedulerConfig
+from crab import SchedulerConfig
 from integrations.agents import TaskConfig, TaskDescription
 
 from benchmarks.config import BenchmarkConfig

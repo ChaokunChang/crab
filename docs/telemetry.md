@@ -1,6 +1,6 @@
 # Telemetry Reference
 
-This document describes the current telemetry emitted by Agent-CR and the benchmark harness.
+This document describes the current telemetry emitted by Crab and the benchmark harness.
 It is intended to be the canonical reference for:
 
 - performance analysis
@@ -23,7 +23,7 @@ Each JSONL line is one record with this high-level shape:
 {
   "timestamp": "2026-03-23T01:45:06.408568+08:00",
   "kind": "event" | "metric",
-  "name": "llm.agentcr_delay_ms",
+  "name": "llm.crab_delay_ms",
   "value": 340.7377160037868,
   "attributes": {
     "run_id": "...",
@@ -124,7 +124,7 @@ Only gated requests emit non-zero `llm.gate_wait_ms` or `interceptor.response_ga
 | `llm.service.request.duration_ms` | Time spent executing the benchmark LLM service handler. |
 | `interceptor.response_gate.wait.duration_ms` | Response-gate wait duration measured by the shared operation helper. This now excludes the helper's own emit overhead. |
 | `llm.gate_wait_ms` | Explicit blocking wait duration inside `wait_for_release(...)`. |
-| `llm.agentcr_delay_ms` | Delay from “upstream response received” to “response released to agent”, sampled before telemetry writes so it no longer absorbs telemetry self-overhead. |
+| `llm.crab_delay_ms` | Delay from “upstream response received” to “response released to agent”, sampled before telemetry writes so it no longer absorbs telemetry self-overhead. |
 | `llm.interceptor_total_ms` | Total interceptor-side request latency from request handling start to release back to sandbox. |
 | `llm.request_total_ms` | Legacy alias for interceptor total latency. Prefer `llm.interceptor_total_ms`. |
 
@@ -147,7 +147,7 @@ The main latency relationships are:
 - `llm.service.request.duration_ms` is the service handler time.
 - `llm.upstream_latency_ms` includes upstream HTTP transport and therefore is usually greater than or equal to `llm.service.request.duration_ms`.
 - `interceptor.request.forward.duration_ms` wraps the full forward call seen by the interceptor and therefore is usually greater than or equal to `llm.upstream_latency_ms`.
-- `llm.agentcr_delay_ms` measures the delay introduced after the upstream response arrives but before the sandbox receives it.
+- `llm.crab_delay_ms` measures the delay introduced after the upstream response arrives but before the sandbox receives it.
 - `llm.gate_wait_ms` is the explicit blocking portion of that delay.
 - `interceptor.response_gate.wait.duration_ms` and `llm.gate_wait_ms` should now be very close; large persistent gaps usually indicate real wrapper work or clocking issues rather than telemetry overhead.
 - `llm.interceptor_total_ms` is the end-to-end interceptor latency and therefore is usually the largest of the LLM path timing metrics.
@@ -159,7 +159,7 @@ For overlapping requests from the same sandbox, correlate by both `request_id` a
 In practice, analysis code should treat:
 
 - `llm.service.request.duration_ms` as service compute
-- `llm.agentcr_delay_ms` as Agent-CR-added response delay
+- `llm.crab_delay_ms` as Crab-added response delay
 - `llm.interceptor_total_ms` as sandbox-observed request latency at the interceptor boundary
 
 ## 2. Scheduler And Coordination
@@ -452,7 +452,7 @@ At the scenario-row level, the benchmark also emits task summaries that may appe
 When these metrics are present, the telemetry report adds a `Speculative Execution Summary` section with saved-time, agent-loop-penalty, hidden-reject-cost, net-gain, and accept-rate charts.
 Task summary tables and task-level charts now group speculative promotions by `task_run_id`, so `spec-0`, `spec-0-spec-1`, and later accepted descendants appear as one logical task run in the report.
 
-When `spec.turn.finish` events carry `fork_finalized` and `reuse_candidate`, the report also renders a `Fork Reuse` subsection with a `total turns → finalized → state-unchanged → cache-eligible → reused` funnel, two gap rows (`state-unchanged → cache-eligible`, `cache-eligible → reused`), a fork-source / reuse-rate summary, and an accept/reject × state-unchanged/state-changed outcome matrix. The same 13 metrics are exported as `spec_fork_reuse.csv`. Under `scenario_options.enable_fork_reuse: false`, `forks_reused` is always `0` by design — every cache-eligible turn falls into the `cache-eligible → reused` gap. See [speculative-execution-benchmark.md](/root/workspace/agent-cr/docs/speculative-execution-benchmark.md#fork-reuse) for the full caching contract.
+When `spec.turn.finish` events carry `fork_finalized` and `reuse_candidate`, the report also renders a `Fork Reuse` subsection with a `total turns → finalized → state-unchanged → cache-eligible → reused` funnel, two gap rows (`state-unchanged → cache-eligible`, `cache-eligible → reused`), a fork-source / reuse-rate summary, and an accept/reject × state-unchanged/state-changed outcome matrix. The same 13 metrics are exported as `spec_fork_reuse.csv`. Under `scenario_options.enable_fork_reuse: false`, `forks_reused` is always `0` by design — every cache-eligible turn falls into the `cache-eligible → reused` gap. See [speculative-execution-benchmark.md](/root/workspace/crab/docs/speculative-execution-benchmark.md#fork-reuse) for the full caching contract.
 
 ## 7. Image And Build Metrics
 
@@ -602,7 +602,7 @@ For future analysis/reporting code, the most useful first-pass queries are:
 6. LLM path breakdown:
    - `llm.service.request.duration_ms`
    - `interceptor.request.forward.duration_ms`
-   - `llm.agentcr_delay_ms`
+   - `llm.crab_delay_ms`
    - `llm.gate_wait_ms`
    - `llm.interceptor_total_ms`
 7. Recovery breakdown:
@@ -624,7 +624,7 @@ For future analysis/reporting code, the most useful first-pass queries are:
 
 This document describes the telemetry currently emitted by:
 
-- core Agent-CR runtime/scheduler/executor/system modules
+- core Crab runtime/scheduler/executor/system modules
 - the interceptor and benchmark LLM service router
 - the real-host benchmark harness and scenario code
 - image/build/export helpers

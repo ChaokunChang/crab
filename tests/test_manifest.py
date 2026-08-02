@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import unittest
 
-from agent_cr import ArtifactKind, ArtifactReference, CheckpointId, CheckpointManifest, SandboxId
-from agent_cr.models import MANIFEST_SCHEMA_VERSION, utc_now
+from crab import ArtifactKind, ArtifactReference, CheckpointId, CheckpointManifest, SandboxId
+from crab.models import MANIFEST_SCHEMA_VERSION, utc_now
 
 
 class ManifestTests(unittest.TestCase):

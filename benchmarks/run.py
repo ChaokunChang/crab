@@ -66,7 +66,7 @@ def _clear_benchmark_root_if_needed(config: BenchmarkConfig, harness_context: ob
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Unified Agent-CR benchmark runner")
+    parser = argparse.ArgumentParser(description="Unified Crab benchmark runner")
     parser.add_argument("--config", type=Path, required=True)
     return parser.parse_args()
 

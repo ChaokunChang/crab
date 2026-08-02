@@ -8,9 +8,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event
 
-from agent_cr import EBPFEvent, EBPFEventKind, InMemoryEBPFEventCollector, Runtime, SandboxId
-from agent_cr.contracts import TelemetrySink
-from agent_cr.models import utc_now
+from crab import EBPFEvent, EBPFEventKind, InMemoryEBPFEventCollector, Runtime, SandboxId
+from crab.contracts import TelemetrySink
+from crab.models import utc_now
 
 from .contracts import SandboxHandle
 

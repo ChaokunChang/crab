@@ -4,8 +4,8 @@ from dataclasses import dataclass
 import random
 import time
 
-from agent_cr import FaultToleranceCheckpointingPolicy, JobStatus, LatestOnlyCheckpointManager, SchedulerConfig
-from agent_cr.models import utc_now
+from crab import FaultToleranceCheckpointingPolicy, JobStatus, LatestOnlyCheckpointManager, SchedulerConfig
+from crab.models import utc_now
 
 from integrations.agents import SandboxHandle, TaskConfig, TaskDescription
 

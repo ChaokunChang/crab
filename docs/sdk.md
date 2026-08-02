@@ -1,6 +1,6 @@
-# Agent-CR SDK
+# Crab SDK
 
-This document describes the user-facing SDK introduced in `agent_cr/` —
+This document describes the user-facing SDK introduced in `crab/` —
 the E2B-style entry point for creating sandboxes, attaching agents, running
 tasks, and using checkpoint/restore.
 
@@ -11,8 +11,8 @@ directly.
 ## Quick start
 
 ```python
-from agent_cr import Sandbox
-from agent_cr.agents_builtin.claude_code import ClaudeCodeAgent
+from crab import Sandbox
+from crab.agents_builtin.claude_code import ClaudeCodeAgent
 
 sbx = Sandbox(
     image="ubuntu:22.04",
@@ -36,7 +36,7 @@ sbx.kill()
 ```
 
 The SDK ships with these built-in agent profiles (registered automatically
-when `agent_cr` is imported):
+when `crab` is imported):
 
 | Name           | Protocol  | Notes                                          |
 | -------------- | --------- | ---------------------------------------------- |
@@ -100,7 +100,7 @@ An agent is a profile that describes how to install and invoke a coding
 assistant inside the sandbox. The contract is small:
 
 ```python
-from agent_cr import Agent, TaskResult
+from crab import Agent, TaskResult
 
 class MyAgent(Agent):
     name = "my-agent"
@@ -134,9 +134,9 @@ Templates describe a prepared sandbox shape without exposing engine-level
 runc/ZFS details on `Sandbox(...)`. For compose-backed task images:
 
 ```python
-from agent_cr import Sandbox
-from agent_cr.agents_builtin.iflow import IFlowAgent
-from agent_cr.templates import DockerComposeTemplate
+from crab import Sandbox
+from crab.agents_builtin.iflow import IFlowAgent
+from crab.templates import DockerComposeTemplate
 
 template = DockerComposeTemplate(
     compose_file="/path/to/docker-compose.yaml",
@@ -157,23 +157,23 @@ provided.
 
 The Engine is the runtime manager that owns the underlying runc/ZFS
 runtime, the checkpoint store, the host inspector, and the LLM
-interceptor. Agent-CR runs it as a **long-lived daemon** (the equivalent
+interceptor. Crab runs it as a **long-lived daemon** (the equivalent
 of `dockerd`); SDK callers connect to it. There is no in-process
 fallback.
 
 Start the daemon once per host:
 
 ```bash
-agentcr daemon start --config examples/sdk/configs/iflow_replay_engine.runc.yaml
+crab daemon start --config examples/sdk/configs/iflow_replay_engine.runc.yaml
 ```
 
 From the SDK process — `Sandbox(...)` connects automatically through
 `get_default_engine()`, which honors the default socket location (and
-`$AGENT_CR_DAEMON_SOCKET`). To pin a specific socket or hold the
+`$CRAB_DAEMON_SOCKET`). To pin a specific socket or hold the
 connection across multiple sandboxes, use `Engine.connect()` directly:
 
 ```python
-from agent_cr import Engine, Sandbox
+from crab import Engine, Sandbox
 
 with Engine.connect() as engine:
     sbx = Sandbox(engine=engine, template=...)
@@ -184,13 +184,13 @@ with Engine.connect() as engine:
 
 `sbx.kill()` and other lifecycle calls only affect sandboxes — they do
 not stop the daemon. The daemon outlives the SDK process; stop it with
-`agentcr daemon stop`.
+`crab daemon stop`.
 
 See [daemon.md](daemon.md) for the operator guide (config, socket
 path, CLI reference, and the v1 RPC surface).
 
 `EngineConfig` is read by the daemon on startup, not by SDK code.
-Operators pass it as `--config FILE` to `agentcr daemon start`. The
+Operators pass it as `--config FILE` to `crab daemon start`. The
 config knobs are unchanged:
 
 | Field                  | Purpose                                                    |
@@ -211,7 +211,7 @@ upstream — the **same architecture used by the benchmark harness**:
 sandbox / on-host agent
         │  LLM call
         ▼
-AgentCRRequestInterceptorServer   ← unchanged from harness; gates requests
+CrabRequestInterceptorServer   ← unchanged from harness; gates requests
         │                            for semantic-aware checkpoint/restore
         ▼  single upstream URL
 SdkLLMForwarder                   ← reads X-Agent-Sandbox-Id, dispatches
@@ -253,7 +253,7 @@ The repo has no `setup.py`, so run examples from the repo root with
 `PYTHONPATH` pointing at it:
 
 ```bash
-cd /root/workspace/acr-deploy/agent-cr
+cd /root/workspace/acr-deploy/crab
 PYTHONPATH=. python3 examples/sdk/02_byo_agent.py
 ```
 
@@ -276,6 +276,6 @@ running as an external replay service. See
   bundle/rootfs and runs through the real `runc` backend when the engine is
   configured with `runtime="runc"`.
 - Only `openai` and `anthropic` LLM protocols are supported. Adding more is
-  a matter of registering env-var lists in `agent_cr.agent.llm_env_vars_for`.
+  a matter of registering env-var lists in `crab.agent.llm_env_vars_for`.
 - Built-in terminus/mini-swe profiles are not yet available in the SDK. The
   harness path for those agents is unchanged.

@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_cr import InMemoryTelemetrySink
+from crab import InMemoryTelemetrySink
 from integrations.sandboxes.claude_code.harness import (
     CLAUDE_CODE_WRAPPER_ARG,
     prepare_claude_code_runtime,
@@ -54,7 +54,7 @@ class ClaudeCodeHarnessTests(unittest.TestCase):
 
             with patch("integrations.sandboxes.claude_code.harness._claude_versions_dir", return_value=versions_dir), patch.dict(
                 os.environ,
-                {"AGENT_CR_CLAUDE_CODE_VERSION": "2.1.86"},
+                {"CRAB_CLAUDE_CODE_VERSION": "2.1.86"},
                 clear=False,
             ):
                 prepared = prepare_claude_code_runtime(work_root=work_root, requested_version="2.1.34")
@@ -70,7 +70,7 @@ class ClaudeCodeHarnessTests(unittest.TestCase):
 
             with patch("integrations.sandboxes.claude_code.harness._claude_versions_dir", return_value=versions_dir), patch.dict(
                 os.environ,
-                {"AGENT_CR_CLAUDE_CODE_BINARY_URL_TEMPLATE": "https://example.test/{version}/claude"},
+                {"CRAB_CLAUDE_CODE_BINARY_URL_TEMPLATE": "https://example.test/{version}/claude"},
                 clear=False,
             ), patch(
                 "integrations.sandboxes.claude_code.harness.urllib.request.urlopen",

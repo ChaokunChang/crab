@@ -8,8 +8,8 @@ import tempfile
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
-from agent_cr import CheckpointId, SandboxDescription, SandboxId
-from agent_cr.models import CheckpointManifest
+from crab import CheckpointId, SandboxDescription, SandboxId
+from crab.models import CheckpointManifest
 from benchmarks.real_host_scenario_base import RealHostScenarioHarness, _SpeculativeSandboxController
 from benchmarks.support import is_replay_llm_service_type
 from integrations.agents import SandboxHandle

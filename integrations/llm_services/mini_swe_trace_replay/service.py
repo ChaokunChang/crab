@@ -207,7 +207,7 @@ def _completion_response(message: dict[str, Any], *, trace_index: int) -> dict[s
         "id": f"chatcmpl-mini-swe-{uuid.uuid4().hex}",
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": "agent-cr-mini-swe-trace-replay",
+        "model": "crab-mini-swe-trace-replay",
         "choices": [
             {
                 "index": 0,

@@ -57,7 +57,7 @@ def prepare_bundle_launch(
         provider=provider,
         sandbox_name=sandbox_name,
         status_port=resolved_status_port,
-        cgroup_path=f"agent-cr-bench/{pool_name}/{sandbox_name}",
+        cgroup_path=f"crab-bench/{pool_name}/{sandbox_name}",
         work_dir_host_path=work_dir_host_path,
         network_namespace_path=network_namespace_path,
         image_defaults=image_defaults,

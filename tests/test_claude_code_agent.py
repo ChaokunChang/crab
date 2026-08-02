@@ -7,8 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from agent_cr import InMemoryTelemetrySink
-from agent_cr import SandboxId
+from crab import InMemoryTelemetrySink
+from crab import SandboxId
 from integrations.agents import SandboxHandle, TaskConfig, TaskDescription
 from integrations.agents.claude_code import (
     CLAUDE_CODE_WRAPPER_ARG,

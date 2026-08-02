@@ -1,9 +1,9 @@
-# Agent-CR daemon
+# Crab daemon
 
-Agent-CR runs as a long-lived host service — the equivalent of
+Crab runs as a long-lived host service — the equivalent of
 `dockerd` — that owns the runc state, ZFS datasets, host inspector,
 LLM interceptor + forwarder, and the sandbox network bridge. SDK
-clients (and the `agentcr` CLI) connect to it over a Unix-domain
+clients (and the `crab` CLI) connect to it over a Unix-domain
 socket.
 
 There is no in-process engine fallback. Starting two daemons (or
@@ -15,7 +15,7 @@ network namespaces.
 
 ```
    ┌─────────────────────────────┐   HTTP/JSON over     ┌─────────────────────┐
-   │  SDK process                │   Unix domain socket │  agentcrd (daemon)  │
+   │  SDK process                │   Unix domain socket │  crabd (daemon)  │
    │                             │ ───────────────────▶ │                     │
    │  Sandbox(...) ── Engine     │                      │  Engine (in-proc)   │
    │    │  .runtime ─ Runtime    │ ◀─────────────────── │   ├─ RuncRuntime    │
@@ -24,7 +24,7 @@ network namespaces.
    │                             │                      │   ├─ Forwarder      │
    └─────────────────────────────┘                      │   └─ NetworkBridge  │
                                                         └─────────────────────┘
-                       agentcr CLI (same protocol)
+                       crab CLI (same protocol)
 ```
 
 The daemon does not host the agent — your SDK process keeps running
@@ -41,7 +41,7 @@ The daemon is independent of any SDK process:
 - `Sandbox(...)` asks the daemon to launch a sandbox.
 - `sbx.kill()` asks the daemon to destroy that sandbox.
 - The daemon stays up across SDK process exits.
-- The daemon only stops on `agentcr daemon stop`, `SIGTERM`/`SIGINT`,
+- The daemon only stops on `crab daemon stop`, `SIGTERM`/`SIGINT`,
   or `POST /shutdown`.
 
 ## Quick start
@@ -49,64 +49,64 @@ The daemon is independent of any SDK process:
 Terminal 1 — start the daemon in the foreground with an engine config:
 
 ```bash
-agentcr daemon start --foreground \
+crab daemon start --foreground \
   --config examples/sdk/configs/iflow_replay_engine.runc.yaml
 ```
 
 Detached:
 
 ```bash
-agentcr daemon start \
+crab daemon start \
   --config examples/sdk/configs/iflow_replay_engine.runc.yaml \
-  --log-file /var/log/agentcrd.log
+  --log-file /var/log/crabd.log
 ```
 
 Terminal 2 — verify it's reachable:
 
 ```bash
-agentcr daemon status
-agentcr info
-agentcr sandbox ls
+crab daemon status
+crab info
+crab sandbox ls
 ```
 
 Terminal 3 — run any SDK script. `Sandbox(...)` will connect to the
 running daemon automatically:
 
 ```bash
-AGENT_CR_REPLAY_BASE_URL=http://127.0.0.1:18080 \
+CRAB_REPLAY_BASE_URL=http://127.0.0.1:18080 \
   PYTHONPATH=. python3 examples/sdk/06_iflow_replay_dataset_runc.py
 ```
 
 Stop the daemon when done:
 
 ```bash
-agentcr daemon stop
+crab daemon stop
 ```
 
 ## Socket location
 
 By default the daemon listens on:
 
-- `/run/agentcr/agentcr.sock` when started as root.
-- `$XDG_RUNTIME_DIR/agentcr/agentcr.sock` (or `~/.cache/agentcr/agentcr.sock`)
+- `/run/crab/crab.sock` when started as root.
+- `$XDG_RUNTIME_DIR/crab/crab.sock` (or `~/.cache/crab/crab.sock`)
   otherwise.
 
-Override with `--socket /path/to/socket` on `agentcr daemon start` and
+Override with `--socket /path/to/socket` on `crab daemon start` and
 either `--socket` on subsequent CLI calls or the
-`AGENT_CR_DAEMON_SOCKET` environment variable for the SDK.
+`CRAB_DAEMON_SOCKET` environment variable for the SDK.
 
 The socket file is created with permissions `0600`; only the user who
 started the daemon can talk to it. There is no separate auth in v1.
 
-## `agentcr` CLI reference
+## `crab` CLI reference
 
-After `pip install -e .` (or `pip install .`), the `agentcr` and
-`agentcrd` console scripts are on `$PATH`. The same subcommands are
-available via `python -m agent_cr.cli ...` and `python -m agent_cr.daemon ...`
+After `pip install -e .` (or `pip install .`), the `crab` and
+`crabd` console scripts are on `$PATH`. The same subcommands are
+available via `python -m crab.cli ...` and `python -m crab.daemon ...`
 without installing.
 
 ```
-agentcr [--socket PATH] [--timeout SECONDS] [--json] <subcommand>
+crab [--socket PATH] [--timeout SECONDS] [--json] <subcommand>
 
   daemon start [--config FILE] [--foreground] [--log-file PATH] [--pid-file PATH]
   daemon stop  [--timeout SECONDS]
@@ -150,7 +150,7 @@ to raw JSON output (useful for scripting).
 - `rm`      — destroy: `runtime.stop()` + `runtime.delete()` +
   network/upstream cleanup. The per-sandbox ZFS dataset is destroyed
   here too. Checkpoint manifests under `storage_root` are NOT pruned
-  by `rm`; use `agentcr checkpoint rm` to clear those.
+  by `rm`; use `crab checkpoint rm` to clear those.
 - `exec`    — run a command in an already-running sandbox; output is
   buffered and printed at the end (streaming is a follow-up).
 
@@ -164,25 +164,25 @@ checkpoint (top-level because it acts on a sandbox using a checkpoint
 — same shape as `git restore`).
 
 ```
-agentcr checkpoint create $SBX               # → prints ckpt-<id>
-agentcr checkpoint ls $SBX                   # → table of checkpoints
-agentcr checkpoint rm $SBX $CKPT             # delete a single checkpoint
-agentcr checkpoint rm $SBX $CKPT --cascade   # also delete descendant checkpoints
+crab checkpoint create $SBX               # → prints ckpt-<id>
+crab checkpoint ls $SBX                   # → table of checkpoints
+crab checkpoint rm $SBX $CKPT             # delete a single checkpoint
+crab checkpoint rm $SBX $CKPT --cascade   # also delete descendant checkpoints
 
-agentcr restore $SBX $CKPT                   # roll filesystem + process back
+crab restore $SBX $CKPT                   # roll filesystem + process back
 ```
 
 ## SDK usage
 
 ```python
-from agent_cr import Engine, Sandbox
+from crab import Engine, Sandbox
 
 # Connects to the default socket; raises FileNotFoundError with a clear
 # message if the daemon is not running.
 engine = Engine.connect()
 
 # Or point at a non-default socket explicitly:
-engine = Engine.connect("/tmp/agentcr-dev.sock")
+engine = Engine.connect("/tmp/crab-dev.sock")
 
 with engine:
     sbx = Sandbox(image="ubuntu:22.04", engine=engine)
@@ -194,7 +194,7 @@ with engine:
 `get_default_engine()`, which connects to the default socket lazily on
 first use.
 
-## What `agentcr daemon stop` destroys
+## What `crab daemon stop` destroys
 
 For every sandbox the daemon tracked this session, stop calls
 `runtime.stop()` + `runtime.delete()` — which kills the runc container
@@ -239,7 +239,7 @@ Routed through the daemon (CLI and SDK proxy):
 
 Not yet routed in v1 (will land in a follow-up):
 
-- Streaming exec — `agentcr sandbox exec` buffers stdout/stderr and
+- Streaming exec — `crab sandbox exec` buffers stdout/stderr and
   prints at the end. No PTY allocation either.
 - Daemon state recovery on restart — a v1 restart starts with an
   empty sandbox registry. Existing runc/ZFS state on disk is

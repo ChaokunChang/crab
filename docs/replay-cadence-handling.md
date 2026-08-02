@@ -1,6 +1,6 @@
 # Replay-Cadence Handling
 
-When agent-cr replays a recorded Terminus trace, the replay's per-turn
+When crab replays a recorded Terminus trace, the replay's per-turn
 wall-clock can drift from the original capture in either direction. The
 trace is just a sequence of recorded LLM responses — neither it nor the
 trace-replay LLM service know how long each shell command will actually
@@ -9,7 +9,7 @@ verbatim, but the foreground commands they trigger run at the replay
 host's resource budget, not the capture host's.
 
 This doc covers two opposite-direction drift problems and how
-agent-cr handles them.
+crab handles them.
 
 ---
 

@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from agent_cr import (
+from crab import (
     CheckpointId,
     FaultToleranceCheckpointingPolicy,
     JobStatus,
@@ -552,7 +552,7 @@ class FaultScenarioTests(unittest.TestCase):
         settings = build_fault_harness_settings(config)
         factory = settings.checkpoint_manager_factory
 
-        with tempfile.TemporaryDirectory(prefix="agent_cr_fault_policy_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_fault_policy_") as tmp:
             base = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
             manager = factory(base)
 

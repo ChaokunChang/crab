@@ -1,7 +1,7 @@
 # Engine config for the iFlow + MiniMax qsort example.
-# Loaded by the daemon: `agentcr daemon start --config <this file>`.
+# Loaded by the daemon: `crab daemon start --config <this file>`.
 # The example owns the agent, task, and LLM endpoint; this file only
-# configures the Agent-CR engine inside the daemon.
+# configures the Crab engine inside the daemon.
 
 runtime: runc
 run_id: sdk-iflow-minimax-qsort-runc
@@ -22,14 +22,14 @@ forwarder:
   host: 127.0.0.1
   port: 0
 
-zfs_dataset_prefix: agentcr-300/agent-cr-sdk-iflow-minimax-qsort
+zfs_dataset_prefix: crab-300/crab-sdk-iflow-minimax-qsort
 
 storage_planes:
-  runtime_root: /root/workspace/agent-cr/data/agent_cr/sdk/iflow-minimax-qsort-runc/runtime
-  storage_root: /root/workspace/agent-cr/data/agent_cr/sdk/iflow-minimax-qsort-runc/storage
-  agent_state_root: /root/workspace/agent-cr/data/agent_cr/sdk/iflow-minimax-qsort-runc/agent-state
-  work_dir_host_root: /root/workspace/agent-cr/data/agent_cr/sdk/iflow-minimax-qsort-runc/work
-  image_cache_root: /root/workspace/agent-cr/data/agent_cr/sdk/iflow-minimax-qsort-runc/image-cache
+  runtime_root: /root/workspace/crab/data/crab/sdk/iflow-minimax-qsort-runc/runtime
+  storage_root: /root/workspace/crab/data/crab/sdk/iflow-minimax-qsort-runc/storage
+  agent_state_root: /root/workspace/crab/data/crab/sdk/iflow-minimax-qsort-runc/agent-state
+  work_dir_host_root: /root/workspace/crab/data/crab/sdk/iflow-minimax-qsort-runc/work
+  image_cache_root: /root/workspace/crab/data/crab/sdk/iflow-minimax-qsort-runc/image-cache
 
 executor:
   max_workers: 1
@@ -58,7 +58,7 @@ host_inspector:
   host: 127.0.0.1
   port: 0
   log_level: DEBUG
-  log_file: /root/workspace/agent-cr/logs/sdk/iflow-minimax-qsort-runc/host-inspector.log
+  log_file: /root/workspace/crab/logs/sdk/iflow-minimax-qsort-runc/host-inspector.log
 
 runc:
   command_timeout_seconds: 120.0
@@ -76,7 +76,7 @@ runc:
     lazy_pages: false
 
 telemetry:
-  output: /root/workspace/agent-cr/logs/sdk/iflow-minimax-qsort-runc/engine.telemetry.jsonl
+  output: /root/workspace/crab/logs/sdk/iflow-minimax-qsort-runc/engine.telemetry.jsonl
   detail_level: detailed
   capture_command_output: false
   max_text_attribute_bytes: 2048
@@ -89,6 +89,6 @@ telemetry:
   serializer: auto
 
 logging:
-  file: /root/workspace/agent-cr/logs/sdk/iflow-minimax-qsort-runc/engine.log
+  file: /root/workspace/crab/logs/sdk/iflow-minimax-qsort-runc/engine.log
   level: debug
   file_mode: write

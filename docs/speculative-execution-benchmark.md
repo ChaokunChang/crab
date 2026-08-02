@@ -1,6 +1,6 @@
 # Speculative Execution Benchmark
 
-This document describes the `spec` benchmark scenario for speculative execution experiments with Agent-CR.
+This document describes the `spec` benchmark scenario for speculative execution experiments with Crab.
 
 ## Purpose
 
@@ -46,7 +46,7 @@ These constraints are enforced during config loading and again when the scenario
 The current implementation works like this:
 
 1. The agent issues paired draft and oracle requests with the same speculative pair id.
-2. Agent-CR treats the pair as one checkpoint coordination unit, so only one checkpoint can be scheduled for that pair.
+2. Crab treats the pair as one checkpoint coordination unit, so only one checkpoint can be scheduled for that pair.
 3. If the oracle response wins the race, the turn degrades to normal oracle execution.
 4. If the draft response wins and a speculative fork is available, the draft command runs on the fork.
 5. When the oracle response arrives, the agent compares the normalized command strings.
@@ -105,8 +105,8 @@ When `enable_fork_reuse` is `false`, the same funnel still renders from telemetr
 
 Checked-in examples:
 
-- [mini_swe.spec.auto.10tasks.debug.yaml](/root/workspace/agent-cr/benchmarks/examples/mini_swe/mini_swe.spec.auto.10tasks.debug.yaml)
-- [terminus.spec.auto.10tasks.debug.yaml](/root/workspace/agent-cr/benchmarks/examples/terminus/terminus.spec.auto.10tasks.debug.yaml)
+- [mini_swe.spec.auto.10tasks.debug.yaml](/root/workspace/crab/benchmarks/examples/mini_swe/mini_swe.spec.auto.10tasks.debug.yaml)
+- [terminus.spec.auto.10tasks.debug.yaml](/root/workspace/crab/benchmarks/examples/terminus/terminus.spec.auto.10tasks.debug.yaml)
 
 Minimal shape (mini_swe variant; for `terminus`, swap `agent` and `llm_service`):
 
@@ -117,7 +117,7 @@ provider: openai
 agent: mini_swe                       # or: terminus
 llm_service: mini_swe_spec_trace_replay  # or: terminus_spec_trace_replay
 iterations: 0
-task_dataset: /root/workspace/agent-cr/results/datasets/...
+task_dataset: /root/workspace/crab/results/datasets/...
 scenario_options:
   acceptance_rate: 0.5
   draft_response_delay_scaling_factor: 0.5
@@ -254,7 +254,7 @@ Speculative execution is critical-path-bound by fork prep latency. The agent rac
 
 ### Headline results
 
-8-task subset of `terminus_replay_spec_friendly`, 8 sandboxes, `incremental_process_enabled=true` baseline. Configs in [`benchmarks/examples/terminus/terminus.spec.auto.incremental_demo.{baseline,chain_sharing,prefork,lazy,b_plus_d,all_opts}.yaml`](/root/workspace/agent-cr/benchmarks/examples/terminus). Comparison helper: [`benchmarks/examples/terminus/incremental_demo_compare.py`](/root/workspace/agent-cr/benchmarks/examples/terminus/incremental_demo_compare.py).
+8-task subset of `terminus_replay_spec_friendly`, 8 sandboxes, `incremental_process_enabled=true` baseline. Configs in [`benchmarks/examples/terminus/terminus.spec.auto.incremental_demo.{baseline,chain_sharing,prefork,lazy,b_plus_d,all_opts}.yaml`](/root/workspace/crab/benchmarks/examples/terminus). Comparison helper: [`benchmarks/examples/terminus/incremental_demo_compare.py`](/root/workspace/crab/benchmarks/examples/terminus/incremental_demo_compare.py).
 
 | variant | mean | p95 | p99 | max | wall-clock | spec_accept_rate | success |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -318,7 +318,7 @@ The host-inspector C helper resolves `fd_kind` by `stat("/proc/<pid>/fd/<fd>")` 
 
 ### Fix
 
-`agent_cr/host_inspector/server.py` now treats the BPF-captured absolute path as authoritative for mutating-open syscalls:
+`crab/host_inspector/server.py` now treats the BPF-captured absolute path as authoritative for mutating-open syscalls:
 
 - If the syscall is `open`/`openat`/`openat2`/`creat`, the flags include `O_CREAT`, `O_TRUNC`, or `O_TMPFILE`, and the captured path is an absolute path outside of `/dev/`, `/proc/`, and `/sys/`, the event is latched as a filesystem change regardless of the post-hoc `fd_kind` value.
 - If the path is empty or points at a pseudo filesystem, the previous `fd_kind`-based filter still applies — so mutating opens of `/dev/null`, `/proc/self/...`, etc. are still ignored.
@@ -331,17 +331,17 @@ Regression tests live in `tests/test_host_inspector_server.py`:
 
 ### Event-delivery latency (unchanged)
 
-Event delivery is still asynchronous — kernel tracepoint → BPF ring buffer → C helper → stdout pipe → Python reader thread → `HostInspectorDaemon._handle_fs_event()`. A command can finish and the Mini-SWE speculative finalizer can inspect the sandbox before that pipeline has updated `filesystem_changed`. The response gate provides the normal checkpoint boundary: a gated draft/oracle response is not released until Agent-CR has run checkpoint coordination for that request generation and any submitted checkpoint has completed or been skipped.
+Event delivery is still asynchronous — kernel tracepoint → BPF ring buffer → C helper → stdout pipe → Python reader thread → `HostInspectorDaemon._handle_fs_event()`. A command can finish and the Mini-SWE speculative finalizer can inspect the sandbox before that pipeline has updated `filesystem_changed`. The response gate provides the normal checkpoint boundary: a gated draft/oracle response is not released until Crab has run checkpoint coordination for that request generation and any submitted checkpoint has completed or been skipped.
 
 ## Evaluation Sweep
 
 The tracked evaluation sweep now uses:
 
-- [spec.0.0.yaml](/root/workspace/agent-cr/benchmarks/evaluation/spec.0.0.yaml)
-- [spec.0.1.yaml](/root/workspace/agent-cr/benchmarks/evaluation/spec.0.1.yaml)
-- [spec.0.2.yaml](/root/workspace/agent-cr/benchmarks/evaluation/spec.0.2.yaml)
-- [spec.0.3.yaml](/root/workspace/agent-cr/benchmarks/evaluation/spec.0.3.yaml)
-- [spec.0.4.yaml](/root/workspace/agent-cr/benchmarks/evaluation/spec.0.4.yaml)
-- [spec.0.5.yaml](/root/workspace/agent-cr/benchmarks/evaluation/spec.0.5.yaml)
+- [spec.0.0.yaml](/root/workspace/crab/benchmarks/evaluation/spec.0.0.yaml)
+- [spec.0.1.yaml](/root/workspace/crab/benchmarks/evaluation/spec.0.1.yaml)
+- [spec.0.2.yaml](/root/workspace/crab/benchmarks/evaluation/spec.0.2.yaml)
+- [spec.0.3.yaml](/root/workspace/crab/benchmarks/evaluation/spec.0.3.yaml)
+- [spec.0.4.yaml](/root/workspace/crab/benchmarks/evaluation/spec.0.4.yaml)
+- [spec.0.5.yaml](/root/workspace/crab/benchmarks/evaluation/spec.0.5.yaml)
 
 Those files sweep `acceptance_rate` from `0.0` to `0.5` while keeping the draft delay scaling fixed at `0.5`.

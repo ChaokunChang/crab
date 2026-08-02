@@ -1013,7 +1013,7 @@ def render_llm_overhead(runs: list[RunStats]) -> list[str]:
     rows: list[tuple[str, list[Any], str]] = []
     for metric, label in (
         ("llm.gate_wait_ms", "gate_wait"),
-        ("llm.agentcr_delay_ms", "agentcr_delay"),
+        ("llm.crab_delay_ms", "crab_delay"),
         ("llm.interceptor_total_ms", "interceptor_total"),
         ("llm.upstream_latency_ms", "upstream_latency"),
         ("interceptor.request.forward.duration_ms", "interceptor.forward"),

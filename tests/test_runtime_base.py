@@ -4,14 +4,14 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from agent_cr.runtime.base import SubprocessCommandRunner
+from crab.runtime.base import SubprocessCommandRunner
 
 
 class RuntimeBaseTests(unittest.TestCase):
     def test_detached_commands_use_devnull_for_all_stdio(self) -> None:
         runner = SubprocessCommandRunner(timeout_seconds=1.0)
 
-        with patch("agent_cr.runtime.base.subprocess.run") as run_mock:
+        with patch("crab.runtime.base.subprocess.run") as run_mock:
             run_mock.return_value = subprocess.CompletedProcess(
                 args=["runc", "run", "-d", "sbx-test"],
                 returncode=0,
@@ -32,7 +32,7 @@ class RuntimeBaseTests(unittest.TestCase):
     def test_attached_commands_capture_stdout_and_stderr(self) -> None:
         runner = SubprocessCommandRunner(timeout_seconds=1.0)
 
-        with patch("agent_cr.runtime.base.subprocess.run") as run_mock:
+        with patch("crab.runtime.base.subprocess.run") as run_mock:
             run_mock.return_value = subprocess.CompletedProcess(
                 args=["runc", "state", "sbx-test"],
                 returncode=0,
@@ -51,7 +51,7 @@ class RuntimeBaseTests(unittest.TestCase):
     def test_run_accepts_timeout_override(self) -> None:
         runner = SubprocessCommandRunner(timeout_seconds=1.0)
 
-        with patch("agent_cr.runtime.base.subprocess.run") as run_mock:
+        with patch("crab.runtime.base.subprocess.run") as run_mock:
             run_mock.return_value = subprocess.CompletedProcess(
                 args=["zfs", "create", "pool/test"],
                 returncode=0,

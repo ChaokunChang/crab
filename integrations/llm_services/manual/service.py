@@ -32,7 +32,7 @@ def _tool_response(*, content: str, turn: int, tool_name: str | None = None, too
             "id": f"chatcmpl-iflow-final-{turn}",
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": "agent-cr-iflow-manual",
+            "model": "crab-iflow-manual",
             "choices": [
                 {
                     "index": 0,
@@ -49,7 +49,7 @@ def _tool_response(*, content: str, turn: int, tool_name: str | None = None, too
         "id": f"chatcmpl-iflow-{turn}",
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": "agent-cr-iflow-manual",
+        "model": "crab-iflow-manual",
         "choices": [
             {
                 "index": 0,

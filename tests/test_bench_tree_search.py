@@ -10,7 +10,7 @@ import time
 from types import SimpleNamespace
 import unittest
 
-from agent_cr import CheckpointId, SandboxId
+from crab import CheckpointId, SandboxId
 from integrations.agents import SandboxHandle, TaskConfig, TaskDescription
 from benchmarks.config import BenchmarkConfig
 from benchmarks.scenarios.tree import (

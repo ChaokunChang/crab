@@ -8,7 +8,7 @@ from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 
-from agent_cr import (
+from crab import (
     ArtifactKind,
     ArtifactPayload,
     ArtifactReference,
@@ -21,9 +21,9 @@ from agent_cr import (
     SandboxId,
     StorageConfig,
 )
-from agent_cr.models import utc_now
-from agent_cr.runtime import CommandRunner
-from agent_cr.workers.composite import resolve_restore_manifest
+from crab.models import utc_now
+from crab.runtime import CommandRunner
+from crab.workers.composite import resolve_restore_manifest
 
 
 class FakeCommandRunner(CommandRunner):
@@ -57,7 +57,7 @@ class StorageTests(unittest.TestCase):
             flush()
 
     def test_local_checkpoint_manager_artifacts_and_manifests(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
             mgr = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
             sid = SandboxId("sbx-1")
             ckpt = CheckpointId("ckpt-1")
@@ -93,7 +93,7 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(len(loaded_manifest.process_artifacts), 1)
 
     def test_list_checkpoints_sorted_by_created_at(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
             mgr = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
             sid = SandboxId("sbx-1")
 
@@ -129,7 +129,7 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(found, [c1, c2])
 
     def test_list_checkpoints_ignores_manifest_removed_during_scan(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
             mgr = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
             sid = SandboxId("sbx-1")
             c1 = CheckpointId("ckpt-1")
@@ -166,7 +166,7 @@ class StorageTests(unittest.TestCase):
                 self.assertEqual(mgr.list_checkpoints(sid), [c1])
 
     def test_latest_only_manager_prune_tolerates_manifest_removed_between_list_and_load(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
             sid = SandboxId("sbx-1")
             base = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
             mgr = LatestOnlyCheckpointManager(base)
@@ -206,7 +206,7 @@ class StorageTests(unittest.TestCase):
                 self.assertEqual(mgr._protected_checkpoint_ids(sid), {m2.checkpoint_id})
 
     def test_delete_checkpoint_removes_manifest_artifacts_and_runtime_refs(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
             root = Path(tmp)
             runner = FakeCommandRunner()
             mgr = LocalCheckpointManager(StorageConfig(root_dir=root), command_runner=runner)
@@ -234,7 +234,7 @@ class StorageTests(unittest.TestCase):
                 ArtifactPayload(
                     kind=ArtifactKind.FILESYSTEM,
                     name="filesystem_checkpoint.json",
-                    data=b'{"filesystem": {"snapshot": "pool/agent-cr/sbx-1@ckpt-1"}}',
+                    data=b'{"filesystem": {"snapshot": "pool/crab/sbx-1@ckpt-1"}}',
                 ),
             )
             mgr.put_manifest(
@@ -256,10 +256,10 @@ class StorageTests(unittest.TestCase):
             self.assertFalse((root / "manifests" / str(sid) / f"{ckpt}.json").exists())
             self.assertFalse((root / "artifacts" / str(sid) / str(ckpt)).exists())
             self.assertFalse(process_dir.parent.exists())
-            self.assertEqual(runner.commands, [("zfs", "destroy", "pool/agent-cr/sbx-1@ckpt-1")])
+            self.assertEqual(runner.commands, [("zfs", "destroy", "pool/crab/sbx-1@ckpt-1")])
 
     def test_latest_only_manager_prunes_older_checkpoints(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
             sid = SandboxId("sbx-1")
             base = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
             mgr = LatestOnlyCheckpointManager(base)
@@ -293,7 +293,7 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(mgr.list_checkpoints(sid), [CheckpointId("ckpt-2")])
 
     def test_latest_only_manager_keeps_latest_filesystem_ancestor_for_process_only_checkpoint(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
             sid = SandboxId("sbx-1")
             base = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
             mgr = LatestOnlyCheckpointManager(base)
@@ -327,7 +327,7 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(mgr.list_checkpoints(sid), [CheckpointId("ckpt-1"), CheckpointId("ckpt-2")])
 
     def test_latest_only_manager_keeps_latest_process_ancestor_for_filesystem_only_checkpoint(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
             sid = SandboxId("sbx-1")
             base = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
             mgr = LatestOnlyCheckpointManager(base)
@@ -361,7 +361,7 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(mgr.list_checkpoints(sid), [CheckpointId("ckpt-1"), CheckpointId("ckpt-2")])
 
     def test_latest_only_manager_can_keep_all_filesystem_checkpoints(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
             sid = SandboxId("sbx-1")
             base = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
             mgr = LatestOnlyCheckpointManager(base, delete_filesystem_checkpoints=False)
@@ -422,7 +422,7 @@ class StorageTests(unittest.TestCase):
             )
 
     def test_latest_only_manager_prunes_in_background(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
             sid = SandboxId("sbx-1")
             base = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
             mgr = LatestOnlyCheckpointManager(base)
@@ -469,7 +469,7 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(mgr.list_checkpoints(sid), [CheckpointId("ckpt-2")])
 
     def test_latest_only_manager_keeps_safe_process_restore_dependency_for_latest_checkpoint(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
             sid = SandboxId("sbx-1")
             base = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
             mgr = LatestOnlyCheckpointManager(base)
@@ -525,7 +525,7 @@ class StorageTests(unittest.TestCase):
             )
 
     def test_latest_only_manager_keeps_pinned_checkpoint_during_prune(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
             sid = SandboxId("sbx-1")
             base = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
             mgr = LatestOnlyCheckpointManager(base)
@@ -579,7 +579,7 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(mgr.list_checkpoints(sid), [CheckpointId("ckpt-3")])
 
     def test_resolve_restore_manifest_can_reuse_preloaded_candidates(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
             sid = SandboxId("sbx-1")
             base = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
             manifests = [
@@ -624,7 +624,7 @@ class StorageTests(unittest.TestCase):
             )
 
     def test_delete_after_restore_manager_removes_checkpoint(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
             sid = SandboxId("sbx-1")
             ckpt = CheckpointId("ckpt-1")
             base = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
@@ -662,7 +662,7 @@ class StorageTests(unittest.TestCase):
         )
 
     def test_link_ancestor_artifact_creates_relative_symlink(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
             mgr = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
             src = SandboxId("source")
             tgt = SandboxId("target")
@@ -684,7 +684,7 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(mgr.get_artifact(tgt, ckpt, linked_ref), b"PAYLOAD")
 
     def test_link_ancestor_artifact_idempotent(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
             mgr = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
             src = SandboxId("source")
             tgt = SandboxId("target")
@@ -696,7 +696,7 @@ class StorageTests(unittest.TestCase):
             self.assertTrue(mgr.is_linked_artifact(tgt, ckpt, relinked))
 
     def test_materialize_linked_artifacts_replaces_with_real_files(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
             mgr = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
             src = SandboxId("source")
             tgt = SandboxId("target")
@@ -713,7 +713,7 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(mgr.materialize_linked_artifacts(tgt), 0)
 
     def test_pin_chain_protects_ancestors_from_pruning(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
             sid = SandboxId("chain-sbx")
             base = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
             mgr = LatestOnlyCheckpointManager(base)
@@ -793,7 +793,7 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(set(mgr.list_checkpoints(sid)), {new})
 
     def test_pin_chain_refcounts_overlap_for_two_forks(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
             sid = SandboxId("chain-sbx")
             base = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
             mgr = LatestOnlyCheckpointManager(base)
@@ -880,7 +880,7 @@ class StorageTests(unittest.TestCase):
         up. Without this gate, the kernel would SIGBUS the restored
         process the next time it raised a userfault for an unloaded
         page."""
-        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
             checkpoint_root = Path(tmp) / "runtime-state"
             (checkpoint_root / "process").mkdir(parents=True)
             (checkpoint_root / "process" / "pages-1.img").write_bytes(b"PAGES")
@@ -909,7 +909,7 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(len(calls), 2)
 
     def test_runtime_image_path_in_use_predicate_exception_does_not_wedge_retention(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
             checkpoint_root = Path(tmp) / "runtime-state"
             (checkpoint_root / "process").mkdir(parents=True)
 
@@ -927,14 +927,14 @@ class StorageTests(unittest.TestCase):
             self.assertFalse(checkpoint_root.exists())
 
     def test_runtime_image_path_in_use_late_bind(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
             mgr = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
             self.assertIsNone(mgr._runtime_image_path_in_use)
             mgr.set_runtime_image_path_in_use(lambda _p: True)
             self.assertTrue(callable(mgr._runtime_image_path_in_use))
 
     def test_keep_all_manager_retains_checkpoints(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_storage_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
             sid = SandboxId("sbx-1")
             base = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
             mgr = KeepAllCheckpointManager(base)

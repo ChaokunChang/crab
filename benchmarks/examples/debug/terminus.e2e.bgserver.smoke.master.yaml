@@ -36,11 +36,11 @@ host_inspector:
   log_level: DEBUG
   log_file: true
 iterations: 1
-output: /root/workspace/agent-cr/logs/terminus/bgserver.smoke.master.csv
-log_file: /root/workspace/agent-cr/logs/terminus/bgserver.smoke.master.log
+output: /root/workspace/crab/logs/terminus/bgserver.smoke.master.csv
+log_file: /root/workspace/crab/logs/terminus/bgserver.smoke.master.log
 log_file_mode: write
 telemetry:
-  output: /root/workspace/agent-cr/logs/terminus/bgserver.smoke.master.telemetry.jsonl
+  output: /root/workspace/crab/logs/terminus/bgserver.smoke.master.telemetry.jsonl
   file_mode: write
   detail_level: detailed
   capture_command_output: false
@@ -54,7 +54,7 @@ telemetry:
   serializer: auto
   report:
     enabled: false
-    output_dir: /root/workspace/agent-cr/logs/terminus/bgserver.smoke.master.report
+    output_dir: /root/workspace/crab/logs/terminus/bgserver.smoke.master.report
     top_k: 50
     log_scale_charts: false
     export_svg: false
@@ -65,7 +65,7 @@ monitoring:
   include_sandboxes: true
 zpool_name: zfspool
 reuse_zpool: true
-benchmark_root: /root/workspace/agent-cr/data/agent_cr/results
+benchmark_root: /root/workspace/crab/data/crab/results
 log_level: debug
 max_agent_timeout_scale: 2.0
 scenario_options:

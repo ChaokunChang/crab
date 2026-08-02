@@ -14,8 +14,8 @@ import unittest
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from agent_cr.engine import Engine, EngineConfig, shutdown_default_engine
-from agent_cr.ids import SandboxId
+from crab.engine import Engine, EngineConfig, shutdown_default_engine
+from crab.ids import SandboxId
 
 
 class _LoggingUpstream:

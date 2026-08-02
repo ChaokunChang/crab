@@ -1,7 +1,7 @@
 instruction: |-
   Launch a Python HTTP server in the background that keeps an in-memory
   counter, exercise it across turns, and write the result to a file.
-author_name: agent-cr
+author_name: crab
 author_email: dev@example.com
 difficulty: easy
 category: synthetic

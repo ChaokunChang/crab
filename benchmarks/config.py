@@ -5,12 +5,12 @@ from pathlib import Path
 
 import yaml
 
-from agent_cr import ExecutorConfig, SchedulerConfig
+from crab import ExecutorConfig, SchedulerConfig
 from integrations.sandboxes.runtime.bundle import (
     DEFAULT_CPU_PERIOD_US,
     SandboxResourceLimits,
 )
-from agent_cr.telemetry import (
+from crab.telemetry import (
     DEFAULT_TELEMETRY_CAPTURE_COMMAND_OUTPUT,
     DEFAULT_TELEMETRY_BATCH_MAX_RECORDS,
     DEFAULT_TELEMETRY_DETAIL_LEVEL,

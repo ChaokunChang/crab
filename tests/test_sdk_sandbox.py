@@ -2,21 +2,21 @@
 
 These tests use the in-memory runtime exclusively so they run anywhere
 without runc/CRIU/ZFS. They validate the SDK contract and the wiring
-between Sandbox → Engine → AgentCRSystem → interceptor.
+between Sandbox → Engine → CrabSystem → interceptor.
 """
 from __future__ import annotations
 
 import unittest
 
-from agent_cr.agent import (
+from crab.agent import (
     Agent,
     TaskResult,
     list_agents,
     register_agent,
     resolve_agent,
 )
-from agent_cr.engine import Engine, EngineConfig, shutdown_default_engine
-from agent_cr.sandbox import Sandbox
+from crab.engine import Engine, EngineConfig, shutdown_default_engine
+from crab.sandbox import Sandbox
 
 
 class _EchoAgent(Agent):
@@ -158,7 +158,7 @@ class TestAgentNamespace(unittest.TestCase):
             env = agent.command_env({"EXTRA": "1"})
             self.assertEqual(env["OPENAI_BASE_URL"], f"{self.engine.interceptor_base_url}/v1")
             self.assertEqual(env["OPENAI_API_BASE"], f"{self.engine.interceptor_base_url}/v1")
-            self.assertEqual(env["AGENT_CR_SANDBOX_ID"], str(sbx.sandbox_id))
+            self.assertEqual(env["CRAB_SANDBOX_ID"], str(sbx.sandbox_id))
             self.assertEqual(env["EXTRA"], "1")
         finally:
             sbx.kill()
@@ -182,7 +182,7 @@ class TestAgentRegistry(unittest.TestCase):
         self.assertIs(resolve_agent(inst), inst)
 
     def test_resolve_by_import_path(self) -> None:
-        spec = "agent_cr.agents_builtin.claude_code:ClaudeCodeAgent"
+        spec = "crab.agents_builtin.claude_code:ClaudeCodeAgent"
         agent = resolve_agent(spec)
         self.assertEqual(agent.name, "claude-code")
         self.assertEqual(agent.llm_protocol, "anthropic")
@@ -216,10 +216,10 @@ class TestEngineLifecycle(unittest.TestCase):
     def test_engine_connect_requires_running_daemon(self) -> None:
         # `Engine.connect()` returns a `RemoteEngine` proxy when a daemon
         # is reachable; if not, it raises `FileNotFoundError` (or a
-        # similar OSError) with a hint pointing at `agentcr daemon start`.
+        # similar OSError) with a hint pointing at `crab daemon start`.
         # The test environment has no daemon at the default socket.
         with self.assertRaises((FileNotFoundError, ConnectionRefusedError, OSError)):
-            Engine.connect("/nonexistent/agentcr.sock")
+            Engine.connect("/nonexistent/crab.sock")
 
     def test_engine_disables_interceptor(self) -> None:
         engine = Engine.start(EngineConfig(runtime="docker", enable_interceptor=False))

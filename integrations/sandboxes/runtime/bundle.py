@@ -345,7 +345,7 @@ def write_bundle_config(
     runtime_env = [
         "PATH=/usr/local/bin:/usr/bin:/bin",
         "PYTHONUNBUFFERED=1",
-        f"AGENT_CR_LLM_BASE_URL={llm_base_url}",
+        f"CRAB_LLM_BASE_URL={llm_base_url}",
         f"STATUS_PORT={status_port}",
         "POLL_INTERVAL_S=0.2",
         "AGENT_WORK_DIR=/work",

@@ -4,7 +4,7 @@
 # This intentionally omits benchmark/user workload concerns such as scenario,
 # dataset, agent, LLM service, phase workers, iterations, CSV output, and
 # replay options. The SDK example owns task selection and uses an external LLM
-# replay service; this file only configures the in-process Agent-CR engine.
+# replay service; this file only configures the in-process Crab engine.
 
 runtime: runc
 run_id: sdk-iflow-replay-runc
@@ -26,17 +26,17 @@ forwarder:
   host: 127.0.0.1
   port: 0
 
-# Benchmark YAML says zpool_name: agentcr-300. The SDK engine takes the more
+# Benchmark YAML says zpool_name: crab-300. The SDK engine takes the more
 # direct runtime-manager form: a dataset prefix under that pool.
-zfs_dataset_prefix: agentcr-300/agent-cr-sdk-iflow-replay
+zfs_dataset_prefix: crab-300/crab-sdk-iflow-replay
 
 # Keep SDK engine data out of /tmp so successful runs leave inspectable state.
 storage_planes:
-  runtime_root: /root/workspace/agent-cr/data/agent_cr/sdk/iflow-replay-runc/runtime
-  storage_root: /root/workspace/agent-cr/data/agent_cr/sdk/iflow-replay-runc/storage
-  agent_state_root: /root/workspace/agent-cr/data/agent_cr/sdk/iflow-replay-runc/agent-state
-  work_dir_host_root: /root/workspace/agent-cr/data/agent_cr/sdk/iflow-replay-runc/work
-  image_cache_root: /root/workspace/agent-cr/data/agent_cr/sdk/iflow-replay-runc/image-cache
+  runtime_root: /root/workspace/crab/data/crab/sdk/iflow-replay-runc/runtime
+  storage_root: /root/workspace/crab/data/crab/sdk/iflow-replay-runc/storage
+  agent_state_root: /root/workspace/crab/data/crab/sdk/iflow-replay-runc/agent-state
+  work_dir_host_root: /root/workspace/crab/data/crab/sdk/iflow-replay-runc/work
+  image_cache_root: /root/workspace/crab/data/crab/sdk/iflow-replay-runc/image-cache
 
 executor:
   max_workers: 2
@@ -68,7 +68,7 @@ host_inspector:
   host: 127.0.0.1
   port: 0
   log_level: DEBUG
-  log_file: /root/workspace/agent-cr/logs/sdk/iflow-replay-runc/host-inspector.log
+  log_file: /root/workspace/crab/logs/sdk/iflow-replay-runc/host-inspector.log
 
 runc:
   command_timeout_seconds: 120.0
@@ -86,7 +86,7 @@ runc:
     lazy_pages: false
 
 telemetry:
-  output: /root/workspace/agent-cr/logs/sdk/iflow-replay-runc/engine.telemetry.jsonl
+  output: /root/workspace/crab/logs/sdk/iflow-replay-runc/engine.telemetry.jsonl
   detail_level: detailed
   capture_command_output: false
   max_text_attribute_bytes: 2048
@@ -99,6 +99,6 @@ telemetry:
   serializer: auto
 
 logging:
-  file: /root/workspace/agent-cr/logs/sdk/iflow-replay-runc/engine.log
+  file: /root/workspace/crab/logs/sdk/iflow-replay-runc/engine.log
   level: debug
   file_mode: write

@@ -57,13 +57,13 @@ _LLM_BREAKDOWN_METRICS = (
     "interceptor.request.forward.duration_ms",
     "llm.interceptor_total_ms",
     "llm.gate_wait_ms",
-    "llm.agentcr_delay_ms",
+    "llm.crab_delay_ms",
 )
 
 _OVERHEAD_ANALYSIS_METRICS = (
     "llm.gate_wait_ms",
     "interceptor.response_gate.wait.duration_ms",
-    "llm.agentcr_delay_ms",
+    "llm.crab_delay_ms",
 )
 
 _SPEC_DRAFT_REPORT_FILTERED_METRICS = frozenset(_OVERHEAD_ANALYSIS_METRICS)

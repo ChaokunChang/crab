@@ -9,12 +9,12 @@ example; it is a host-side service, like a local OpenAI-compatible endpoint.
 In terminal 1, start the existing benchmark LLM router from the repo root:
 
 ```bash
-cd /root/workspace/acr-deploy/agent-cr
+cd /root/workspace/acr-deploy/crab
 
 PYTHONPATH=. python3 -m integrations.llm_services.router \
   --host 127.0.0.1 \
   --port 18080 \
-  --telemetry-jsonl /tmp/agentcr-iflow-router.telemetry.jsonl
+  --telemetry-jsonl /tmp/crab-iflow-router.telemetry.jsonl
 ```
 
 Leave this process running. In another shell, check that it is ready:
@@ -42,15 +42,15 @@ If you prefer a background process in your own shell, redirect the logs
 explicitly:
 
 ```bash
-cd /root/workspace/acr-deploy/agent-cr
+cd /root/workspace/acr-deploy/crab
 
 PYTHONPATH=. python3 -m integrations.llm_services.router \
   --host 127.0.0.1 \
   --port 18080 \
-  --telemetry-jsonl /tmp/agentcr-iflow-router.telemetry.jsonl \
-  > /tmp/agentcr-iflow-router.log 2>&1 &
+  --telemetry-jsonl /tmp/crab-iflow-router.telemetry.jsonl \
+  > /tmp/crab-iflow-router.log 2>&1 &
 
-echo $! > /tmp/agentcr-iflow-router.pid
+echo $! > /tmp/crab-iflow-router.pid
 ```
 
 ## 2. Run The SDK Example
@@ -58,9 +58,9 @@ echo $! > /tmp/agentcr-iflow-router.pid
 In terminal 2:
 
 ```bash
-cd /root/workspace/acr-deploy/agent-cr
+cd /root/workspace/acr-deploy/crab
 
-AGENT_CR_REPLAY_BASE_URL=http://127.0.0.1:18080 \
+CRAB_REPLAY_BASE_URL=http://127.0.0.1:18080 \
   PYTHONPATH=. python3 examples/sdk/06_iflow_replay_dataset_runc.py
 ```
 
@@ -73,19 +73,19 @@ examples/sdk/configs/iflow_replay_engine.runc.yaml
 Override that with:
 
 ```bash
-AGENT_CR_ENGINE_CONFIG=/path/to/engine.yaml
+CRAB_ENGINE_CONFIG=/path/to/engine.yaml
 ```
 
 The example reads the first two rows from:
 
 ```text
-/root/workspace/agent-cr/results/datasets/termnius_iflow_replay_128tasks_light.jsonl
+/root/workspace/crab/results/datasets/termnius_iflow_replay_128tasks_light.jsonl
 ```
 
 Override that with:
 
 ```bash
-AGENT_CR_REPLAY_DATASET=/path/to/dataset.jsonl
+CRAB_REPLAY_DATASET=/path/to/dataset.jsonl
 ```
 
 Expected success signal:
@@ -102,8 +102,8 @@ If the router is running in the foreground, stop it with `Ctrl-C`.
 If you used the background command:
 
 ```bash
-kill "$(cat /tmp/agentcr-iflow-router.pid)"
-rm -f /tmp/agentcr-iflow-router.pid
+kill "$(cat /tmp/crab-iflow-router.pid)"
+rm -f /tmp/crab-iflow-router.pid
 ```
 
 ## Telemetry And Logs
@@ -112,9 +112,9 @@ For this external router process:
 
 - Router stdout/stderr stay in terminal 1 when run in the foreground.
 - With the background command above, router stdout/stderr are redirected to
-  `/tmp/agentcr-iflow-router.log`.
+  `/tmp/crab-iflow-router.log`.
 - Router telemetry JSONL is written to
-  `/tmp/agentcr-iflow-router.telemetry.jsonl` because the start command passes
+  `/tmp/crab-iflow-router.telemetry.jsonl` because the start command passes
   `--telemetry-jsonl`.
 
 For the SDK engine inside the example:
@@ -122,17 +122,17 @@ For the SDK engine inside the example:
 - This example uses
   `examples/sdk/configs/iflow_replay_engine.runc.yaml`, so engine telemetry is
   written to
-  `/root/workspace/agent-cr/logs/sdk/iflow-replay-runc/engine.telemetry.jsonl`.
+  `/root/workspace/crab/logs/sdk/iflow-replay-runc/engine.telemetry.jsonl`.
 - Engine telemetry is stamped with `run_id: sdk-iflow-replay-runc`, which lets
   the existing telemetry report CLI analyze it.
 - Engine logs are written to
-  `/root/workspace/agent-cr/logs/sdk/iflow-replay-runc/engine.log`.
+  `/root/workspace/crab/logs/sdk/iflow-replay-runc/engine.log`.
 - Runtime/checkpoint/agent state is kept under
-  `/root/workspace/agent-cr/data/agent_cr/sdk/iflow-replay-runc/`.
+  `/root/workspace/crab/data/crab/sdk/iflow-replay-runc/`.
 - The runc `--root` path is
-  `/root/workspace/agent-cr/data/agent_cr/sdk/iflow-replay-runc/runtime/runtime-state`.
+  `/root/workspace/crab/data/crab/sdk/iflow-replay-runc/runtime/runtime-state`.
 - Sandbox ZFS datasets use the prefix
-  `agentcr-300/agent-cr-sdk-iflow-replay`.
+  `crab-300/crab-sdk-iflow-replay`.
 - The config's `host_inspector.launch_mode: in_process` documents the current
   SDK behavior: the in-process engine uses `EBPFSandboxInspector` directly.
   The benchmark host-inspector process launcher is still benchmark-only.
@@ -140,27 +140,27 @@ For the SDK engine inside the example:
 Generate the same style of telemetry report bundle manually with:
 
 ```bash
-cd /root/workspace/acr-deploy/agent-cr
+cd /root/workspace/acr-deploy/crab
 
 PYTHONPATH=. python3 -m benchmarks.telemetry_analysis.report \
-  --input /root/workspace/agent-cr/logs/sdk/iflow-replay-runc/engine.telemetry.jsonl \
-  --output-dir /root/workspace/agent-cr/logs/sdk/iflow-replay-runc/report \
+  --input /root/workspace/crab/logs/sdk/iflow-replay-runc/engine.telemetry.jsonl \
+  --output-dir /root/workspace/crab/logs/sdk/iflow-replay-runc/report \
   --top-k 50 \
   --figure-window-seconds 10
 ```
 - With plain `EngineConfig(runtime="runc")` and no YAML file, telemetry falls
   back to an in-memory sink and runtime state defaults under a temporary
-  `/tmp/agentcr-engine-*/` directory.
+  `/tmp/crab-engine-*/` directory.
 - To persist SDK engine telemetry, pass a `TelemetryConfig`:
 
 ```python
 from pathlib import Path
-from agent_cr import EngineConfig, TelemetryConfig
+from crab import EngineConfig, TelemetryConfig
 
 config = EngineConfig(
     runtime="runc",
     telemetry_config=TelemetryConfig(
-        jsonl_path=Path("/tmp/agentcr-sdk.telemetry.jsonl"),
+        jsonl_path=Path("/tmp/crab-sdk.telemetry.jsonl"),
         keep_in_memory_copy=True,
     ),
 )

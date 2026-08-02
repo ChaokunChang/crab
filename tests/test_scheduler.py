@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import timedelta
 import unittest
 
-from agent_cr import (
+from crab import (
     CRScheduler,
     FaultToleranceCheckpointingPolicy,
     InMemorySandboxInspector,
@@ -13,7 +13,7 @@ from agent_cr import (
     SandboxSnapshot,
     SchedulerConfig,
 )
-from agent_cr.models import utc_now
+from crab.models import utc_now
 
 
 class RecordingSandboxManager:

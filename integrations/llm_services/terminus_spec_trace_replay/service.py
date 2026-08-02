@@ -30,8 +30,8 @@ _DEFAULT_MINIMAL_DELAY_MS = 0.0
 _DEFAULT_MAXIMAL_DELAY_MS = 1_000_000_000.0
 _RESPONSE_DELAY_POLICIES = {"fixed", "trace_replay"}
 _SUPPORTED_MISMATCH_POLICIES = {"preserve_command_class"}
-_SPEC_PAIR_HEADER = "X-AgentCR-Spec-Pair-Id"
-_SPEC_ROLE_HEADER = "X-AgentCR-Spec-Role"
+_SPEC_PAIR_HEADER = "X-Crab-Spec-Pair-Id"
+_SPEC_ROLE_HEADER = "X-Crab-Spec-Role"
 _SPEC_ROLE_ORACLE = "oracle"
 _SPEC_ROLE_DRAFT = "draft"
 

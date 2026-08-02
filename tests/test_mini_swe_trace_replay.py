@@ -190,12 +190,12 @@ class MiniSWESpecTraceReplayTests(unittest.TestCase):
 
             draft = state.handle_request(
                 path="/v1/chat/completions",
-                headers={"X-AgentCR-Spec-Role": "draft", "X-AgentCR-Spec-Pair-Id": "pair-1"},
+                headers={"X-Crab-Spec-Role": "draft", "X-Crab-Spec-Pair-Id": "pair-1"},
                 payload={},
             )
             oracle = state.handle_request(
                 path="/v1/chat/completions",
-                headers={"X-AgentCR-Spec-Role": "oracle", "X-AgentCR-Spec-Pair-Id": "pair-1"},
+                headers={"X-Crab-Spec-Role": "oracle", "X-Crab-Spec-Pair-Id": "pair-1"},
                 payload={},
             )
             snapshot = state.snapshot()
@@ -215,7 +215,7 @@ class MiniSWESpecTraceReplayTests(unittest.TestCase):
 
             response = state.handle_request(
                 path="/v1/chat/completions",
-                headers={"X-AgentCR-Spec-Role": "draft", "X-AgentCR-Spec-Pair-Id": "pair-1"},
+                headers={"X-Crab-Spec-Role": "draft", "X-Crab-Spec-Pair-Id": "pair-1"},
                 payload={},
             )
 
@@ -245,7 +245,7 @@ class MiniSWESpecTraceReplayTests(unittest.TestCase):
 
             response = state.handle_request(
                 path="/v1/chat/completions",
-                headers={"X-AgentCR-Spec-Role": "draft", "X-AgentCR-Spec-Pair-Id": "pair-submit"},
+                headers={"X-Crab-Spec-Role": "draft", "X-Crab-Spec-Pair-Id": "pair-submit"},
                 payload={},
             )
 
@@ -262,12 +262,12 @@ class MiniSWESpecTraceReplayTests(unittest.TestCase):
 
             first_response = first.handle_request(
                 path="/v1/chat/completions",
-                headers={"X-AgentCR-Spec-Role": "draft", "X-AgentCR-Spec-Pair-Id": "pair-alpha"},
+                headers={"X-Crab-Spec-Role": "draft", "X-Crab-Spec-Pair-Id": "pair-alpha"},
                 payload={},
             )
             second_response = second.handle_request(
                 path="/v1/chat/completions",
-                headers={"X-AgentCR-Spec-Role": "draft", "X-AgentCR-Spec-Pair-Id": "pair-beta"},
+                headers={"X-Crab-Spec-Role": "draft", "X-Crab-Spec-Pair-Id": "pair-beta"},
                 payload={},
             )
 
@@ -293,12 +293,12 @@ class MiniSWESpecTraceReplayTests(unittest.TestCase):
             with patch("integrations.llm_services.mini_swe_spec_trace_replay.service.time.sleep") as sleep:
                 state.handle_request(
                     path="/v1/chat/completions",
-                    headers={"X-AgentCR-Spec-Role": "draft", "X-AgentCR-Spec-Pair-Id": "pair-1"},
+                    headers={"X-Crab-Spec-Role": "draft", "X-Crab-Spec-Pair-Id": "pair-1"},
                     payload={},
                 )
                 state.handle_request(
                     path="/v1/chat/completions",
-                    headers={"X-AgentCR-Spec-Role": "oracle", "X-AgentCR-Spec-Pair-Id": "pair-1"},
+                    headers={"X-Crab-Spec-Role": "oracle", "X-Crab-Spec-Pair-Id": "pair-1"},
                     payload={},
                 )
 
@@ -314,12 +314,12 @@ class MiniSWESpecTraceReplayTests(unittest.TestCase):
 
             source.handle_request(
                 path="/v1/chat/completions",
-                headers={"X-AgentCR-Spec-Role": "draft", "X-AgentCR-Spec-Pair-Id": "pair-1"},
+                headers={"X-Crab-Spec-Role": "draft", "X-Crab-Spec-Pair-Id": "pair-1"},
                 payload={},
             )
             source.handle_request(
                 path="/v1/chat/completions",
-                headers={"X-AgentCR-Spec-Role": "oracle", "X-AgentCR-Spec-Pair-Id": "pair-1"},
+                headers={"X-Crab-Spec-Role": "oracle", "X-Crab-Spec-Pair-Id": "pair-1"},
                 payload={},
             )
             target.import_state(source.export_state())

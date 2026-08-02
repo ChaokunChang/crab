@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from typing import Callable
 from unittest.mock import patch
 
-from agent_cr import SandboxExecResult, SandboxId
+from crab import SandboxExecResult, SandboxId
 from integrations.agents import SandboxHandle, TaskConfig, TaskDescription
 from integrations.agents.mini_swe import MiniSweAgent
 

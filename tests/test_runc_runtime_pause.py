@@ -4,8 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent_cr import RuncRuntime, RuncRuntimePaths, SandboxId
-from agent_cr.runtime.base import CommandResult, CommandRunner
+from crab import RuncRuntime, RuncRuntimePaths, SandboxId
+from crab.runtime.base import CommandResult, CommandRunner
 
 
 class _PauseFailRunner(CommandRunner):
@@ -47,7 +47,7 @@ class RuncRuntimePauseTests(unittest.TestCase):
                 state_root=root / "state",
                 bundle_root=root / "bundles",
                 metadata_root=root / "metadata",
-                zfs_dataset_prefix="pool/agent-cr",
+                zfs_dataset_prefix="pool/crab",
             ),
         )
         runtime.launch(
@@ -65,7 +65,7 @@ class RuncRuntimePauseTests(unittest.TestCase):
         paused container". The fix issues a defensive `runc resume`
         before re-raising; resume is idempotent on a thawed cgroup
         (returns "container not paused")."""
-        with tempfile.TemporaryDirectory(prefix="agent_cr_runc_pause_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_runc_pause_") as tmp:
             root = Path(tmp)
             pause_cmd = ("runc", "--root", str(root / "state"), "pause", "sbx-test")
             runner = _PauseFailRunner(
@@ -106,7 +106,7 @@ class RuncRuntimePauseTests(unittest.TestCase):
         First defensive resume call returns the same freeze-timeout;
         second call (after retry delay) succeeds. Both must appear in
         the recorded command stream."""
-        with tempfile.TemporaryDirectory(prefix="agent_cr_runc_pause_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_runc_pause_") as tmp:
             root = Path(tmp)
             pause_cmd = ("runc", "--root", str(root / "state"), "pause", "sbx-test")
             resume_cmd = ("runc", "--root", str(root / "state"), "resume", "sbx-test")
@@ -140,7 +140,7 @@ class RuncRuntimePauseTests(unittest.TestCase):
             # the retry sequence verified.
             from unittest.mock import patch
 
-            with patch("agent_cr.runtime.runc.time.sleep"):
+            with patch("crab.runtime.runc.time.sleep"):
                 with self.assertRaises(RuntimeError):
                     runtime.pause(SandboxId("sbx-test"))
 
@@ -153,7 +153,7 @@ class RuncRuntimePauseTests(unittest.TestCase):
         gone, there is nothing to thaw. The defensive resume is for
         the freeze-timeout path; on container-gone we just sync
         runtime state and re-raise."""
-        with tempfile.TemporaryDirectory(prefix="agent_cr_runc_pause_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_runc_pause_") as tmp:
             root = Path(tmp)
             pause_cmd = ("runc", "--root", str(root / "state"), "pause", "sbx-test")
             runner = _PauseFailRunner(

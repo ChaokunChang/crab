@@ -533,9 +533,9 @@ class MiniSweAgent(BaseAgent):
             },
         )
         if pair_id:
-            request.add_header("X-AgentCR-Spec-Pair-Id", pair_id)
+            request.add_header("X-Crab-Spec-Pair-Id", pair_id)
         if role:
-            request.add_header("X-AgentCR-Spec-Role", role)
+            request.add_header("X-Crab-Spec-Role", role)
         with urllib.request.urlopen(request, timeout=self._llm_request_timeout_seconds()) as response:
             payload = json.loads(response.read().decode("utf-8"))
         choices = payload.get("choices")

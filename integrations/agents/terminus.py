@@ -178,7 +178,7 @@ class _RecordedCommand:
 
 # Default tmux session geometry — matches terminal-bench's TmuxSession defaults
 # so traces authored against the original protocol see the same pane shape.
-_TMUX_SESSION_NAME = "agent-cr-terminus"
+_TMUX_SESSION_NAME = "crab-terminus"
 _TMUX_PANE_X = 160
 _TMUX_PANE_Y = 40
 _TMUX_HISTORY_LIMIT = 50000
@@ -1469,7 +1469,7 @@ class TerminusAgent(BaseAgent):
         with self._lock:
             messages = list(self._messages)
         request_payload = {
-            "model": "agent-cr-terminus-trace-replay",
+            "model": "crab-terminus-trace-replay",
             "messages": messages,
         }
         headers = {
@@ -1477,9 +1477,9 @@ class TerminusAgent(BaseAgent):
             "X-Agent-Sandbox-Id": str(self.sandbox.sandbox_id),
         }
         if pair_id:
-            headers["X-AgentCR-Spec-Pair-Id"] = pair_id
+            headers["X-Crab-Spec-Pair-Id"] = pair_id
         if role:
-            headers["X-AgentCR-Spec-Role"] = role
+            headers["X-Crab-Spec-Role"] = role
         request = urllib.request.Request(
             f"{self.llm_base_url}/chat/completions",
             data=json.dumps(request_payload).encode("utf-8"),

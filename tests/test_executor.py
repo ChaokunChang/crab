@@ -4,9 +4,9 @@ import time
 import threading
 import unittest
 
-from agent_cr import CRExecutor, ExecutorConfig, InMemoryTelemetrySink
-from agent_cr.ids import CheckpointId, JobId, SandboxId
-from agent_cr.models import (
+from crab import CRExecutor, ExecutorConfig, InMemoryTelemetrySink
+from crab.ids import CheckpointId, JobId, SandboxId
+from crab.models import (
     CheckpointJob,
     CheckpointManifest,
     CheckpointResult,

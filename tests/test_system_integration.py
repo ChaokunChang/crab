@@ -7,8 +7,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent_cr import (
-    AgentCRSystem,
+from crab import (
+    CrabSystem,
     AdapterFileSystemCWorker,
     AdapterFileSystemRWorker,
     AdapterProcessCWorker,
@@ -42,9 +42,9 @@ from agent_cr import (
     SpotPreemptionCheckpointingPolicy,
     StorageConfig,
 )
-from agent_cr.models import CheckpointManifest, JobStatus, RecoveryEvent, RecoveryRecord, utc_now
+from crab.models import CheckpointManifest, JobStatus, RecoveryEvent, RecoveryRecord, utc_now
 from integrations.llm_services.simulated.service import SimulatedLLMState, handle_request
-from agent_cr.runtime import CommandRunner
+from crab.runtime import CommandRunner
 
 RuncRuntimeAdapter = RuncRuntime
 RuncSandboxManager = RuncRuntime
@@ -140,7 +140,7 @@ class SystemIntegrationTests(unittest.TestCase):
         response_gate_registry.enable()
         sandbox_id = SandboxId("sbx-spec-group")
         telemetry = InMemoryTelemetrySink()
-        system = AgentCRSystem.__new__(AgentCRSystem)
+        system = CrabSystem.__new__(CrabSystem)
         system.request_state_store = request_store
         system.response_gate_registry = response_gate_registry
         system.extra_checkpoint_metadata_provider = None
@@ -185,7 +185,7 @@ class SystemIntegrationTests(unittest.TestCase):
             request_group_id="pair-1",
         )
 
-        metadata = AgentCRSystem._build_checkpoint_metadata(system, sandbox_id)
+        metadata = CrabSystem._build_checkpoint_metadata(system, sandbox_id)
 
         self.assertTrue(metadata["captures_inflight_llm"])
         self.assertEqual(metadata["captured_request_group_kind"], "spec_pair")
@@ -196,7 +196,7 @@ class SystemIntegrationTests(unittest.TestCase):
         response_gate_registry = SandboxResponseGateRegistry()
         response_gate_registry.enable()
         sandbox_id = SandboxId("sbx-spec-group")
-        system = AgentCRSystem.__new__(AgentCRSystem)
+        system = CrabSystem.__new__(CrabSystem)
         system.response_gate_registry = response_gate_registry
         response_gate_registry.arm(
             sandbox_id,
@@ -228,11 +228,11 @@ class SystemIntegrationTests(unittest.TestCase):
         ).with_integrity()
         system._resolve_restore_manifest = lambda _sandbox_id, _checkpoint_id: manifest
 
-        message = AgentCRSystem._validate_restore_checkpoint(system, sandbox_id, CheckpointId("ckpt-1"))
+        message = CrabSystem._validate_restore_checkpoint(system, sandbox_id, CheckpointId("ckpt-1"))
 
         self.assertIsNone(message)
 
-    def _wait_for_record(self, system: AgentCRSystem, sandbox_id: SandboxId, expected_event_type: str):
+    def _wait_for_record(self, system: CrabSystem, sandbox_id: SandboxId, expected_event_type: str):
         import time
 
         deadline = time.time() + 5.0
@@ -254,14 +254,14 @@ class SystemIntegrationTests(unittest.TestCase):
         relaunch_handler=None,
         enforce_restore_checkpoint_validation: bool = False,
         relaunch_on_restore_failure: bool = False,
-    ) -> tuple[AgentCRSystem, CRExecutor]:
+    ) -> tuple[CrabSystem, CRExecutor]:
         runtime = RuncRuntimeAdapter(
             command_runner=runner,
             paths=RuncRuntimePaths(
                 state_root=root / "runtime-state",
                 bundle_root=root / "bundles",
                 checkpoint_root=root / "checkpoints",
-                zfs_dataset_prefix="pool/agent-cr",
+                zfs_dataset_prefix="pool/crab",
             ),
         )
         storage = LocalCheckpointManager(StorageConfig(root_dir=root / "storage"))
@@ -286,7 +286,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 state_root=root / "runtime-state",
                 bundle_root=root / "bundles",
                 metadata_root=root / "sandbox-metadata",
-                zfs_dataset_prefix="pool/agent-cr",
+                zfs_dataset_prefix="pool/crab",
             ),
         )
         scheduler_cfg = SchedulerConfig(
@@ -302,7 +302,7 @@ class SystemIntegrationTests(unittest.TestCase):
             telemetry,
             FaultToleranceCheckpointingPolicy(scheduler_cfg),
         )
-        system = AgentCRSystem(
+        system = CrabSystem(
             scheduler=scheduler,
             executor=executor,
             storage=storage,
@@ -317,7 +317,7 @@ class SystemIntegrationTests(unittest.TestCase):
         return system, executor
 
     def test_recovery_workers_match_restore_workers_and_run_different_sandboxes_in_parallel(self) -> None:
-        class BlockingRecoverySystem(AgentCRSystem):
+        class BlockingRecoverySystem(CrabSystem):
             def __post_init__(self) -> None:
                 super().__post_init__()
                 self.release_event = threading.Event()
@@ -393,7 +393,7 @@ class SystemIntegrationTests(unittest.TestCase):
 
     def test_recovery_queue_wait_metric_is_emitted(self) -> None:
         telemetry = InMemoryTelemetrySink()
-        system = AgentCRSystem(
+        system = CrabSystem(
             scheduler=object(),  # type: ignore[arg-type]
             executor=MinimalExecutor(restore_workers=1),  # type: ignore[arg-type]
             storage=EmptyCheckpointManager(),  # type: ignore[arg-type]
@@ -428,7 +428,7 @@ class SystemIntegrationTests(unittest.TestCase):
         self.assertEqual(record.status, "no_checkpoint")
 
     def test_runc_system_checkpoint_restore_lifecycle(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_system_it_") as tmp:
             root = Path(tmp)
             runner = FakeCommandRunner()
             telemetry = InMemoryTelemetrySink()
@@ -439,13 +439,13 @@ class SystemIntegrationTests(unittest.TestCase):
                 state_root=root / "runtime-state",
                 bundle_root=root / "bundles",
                 checkpoint_root=root / "checkpoints",
-                zfs_dataset_prefix="pool/agent-cr",
+                zfs_dataset_prefix="pool/crab",
             )
             sandbox_paths = RuncSandboxManagerPaths(
                 state_root=root / "runtime-state",
                 bundle_root=root / "bundles",
                 metadata_root=root / "sandbox-metadata",
-                zfs_dataset_prefix="pool/agent-cr",
+                zfs_dataset_prefix="pool/crab",
             )
 
             runtime = RuncRuntimeAdapter(command_runner=runner, paths=runtime_paths)
@@ -475,7 +475,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 InMemorySchedulerStateStore(),
                 telemetry,
             )
-            system = AgentCRSystem(
+            system = CrabSystem(
                 scheduler=scheduler,
                 executor=executor,
                 storage=storage,
@@ -533,8 +533,8 @@ class SystemIntegrationTests(unittest.TestCase):
             self.assertEqual(
                 runner.commands[:5],
                 [
-                    ("zfs", "destroy", "-r", "pool/agent-cr/sbx-int"),
-                    ("zfs", "create", "-o", f"mountpoint={root / 'bundles' / 'sbx-int' / 'rootfs'}", "pool/agent-cr/sbx-int"),
+                    ("zfs", "destroy", "-r", "pool/crab/sbx-int"),
+                    ("zfs", "create", "-o", f"mountpoint={root / 'bundles' / 'sbx-int' / 'rootfs'}", "pool/crab/sbx-int"),
                     (
                         "runc",
                         "--root",
@@ -568,7 +568,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 runner.commands,
             )
             self.assertIn(
-                ("zfs", "snapshot", f"pool/agent-cr/sbx-int@{checkpoint_result.checkpoint_id}"),
+                ("zfs", "snapshot", f"pool/crab/sbx-int@{checkpoint_result.checkpoint_id}"),
                 runner.commands,
             )
             self.assertIn(
@@ -576,7 +576,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 runner.commands,
             )
             self.assertIn(
-                ("zfs", "rollback", "-r", f"pool/agent-cr/sbx-int@{checkpoint_result.checkpoint_id}"),
+                ("zfs", "rollback", "-r", f"pool/crab/sbx-int@{checkpoint_result.checkpoint_id}"),
                 runner.commands,
             )
             self.assertIn(
@@ -611,7 +611,7 @@ class SystemIntegrationTests(unittest.TestCase):
                         "TERM",
                     ),
                     ("runc", "--root", str(root / "runtime-state"), "delete", "-f", "sbx-int"),
-                    ("zfs", "destroy", "-r", "pool/agent-cr/sbx-int"),
+                    ("zfs", "destroy", "-r", "pool/crab/sbx-int"),
                 ],
             )
 
@@ -621,7 +621,7 @@ class SystemIntegrationTests(unittest.TestCase):
             executor.shutdown()
 
     def test_notify_fault_marks_sandbox_not_running_before_recovery_runs(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_system_it_") as tmp:
             root = Path(tmp)
             runner = FakeCommandRunner()
             telemetry = InMemoryTelemetrySink()
@@ -659,7 +659,7 @@ class SystemIntegrationTests(unittest.TestCase):
             executor.shutdown()
 
     def test_fault_tolerance_policy_resumes_sandbox_after_checkpoint(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_system_it_") as tmp:
             root = Path(tmp)
             runner = FakeCommandRunner()
             telemetry = InMemoryTelemetrySink()
@@ -672,7 +672,7 @@ class SystemIntegrationTests(unittest.TestCase):
                     state_root=root / "runtime-state",
                     bundle_root=root / "bundles",
                     checkpoint_root=root / "checkpoints",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
             storage = LocalCheckpointManager(StorageConfig(root_dir=root / "storage"))
@@ -697,7 +697,7 @@ class SystemIntegrationTests(unittest.TestCase):
                     state_root=root / "runtime-state",
                     bundle_root=root / "bundles",
                     metadata_root=root / "sandbox-metadata",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
             scheduler = CRScheduler(
@@ -718,7 +718,7 @@ class SystemIntegrationTests(unittest.TestCase):
                     )
                 ),
             )
-            system = AgentCRSystem(
+            system = CrabSystem(
                 scheduler=scheduler,
                 executor=executor,
                 storage=storage,
@@ -752,7 +752,7 @@ class SystemIntegrationTests(unittest.TestCase):
             executor.shutdown()
 
     def test_fault_notification_restores_latest_checkpoint(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_system_it_") as tmp:
             root = Path(tmp)
             runner = FakeCommandRunner()
             telemetry = InMemoryTelemetrySink()
@@ -766,7 +766,7 @@ class SystemIntegrationTests(unittest.TestCase):
                     state_root=root / "runtime-state",
                     bundle_root=root / "bundles",
                     checkpoint_root=root / "checkpoints",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
             storage = LocalCheckpointManager(StorageConfig(root_dir=root / "storage"))
@@ -791,7 +791,7 @@ class SystemIntegrationTests(unittest.TestCase):
                     state_root=root / "runtime-state",
                     bundle_root=root / "bundles",
                     metadata_root=root / "sandbox-metadata",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
             scheduler_cfg = SchedulerConfig(
@@ -807,7 +807,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 telemetry,
                 FaultToleranceCheckpointingPolicy(scheduler_cfg),
             )
-            system = AgentCRSystem(
+            system = CrabSystem(
                 scheduler=scheduler,
                 executor=executor,
                 storage=storage,
@@ -879,7 +879,7 @@ class SystemIntegrationTests(unittest.TestCase):
             )
 
     def test_restore_releases_buffered_response_for_matching_live_request_checkpoint(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_system_it_") as tmp:
             root = Path(tmp)
             runner = FakeCommandRunner()
             telemetry = InMemoryTelemetrySink()
@@ -917,9 +917,9 @@ class SystemIntegrationTests(unittest.TestCase):
             request_finished = threading.Event()
 
             def _run_intercept() -> None:
-                from agent_cr import AgentCRRequestInterceptor
+                from crab import CrabRequestInterceptor
 
-                interceptor = AgentCRRequestInterceptor(
+                interceptor = CrabRequestInterceptor(
                     upstream_transport=lambda path, headers, body: (
                         200,
                         [("Content-Type", "application/json")],
@@ -981,7 +981,7 @@ class SystemIntegrationTests(unittest.TestCase):
             executor.shutdown()
 
     def test_restore_validation_can_reject_invalid_live_request_checkpoint_when_enabled(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_system_it_") as tmp:
             root = Path(tmp)
             runner = FakeCommandRunner()
             telemetry = InMemoryTelemetrySink()
@@ -1039,7 +1039,7 @@ class SystemIntegrationTests(unittest.TestCase):
             executor.shutdown()
 
     def test_fault_notification_skips_stale_live_request_checkpoint_for_older_safe_checkpoint(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_system_it_") as tmp:
             root = Path(tmp)
             runner = FakeCommandRunner()
             telemetry = InMemoryTelemetrySink()
@@ -1147,7 +1147,7 @@ class SystemIntegrationTests(unittest.TestCase):
             )
 
     def test_fault_notification_relaunches_when_no_satisfiable_live_request_checkpoint_exists(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_system_it_") as tmp:
             root = Path(tmp)
             runner = FakeCommandRunner()
             telemetry = InMemoryTelemetrySink()
@@ -1222,7 +1222,7 @@ class SystemIntegrationTests(unittest.TestCase):
             self.assertFalse(any(command[3] == "restore" for command in runner.commands if len(command) > 3))
 
     def test_fault_notification_relaunches_when_restore_fails(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_system_it_") as tmp:
             root = Path(tmp)
             runner = FailingRestoreRunner()
             telemetry = InMemoryTelemetrySink()
@@ -1238,7 +1238,7 @@ class SystemIntegrationTests(unittest.TestCase):
                     state_root=root / "runtime-state",
                     bundle_root=root / "bundles",
                     checkpoint_root=root / "checkpoints",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
             storage = LocalCheckpointManager(StorageConfig(root_dir=root / "storage"))
@@ -1263,7 +1263,7 @@ class SystemIntegrationTests(unittest.TestCase):
                     state_root=root / "runtime-state",
                     bundle_root=root / "bundles",
                     metadata_root=root / "sandbox-metadata",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
             scheduler_cfg = SchedulerConfig(
@@ -1279,7 +1279,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 telemetry,
                 FaultToleranceCheckpointingPolicy(scheduler_cfg),
             )
-            system = AgentCRSystem(
+            system = CrabSystem(
                 scheduler=scheduler,
                 executor=executor,
                 storage=storage,
@@ -1343,7 +1343,7 @@ class SystemIntegrationTests(unittest.TestCase):
         # failure during recovery must NOT silently fall through to
         # relaunch_handler. The system instead records a failed recovery and
         # leaves relaunch_handler untouched, so latent bugs surface loudly.
-        with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_system_it_") as tmp:
             root = Path(tmp)
             runner = FailingRestoreRunner()
             telemetry = InMemoryTelemetrySink()
@@ -1358,7 +1358,7 @@ class SystemIntegrationTests(unittest.TestCase):
                     state_root=root / "runtime-state",
                     bundle_root=root / "bundles",
                     checkpoint_root=root / "checkpoints",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
             storage = LocalCheckpointManager(StorageConfig(root_dir=root / "storage"))
@@ -1383,7 +1383,7 @@ class SystemIntegrationTests(unittest.TestCase):
                     state_root=root / "runtime-state",
                     bundle_root=root / "bundles",
                     metadata_root=root / "sandbox-metadata",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
             scheduler_cfg = SchedulerConfig(
@@ -1399,7 +1399,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 telemetry,
                 FaultToleranceCheckpointingPolicy(scheduler_cfg),
             )
-            system = AgentCRSystem(
+            system = CrabSystem(
                 scheduler=scheduler,
                 executor=executor,
                 storage=storage,
@@ -1456,7 +1456,7 @@ class SystemIntegrationTests(unittest.TestCase):
             self.assertEqual(relaunched, [])
 
     def test_restore_once_fails_when_runtime_does_not_come_back(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_system_it_") as tmp:
             root = Path(tmp)
             runner = RestoreMissingRuntimeRunner()
             telemetry = InMemoryTelemetrySink()
@@ -1506,7 +1506,7 @@ class SystemIntegrationTests(unittest.TestCase):
                     self._events.append("restore_command")
                 return super().run(command, cwd=cwd, timeout_seconds=timeout_seconds)
 
-        with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_system_it_") as tmp:
             root = Path(tmp)
             events: list[str] = []
             runner = RestoreOrderingRunner(events)
@@ -1552,7 +1552,7 @@ class SystemIntegrationTests(unittest.TestCase):
             self.assertLess(events.index(next(event for event in events if event.startswith("restore_metadata:"))), events.index("restore_command"))
 
     def test_preemption_notification_checkpoints_then_restores(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_system_it_") as tmp:
             root = Path(tmp)
             runner = FakeCommandRunner()
             telemetry = InMemoryTelemetrySink()
@@ -1565,7 +1565,7 @@ class SystemIntegrationTests(unittest.TestCase):
                     state_root=root / "runtime-state",
                     bundle_root=root / "bundles",
                     checkpoint_root=root / "checkpoints",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
             storage = LocalCheckpointManager(StorageConfig(root_dir=root / "storage"))
@@ -1590,7 +1590,7 @@ class SystemIntegrationTests(unittest.TestCase):
                     state_root=root / "runtime-state",
                     bundle_root=root / "bundles",
                     metadata_root=root / "sandbox-metadata",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
             scheduler_cfg = SchedulerConfig(
@@ -1606,7 +1606,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 telemetry,
                 SpotPreemptionCheckpointingPolicy(scheduler_cfg),
             )
-            system = AgentCRSystem(
+            system = CrabSystem(
                 scheduler=scheduler,
                 executor=executor,
                 storage=storage,
@@ -1645,7 +1645,7 @@ class SystemIntegrationTests(unittest.TestCase):
             self.assertTrue(any(command[3] == "restore" for command in runner.commands if len(command) > 3))
 
     def test_preemption_reuses_recent_checkpoint_without_duplicate_pause(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_system_it_") as tmp:
             root = Path(tmp)
             runner = FakeCommandRunner()
             telemetry = InMemoryTelemetrySink()
@@ -1658,7 +1658,7 @@ class SystemIntegrationTests(unittest.TestCase):
                     state_root=root / "runtime-state",
                     bundle_root=root / "bundles",
                     checkpoint_root=root / "checkpoints",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
             storage = LocalCheckpointManager(StorageConfig(root_dir=root / "storage"))
@@ -1683,7 +1683,7 @@ class SystemIntegrationTests(unittest.TestCase):
                     state_root=root / "runtime-state",
                     bundle_root=root / "bundles",
                     metadata_root=root / "sandbox-metadata",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
             scheduler_cfg = SchedulerConfig(
@@ -1699,7 +1699,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 telemetry,
                 SpotPreemptionCheckpointingPolicy(scheduler_cfg),
             )
-            system = AgentCRSystem(
+            system = CrabSystem(
                 scheduler=scheduler,
                 executor=executor,
                 storage=storage,
@@ -1756,7 +1756,7 @@ class SystemIntegrationTests(unittest.TestCase):
             self.assertEqual(len(restore_commands), 1)
 
     def test_preemption_notification_restores_with_delete_after_restore_storage_policy(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_system_it_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_system_it_") as tmp:
             root = Path(tmp)
             runner = FakeCommandRunner()
             telemetry = InMemoryTelemetrySink()
@@ -1769,7 +1769,7 @@ class SystemIntegrationTests(unittest.TestCase):
                     state_root=root / "runtime-state",
                     bundle_root=root / "bundles",
                     checkpoint_root=root / "checkpoints",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
             storage = DeleteAfterRestoreCheckpointManager(
@@ -1796,7 +1796,7 @@ class SystemIntegrationTests(unittest.TestCase):
                     state_root=root / "runtime-state",
                     bundle_root=root / "bundles",
                     metadata_root=root / "sandbox-metadata",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
             scheduler_cfg = SchedulerConfig(
@@ -1812,7 +1812,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 telemetry,
                 SpotPreemptionCheckpointingPolicy(scheduler_cfg),
             )
-            system = AgentCRSystem(
+            system = CrabSystem(
                 scheduler=scheduler,
                 executor=executor,
                 storage=storage,
@@ -1853,7 +1853,7 @@ class SystemIntegrationTests(unittest.TestCase):
 
 class QuiesceForVerificationTests(unittest.TestCase):
     def _build_system(self, *, paused: bool, active_job_counts: list[int]):
-        from agent_cr.models import SandboxDescription
+        from crab.models import SandboxDescription
 
         sandbox_id = SandboxId("sbx-quiesce")
 
@@ -1897,7 +1897,7 @@ class QuiesceForVerificationTests(unittest.TestCase):
             def sync_runtime_state(self, sid: SandboxId, *, is_running: bool) -> None:
                 self.sync_calls.append((sid, is_running))
 
-        system = AgentCRSystem.__new__(AgentCRSystem)
+        system = CrabSystem.__new__(CrabSystem)
         system.scheduler = FakeScheduler()
         system.executor = FakeExecutor(active_job_counts)
         system.runtime = FakeRuntime(is_paused=paused)

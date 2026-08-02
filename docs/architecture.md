@@ -1,4 +1,4 @@
-# Agent-CR Architecture
+# Crab Architecture
 
 This document describes the code paths that exist in the current repository, not the earlier design snapshots.
 
@@ -6,7 +6,7 @@ This document describes the code paths that exist in the current repository, not
 
 ```mermaid
 flowchart TD
-    Client[Client / Benchmark Harness] --> System[AgentCRSystem]
+    Client[Client / Benchmark Harness] --> System[CrabSystem]
 
     System --> Scheduler[CRScheduler]
     System --> Executor[CRExecutor]
@@ -59,18 +59,18 @@ flowchart TD
 
 The request-aware flow is built from these pieces:
 
-- `AgentCRRequestInterceptor` or `AgentCRRequestInterceptorServer`
+- `CrabRequestInterceptor` or `CrabRequestInterceptorServer`
 - `InMemoryRequestStateStore`
 - `SandboxResponseGateRegistry`
 - `RequestAwareSandboxInspector`
-- `AgentCRSystem.start()`
+- `CrabSystem.start()`
 
 Flow:
 
 1. The interceptor sees an outbound LLM request from a sandbox.
 2. It records request state in `InMemoryRequestStateStore`.
 3. If response gating is enabled for that request, it arms `SandboxResponseGateRegistry` with the sandbox ID, request ID, and a monotonically increasing request generation.
-4. The interceptor notifies `AgentCRSystem.notify_interceptor_state_change(...)`.
+4. The interceptor notifies `CrabSystem.notify_interceptor_state_change(...)`.
 5. The system monitor loop coordinates pending gated requests for that sandbox generation by generation and keeps looping until no pending request remains.
 6. `_execute_checkpoint_flow(...)` asks `CRScheduler` whether a checkpoint should run for the current pending request generation.
 7. If a checkpoint runs while the request is still in flight and the pending gate matches, `_build_checkpoint_metadata(...)` stores live-request metadata in the checkpoint manifest, including the request generation.
@@ -161,7 +161,7 @@ Manifest resolution is important because restore may depend on artifacts from ea
 
 ## Recovery Loop
 
-`AgentCRSystem.start()` launches a recovery thread that consumes queued `RecoveryEvent` records.
+`CrabSystem.start()` launches a recovery thread that consumes queued `RecoveryEvent` records.
 
 ### Fault recovery
 
@@ -205,7 +205,7 @@ Checkpoint manifests include runtime metadata, artifact references, and an integ
 
 ## Benchmark Harness
 
-The real-host benchmarks share `RealHostScenarioHarness` in [benchmarks/real_host_scenario_base.py](/root/workspace/agent-cr/benchmarks/real_host_scenario_base.py).
+The real-host benchmarks share `RealHostScenarioHarness` in [benchmarks/real_host_scenario_base.py](/root/workspace/crab/benchmarks/real_host_scenario_base.py).
 
 That harness:
 
@@ -215,7 +215,7 @@ That harness:
 - Reuses shared rootfs base datasets and clones ZFS snapshots into sandbox datasets when benchmark rootfs reuse is enabled
 - Launches `runc` sandboxes through an explicit phased pipeline
 - Runs an interceptor server in front of the benchmark LLM router over HTTP on `localhost`
-- Wires `AgentCRSystem` with policy-specific retention and recovery settings
+- Wires `CrabSystem` with policy-specific retention and recovery settings
 - Exposes helpers for checkpoint, restore, fault injection, preemption injection, and checkpoint cloning for tree-search fan-out
 
 The benchmark LLM router can run in either:
@@ -245,9 +245,9 @@ At the `run → verification` handoff, the harness calls `CRScheduler.deactivate
 
 The main benchmark entrypoints and configuration surface are:
 
-- [benchmarks/run.py](/root/workspace/agent-cr/benchmarks/run.py)
-- [benchmarks/config.py](/root/workspace/agent-cr/benchmarks/config.py)
-- [benchmarks/scenarios/fault.py](/root/workspace/agent-cr/benchmarks/scenarios/fault.py)
-- [benchmarks/scenarios/spot.py](/root/workspace/agent-cr/benchmarks/scenarios/spot.py)
-- [benchmarks/scenarios/tree.py](/root/workspace/agent-cr/benchmarks/scenarios/tree.py)
-- [benchmarks/scenarios/e2e.py](/root/workspace/agent-cr/benchmarks/scenarios/e2e.py)
+- [benchmarks/run.py](/root/workspace/crab/benchmarks/run.py)
+- [benchmarks/config.py](/root/workspace/crab/benchmarks/config.py)
+- [benchmarks/scenarios/fault.py](/root/workspace/crab/benchmarks/scenarios/fault.py)
+- [benchmarks/scenarios/spot.py](/root/workspace/crab/benchmarks/scenarios/spot.py)
+- [benchmarks/scenarios/tree.py](/root/workspace/crab/benchmarks/scenarios/tree.py)
+- [benchmarks/scenarios/e2e.py](/root/workspace/crab/benchmarks/scenarios/e2e.py)

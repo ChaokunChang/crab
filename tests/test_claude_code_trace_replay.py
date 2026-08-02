@@ -500,7 +500,7 @@ class ClaudeCodeTraceReplayTests(unittest.TestCase):
 
         normalized = _normalize_runtime_specific_bash_command(command)
 
-        self.assertIn("agent_cr_retry_apt_command", normalized)
+        self.assertIn("crab_retry_apt_command", normalized)
         self.assertIn("wait_for_apt_lock()", normalized)
         self.assertIn(command, normalized)
 

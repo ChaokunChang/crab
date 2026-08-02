@@ -3,15 +3,15 @@ mode: auto
 provider: openai
 agent: iflow
 llm_service: iflow_trace_replay
-task_dataset: /root/workspace/agent-cr/results/datasets/termnius_iflow_replay_nginx.jsonl
+task_dataset: /root/workspace/crab/results/datasets/termnius_iflow_replay_nginx.jsonl
 sandboxes: 1
 max_workers: 10
 iterations: 30
 output: ../../logs/iflow.fault.auto.nginx.morefault.debug.3.csv
 log_file: ../../logs/iflow.fault.auto.nginx.morefault.debug.3.log
 zpool_size: 64G
-zpool_name: agentcrbench-debug-morefault
-zpool_image: /root/workspace/agent-cr/data/agent_cr/results/zpool/agentcrbench-debug-morefault.zpool.img
+zpool_name: crabbench-debug-morefault
+zpool_image: /root/workspace/crab/data/crab/results/zpool/crabbench-debug-morefault.zpool.img
 reuse_zpool: true
 log_level: debug
 scenario_options:

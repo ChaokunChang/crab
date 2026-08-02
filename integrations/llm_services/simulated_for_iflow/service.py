@@ -14,7 +14,7 @@ from typing import Any
 DEFAULT_RESPONSE_DELAY_MS = 2000
 DEFAULT_MAX_TOOL_CALLS_BEFORE_FINISH = 3
 
-_MODEL_NAME = "agent-cr-iflow-simulated"
+_MODEL_NAME = "crab-iflow-simulated"
 _FINAL_RESPONSE_STEP = {
     "phase": "final_response",
     "content": "Done.",

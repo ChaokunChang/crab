@@ -8,14 +8,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_cr import RuncRuntime, RuncRuntimePaths, SandboxId
-from agent_cr.models import SandboxDescription
-from agent_cr.runtime.runc import _repair_postfix_rootfs_permissions
+from crab import RuncRuntime, RuncRuntimePaths, SandboxId
+from crab.models import SandboxDescription
+from crab.runtime.runc import _repair_postfix_rootfs_permissions
 
 
 class RuncRuntimePrepareTests(unittest.TestCase):
     def test_repair_postfix_rootfs_permissions_normalizes_queue_owners(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_runc_prepare_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_runc_prepare_") as tmp:
             root = Path(tmp)
             (root / "etc").mkdir(parents=True, exist_ok=True)
             (root / "var" / "spool" / "postfix").mkdir(parents=True, exist_ok=True)
@@ -55,7 +55,7 @@ class RuncRuntimePrepareTests(unittest.TestCase):
             self.assertEqual((root / "var" / "spool" / "postfix" / "restart").stat().st_mode & 0o7777, 0o644)
 
     def test_persist_uses_unique_temp_paths_for_concurrent_metadata_updates(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_runc_prepare_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_runc_prepare_") as tmp:
             root = Path(tmp)
             runtime = RuncRuntime(
                 paths=RuncRuntimePaths(
@@ -63,7 +63,7 @@ class RuncRuntimePrepareTests(unittest.TestCase):
                     bundle_root=root / "bundles",
                     checkpoint_root=root / "checkpoints",
                     metadata_root=root / "metadata",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 )
             )
             sandbox_id = SandboxId("sbx-test")

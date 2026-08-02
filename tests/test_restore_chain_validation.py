@@ -5,16 +5,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent_cr.config import StorageConfig
-from agent_cr.ids import CheckpointId, SandboxId
-from agent_cr.models import (
+from crab.config import StorageConfig
+from crab.ids import CheckpointId, SandboxId
+from crab.models import (
     CheckpointManifest,
     MANIFEST_SCHEMA_VERSION,
     RuntimeCapabilities,
     utc_now,
 )
-from agent_cr.storage.local import LocalCheckpointManager
-from agent_cr.workers.composite import _validate_incremental_chain
+from crab.storage.local import LocalCheckpointManager
+from crab.workers.composite import _validate_incremental_chain
 
 
 class _StubRuntime:

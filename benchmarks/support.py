@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from agent_cr import CheckpointId, CheckpointManifest
+from crab import CheckpointId, CheckpointManifest
 from integrations.agents import TaskConfig, TaskDescription
 
 

@@ -187,8 +187,8 @@ class BenchmarkLLMRouterTests(unittest.TestCase):
                 path="/v1/chat/completions",
                 headers={
                     "X-Agent-Sandbox-Id": "sbx-src",
-                    "X-AgentCR-Spec-Role": "draft",
-                    "X-AgentCR-Spec-Pair-Id": "pair-1",
+                    "X-Crab-Spec-Role": "draft",
+                    "X-Crab-Spec-Pair-Id": "pair-1",
                 },
                 payload={"messages": []},
             )
@@ -196,8 +196,8 @@ class BenchmarkLLMRouterTests(unittest.TestCase):
                 path="/v1/chat/completions",
                 headers={
                     "X-Agent-Sandbox-Id": "sbx-src",
-                    "X-AgentCR-Spec-Role": "oracle",
-                    "X-AgentCR-Spec-Pair-Id": "pair-1",
+                    "X-Crab-Spec-Role": "oracle",
+                    "X-Crab-Spec-Pair-Id": "pair-1",
                 },
                 payload={"messages": []},
             )

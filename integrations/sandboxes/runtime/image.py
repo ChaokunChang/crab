@@ -11,8 +11,8 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from agent_cr.contracts import TelemetrySink
-from agent_cr.telemetry import NoopTelemetrySink
+from crab.contracts import TelemetrySink
+from crab.telemetry import NoopTelemetrySink
 
 
 @dataclass(frozen=True)

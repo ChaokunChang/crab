@@ -15,7 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from agent_cr import (
+from crab import (
     ArtifactKind,
     ArtifactReference,
     CheckpointId,
@@ -36,7 +36,7 @@ from benchmarks.config import BenchmarkConfig
 from benchmarks.core import benchmark_phase_map, benchmark_setup_run_pipeline, emit_benchmark_phase_skipped
 from benchmarks.scenarios.common import finalize_replay_row
 from benchmarks.scenarios.e2e import run_manual as run_e2e_manual
-from agent_cr.models import utc_now
+from crab.models import utc_now
 from benchmarks.scenarios.tree import choose_replay_steps
 from benchmarks.support import (
     BenchmarkTaskRecord,
@@ -152,7 +152,7 @@ class BenchmarkHelperTests(unittest.TestCase):
             benchmark_run_name="run-a",
         )
 
-        with patch.dict(os.environ, {"AGENTCR_BENCH_DIR": "tmp"}):
+        with patch.dict(os.environ, {"CRAB_BENCH_DIR": "tmp"}):
             with self.assertRaisesRegex(ValueError, "benchmark_run_name requires"):
                 harness._resolve_benchmark_run_root()
 
@@ -493,11 +493,11 @@ class BenchmarkHelperTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][0][:2], ["/bin/bash", "-lc"])
         self.assertIn("$HOME/.local/bin/uv", calls[0][0][2])
-        self.assertIn("$HOME/.local/agent-cr-verification/bin", calls[0][0][2])
+        self.assertIn("$HOME/.local/crab-verification/bin", calls[0][0][2])
         self.assertAlmostEqual(float(calls[0][1]["timeout_s"]), 120.0, places=2)
         self.assertEqual(calls[1][0], ["/bin/bash", "-lc", "bash /tests/run-tests.sh"])
         self.assertEqual(calls[1][1]["env"]["TEST_DIR"], "/tests")
-        self.assertIn("/root/.local/agent-cr-verification/bin", calls[1][1]["env"]["PATH"])
+        self.assertIn("/root/.local/crab-verification/bin", calls[1][1]["env"]["PATH"])
         self.assertEqual(calls[1][1]["timeout_s"], 120.0)
         self.assertEqual(verification["verification_status"], "passed")
 
@@ -598,8 +598,8 @@ class BenchmarkHelperTests(unittest.TestCase):
         calls: list[list[str]] = []
         with tempfile.TemporaryDirectory() as tmpdir:
             venv_root = Path(tmpdir) / "venv"
-            (venv_root / ".agent_cr_fake_venv").parent.mkdir(parents=True, exist_ok=True)
-            (venv_root / ".agent_cr_fake_venv").write_text("", encoding="utf-8")
+            (venv_root / ".crab_fake_venv").parent.mkdir(parents=True, exist_ok=True)
+            (venv_root / ".crab_fake_venv").write_text("", encoding="utf-8")
             with patch.dict(os.environ, {"VIRTUAL_ENV": str(venv_root)}, clear=False):
                 with patch.object(namespace["shutil"], "which", return_value="/tmp/pytest"):
                     with patch.object(namespace["subprocess"], "call") as call_mock:
@@ -770,7 +770,7 @@ class BenchmarkHelperTests(unittest.TestCase):
             run.call_args_list,
             [
                 unittest.mock.call(
-                    ["zfs", "destroy", "-r", "benchpool/agent-cr"],
+                    ["zfs", "destroy", "-r", "benchpool/crab"],
                     check=False,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
@@ -1232,7 +1232,7 @@ class BenchmarkHelperTests(unittest.TestCase):
         )
         self.assertEqual(
             harness._sandbox_image_tag("simulated"),
-            "agent-cr-simulated-bench:workspace",
+            "crab-simulated-bench:workspace",
         )
 
     def test_compose_build_tag_is_stable_for_same_definition(self) -> None:
@@ -1358,12 +1358,12 @@ class BenchmarkHelperTests(unittest.TestCase):
                 provider="openai",
                 sandbox_name="sandbox-1",
                 status_port=9001,
-                cgroup_path="agent-cr/test/sandbox-1",
+                cgroup_path="crab/test/sandbox-1",
                 work_dir_host_path=work_dir_host_path,
             )
 
             payload = json.loads(config_path.read_text(encoding="utf-8"))
-            self.assertIn("AGENT_CR_LLM_BASE_URL=http://127.0.0.1:9000/v1", payload["process"]["env"])
+            self.assertIn("CRAB_LLM_BASE_URL=http://127.0.0.1:9000/v1", payload["process"]["env"])
             work_mounts = [mount for mount in payload["mounts"] if mount["destination"] == "/work"]
             self.assertEqual(
                 work_mounts,
@@ -1406,7 +1406,7 @@ class BenchmarkHelperTests(unittest.TestCase):
                 provider="openai",
                 sandbox_name="sandbox-1",
                 status_port=9001,
-                cgroup_path="agent-cr/test/sandbox-1",
+                cgroup_path="crab/test/sandbox-1",
                 image_defaults=ImageRuntimeDefaults(
                     environment=("IMAGE_ONLY=1", "PATH=/image/bin"),
                     working_dir="/app",
@@ -1443,7 +1443,7 @@ class BenchmarkHelperTests(unittest.TestCase):
                 provider="openai",
                 sandbox_name="sandbox-rl",
                 status_port=9001,
-                cgroup_path="agent-cr/test/sandbox-rl",
+                cgroup_path="crab/test/sandbox-rl",
                 resource_limits=sandbox_bundle.SandboxResourceLimits(
                     cpus=4,
                     memory_bytes=2 * 1024 * 1024 * 1024,
@@ -1512,7 +1512,7 @@ class BenchmarkHelperTests(unittest.TestCase):
                 provider="openai",
                 sandbox_name="sandbox-no-rl",
                 status_port=9001,
-                cgroup_path="agent-cr/test/sandbox-no-rl",
+                cgroup_path="crab/test/sandbox-no-rl",
             )
 
             payload = json.loads(config_path.read_text(encoding="utf-8"))
@@ -1558,7 +1558,7 @@ class BenchmarkHelperTests(unittest.TestCase):
     def test_benchmark_network_manager_configure_accepts_large_env_override(self) -> None:
         manager = sandbox_network.BenchmarkNetworkManager()
 
-        with patch.dict("os.environ", {"AGENT_CR_BENCHMARK_NETWORK_CIDR": "10.250.8.0/22"}, clear=False):
+        with patch.dict("os.environ", {"CRAB_BENCHMARK_NETWORK_CIDR": "10.250.8.0/22"}, clear=False):
             manager.configure(expected_sandboxes=640)
 
         self.assertEqual(manager.network_cidr, "10.250.8.0/22")
@@ -1571,7 +1571,7 @@ class BenchmarkHelperTests(unittest.TestCase):
     def test_benchmark_network_manager_configure_rejects_small_env_override(self) -> None:
         manager = sandbox_network.BenchmarkNetworkManager()
 
-        with patch.dict("os.environ", {"AGENT_CR_BENCHMARK_NETWORK_CIDR": "10.250.8.0/24"}, clear=False):
+        with patch.dict("os.environ", {"CRAB_BENCHMARK_NETWORK_CIDR": "10.250.8.0/24"}, clear=False):
             with self.assertRaisesRegex(ValueError, "supports at most 253 guest sandboxes, need 640"):
                 manager.configure(expected_sandboxes=640)
 
@@ -2048,7 +2048,7 @@ class BenchmarkHelperTests(unittest.TestCase):
             describe=lambda sandbox_id: SimpleNamespace(
                 metadata={
                     "sandbox_id": str(sandbox.sandbox_id),
-                    "zfs_dataset": "pool/agent-cr/sbx-relaunch-preserve-fs",
+                    "zfs_dataset": "pool/crab/sbx-relaunch-preserve-fs",
                     "bundle_path": "/tmp/bundle",
                 }
             ),
@@ -2074,8 +2074,8 @@ class BenchmarkHelperTests(unittest.TestCase):
         destroy_dataset.assert_not_called()
         runtime_launch.assert_called_once()
         launch_metadata = runtime_launch.call_args.args[1]
-        self.assertTrue(launch_metadata["_agent_cr_runtime_reuse_existing_rootfs"])
-        self.assertEqual(launch_metadata["zfs_dataset"], "pool/agent-cr/sbx-relaunch-preserve-fs")
+        self.assertTrue(launch_metadata["_crab_runtime_reuse_existing_rootfs"])
+        self.assertEqual(launch_metadata["zfs_dataset"], "pool/crab/sbx-relaunch-preserve-fs")
 
     def test_harness_exit_requests_stop_for_running_tasks(self) -> None:
         harness = RealHostScenarioHarness(
@@ -2130,7 +2130,7 @@ class BenchmarkHelperTests(unittest.TestCase):
             checkpoint_manager_factory=lambda base: base,
             max_workers=1,
         )
-        harness.root = Path(tempfile.mkdtemp(prefix="agent_cr_compose_test_"))
+        harness.root = Path(tempfile.mkdtemp(prefix="crab_compose_test_"))
         harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())
         launch_mock = Mock()
         harness.system = SimpleNamespace(sandbox_manager=SimpleNamespace(launch=launch_mock))
@@ -2195,7 +2195,7 @@ services:
             checkpoint_manager_factory=lambda base: base,
             max_workers=1,
         )
-        harness.root = Path(tempfile.mkdtemp(prefix="agent_cr_compose_termnius_test_"))
+        harness.root = Path(tempfile.mkdtemp(prefix="crab_compose_termnius_test_"))
         harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())
         launch_mock = Mock()
         harness.system = SimpleNamespace(sandbox_manager=SimpleNamespace(launch=launch_mock))
@@ -2271,7 +2271,7 @@ services:
             checkpoint_manager_factory=lambda base: base,
             max_workers=1,
         )
-        harness.root = Path(tempfile.mkdtemp(prefix="agent_cr_compose_defaults_test_"))
+        harness.root = Path(tempfile.mkdtemp(prefix="crab_compose_defaults_test_"))
         harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())
         launch_mock = Mock()
         harness.system = SimpleNamespace(sandbox_manager=SimpleNamespace(launch=launch_mock))
@@ -2347,7 +2347,7 @@ services:
             checkpoint_manager_factory=lambda base: base,
             max_workers=1,
         )
-        harness.root = Path(tempfile.mkdtemp(prefix="agent_cr_launch_defaults_test_"))
+        harness.root = Path(tempfile.mkdtemp(prefix="crab_launch_defaults_test_"))
         harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())
         harness.system = SimpleNamespace(sandbox_manager=SimpleNamespace(launch=Mock()))
         harness.interceptor = SimpleNamespace(port=43123)
@@ -2393,7 +2393,7 @@ services:
                 provider="openai",
                 sandbox_name="sbx-launch-defaults",
                 status_port=8123,
-                cgroup_path="agent-cr/test/sbx-launch-defaults",
+                cgroup_path="crab/test/sbx-launch-defaults",
                 image_defaults=kwargs["image_defaults"],
                 image_rootfs_dir=kwargs["image_rootfs_dir"],
             )
@@ -2428,7 +2428,7 @@ services:
             checkpoint_manager_factory=lambda base: base,
             max_workers=1,
         )
-        harness.root = Path(tempfile.mkdtemp(prefix="agent_cr_launch_test_"))
+        harness.root = Path(tempfile.mkdtemp(prefix="crab_launch_test_"))
         harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())
         harness.system = SimpleNamespace(sandbox_manager=SimpleNamespace(launch=Mock()))
         harness.interceptor = SimpleNamespace(port=43123)
@@ -2502,7 +2502,7 @@ services:
         results: list[object] = []
         start_barrier = threading.Barrier(3)
 
-        with tempfile.TemporaryDirectory(prefix="agent_cr_image_lock_test_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_image_lock_test_") as tmp:
             harness.root = Path(tmp)
             exported_rootfs = harness.root / "image" / "simulated" / "rootfs"
             exported_rootfs.mkdir(parents=True, exist_ok=True)
@@ -2553,7 +2553,7 @@ services:
             checkpoint_manager_factory=lambda base: base,
             max_workers=1,
         )
-        harness.root = Path(tempfile.mkdtemp(prefix="agent_cr_handle_test_"))
+        harness.root = Path(tempfile.mkdtemp(prefix="crab_handle_test_"))
         harness.interceptor = SimpleNamespace(port=43123)
         harness.sandbox_manager = SimpleNamespace(write_bundle_spec=Mock())
         register_sandbox = Mock()
@@ -2665,7 +2665,7 @@ services:
             checkpoint_manager_factory=lambda base: base,
             max_workers=1,
         )
-        harness.root = Path(tempfile.mkdtemp(prefix="agent_cr_launch_test_"))
+        harness.root = Path(tempfile.mkdtemp(prefix="crab_launch_test_"))
         harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())
         harness.system = SimpleNamespace(sandbox_manager=SimpleNamespace(launch=Mock()))
         harness.interceptor = SimpleNamespace(port=43123)
@@ -2758,7 +2758,7 @@ services:
             max_workers=1,
             reuse_zpool=True,
         )
-        harness.root = Path(tempfile.mkdtemp(prefix="agent_cr_prepare_compose_test_"))
+        harness.root = Path(tempfile.mkdtemp(prefix="crab_prepare_compose_test_"))
         harness.image_cache_root = harness.root / "images"
         harness.image_cache_root.mkdir(parents=True, exist_ok=True)
         harness._compose_image_tags = set()
@@ -2997,9 +2997,9 @@ services:
             payload = json.loads(config_path.read_text(encoding="utf-8"))
             self.assertEqual(payload["process"]["cwd"], "/app")
             self.assertEqual(payload["process"]["args"][:2], ["/bin/sh", "-lc"])
-            self.assertIn("export AGENT_CR_IFLOW_ENTRYPOINT=/opt/iflow-runtime/global/lib/node_modules/@iflow-ai/iflow-cli/bundle/entry.js", payload["process"]["args"][2])
-            self.assertIn("export AGENT_CR_IFLOW_CWD=/app", payload["process"]["args"][2])
-            self.assertIn("export AGENT_CR_IFLOW_KEEPALIVE_AFTER_TASK=true", payload["process"]["args"][2])
+            self.assertIn("export CRAB_IFLOW_ENTRYPOINT=/opt/iflow-runtime/global/lib/node_modules/@iflow-ai/iflow-cli/bundle/entry.js", payload["process"]["args"][2])
+            self.assertIn("export CRAB_IFLOW_CWD=/app", payload["process"]["args"][2])
+            self.assertIn("export CRAB_IFLOW_KEEPALIVE_AFTER_TASK=true", payload["process"]["args"][2])
             self.assertIn("cd /app", payload["process"]["args"][2])
             self.assertIn("if [ -f /installed-agent/setup-env.sh ]; then . /installed-agent/setup-env.sh; fi", payload["process"]["args"][2])
             self.assertIn(
@@ -3625,8 +3625,8 @@ services:
         harness.sandbox_manager = SimpleNamespace(
             _items={},
             _persist=Mock(),
-            dataset_name_for=lambda sandbox_id: f"pool/agent-cr/{sandbox_id}",
-            clone_filesystem_snapshot=Mock(return_value="pool/agent-cr/sbx-fork"),
+            dataset_name_for=lambda sandbox_id: f"pool/crab/{sandbox_id}",
+            clone_filesystem_snapshot=Mock(return_value="pool/crab/sbx-fork"),
         )
         harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())
         harness.storage = SimpleNamespace(
@@ -3691,11 +3691,11 @@ services:
         harness.root = Path("/tmp")
         persisted_descriptions: list[object] = []
         harness.runtime = object()
-        clone_snapshot = Mock(return_value="pool/agent-cr/sbx-fork")
+        clone_snapshot = Mock(return_value="pool/crab/sbx-fork")
         harness.sandbox_manager = SimpleNamespace(
             _items={},
             _persist=lambda description: persisted_descriptions.append(description),
-            dataset_name_for=lambda sandbox_id: f"pool/agent-cr/{sandbox_id}",
+            dataset_name_for=lambda sandbox_id: f"pool/crab/{sandbox_id}",
             clone_filesystem_snapshot=clone_snapshot,
         )
         harness.base_inspector = SimpleNamespace(upsert_snapshot=Mock())

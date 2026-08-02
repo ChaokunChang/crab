@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_cr import (
+from crab import (
     AdapterFileSystemCWorker,
     AdapterFileSystemRWorker,
     AdapterProcessCWorker,
@@ -40,8 +40,8 @@ from agent_cr import (
     SandboxSnapshot,
     StorageConfig,
 )
-from agent_cr.models import CheckpointManifest, RuntimeOperationStatus, WorkerStepResult, utc_now
-from agent_cr.runtime import CommandRunner
+from crab.models import CheckpointManifest, RuntimeOperationStatus, WorkerStepResult, utc_now
+from crab.runtime import CommandRunner
 
 DockerRuntimeAdapter = InMemoryRuntime
 RuncRuntimeAdapter = RuncRuntime
@@ -253,14 +253,14 @@ class ContractTests(unittest.TestCase):
             > 0
         )
 
-        with tempfile.TemporaryDirectory(prefix="agent_cr_runtime_contract_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_runtime_contract_") as tmp:
             adapter = RuncRuntimeAdapter(
                 command_runner=FakeCommandRunner(),
                 paths=RuncRuntimePaths(
                     state_root=Path(tmp) / "state",
                     bundle_root=Path(tmp) / "bundles",
                     checkpoint_root=Path(tmp) / "checkpoints",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
             self.assertIsInstance(adapter, SandboxRuntimeAdapter)
@@ -276,7 +276,7 @@ class ContractTests(unittest.TestCase):
             )
 
     def test_runc_runtime_uses_default_optional_checkpoint_and_restore_args(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_runtime_contract_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_runtime_contract_") as tmp:
             base = Path(tmp)
             runner = FakeCommandRunner()
             adapter = RuncRuntimeAdapter(
@@ -285,7 +285,7 @@ class ContractTests(unittest.TestCase):
                     state_root=base / "state",
                     bundle_root=base / "bundles",
                     checkpoint_root=base / "checkpoints",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
 
@@ -333,7 +333,7 @@ class ContractTests(unittest.TestCase):
             )
 
     def test_runc_runtime_options_allow_overriding_optional_args(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_runtime_contract_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_runtime_contract_") as tmp:
             base = Path(tmp)
             runner = FakeCommandRunner()
             adapter = RuncRuntimeAdapter(
@@ -342,7 +342,7 @@ class ContractTests(unittest.TestCase):
                     state_root=base / "state",
                     bundle_root=base / "bundles",
                     checkpoint_root=base / "checkpoints",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
                 options=RuncRuntimeOptions(
                     checkpoint=RuncCheckpointOptions(
@@ -445,7 +445,7 @@ class ContractTests(unittest.TestCase):
         self.assertFalse(r_fs_result.operation_status.executed)
 
     def test_runc_process_checkpoint_emits_only_metadata_artifact(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_process_contract_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_process_contract_") as tmp:
             base = Path(tmp)
             adapter = RuncRuntimeAdapter(
                 command_runner=FakeCommandRunner(),
@@ -453,7 +453,7 @@ class ContractTests(unittest.TestCase):
                     state_root=base / "state",
                     bundle_root=base / "bundles",
                     checkpoint_root=base / "checkpoints",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
             process_c = AdapterProcessCWorker(adapter)
@@ -480,7 +480,7 @@ class ContractTests(unittest.TestCase):
             )
 
     def test_runc_process_restore_requires_existing_checkpoint_directory(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_process_restore_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_process_restore_") as tmp:
             base = Path(tmp)
             adapter = RuncRuntimeAdapter(
                 command_runner=FakeCommandRunner(),
@@ -488,7 +488,7 @@ class ContractTests(unittest.TestCase):
                     state_root=base / "state",
                     bundle_root=base / "bundles",
                     checkpoint_root=base / "checkpoints",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
             process_r = AdapterProcessRWorker(adapter)
@@ -1107,7 +1107,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(process_worker.manifests[0].metadata["filesystem_restore_checkpoint_id"], "ckpt-2")
 
     def test_runc_runtime_executes_real_commands_via_runner(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_runc_runtime_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_runc_runtime_") as tmp:
             runner = FakeCommandRunner()
             base = Path(tmp)
             adapter = RuncRuntimeAdapter(
@@ -1116,7 +1116,7 @@ class ContractTests(unittest.TestCase):
                     state_root=base / "state",
                     bundle_root=base / "bundles",
                     checkpoint_root=base / "checkpoints",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
 
@@ -1131,10 +1131,10 @@ class ContractTests(unittest.TestCase):
             self.assertTrue(fs_status.executed)
             self.assertEqual(runner.commands[0][0:3], ("runc", "--root", str(base / "state")))
             self.assertIn("--leave-running=true", runner.commands[0])
-            self.assertEqual(runner.commands[1], ("zfs", "snapshot", "pool/agent-cr/sbx-1@ckpt-1"))
+            self.assertEqual(runner.commands[1], ("zfs", "snapshot", "pool/crab/sbx-1@ckpt-1"))
 
     def test_runc_runtime_checkpoint_reports_process_size_and_snapshot_stats(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_runc_runtime_stats_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_runc_runtime_stats_") as tmp:
             base = Path(tmp)
             process_dir = base / "checkpoints" / "sbx-1" / "ckpt-1" / "process"
             process_dir.mkdir(parents=True, exist_ok=True)
@@ -1142,7 +1142,7 @@ class ContractTests(unittest.TestCase):
             (process_dir / "inventory.img").write_bytes(b"b" * 16)
             runner = MappingCommandRunner(
                 responses={
-                    ("zfs", "get", "-Hp", "-o", "property,value", "written,used", "pool/agent-cr/sbx-1@ckpt-1"): (
+                    ("zfs", "get", "-Hp", "-o", "property,value", "written,used", "pool/crab/sbx-1@ckpt-1"): (
                         0,
                         "written\t128\nused\t512\n",
                         "",
@@ -1155,7 +1155,7 @@ class ContractTests(unittest.TestCase):
                     state_root=base / "state",
                     bundle_root=base / "bundles",
                     checkpoint_root=base / "checkpoints",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
 
@@ -1168,7 +1168,7 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(fs_status.metadata["filesystem_checkpoint_used_bytes"], 512)
 
     def test_runc_runtime_exec_emits_telemetry_without_deleted_helper(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_runc_exec_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_runc_exec_") as tmp:
             base = Path(tmp)
             telemetry = InMemoryTelemetrySink()
             adapter = RuncRuntimeAdapter(
@@ -1178,7 +1178,7 @@ class ContractTests(unittest.TestCase):
                     bundle_root=base / "bundles",
                     checkpoint_root=base / "checkpoints",
                     metadata_root=base / "metadata",
-                    zfs_dataset_prefix="pool/agent-cr",
+                    zfs_dataset_prefix="pool/crab",
                 ),
             )
 
@@ -1188,7 +1188,7 @@ class ContractTests(unittest.TestCase):
                 stdout="ok\n",
                 stderr="",
             )
-            with patch("agent_cr.runtime.runc.subprocess.run", return_value=completed):
+            with patch("crab.runtime.runc.subprocess.run", return_value=completed):
                 result = adapter.exec(
                     SandboxId("sbx-1"),
                     ["/bin/true"],
@@ -1330,7 +1330,7 @@ class ContractTests(unittest.TestCase):
         self.assertTrue(updated.filesystem_changed)
 
     def test_local_storage_implements_checkpoint_manager_contract(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_contract_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_contract_") as tmp:
             mgr = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
             self.assertIsInstance(mgr, CheckpointManager)
 

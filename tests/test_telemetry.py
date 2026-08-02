@@ -7,8 +7,8 @@ import time
 import unittest
 from pathlib import Path
 
-from agent_cr import (
-    AgentCRRequestInterceptor,
+from crab import (
+    CrabRequestInterceptor,
     AsyncJsonlTelemetrySink,
     CompositeTelemetrySink,
     InMemoryRequestStateStore,
@@ -47,7 +47,7 @@ class SlowInMemoryTelemetrySink(InMemoryTelemetrySink):
 
 class TelemetryTests(unittest.TestCase):
     def test_jsonl_telemetry_sink_writes_event_and_metric_records(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_telemetry_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_telemetry_") as tmp:
             path = Path(tmp) / "telemetry.jsonl"
             sink = JsonlTelemetrySink(path)
 
@@ -65,7 +65,7 @@ class TelemetryTests(unittest.TestCase):
 
     def test_composite_telemetry_sink_fans_out_to_multiple_sinks(self) -> None:
         in_memory = InMemoryTelemetrySink()
-        with tempfile.TemporaryDirectory(prefix="agent_cr_telemetry_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_telemetry_") as tmp:
             path = Path(tmp) / "telemetry.jsonl"
             composite = CompositeTelemetrySink([in_memory, JsonlTelemetrySink(path)])
 
@@ -78,7 +78,7 @@ class TelemetryTests(unittest.TestCase):
 
     def test_interceptor_emits_total_request_latency_metric(self) -> None:
         telemetry = InMemoryTelemetrySink()
-        interceptor = AgentCRRequestInterceptor(
+        interceptor = CrabRequestInterceptor(
             upstream_transport=lambda path, headers, body: (200, [], b"{}"),
             request_state_store=InMemoryRequestStateStore(),
             telemetry=telemetry,
@@ -94,7 +94,7 @@ class TelemetryTests(unittest.TestCase):
         self.assertIn("llm.request_total_ms", metric_names)
 
     def test_jsonl_telemetry_sink_supports_cross_process_writes(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_telemetry_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_telemetry_") as tmp:
             path = Path(tmp) / "telemetry.jsonl"
             processes = [
                 multiprocessing.Process(target=_emit_jsonl_records, args=(str(path), "a")),
@@ -114,7 +114,7 @@ class TelemetryTests(unittest.TestCase):
         self.assertEqual(workers, {"a", "b"})
 
     def test_async_jsonl_telemetry_sink_drops_new_records_when_queue_is_full(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="agent_cr_telemetry_") as tmp:
+        with tempfile.TemporaryDirectory(prefix="crab_telemetry_") as tmp:
             path = Path(tmp) / "telemetry.jsonl"
             sink = AsyncJsonlTelemetrySink(
                 SlowJsonlTelemetrySink(path),

@@ -32,14 +32,14 @@ _DEFAULT_OUTPUT_SINK_PATH = "/dev/null"
 _CLAUDE_CODE_INLINE_WRAPPER = """
 #!/bin/sh
 
-CLAUDE_BIN="$AGENT_CR_CLAUDE_CODE_BIN"
-TASK="$AGENT_CR_CLAUDE_CODE_TASK"
-DONE_PATH="$AGENT_CR_CLAUDE_CODE_DONE_PATH"
-EXIT_PATH="$AGENT_CR_CLAUDE_CODE_EXIT_PATH"
-TASK_CWD="$AGENT_CR_CLAUDE_CODE_CWD"
-DEBUG_LOG_PATH="$AGENT_CR_CLAUDE_CODE_DEBUG_LOG_PATH"
-OUTPUT_LOG_PATH="$AGENT_CR_CLAUDE_CODE_OUTPUT_LOG_PATH"
-BARE_FLAG="$AGENT_CR_CLAUDE_CODE_BARE_FLAG"
+CLAUDE_BIN="$CRAB_CLAUDE_CODE_BIN"
+TASK="$CRAB_CLAUDE_CODE_TASK"
+DONE_PATH="$CRAB_CLAUDE_CODE_DONE_PATH"
+EXIT_PATH="$CRAB_CLAUDE_CODE_EXIT_PATH"
+TASK_CWD="$CRAB_CLAUDE_CODE_CWD"
+DEBUG_LOG_PATH="$CRAB_CLAUDE_CODE_DEBUG_LOG_PATH"
+OUTPUT_LOG_PATH="$CRAB_CLAUDE_CODE_OUTPUT_LOG_PATH"
+BARE_FLAG="$CRAB_CLAUDE_CODE_BARE_FLAG"
 
 cd "$TASK_CWD"
 
@@ -59,7 +59,7 @@ fi
 echo "$EXIT_CODE" > "$EXIT_PATH"
 
 # Keep alive if requested
-if [ "$AGENT_CR_CLAUDE_CODE_KEEPALIVE_AFTER_TASK" = "true" ]; then
+if [ "$CRAB_CLAUDE_CODE_KEEPALIVE_AFTER_TASK" = "true" ]; then
     exec sleep infinity > /dev/null 2>&1
 fi
 
@@ -165,7 +165,7 @@ class ClaudeCodeAgent(BaseAgent):
             telemetry=self.telemetry,
             sandbox_id=str(self.sandbox.sandbox_id),
         )
-        model_name = str(os.environ.get("AGENT_CR_CLAUDE_CODE_MODEL_NAME", "claude-opus-4-6"))
+        model_name = str(os.environ.get("CRAB_CLAUDE_CODE_MODEL_NAME", "claude-opus-4-6"))
         prepared_state = prepare_claude_code_state(
             work_root=sandbox_root,
             base_url=self.llm_base_url,
@@ -233,12 +233,12 @@ class ClaudeCodeAgent(BaseAgent):
                 "UV_USE_IO_URING=0",
                 f"HOME={CLAUDE_HOME_ROOT_MOUNT_PATH}",
                 f"ANTHROPIC_BASE_URL={api_base_url}",
-                "ANTHROPIC_API_KEY=sk-agent-cr-claude-code",
+                "ANTHROPIC_API_KEY=sk-crab-claude-code",
                 f"ANTHROPIC_MODEL={model_name}",
                 "CLAUDE_CODE_SIMPLE=1",
                 "IS_SANDBOX=1",
                 *(
-                    [f"AGENT_CR_CLAUDE_CODE_VERSION={resolved_version}"]
+                    [f"CRAB_CLAUDE_CODE_VERSION={resolved_version}"]
                     if isinstance(resolved_version, str) and resolved_version
                     else []
                 ),
@@ -280,26 +280,26 @@ class ClaudeCodeAgent(BaseAgent):
             command = ";\n".join(
                 [
                     f"export HOME={shlex.quote(CLAUDE_HOME_ROOT_MOUNT_PATH)}",
-                    f"export AGENT_CR_CLAUDE_CODE_BIN={shlex.quote(claude_bin)}",
-                    f"export AGENT_CR_CLAUDE_CODE_TASK={escaped_task}",
-                    f"export AGENT_CR_CLAUDE_CODE_CWD={shlex.quote(compose_cwd)}",
-                    "export AGENT_CR_CLAUDE_CODE_KEEPALIVE_AFTER_TASK=true",
-                    f"export AGENT_CR_CLAUDE_CODE_DONE_PATH={shlex.quote(marker_mount_paths['done'])}",
-                    f"export AGENT_CR_CLAUDE_CODE_EXIT_PATH={shlex.quote(marker_mount_paths['exit'])}",
+                    f"export CRAB_CLAUDE_CODE_BIN={shlex.quote(claude_bin)}",
+                    f"export CRAB_CLAUDE_CODE_TASK={escaped_task}",
+                    f"export CRAB_CLAUDE_CODE_CWD={shlex.quote(compose_cwd)}",
+                    "export CRAB_CLAUDE_CODE_KEEPALIVE_AFTER_TASK=true",
+                    f"export CRAB_CLAUDE_CODE_DONE_PATH={shlex.quote(marker_mount_paths['done'])}",
+                    f"export CRAB_CLAUDE_CODE_EXIT_PATH={shlex.quote(marker_mount_paths['exit'])}",
                     (
-                        "export AGENT_CR_CLAUDE_CODE_DEBUG_LOG_PATH="
+                        "export CRAB_CLAUDE_CODE_DEBUG_LOG_PATH="
                         f"{shlex.quote(_DEFAULT_DEBUG_LOG_MOUNT_PATH)}"
                     ),
                     (
-                        "export AGENT_CR_CLAUDE_CODE_OUTPUT_LOG_PATH="
+                        "export CRAB_CLAUDE_CODE_OUTPUT_LOG_PATH="
                         f"{shlex.quote(_DEFAULT_OUTPUT_SINK_PATH)}"
                     ),
                     (
-                        "export AGENT_CR_CLAUDE_CODE_BARE_FLAG="
+                        "export CRAB_CLAUDE_CODE_BARE_FLAG="
                         f"{shlex.quote('--bare' if supports_bare_flag else '')}"
                     ),
                     f"export ANTHROPIC_BASE_URL={shlex.quote(api_base_url)}",
-                    "export ANTHROPIC_API_KEY=sk-agent-cr-claude-code",
+                    "export ANTHROPIC_API_KEY=sk-crab-claude-code",
                     f"export ANTHROPIC_MODEL={shlex.quote(model_name)}",
                     "export CLAUDE_CODE_SIMPLE=1",
                     "export IS_SANDBOX=1",
@@ -329,25 +329,25 @@ class ClaudeCodeAgent(BaseAgent):
             command = ";\n".join(
                 [
                     f"export HOME={shlex.quote(CLAUDE_HOME_ROOT_MOUNT_PATH)}",
-                    f"export AGENT_CR_CLAUDE_CODE_BIN={shlex.quote(claude_bin)}",
-                    f"export AGENT_CR_CLAUDE_CODE_TASK={escaped_task}",
-                    "export AGENT_CR_CLAUDE_CODE_CWD=/work",
-                    f"export AGENT_CR_CLAUDE_CODE_DONE_PATH={shlex.quote(marker_mount_paths['done'])}",
-                    f"export AGENT_CR_CLAUDE_CODE_EXIT_PATH={shlex.quote(marker_mount_paths['exit'])}",
+                    f"export CRAB_CLAUDE_CODE_BIN={shlex.quote(claude_bin)}",
+                    f"export CRAB_CLAUDE_CODE_TASK={escaped_task}",
+                    "export CRAB_CLAUDE_CODE_CWD=/work",
+                    f"export CRAB_CLAUDE_CODE_DONE_PATH={shlex.quote(marker_mount_paths['done'])}",
+                    f"export CRAB_CLAUDE_CODE_EXIT_PATH={shlex.quote(marker_mount_paths['exit'])}",
                     (
-                        "export AGENT_CR_CLAUDE_CODE_DEBUG_LOG_PATH="
+                        "export CRAB_CLAUDE_CODE_DEBUG_LOG_PATH="
                         f"{shlex.quote(_DEFAULT_DEBUG_LOG_MOUNT_PATH)}"
                     ),
                     (
-                        "export AGENT_CR_CLAUDE_CODE_OUTPUT_LOG_PATH="
+                        "export CRAB_CLAUDE_CODE_OUTPUT_LOG_PATH="
                         f"{shlex.quote(_DEFAULT_OUTPUT_SINK_PATH)}"
                     ),
                     (
-                        "export AGENT_CR_CLAUDE_CODE_BARE_FLAG="
+                        "export CRAB_CLAUDE_CODE_BARE_FLAG="
                         f"{shlex.quote('--bare' if supports_bare_flag else '')}"
                     ),
                     f"export ANTHROPIC_BASE_URL={shlex.quote(api_base_url)}",
-                    "export ANTHROPIC_API_KEY=sk-agent-cr-claude-code",
+                    "export ANTHROPIC_API_KEY=sk-crab-claude-code",
                     f"export ANTHROPIC_MODEL={shlex.quote(model_name)}",
                     "export CLAUDE_CODE_SIMPLE=1",
                     "export IS_SANDBOX=1",
