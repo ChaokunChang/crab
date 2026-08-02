@@ -56,7 +56,9 @@ Compose service into a runc sandbox, runs all recorded tool calls, prints the
 checkpoints created at LLM request boundaries, runs the task's
 `/tests/run-tests.sh`, and unregisters the trace on exit. The tracked iFlow
 runtime archives are packaged with Crab, so the replay does not install a live
-iFlow release or require an iFlow account.
+iFlow release or require an iFlow account. Their upstream sources, versions,
+licenses, and checksums are recorded in
+[`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md).
 
 Keep the sandbox and its checkpoints for CLI inspection:
 

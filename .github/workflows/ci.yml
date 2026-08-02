@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install Crab
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - name: Run dependency-light tests
+        run: |
+          python -m unittest -v \
+            tests.test_remote_engine_checkpoint \
+            tests.test_image_runtime \
+            tests.test_sdk_sandbox \
+            tests.test_iflow_trace_replay
+
+  release-surface:
+    name: Release surface
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . build
+
+      - name: Check shell scripts
+        run: bash -n scripts/install-ubuntu.sh scripts/smoke-rollback.sh
+
+      - name: Parse public configs
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from crab.engine import EngineConfig
+
+          paths = sorted(Path("config").glob("*.yaml"))
+          paths += sorted(Path("examples/sdk/configs").glob("*.yaml"))
+          for path in paths:
+              EngineConfig.from_file(path)
+              print("OK", path)
+          PY
+
+      - name: Check Markdown links
+        run: |
+          python - <<'PY'
+          import re
+          import subprocess
+          from pathlib import Path
+
+          markdown_files = subprocess.check_output(
+              ["git", "ls-files", "*.md"], text=True
+          ).splitlines()
+          missing = []
+          for name in markdown_files:
+              source = Path(name)
+              text = source.read_text(encoding="utf-8")
+              for raw_target in re.findall(r"(?<!!)\[[^]]*\]\(([^)]+)\)", text):
+                  target = raw_target.strip().split()[0].strip("<>")
+                  if not target or target.startswith(("#", "http://", "https://", "mailto:")):
+                      continue
+                  relative = target.split("#", 1)[0]
+                  if relative and not (source.parent / relative).resolve().exists():
+                      missing.append(f"{source}: {target}")
+          if missing:
+              raise SystemExit("Broken local Markdown links:\n" + "\n".join(missing))
+          print(f"Checked {len(markdown_files)} Markdown files")
+          PY
+
+      - name: Verify replay runtime archives
+        run: |
+          echo "c1bfeecf1d7404fa74728f9db72e697decbd8119ccc6f5a294d795756dfcfca7  integrations/sandboxes/iflow/cache/node-v22.18.0-linux-x64.tar.xz" | sha256sum -c -
+          echo "e5bec219dc8a17e6b815e715a74d42fd00a5df71d4d5712e96e41fdfdbe10289  integrations/sandboxes/iflow/cache/iflow-ai-iflow-cli-for-roll-0-4-4-v4.tgz" | sha256sum -c -
+
+      - name: Check patches and build distributions
+        run: |
+          git diff --check
+          python -m build
+
+      - name: Smoke-test built wheel
+        run: |
+          python -m venv /tmp/crab-wheel-smoke
+          /tmp/crab-wheel-smoke/bin/python -m pip install dist/*.whl
+          cd /tmp
+          /tmp/crab-wheel-smoke/bin/python -c "import crab; print(crab.__file__)"
+          /tmp/crab-wheel-smoke/bin/crab --help >/dev/null
+          /tmp/crab-wheel-smoke/bin/crabd --help >/dev/null
