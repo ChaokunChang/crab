@@ -217,6 +217,22 @@ Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and
 testing, and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the runtime
 archives included with the replay example.
 
+## Citation
+
+If Crab is useful in your work, please cite the arXiv paper:
+
+```bibtex
+@misc{wu2026crabsemanticsawarecheckpointrestoreruntime,
+  title={Crab: A Semantics-Aware Checkpoint/Restore Runtime for Agent Sandboxes},
+  author={Tianyuan Wu and Chaokun Chang and Lunxi Cao and Wei Gao and Wei Wang},
+  year={2026},
+  eprint={2604.28138},
+  archivePrefix={arXiv},
+  primaryClass={cs.OS},
+  url={https://arxiv.org/abs/2604.28138},
+}
+```
+
 ## Development
 
 ```bash

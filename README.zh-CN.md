@@ -146,6 +146,22 @@ Crab 也无法撤销 sandbox 外部的副作用，例如 GitHub push、云 API �
 
 欢迎贡献。开发和测试要求见 [CONTRIBUTING.md](CONTRIBUTING.md)，replay example 内置 runtime archive 的来源见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
+## 引用
+
+如果 Crab 对你的工作有帮助，请引用 arXiv 论文：
+
+```bibtex
+@misc{wu2026crabsemanticsawarecheckpointrestoreruntime,
+  title={Crab: A Semantics-Aware Checkpoint/Restore Runtime for Agent Sandboxes},
+  author={Tianyuan Wu and Chaokun Chang and Lunxi Cao and Wei Gao and Wei Wang},
+  year={2026},
+  eprint={2604.28138},
+  archivePrefix={arXiv},
+  primaryClass={cs.OS},
+  url={https://arxiv.org/abs/2604.28138},
+}
+```
+
 ## 开发
 
 ```bash
