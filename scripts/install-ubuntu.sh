@@ -9,10 +9,16 @@ Usage:
   sudo ./scripts/install-ubuntu.sh [options]
 
 Options:
+  --fs-backend NAME  Filesystem backend: zfs (default) or btrfs
   --zpool NAME       Dedicated ZFS pool name (default: crab)
   --zpool-file PATH  Sparse backing file for a new pool
                      (default: /var/lib/crab/crab.zpool)
   --zpool-size SIZE  Sparse backing file size (default: 32G)
+  --btrfs-file PATH  Sparse backing file for a new btrfs filesystem
+                     (default: /var/lib/crab/crab.btrfs)
+  --btrfs-root PATH  Mountpoint for the btrfs filesystem
+                     (default: /var/lib/crab/btrfs)
+  --btrfs-size SIZE  Sparse backing file size (default: 32G)
   --config PATH      Installed config path (default: /etc/crab/config.yaml)
   --skip-packages    Do not run apt; only verify/build/install/configure
   --no-create-pool   Require --zpool to name an existing pool
@@ -31,6 +37,7 @@ EOF
 #   sudo ./scripts/install-ubuntu.sh [options]
 #
 # Options:
+#   --fs-backend NAME  Filesystem backend: zfs (default) or btrfs
 #   --zpool NAME       Dedicated ZFS pool name (default: crab)
 #   --zpool-file PATH  Sparse backing file for a new pool
 #                      (default: /var/lib/crab/crab.zpool)
@@ -62,18 +69,42 @@ command_exists() {
   command -v "$1" >/dev/null 2>&1
 }
 
+FS_BACKEND=zfs
 ZPOOL_NAME=crab
 ZPOOL_FILE=/var/lib/crab/crab.zpool
 ZPOOL_SIZE=32G
+BTRFS_FILE=/var/lib/crab/crab.btrfs
+BTRFS_ROOT=/var/lib/crab/btrfs
+BTRFS_SIZE=32G
 CONFIG_PATH=/etc/crab/config.yaml
 SKIP_PACKAGES=0
 CREATE_POOL=1
 
 while (($#)); do
   case "$1" in
+    --fs-backend)
+      (($# >= 2)) || die "--fs-backend requires a value"
+      FS_BACKEND=$2
+      shift 2
+      ;;
     --zpool)
       (($# >= 2)) || die "--zpool requires a value"
       ZPOOL_NAME=$2
+      shift 2
+      ;;
+    --btrfs-file)
+      (($# >= 2)) || die "--btrfs-file requires a value"
+      BTRFS_FILE=$2
+      shift 2
+      ;;
+    --btrfs-root)
+      (($# >= 2)) || die "--btrfs-root requires a value"
+      BTRFS_ROOT=$2
+      shift 2
+      ;;
+    --btrfs-size)
+      (($# >= 2)) || die "--btrfs-size requires a value"
+      BTRFS_SIZE=$2
       shift 2
       ;;
     --zpool-file)
@@ -113,6 +144,9 @@ require_root
 
 [[ ${ZPOOL_NAME} =~ ^[A-Za-z][A-Za-z0-9_.:-]*$ ]] || die "invalid zpool name: ${ZPOOL_NAME}"
 [[ ${ZPOOL_FILE} = /* ]] || die "--zpool-file must be an absolute path"
+[[ ${FS_BACKEND} = zfs || ${FS_BACKEND} = btrfs ]] || die "--fs-backend must be zfs or btrfs"
+[[ ${BTRFS_FILE} = /* ]] || die "--btrfs-file must be an absolute path"
+[[ ${BTRFS_ROOT} = /* ]] || die "--btrfs-root must be an absolute path"
 [[ ${CONFIG_PATH} = /* ]] || die "--config must be an absolute path"
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -137,14 +171,20 @@ if ((SKIP_PACKAGES == 0)); then
   command_exists docker || packages+=(docker.io)
   command_exists runc || packages+=(runc)
   command_exists criu || packages+=(criu)
-  command_exists zfs || packages+=(zfsutils-linux)
+  if [[ ${FS_BACKEND} = zfs ]]; then
+    command_exists zfs || packages+=(zfsutils-linux)
+  else
+    command_exists btrfs || packages+=(btrfs-progs)
+  fi
   if apt-cache show "linux-headers-$(uname -r)" >/dev/null 2>&1; then
     packages+=("linux-headers-$(uname -r)")
   fi
   apt-get install -y --no-install-recommends "${packages[@]}"
 fi
 
-for binary in docker runc criu zfs zpool clang gcc make python3; do
+fs_binaries=(zfs zpool)
+[[ ${FS_BACKEND} = btrfs ]] && fs_binaries=(btrfs)
+for binary in docker runc criu "${fs_binaries[@]}" clang gcc make python3; do
   command_exists "${binary}" || die "missing dependency after installation: ${binary}"
 done
 
@@ -155,17 +195,36 @@ docker info >/dev/null 2>&1 || die "Docker daemon is not reachable"
 
 install -d -m 0755 /var/lib/crab /var/lib/crab/logs /opt/crab /etc/crab
 
-if zpool list -H -o name "${ZPOOL_NAME}" >/dev/null 2>&1; then
-  log "Using existing explicitly named zpool ${ZPOOL_NAME}"
+if [[ ${FS_BACKEND} = zfs ]]; then
+  if zpool list -H -o name "${ZPOOL_NAME}" >/dev/null 2>&1; then
+    log "Using existing explicitly named zpool ${ZPOOL_NAME}"
+  else
+    ((CREATE_POOL == 1)) || die "zpool ${ZPOOL_NAME} does not exist"
+    [[ ! -e ${ZPOOL_FILE} ]] || die "refusing to reuse existing pool file ${ZPOOL_FILE}"
+    log "Creating dedicated sparse-file zpool ${ZPOOL_NAME} (${ZPOOL_SIZE})"
+    install -d -m 0755 "$(dirname -- "${ZPOOL_FILE}")"
+    truncate -s "${ZPOOL_SIZE}" "${ZPOOL_FILE}"
+    if ! zpool create -m none "${ZPOOL_NAME}" "${ZPOOL_FILE}"; then
+      rm -f -- "${ZPOOL_FILE}"
+      die "failed to create zpool ${ZPOOL_NAME}"
+    fi
+  fi
 else
-  ((CREATE_POOL == 1)) || die "zpool ${ZPOOL_NAME} does not exist"
-  [[ ! -e ${ZPOOL_FILE} ]] || die "refusing to reuse existing pool file ${ZPOOL_FILE}"
-  log "Creating dedicated sparse-file zpool ${ZPOOL_NAME} (${ZPOOL_SIZE})"
-  install -d -m 0755 "$(dirname -- "${ZPOOL_FILE}")"
-  truncate -s "${ZPOOL_SIZE}" "${ZPOOL_FILE}"
-  if ! zpool create -m none "${ZPOOL_NAME}" "${ZPOOL_FILE}"; then
-    rm -f -- "${ZPOOL_FILE}"
-    die "failed to create zpool ${ZPOOL_NAME}"
+  if [[ $(stat -f -c %T "${BTRFS_ROOT}" 2>/dev/null) = btrfs ]]; then
+    log "Using existing btrfs filesystem at ${BTRFS_ROOT}"
+  else
+    ((CREATE_POOL == 1)) || die "no btrfs filesystem mounted at ${BTRFS_ROOT}"
+    # Same safety rule as the zpool flow: never adopt an existing backing
+    # file whose provenance we don't know.
+    [[ ! -e ${BTRFS_FILE} ]] || die "refusing to reuse existing btrfs file ${BTRFS_FILE}"
+    log "Creating dedicated loop-backed btrfs filesystem at ${BTRFS_ROOT} (${BTRFS_SIZE})"
+    install -d -m 0755 "$(dirname -- "${BTRFS_FILE}")" "${BTRFS_ROOT}"
+    truncate -s "${BTRFS_SIZE}" "${BTRFS_FILE}"
+    if ! mkfs.btrfs -q "${BTRFS_FILE}" || ! mount -o loop "${BTRFS_FILE}" "${BTRFS_ROOT}"; then
+      rm -f -- "${BTRFS_FILE}"
+      die "failed to create btrfs filesystem at ${BTRFS_ROOT}"
+    fi
+    grep -q "${BTRFS_FILE}" /etc/fstab ||       echo "${BTRFS_FILE} ${BTRFS_ROOT} btrfs loop 0 0" >>/etc/fstab
   fi
 fi
 
@@ -182,13 +241,22 @@ ln -sfn /opt/crab/venv/bin/crabd /usr/local/bin/crabd
 log "Installing ${CONFIG_PATH}"
 config_tmp=$(mktemp)
 trap 'rm -f -- "${config_tmp}"' EXIT
-sed "s|^zfs_dataset_prefix: crab/sandboxes$|zfs_dataset_prefix: ${ZPOOL_NAME}/sandboxes|" \
-  "${REPO_ROOT}/config/crab.yaml" >"${config_tmp}"
+if [[ ${FS_BACKEND} = zfs ]]; then
+  sed "s|^zfs_dataset_prefix: crab/sandboxes$|zfs_dataset_prefix: ${ZPOOL_NAME}/sandboxes|" \
+    "${REPO_ROOT}/config/crab.yaml" >"${config_tmp}"
+else
+  sed "s|^zfs_dataset_prefix: crab/sandboxes$|filesystem_backend: btrfs\nbtrfs_root: ${BTRFS_ROOT}|" \
+    "${REPO_ROOT}/config/crab.yaml" >"${config_tmp}"
+fi
 install -D -m 0644 "${config_tmp}" "${CONFIG_PATH}"
 
-log "Checking CRIU and ZFS"
+log "Checking CRIU and the filesystem backend"
 criu check
-zpool status "${ZPOOL_NAME}"
+if [[ ${FS_BACKEND} = zfs ]]; then
+  zpool status "${ZPOOL_NAME}"
+else
+  btrfs filesystem show "${BTRFS_ROOT}"
+fi
 
 echo
 echo "Crab is installed. Run the real checkpoint/restore smoke test:"

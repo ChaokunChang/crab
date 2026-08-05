@@ -37,7 +37,7 @@ import tempfile
 import threading
 import time
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
@@ -55,6 +55,7 @@ from .interceptor import (
 )
 from .remote_inspector import HostInspectorServiceClient, RemoteSandboxInspector
 from .runtime import (
+    BtrfsProvider,
     RuncCheckpointOptions,
     RuncRestoreOptions,
     RuncRuntime,
@@ -287,6 +288,11 @@ def _runc_options_from_mapping(data: Mapping[str, Any]) -> RuncRuntimeOptions:
         restore=restore,
         command_timeout_seconds=float(data.get("command_timeout_seconds", base.command_timeout_seconds)),
         zfs_prepare_timeout_seconds=float(data.get("zfs_prepare_timeout_seconds", base.zfs_prepare_timeout_seconds)),
+        filesystem_backend=str(data.get("filesystem_backend", base.filesystem_backend)).strip().lower(),
+        btrfs_qgroups_enabled=_as_bool(
+            data.get("btrfs_qgroups_enabled"),
+            default=base.btrfs_qgroups_enabled,
+        ),
     )
 
 
@@ -298,6 +304,7 @@ def _runc_paths_from_mapping(data: Mapping[str, Any], *, base_dir: Path) -> Runc
         checkpoint_root=_resolve_config_path(data.get("checkpoint_root"), base_dir=base_dir) or base.checkpoint_root,
         metadata_root=_resolve_config_path(data.get("metadata_root"), base_dir=base_dir) or base.metadata_root,
         zfs_dataset_prefix=str(data.get("zfs_dataset_prefix", base.zfs_dataset_prefix)).rstrip("/"),
+        btrfs_root=_resolve_config_path(data.get("btrfs_root"), base_dir=base_dir) or base.btrfs_root,
     )
 
 
@@ -372,6 +379,20 @@ class EngineConfig:
     `$CRAB_ZFS_DATASET_PREFIX`, `$CRAB_ZPOOL_NAME/crab-sdk`, or
     an installed zpool whose name starts with `crab`."""
 
+    filesystem_backend: str = "zfs"
+    """CoW backend for sandbox rootfs checkpoints: `zfs` (default) or
+    `btrfs`. With btrfs, the engine verifies `btrfs_root` is a btrfs
+    mount instead of resolving/creating a zpool dataset prefix."""
+
+    btrfs_root: Path | None = None
+    """Root of the btrfs filesystem holding sandbox subvolumes. Only
+    used when `filesystem_backend == "btrfs"`. Defaults to
+    `/var/lib/crab/btrfs` (the installer's `--fs-backend btrfs` mount)."""
+
+    btrfs_qgroups_enabled: bool = False
+    """Enable btrfs qgroups-backed per-snapshot byte stats (real
+    overhead; off by default, stats degrade to unknown)."""
+
     runtime_root: Path | None = None
     """Host root for runc state, bundles, metadata, image cache, work dirs,
     and per-agent state. Defaults under `storage_root`."""
@@ -442,6 +463,9 @@ class EngineConfig:
         telemetry_data = _optional_mapping(data.get("telemetry"), label="telemetry")
         runc_data = _optional_mapping(data.get("runc"), label="runc")
         runc_paths_data = _optional_mapping(data.get("runc_paths"), label="runc_paths")
+        filesystem_data = _optional_mapping(data.get("filesystem"), label="filesystem")
+        btrfs_data = _optional_mapping(filesystem_data.get("btrfs"), label="filesystem.btrfs")
+        zfs_data = _optional_mapping(filesystem_data.get("zfs"), label="filesystem.zfs")
 
         storage_root = _resolve_config_path(
             data.get("storage_root", storage_planes.get("storage_root")),
@@ -521,8 +545,19 @@ class EngineConfig:
             runc_paths=runc_paths,
             zfs_dataset_prefix=(
                 None
-                if data.get("zfs_dataset_prefix") is None
-                else str(data.get("zfs_dataset_prefix")).rstrip("/")
+                if data.get("zfs_dataset_prefix", zfs_data.get("dataset_prefix")) is None
+                else str(data.get("zfs_dataset_prefix", zfs_data.get("dataset_prefix"))).rstrip("/")
+            ),
+            filesystem_backend=str(
+                filesystem_data.get("backend", data.get("filesystem_backend", "zfs"))
+            ).strip().lower(),
+            btrfs_root=_resolve_config_path(
+                btrfs_data.get("root", data.get("btrfs_root")),
+                base_dir=config_base_dir,
+            ),
+            btrfs_qgroups_enabled=_as_bool(
+                btrfs_data.get("qgroups_enabled", data.get("btrfs_qgroups_enabled")),
+                default=False,
             ),
             runtime_root=runtime_root,
             image_cache_root=image_cache_root,
@@ -820,14 +855,33 @@ class Engine:
         cfg = self._config
         assert self._request_state_store is not None
         assert self._runtime_root is not None
+        backend = cfg.filesystem_backend.strip().lower()
+        if backend not in {"zfs", "btrfs"}:
+            raise ValueError(f"unsupported filesystem_backend: {cfg.filesystem_backend!r} (expected 'zfs' or 'btrfs')")
+        btrfs_root = cfg.btrfs_root or RuncRuntimePaths().btrfs_root
         paths = cfg.runc_paths or RuncRuntimePaths(
             state_root=self._runtime_root / "runtime-state",
             bundle_root=self._runtime_root / "bundles",
             checkpoint_root=self._runtime_root / "checkpoints",
             metadata_root=self._runtime_root / "sandbox-meta",
-            zfs_dataset_prefix=ZfsProvider.resolve_dataset_prefix(cfg.zfs_dataset_prefix),
+            zfs_dataset_prefix=(
+                ZfsProvider.resolve_dataset_prefix(cfg.zfs_dataset_prefix)
+                if backend == "zfs"
+                else RuncRuntimePaths().zfs_dataset_prefix
+            ),
+            btrfs_root=btrfs_root,
         )
-        ZfsProvider.ensure_parent_dataset(paths.zfs_dataset_prefix)
+        if backend == "zfs":
+            ZfsProvider.ensure_parent_dataset(paths.zfs_dataset_prefix)
+        else:
+            BtrfsProvider.ensure_root(paths.btrfs_root)
+        runc_options = cfg.runc_options or RuncRuntimeOptions()
+        if runc_options.filesystem_backend != backend or runc_options.btrfs_qgroups_enabled != cfg.btrfs_qgroups_enabled:
+            runc_options = replace(
+                runc_options,
+                filesystem_backend=backend,
+                btrfs_qgroups_enabled=cfg.btrfs_qgroups_enabled,
+            )
         telemetry_cfg = cfg.telemetry_config or TelemetryConfig(enabled=True)
         telemetry = build_configured_telemetry_sink(
             telemetry_cfg,
@@ -836,7 +890,7 @@ class Engine:
         )
         runtime = RuncRuntime(
             paths=paths,
-            options=cfg.runc_options,
+            options=runc_options,
             telemetry=telemetry,
             host_inspector_client=self._host_inspector_client,
         )

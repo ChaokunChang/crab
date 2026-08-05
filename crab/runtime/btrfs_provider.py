@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import subprocess
 import uuid
 from dataclasses import replace
 from pathlib import Path
@@ -77,6 +78,30 @@ class BtrfsProvider(FilesystemProvider):
     @property
     def name(self) -> str:
         return "btrfs"
+
+    # ------------------------------------------------------------------
+    # Host preparation (used by the engine before any runtime exists)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def ensure_root(btrfs_root: Path) -> None:
+        """Verify ``btrfs_root`` sits on a btrfs filesystem. Unlike the
+        ZFS pool flow the engine never creates the filesystem itself
+        (mkfs needs a device decision an SDK must not make); the
+        installer or operator prepares the mount."""
+        probe = subprocess.run(
+            ["stat", "-f", "-c", "%T", str(btrfs_root)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        fs_type = probe.stdout.strip()
+        if probe.returncode != 0 or fs_type != "btrfs":
+            raise RuntimeError(
+                f"filesystem_backend=btrfs requires {btrfs_root} to be on a btrfs "
+                f"filesystem (found {fs_type or 'nothing'}); prepare it with "
+                "scripts/install-ubuntu.sh --fs-backend btrfs or mount one manually"
+            )
 
     # ------------------------------------------------------------------
     # Naming / layout

@@ -393,5 +393,183 @@ class BtrfsRealIntegrationTests(unittest.TestCase):
         self.assertFalse(Path(str(fork_meta["snapshot"])).exists())
 
 
+class FilesystemBackendSelectionTests(unittest.TestCase):
+    """RuncRuntime builds the provider matching options.filesystem_backend,
+    and EngineConfig parses both the nested `filesystem` block and the
+    flat legacy keys."""
+
+    def _paths(self, base: Path):
+        from crab.runtime import RuncRuntimePaths
+
+        return RuncRuntimePaths(
+            state_root=base / "state",
+            bundle_root=base / "bundles",
+            checkpoint_root=base / "checkpoints",
+            metadata_root=base / "metadata",
+            zfs_dataset_prefix="pool/crab",
+            btrfs_root=base / "btrfs",
+        )
+
+    def test_runtime_backend_selection(self) -> None:
+        from crab.runtime import RuncRuntime, RuncRuntimeOptions
+
+        with tempfile.TemporaryDirectory(prefix="crab_backend_sel_") as tmp:
+            base = Path(tmp)
+            default_runtime = RuncRuntime(paths=self._paths(base))
+            self.assertEqual(default_runtime._fs.name, "zfs")
+
+            btrfs_runtime = RuncRuntime(
+                paths=self._paths(base),
+                options=RuncRuntimeOptions(filesystem_backend="btrfs"),
+            )
+            self.assertEqual(btrfs_runtime._fs.name, "btrfs")
+
+            with self.assertRaisesRegex(ValueError, "unsupported filesystem_backend"):
+                RuncRuntime(
+                    paths=self._paths(base),
+                    options=RuncRuntimeOptions(filesystem_backend="ext4"),
+                )
+
+    def test_engine_config_parses_filesystem_block_and_flat_keys(self) -> None:
+        from crab.engine import EngineConfig
+
+        nested = EngineConfig.from_mapping(
+            {
+                "filesystem": {
+                    "backend": "btrfs",
+                    "btrfs": {"root": "/mnt/pool", "qgroups_enabled": True},
+                }
+            }
+        )
+        self.assertEqual(nested.filesystem_backend, "btrfs")
+        self.assertEqual(nested.btrfs_root, Path("/mnt/pool"))
+        self.assertTrue(nested.btrfs_qgroups_enabled)
+
+        flat = EngineConfig.from_mapping(
+            {"filesystem_backend": "btrfs", "btrfs_root": "/mnt/flat"}
+        )
+        self.assertEqual(flat.filesystem_backend, "btrfs")
+        self.assertEqual(flat.btrfs_root, Path("/mnt/flat"))
+        self.assertFalse(flat.btrfs_qgroups_enabled)
+
+        default = EngineConfig.from_mapping({})
+        self.assertEqual(default.filesystem_backend, "zfs")
+        self.assertIsNone(default.btrfs_root)
+
+
+class BtrfsRealContainerTests(unittest.TestCase):
+    """Full runc container lifecycle on a btrfs-backed rootfs: launch,
+    exec, filesystem checkpoint, CRIU process checkpoint, filesystem +
+    process restore. This is the end-to-end proof that CRIU tolerates
+    the bind-mounted subvolume rootfs. Runs only inside the crab-dev VM
+    (needs docker/runc/criu/btrfs and root)."""
+
+    _IMAGE = "python:3.11-slim"
+
+    def setUp(self) -> None:
+        for tool in ("docker", "runc", "criu", "btrfs"):
+            if shutil.which(tool) is None:
+                self.skipTest(f"{tool} not installed")
+        if not _btrfs_playground_available():
+            self.skipTest("btrfs playground not available")
+        probe = subprocess.run(["docker", "image", "inspect", self._IMAGE], capture_output=True, check=False)
+        if probe.returncode != 0:
+            pull = subprocess.run(["docker", "pull", self._IMAGE], capture_output=True, check=False)
+            if pull.returncode != 0:
+                self.skipTest(f"cannot pull {self._IMAGE}")
+
+    def test_container_lifecycle_with_criu_on_btrfs_rootfs(self) -> None:
+        import json as json_module
+
+        from crab.runtime import RuncRuntime, RuncRuntimeOptions, RuncRuntimePaths
+        from integrations.sandboxes.runtime.image import export_image_rootfs
+
+        playground = Path("/var/lib/crab/btrfs") / f"container-test-{SandboxId.new()}"
+        playground.mkdir(parents=True)
+        tmpdir = tempfile.TemporaryDirectory(prefix="crab_btrfs_e2e_")
+        self.addCleanup(tmpdir.cleanup)
+        base = Path(tmpdir.name)
+        sid = SandboxId("sbx-btrfs-e2e")
+        bundle_dir = base / "bundles" / str(sid)
+
+        runtime = RuncRuntime(
+            paths=RuncRuntimePaths(
+                state_root=base / "state",
+                bundle_root=base / "bundles",
+                checkpoint_root=base / "checkpoints",
+                metadata_root=base / "metadata",
+                btrfs_root=playground,
+            ),
+            options=RuncRuntimeOptions(filesystem_backend="btrfs"),
+        )
+
+        def _cleanup() -> None:
+            runtime.delete_runtime(sid, force=True, ignore_missing=True)
+            try:
+                runtime.destroy_filesystem_dataset(sid)
+            except Exception:
+                pass
+            subprocess.run(["umount", str(bundle_dir / "rootfs")], check=False, capture_output=True)
+            for sub in sorted((playground / "sandboxes").glob("*"), reverse=True):
+                subprocess.run(["btrfs", "subvolume", "delete", str(sub)], check=False, capture_output=True)
+            shutil.rmtree(playground, ignore_errors=True)
+
+        self.addCleanup(_cleanup)
+
+        exported_rootfs = export_image_rootfs(tag=self._IMAGE, output_dir=base / "image")
+
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["runc", "spec"], cwd=bundle_dir, check=True, capture_output=True)
+        config_path = bundle_dir / "config.json"
+        cfg = json_module.loads(config_path.read_text())
+        linux_cfg = cfg.get("linux", {})
+        linux_cfg["namespaces"] = [
+            ns for ns in linux_cfg.get("namespaces", []) if ns.get("type") not in {"network", "cgroup"}
+        ]
+        linux_cfg.pop("seccomp", None)
+        cfg["linux"] = linux_cfg
+        cfg["process"]["terminal"] = False
+        cfg["process"]["args"] = ["/bin/sh", "-c", "while :; do sleep 0.5; done"]
+        cfg["root"]["path"] = "rootfs"
+        cfg["root"]["readonly"] = False
+        config_path.write_text(json_module.dumps(cfg, indent=2))
+
+        runtime.launch(
+            "runc",
+            {
+                "sandbox_id": str(sid),
+                "bundle_path": str(bundle_dir),
+                "rootfs_init_dirs": ["proc", "dev", "dev/pts", "dev/shm", "dev/mqueue", "sys", "run", "tmp"],
+                "rootfs_copy_paths": [{"source": str(exported_rootfs), "destination": "/"}],
+            },
+        )
+
+        write_v1 = runtime.exec(sid, ["/bin/sh", "-c", "echo v1 > /state.txt && cat /state.txt"])
+        self.assertEqual(write_v1.returncode, 0)
+        self.assertEqual(write_v1.stdout.strip(), "v1")
+
+        fs_status = runtime.checkpoint_filesystem(sid, CheckpointId("ckpt-1"))
+        self.assertTrue(fs_status.executed)
+
+        runtime.exec(sid, ["/bin/sh", "-c", "echo v2 > /state.txt"])
+
+        # CRIU dump on the bind-mounted subvolume rootfs; container stops.
+        proc_status = runtime.checkpoint_process(sid, CheckpointId("ckpt-1"), leave_running=False)
+        self.assertTrue(proc_status.executed)
+        runtime.delete_runtime(sid, force=True, ignore_missing=True)
+
+        restore_fs = runtime.restore_filesystem(sid, CheckpointId("ckpt-1"))
+        self.assertTrue(restore_fs.executed)
+
+        # CRIU restore back onto the swapped-in subvolume.
+        restore_proc = runtime.restore_process(sid, CheckpointId("ckpt-1"))
+        self.assertTrue(restore_proc.executed)
+
+        read_back = runtime.exec(sid, ["/bin/sh", "-c", "cat /state.txt"])
+        self.assertEqual(read_back.returncode, 0)
+        self.assertEqual(read_back.stdout.strip(), "v1")
+
+
+
 if __name__ == "__main__":
     unittest.main()
