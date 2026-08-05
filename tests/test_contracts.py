@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from crab import (
     AdapterFileSystemCWorker,
@@ -52,8 +52,8 @@ class FakeCommandRunner(CommandRunner):
     def __init__(self) -> None:
         self.commands: list[tuple[str, ...]] = []
 
-    def run(self, command: list[str], *, cwd: Path | None = None):
-        _ = cwd
+    def run(self, command: list[str], *, cwd: Path | None = None, timeout_seconds: float | None = None):
+        _ = cwd, timeout_seconds
         self.commands.append(tuple(command))
         return type(
             "Result",
@@ -67,8 +67,8 @@ class MappingCommandRunner(CommandRunner):
         self.responses = responses or {}
         self.commands: list[tuple[str, ...]] = []
 
-    def run(self, command: list[str], *, cwd: Path | None = None):
-        _ = cwd
+    def run(self, command: list[str], *, cwd: Path | None = None, timeout_seconds: float | None = None):
+        _ = cwd, timeout_seconds
         key = tuple(command)
         self.commands.append(key)
         returncode, stdout, stderr = self.responses.get(key, (0, "", ""))
@@ -1182,13 +1182,13 @@ class ContractTests(unittest.TestCase):
                 ),
             )
 
-            completed = subprocess.CompletedProcess(
-                args=["runc", "exec"],
-                returncode=0,
-                stdout="ok\n",
-                stderr="",
-            )
-            with patch("crab.runtime.runc.subprocess.run", return_value=completed):
+            # exec() moved from subprocess.run to subprocess.Popen so the
+            # runtime can track (and spot-kill) in-flight `runc exec`
+            # processes; fake the Popen handle accordingly.
+            fake_proc = MagicMock()
+            fake_proc.communicate.return_value = ("ok\n", "")
+            fake_proc.returncode = 0
+            with patch("crab.runtime.runc.subprocess.Popen", return_value=fake_proc):
                 result = adapter.exec(
                     SandboxId("sbx-1"),
                     ["/bin/true"],
