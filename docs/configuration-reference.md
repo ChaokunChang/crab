@@ -28,6 +28,15 @@ storage_planes:
 
 - `runtime`: `runc` is the real v0 backend. `docker` selects an in-memory test
   implementation; it is not a Docker checkpoint/restore fallback.
+- `filesystem_backend`: CoW backend for sandbox root filesystems: `zfs`
+  (default) or `btrfs`. Also accepted as a nested block:
+  `filesystem: {backend: btrfs, btrfs: {root: ..., qgroups_enabled: false}}`.
+- `btrfs_root`: mountpoint of the btrfs filesystem holding sandbox
+  subvolumes (default `/var/lib/crab/btrfs`). Only used with
+  `filesystem_backend: btrfs`; the mount must already exist (the installer's
+  `--fs-backend btrfs` prepares it).
+- `btrfs_qgroups_enabled`: enable qgroups-backed per-snapshot byte stats
+  (measurable overhead; default `false`, stats degrade to unknown).
 - `zfs_dataset_prefix`: parent dataset for sandbox root filesystems. Name it
   explicitly; do not rely on automatic pool discovery in production.
 - `storage_root`: checkpoint manifests and artifact metadata.

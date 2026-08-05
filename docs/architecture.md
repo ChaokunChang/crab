@@ -53,7 +53,12 @@ flowchart TD
 - `build_default_system(runtime="runc")` creates `RuncRuntime`.
 - Real-host scenarios also construct this directly with explicit `RuncRuntimePaths`.
 - Process state is handled through `runc checkpoint` and `runc restore` backed by CRIU image directories.
-- Filesystem state is handled through ZFS snapshots and rollbacks.
+- Filesystem state is handled through a pluggable `FilesystemProvider`
+  (`crab/runtime/fs_provider.py`). The default `ZfsProvider` maps
+  checkpoints to ZFS snapshots/rollbacks/clones; the `BtrfsProvider`
+  maps them to btrfs subvolume snapshots with an emulated rollback
+  (trash-swap) and needs no `promote` because btrfs snapshots carry no
+  clone-origin dependency. Select the backend with `filesystem_backend`.
 
 ## Request Interception And Checkpoint Coordination
 

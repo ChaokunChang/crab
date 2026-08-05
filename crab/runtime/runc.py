@@ -18,6 +18,7 @@ from ..models import RuntimeCapabilities, RuntimeOperationStatus, SandboxDescrip
 from ..remote_inspector import HostInspectorServiceClient
 from ..telemetry import NoopTelemetrySink, start_operation, telemetry_capture_command_output, telemetry_is_detailed
 from .base import CommandResult, CommandRunner, SubprocessCommandRunner
+from .btrfs_provider import BtrfsProvider
 from .fs_provider import FilesystemProvider
 from .zfs_provider import ZfsProvider
 
@@ -156,6 +157,9 @@ class RuncRuntimePaths:
     checkpoint_root: Path = Path("/var/lib/crab/checkpoints")
     metadata_root: Path = Path("/var/lib/crab/sandbox-metadata")
     zfs_dataset_prefix: str = "crab/sandboxes"
+    # Root of the btrfs filesystem holding sandbox subvolumes. Only
+    # consulted when RuncRuntimeOptions.filesystem_backend == "btrfs".
+    btrfs_root: Path = Path("/var/lib/crab/btrfs")
 
 
 @dataclass(frozen=True)
@@ -201,6 +205,12 @@ class RuncRuntimeOptions:
     restore: RuncRestoreOptions = field(default_factory=RuncRestoreOptions)
     command_timeout_seconds: float = _DEFAULT_RUNTIME_COMMAND_TIMEOUT_SECONDS
     zfs_prepare_timeout_seconds: float = _DEFAULT_ZFS_PREPARE_TIMEOUT_SECONDS
+    # CoW backend for sandbox rootfs checkpoints: "zfs" (default) or
+    # "btrfs". Ignored when an explicit fs_provider is injected.
+    filesystem_backend: str = "zfs"
+    # Per-snapshot byte stats on btrfs require qgroups, which carry real
+    # overhead; default off (stats degrade to unknown).
+    btrfs_qgroups_enabled: bool = False
 
 
 class RuncRuntime(Runtime):
@@ -233,15 +243,33 @@ class RuncRuntime(Runtime):
         # runtime's _run_command/_run_status so telemetry stays identical;
         # dataset naming that depends on per-sandbox descriptions resolves
         # back through dataset_name_for/rootfs_path_for.
-        self._fs = fs_provider or ZfsProvider(
-            dataset_prefix=self._paths.zfs_dataset_prefix,
-            runtime_name=self.name,
-            run_command=self._run_command,
-            run_status=self._run_status,
-            dataset_resolver=self.dataset_name_for,
-            rootfs_resolver=self.rootfs_path_for,
-            zfs_bin=zfs_bin,
-        )
+        if fs_provider is not None:
+            self._fs = fs_provider
+        elif resolved_options.filesystem_backend == "btrfs":
+            self._fs = BtrfsProvider(
+                btrfs_root=self._paths.btrfs_root,
+                runtime_name=self.name,
+                run_command=self._run_command,
+                run_status=self._run_status,
+                dataset_resolver=self.dataset_name_for,
+                rootfs_resolver=self.rootfs_path_for,
+                qgroups_enabled=resolved_options.btrfs_qgroups_enabled,
+            )
+        elif resolved_options.filesystem_backend == "zfs":
+            self._fs = ZfsProvider(
+                dataset_prefix=self._paths.zfs_dataset_prefix,
+                runtime_name=self.name,
+                run_command=self._run_command,
+                run_status=self._run_status,
+                dataset_resolver=self.dataset_name_for,
+                rootfs_resolver=self.rootfs_path_for,
+                zfs_bin=zfs_bin,
+            )
+        else:
+            raise ValueError(
+                f"unsupported filesystem_backend: {resolved_options.filesystem_backend!r} "
+                "(expected 'zfs' or 'btrfs')"
+            )
         self._lock = Lock()
         self._items: dict[SandboxId, SandboxDescription] = {}
         # In-flight `runc exec` subprocesses keyed by sandbox. The spot
