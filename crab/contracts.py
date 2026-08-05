@@ -230,6 +230,18 @@ class Runtime(ABC):
         _ = path
         return False
 
+    def destroy_filesystem_ref(self, fs_ref: str) -> None:
+        """Storage retention hook: destroy a filesystem checkpoint by the
+        opaque ``fs_ref`` recorded in its artifact payload. Routed to the
+        runtime's filesystem provider so storage never shells out to a
+        backend binary itself. Best-effort by contract: unknown refs and
+        already-deleted snapshots are tolerated.
+
+        Default: no-op (runtimes without filesystem checkpoints).
+        """
+        _ = fs_ref
+        return None
+
     @abstractmethod
     def checkpoint_filesystem(
         self,

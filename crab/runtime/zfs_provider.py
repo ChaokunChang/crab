@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
+import subprocess
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -23,6 +25,7 @@ _DATASET_DESTROY_BUSY_RETRIES = 10
 _DATASET_DESTROY_BUSY_RETRY_DELAY_S = 0.5
 _DATASET_PROMOTE_CONFLICT_RETRIES = 8
 _PROMOTE_CONFLICTING_SNAPSHOT_RE = re.compile(r"conflicting snapshot '([^']+)'")
+_FS_REF_PREFIX = "zfs:"
 
 
 class ZfsProvider(FilesystemProvider):
@@ -298,7 +301,35 @@ class ZfsProvider(FilesystemProvider):
             "dataset": dataset,
             "snapshot": snapshot,
             "mountpoint": str(self._rootfs_resolver(sandbox_id)),
+            # Backend-neutral handle for storage retention. The legacy
+            # `snapshot` key above stays for one release so pre-fs_ref
+            # manifests and readers keep working.
+            "fs_ref": f"{_FS_REF_PREFIX}{snapshot}",
         }
+
+    def destroy_snapshot_ref(self, fs_ref: str) -> None:
+        # Legacy artifact payloads carry a bare snapshot name instead of a
+        # prefixed fs_ref; accept both so retention of old checkpoints
+        # keeps working after the cutover.
+        snapshot = fs_ref[len(_FS_REF_PREFIX):] if fs_ref.startswith(_FS_REF_PREFIX) else fs_ref
+        if not snapshot:
+            return
+        result = self._run_command(
+            [self._zfs_bin, "destroy", snapshot],
+            operation="storage.zfs_destroy_snapshot_ref",
+            check=False,
+            metadata={"snapshot": snapshot, "fs_ref": fs_ref},
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            if "dataset does not exist" in stderr or "snapshot does not exist" in stderr:
+                return
+            logger.warning(
+                "Failed to destroy filesystem snapshot %s rc=%d stderr=%s",
+                snapshot,
+                result.returncode,
+                stderr,
+            )
 
     def destroy_filesystem_dataset(self, sandbox_id: SandboxId, dataset: str) -> None:
         result: CommandResult | None = None
@@ -453,3 +484,58 @@ class ZfsProvider(FilesystemProvider):
                     checkpoint_id,
                     snapshot,
                 )
+
+    # ------------------------------------------------------------------
+    # Host preparation (used by the engine before any runtime exists)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def resolve_dataset_prefix(configured: str | None) -> str:
+        """Resolve the dataset prefix for the SDK engine. Precedence:
+        explicit config > $CRAB_ZFS_DATASET_PREFIX > $CRAB_ZPOOL_NAME >
+        an installed zpool whose name starts with `crab`. Moved verbatim
+        from Engine._resolve_zfs_dataset_prefix so pool discovery lives
+        with the backend that understands it."""
+        if configured:
+            return configured.rstrip("/")
+        env_prefix = os.environ.get("CRAB_ZFS_DATASET_PREFIX", "").strip()
+        if env_prefix:
+            return env_prefix.rstrip("/")
+        env_pool = os.environ.get("CRAB_ZPOOL_NAME", "").strip()
+        if env_pool:
+            return f"{env_pool}/crab-sdk"
+        try:
+            result = subprocess.run(
+                ["zpool", "list", "-H", "-o", "name"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError:
+            return "crab/crab-sdk"
+        pools = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        for pool in pools:
+            if pool.startswith("crab"):
+                return f"{pool}/crab-sdk"
+        return f"{pools[0]}/crab-sdk" if pools else "crab/crab-sdk"
+
+    @staticmethod
+    def ensure_parent_dataset(dataset_prefix: str) -> None:
+        """Create the prefix's parent datasets if missing (e.g.
+        `crab/crab-sdk` under pool `crab`). Moved verbatim from
+        Engine._ensure_zfs_parent_dataset."""
+        parts = [part for part in dataset_prefix.strip("/").split("/") if part]
+        if len(parts) < 2:
+            return
+        current = parts[0]
+        for part in parts[1:]:
+            current = f"{current}/{part}"
+            exists = subprocess.run(
+                ["zfs", "list", "-H", "-o", "name", current],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ).returncode == 0
+            if exists:
+                continue
+            subprocess.run(["zfs", "create", current], check=True)

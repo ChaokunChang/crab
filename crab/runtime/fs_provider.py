@@ -210,3 +210,13 @@ class FilesystemProvider(ABC):
     ) -> None:
         """Best-effort removal of a checkpoint's filesystem snapshot after
         a partially failed composite checkpoint."""
+
+    @abstractmethod
+    def destroy_snapshot_ref(self, fs_ref: str) -> None:
+        """Best-effort destroy of a filesystem checkpoint by its opaque
+        ``fs_ref`` (recorded in the checkpoint's artifact payload by
+        ``filesystem_checkpoint_metadata``). Storage retention routes
+        snapshot deletion here instead of shelling out to a backend
+        binary itself. Refs the provider does not recognize and
+        already-deleted snapshots must be tolerated (log, don't raise):
+        retention is best-effort and must never wedge on cleanup."""
