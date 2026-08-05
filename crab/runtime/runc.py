@@ -1701,6 +1701,9 @@ class RuncRuntime(Runtime):
             dataset = self._fs.default_dataset_name(sandbox_id)
         self._fs.destroy_filesystem_dataset(sandbox_id, dataset)
 
+    def destroy_filesystem_ref(self, fs_ref: str) -> None:
+        self._fs.destroy_snapshot_ref(fs_ref)
+
     def promote_filesystem_dataset(self, sandbox_id: SandboxId) -> None:
         self._fs.promote_filesystem_dataset(sandbox_id)
 

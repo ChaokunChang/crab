@@ -1605,6 +1605,7 @@ def build_default_system(
     storage = checkpoint_manager or LocalCheckpointManager(
         store_cfg,
         runtime_image_path_in_use=runtime_impl.runtime_image_path_in_use,
+        destroy_filesystem_ref=runtime_impl.destroy_filesystem_ref,
     )
     if checkpoint_manager is None:
         # When the caller supplied their own manager (likely wrapped in a
@@ -1617,6 +1618,9 @@ def build_default_system(
     setter = getattr(storage, "set_runtime_image_path_in_use", None)
     if callable(setter):
         setter(runtime_impl.runtime_image_path_in_use)
+    fs_ref_setter = getattr(storage, "set_destroy_filesystem_ref", None)
+    if callable(fs_ref_setter):
+        fs_ref_setter(runtime_impl.destroy_filesystem_ref)
     request_store = request_state_store or InMemoryRequestStateStore()
     response_gate_registry = SandboxResponseGateRegistry()
     base_inspector: SandboxInspector

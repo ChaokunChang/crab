@@ -60,6 +60,7 @@ from .runtime import (
     RuncRuntime,
     RuncRuntimeOptions,
     RuncRuntimePaths,
+    ZfsProvider,
 )
 from .scheduler import CRScheduler, FaultToleranceCheckpointingPolicy, InMemorySchedulerStateStore
 from .sdk_llm_forwarder import SdkLLMForwarder, serve_sdk_llm_forwarder
@@ -824,9 +825,9 @@ class Engine:
             bundle_root=self._runtime_root / "bundles",
             checkpoint_root=self._runtime_root / "checkpoints",
             metadata_root=self._runtime_root / "sandbox-meta",
-            zfs_dataset_prefix=self._resolve_zfs_dataset_prefix(),
+            zfs_dataset_prefix=ZfsProvider.resolve_dataset_prefix(cfg.zfs_dataset_prefix),
         )
-        self._ensure_zfs_parent_dataset(paths.zfs_dataset_prefix)
+        ZfsProvider.ensure_parent_dataset(paths.zfs_dataset_prefix)
         telemetry_cfg = cfg.telemetry_config or TelemetryConfig(enabled=True)
         telemetry = build_configured_telemetry_sink(
             telemetry_cfg,
@@ -843,6 +844,7 @@ class Engine:
         storage = LocalCheckpointManager(
             storage_cfg,
             runtime_image_path_in_use=runtime.runtime_image_path_in_use,
+            destroy_filesystem_ref=runtime.destroy_filesystem_ref,
         )
         if self._host_inspector_client is not None:
             base_inspector = RemoteSandboxInspector(
@@ -1066,48 +1068,6 @@ class Engine:
             return configured_host
         bridge_ip = getattr(manager, "bridge_ip", None)
         return str(bridge_ip) if bridge_ip else configured_host
-
-    def _resolve_zfs_dataset_prefix(self) -> str:
-        cfg = self._config
-        if cfg.zfs_dataset_prefix:
-            return cfg.zfs_dataset_prefix.rstrip("/")
-        env_prefix = os.environ.get("CRAB_ZFS_DATASET_PREFIX", "").strip()
-        if env_prefix:
-            return env_prefix.rstrip("/")
-        env_pool = os.environ.get("CRAB_ZPOOL_NAME", "").strip()
-        if env_pool:
-            return f"{env_pool}/crab-sdk"
-        try:
-            result = subprocess.run(
-                ["zpool", "list", "-H", "-o", "name"],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-        except OSError:
-            return "crab/crab-sdk"
-        pools = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-        for pool in pools:
-            if pool.startswith("crab"):
-                return f"{pool}/crab-sdk"
-        return f"{pools[0]}/crab-sdk" if pools else "crab/crab-sdk"
-
-    def _ensure_zfs_parent_dataset(self, dataset_prefix: str) -> None:
-        parts = [part for part in dataset_prefix.strip("/").split("/") if part]
-        if len(parts) < 2:
-            return
-        current = parts[0]
-        for part in parts[1:]:
-            current = f"{current}/{part}"
-            exists = subprocess.run(
-                ["zfs", "list", "-H", "-o", "name", current],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            ).returncode == 0
-            if exists:
-                continue
-            subprocess.run(["zfs", "create", current], check=True)
 
     def stop(self) -> None:
         with self._lock:

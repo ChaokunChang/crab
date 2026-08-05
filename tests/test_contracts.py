@@ -1133,6 +1133,38 @@ class ContractTests(unittest.TestCase):
             self.assertIn("--leave-running=true", runner.commands[0])
             self.assertEqual(runner.commands[1], ("zfs", "snapshot", "pool/crab/sbx-1@ckpt-1"))
 
+    def test_runc_runtime_records_fs_ref_and_destroys_by_ref(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="crab_runc_runtime_fsref_") as tmp:
+            runner = FakeCommandRunner()
+            base = Path(tmp)
+            adapter = RuncRuntimeAdapter(
+                command_runner=runner,
+                paths=RuncRuntimePaths(
+                    state_root=base / "state",
+                    bundle_root=base / "bundles",
+                    checkpoint_root=base / "checkpoints",
+                    zfs_dataset_prefix="pool/crab",
+                ),
+            )
+
+            metadata = adapter.filesystem_checkpoint_metadata(SandboxId("sbx-1"), CheckpointId("ckpt-1"))
+            # Backend-neutral ref recorded alongside the legacy `snapshot`
+            # key (dual-write for one release).
+            self.assertEqual(metadata["fs_ref"], "zfs:pool/crab/sbx-1@ckpt-1")
+            self.assertEqual(metadata["snapshot"], "pool/crab/sbx-1@ckpt-1")
+
+            # Prefixed ref (new payloads) and bare snapshot name (legacy
+            # payloads) both destroy the same snapshot.
+            adapter.destroy_filesystem_ref("zfs:pool/crab/sbx-1@ckpt-1")
+            adapter.destroy_filesystem_ref("pool/crab/sbx-1@ckpt-2")
+            self.assertEqual(
+                runner.commands,
+                [
+                    ("zfs", "destroy", "pool/crab/sbx-1@ckpt-1"),
+                    ("zfs", "destroy", "pool/crab/sbx-1@ckpt-2"),
+                ],
+            )
+
     def test_runc_runtime_checkpoint_reports_process_size_and_snapshot_stats(self) -> None:
         with tempfile.TemporaryDirectory(prefix="crab_runc_runtime_stats_") as tmp:
             base = Path(tmp)
