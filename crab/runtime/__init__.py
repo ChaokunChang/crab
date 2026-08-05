@@ -1,5 +1,6 @@
 from ..contracts import Runtime
 from .base import CommandRunner, SubprocessCommandRunner
+from .btrfs_provider import BtrfsProvider
 from .fs_provider import FilesystemProvider
 from .in_memory import InMemoryRuntime
 from .runc import (
@@ -12,6 +13,7 @@ from .runc import (
 from .zfs_provider import ZfsProvider
 
 __all__ = [
+    "BtrfsProvider",
     "CommandRunner",
     "FilesystemProvider",
     "InMemoryRuntime",
