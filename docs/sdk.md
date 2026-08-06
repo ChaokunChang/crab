@@ -199,7 +199,12 @@ service behavior should be validated for each task.
 
 ## Current limitations
 
-- `Sandbox.fork()` is reserved but not implemented in the public SDK path.
+- `Sandbox.fork(count, lazy=False)` clones a running sandbox via
+  checkpoint+restore: each fork is an independent, running sandbox sharing
+  the parent's state at fork time (incremental chain sharing applies when
+  available). `lazy=True` restores with CRIU lazy-pages for a faster
+  return. Forks share the parent's `work_dir` host mount. Local (in-process
+  engine) only for now; daemon RPC lands in a follow-up.
 - Daemon restart rehydration is not implemented.
 - Exec output is buffered; streaming and PTY support are not implemented.
 - `resources`, `timeout`, and `labels` constructor arguments are currently

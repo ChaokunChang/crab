@@ -17,6 +17,7 @@ from .inspector import EBPFSandboxInspector
 from .remote_inspector import HostInspectorServiceClient, RemoteSandboxInspector
 from .interceptor import InMemoryRequestStateStore, RequestAwareSandboxInspector, SandboxResponseGateRegistry
 from .models import (
+    ArtifactPayload,
     CheckpointManifest,
     CheckpointJob,
     CheckpointResult,
@@ -27,8 +28,10 @@ from .models import (
     RestoreJob,
     RestoreResult,
     SandboxId,
+    SandboxSnapshot,
     utc_now,
 )
+from . import forking
 from .runtime import InMemoryRuntime, RuncRuntime, RuncRuntimeOptions
 from .scheduler import CRScheduler, InMemorySchedulerStateStore, SchedulerPolicy
 from .storage import LocalCheckpointManager
@@ -123,6 +126,9 @@ class CrabSystem:
     _recovery_futures: list[Future[None]] = field(init=False, repr=False, default_factory=list)
     _recovery_worker_count: int = field(init=False, repr=False, default=0)
     _coordination_pool: ThreadPoolExecutor | None = field(init=False, repr=False, default=None)
+    _fork_lock: Lock = field(init=False, repr=False)
+    _fork_chain_pins: dict[SandboxId, tuple[SandboxId, CheckpointId]] = field(init=False, repr=False)
+    _fork_children: dict[SandboxId, set[SandboxId]] = field(init=False, repr=False)
 
     @property
     def sandbox_manager(self) -> Runtime:
@@ -143,6 +149,9 @@ class CrabSystem:
         self._recovery_queue = Queue()
         self._recovery_records = {}
         self._stop_event = Event()
+        self._fork_lock = Lock()
+        self._fork_chain_pins = {}
+        self._fork_children = {}
 
     def start(self) -> None:
         with self._coordination_lock:
@@ -306,7 +315,13 @@ class CrabSystem:
                 results.append(result)
         return results
 
-    def restore_once(self, sandbox_id: SandboxId, checkpoint_id) -> RestoreResult:
+    def restore_once(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id,
+        *,
+        restore_metadata: dict[str, object] | None = None,
+    ) -> RestoreResult:
         logger.info("Running manual restore for sandbox %s checkpoint=%s", sandbox_id, checkpoint_id)
         started = utc_now()
         restore_checkpoint_id = CheckpointId(str(checkpoint_id))
@@ -366,6 +381,7 @@ class CrabSystem:
             checkpoint_id=restore_checkpoint_id,
             requested_at=utc_now(),
             reason="manual",
+            metadata=dict(restore_metadata or {}),
         )
         result = self.executor.run_restore(job)
         if result.status.value == "succeeded":
@@ -403,6 +419,325 @@ class CrabSystem:
             },
         )
         return result
+
+    def fork_once(
+        self,
+        source_sandbox_id: SandboxId,
+        target_sandbox_id: SandboxId,
+        *,
+        checkpoint_id: CheckpointId | None = None,
+        target_rootfs_path: Path,
+        bundle_root: Path | None = None,
+        checkpoint_root: Path | None = None,
+    ) -> forking.ForkResult:
+        """Clone a source sandbox's checkpoint state onto a new sandbox id.
+
+        Takes a fresh checkpoint when ``checkpoint_id`` is None, clones the
+        filesystem via the runtime's provider, copies manifests/artifacts
+        with path rewrites, and applies incremental chain sharing (pin +
+        ancestor symlinks) when available. The fork is left *stopped*;
+        callers restore it (Engine.fork_sandbox does, optionally lazily).
+        Mechanics sunk from the benchmark harness's clone_checkpoint_to_fork.
+        """
+        paths = getattr(self.runtime, "paths", None)
+        if bundle_root is None:
+            bundle_root = None if paths is None else paths.bundle_root
+        if checkpoint_root is None:
+            checkpoint_root = None if paths is None else paths.checkpoint_root
+        if bundle_root is None or checkpoint_root is None:
+            raise ValueError("fork_once requires bundle_root/checkpoint_root (runtime exposes no paths)")
+
+        operation = start_operation(
+            self.telemetry,
+            "fork.flow",
+            self._telemetry_attrs(
+                source_sandbox_id,
+                component="system",
+                extra={"target_sandbox_id": str(target_sandbox_id)},
+            ),
+        )
+        try:
+            if checkpoint_id is None:
+                checkpoint_result = self.checkpoint_once(source_sandbox_id, leave_running=True)
+                if checkpoint_result.status.value != "succeeded" or checkpoint_result.checkpoint_id is None:
+                    raise RuntimeError(
+                        f"fork checkpoint failed for sandbox {source_sandbox_id}: "
+                        f"status={checkpoint_result.status.value}"
+                    )
+                checkpoint_id = checkpoint_result.checkpoint_id
+
+            manifests = {
+                cid: self.storage.get_manifest(source_sandbox_id, cid)
+                for cid in self.storage.list_checkpoints(source_sandbox_id)
+            }
+            if checkpoint_id not in manifests:
+                raise ValueError(f"checkpoint {checkpoint_id} not found for sandbox {source_sandbox_id}")
+            checkpoint_order = list(manifests.keys())
+            copy_plan = forking.resolve_checkpoint_copy_plan(checkpoint_order, manifests, checkpoint_id)
+            filesystem_checkpoint_id = next(
+                copy_id for copy_id, _, copy_filesystem in reversed(copy_plan) if copy_filesystem
+            )
+
+            target_rootfs_path.mkdir(parents=True, exist_ok=True)
+            target_dataset = self.runtime.clone_filesystem_snapshot(
+                source_sandbox_id,
+                filesystem_checkpoint_id,
+                target_sandbox_id,
+                target_rootfs_path=target_rootfs_path,
+            )
+            # Restore flows (prepare_for_restore/mark_restored) require a
+            # runtime description; forks were never launched, so adopt one.
+            self.runtime.adopt_sandbox_description(
+                target_sandbox_id,
+                runtime_name=self.runtime.name,
+                status="stopped",
+                metadata={
+                    "sandbox_id": str(target_sandbox_id),
+                    "bundle_path": str(bundle_root / str(target_sandbox_id)),
+                    "rootfs_path": str(target_rootfs_path),
+                    "zfs_dataset": target_dataset,
+                    "forked_from": str(source_sandbox_id),
+                },
+            )
+
+            # Chain sharing: only meaningful when the runtime supports
+            # incremental process checkpoints and the leaf has ancestors.
+            chain_sharing_active = False
+            leaf = manifests.get(checkpoint_id)
+            try:
+                supports_incremental = bool(self.runtime.capabilities().supports_incremental_process)
+            except Exception:
+                supports_incremental = False
+            if supports_incremental and leaf is not None and leaf.parent_checkpoint_id is not None:
+                pin_chain = getattr(self.storage, "pin_chain", None)
+                if callable(pin_chain) and pin_chain(source_sandbox_id, checkpoint_id):
+                    with self._fork_lock:
+                        self._fork_chain_pins[target_sandbox_id] = (source_sandbox_id, checkpoint_id)
+                    chain_sharing_active = True
+                else:
+                    logger.warning(
+                        "Fork chain-sharing pin unavailable; using copy mode source=%s target=%s checkpoint=%s",
+                        source_sandbox_id,
+                        target_sandbox_id,
+                        checkpoint_id,
+                    )
+
+            chain_links = 0
+            chain_bytes_saved = 0
+            for copy_id, copy_process, copy_filesystem in copy_plan:
+                source_manifest = manifests[copy_id]
+                is_leaf = copy_id == checkpoint_id
+                link_this_entry = chain_sharing_active and copy_process and not is_leaf
+                process_refs = []
+                filesystem_refs = []
+                if copy_process:
+                    if link_this_entry:
+                        self.runtime.link_ancestor_pre_dump(source_sandbox_id, target_sandbox_id, copy_id)
+                    for reference in source_manifest.process_artifacts:
+                        payload = self.storage.get_artifact(source_sandbox_id, copy_id, reference)
+                        if link_this_entry:
+                            rewritten = forking.rewrite_process_artifact_linked(
+                                payload,
+                                target_sandbox_id=target_sandbox_id,
+                                checkpoint_id=copy_id,
+                                bundle_root=bundle_root,
+                                checkpoint_root=checkpoint_root,
+                            )
+                            chain_links += 1
+                            chain_bytes_saved += int(reference.size_bytes or 0)
+                        else:
+                            rewritten = forking.rewrite_process_artifact(
+                                payload,
+                                source_sandbox_id=source_sandbox_id,
+                                target_sandbox_id=target_sandbox_id,
+                                checkpoint_id=copy_id,
+                                bundle_root=bundle_root,
+                                checkpoint_root=checkpoint_root,
+                                preserve_symlinks=chain_sharing_active and is_leaf,
+                            )
+                        process_refs.append(
+                            self.storage.put_artifact(
+                                target_sandbox_id,
+                                copy_id,
+                                ArtifactPayload(
+                                    kind=reference.kind,
+                                    name=reference.name,
+                                    data=rewritten,
+                                    metadata=dict(reference.metadata),
+                                ),
+                            )
+                        )
+                if copy_filesystem:
+                    fork_fs_metadata = self.runtime.filesystem_checkpoint_metadata(target_sandbox_id, copy_id)
+                    for reference in source_manifest.filesystem_artifacts:
+                        payload = self.storage.get_artifact(source_sandbox_id, copy_id, reference)
+                        filesystem_refs.append(
+                            self.storage.put_artifact(
+                                target_sandbox_id,
+                                copy_id,
+                                ArtifactPayload(
+                                    kind=reference.kind,
+                                    name=reference.name,
+                                    data=forking.rewrite_filesystem_artifact(
+                                        payload,
+                                        target_sandbox_id=target_sandbox_id,
+                                        checkpoint_id=copy_id,
+                                        filesystem_metadata=fork_fs_metadata,
+                                    ),
+                                    metadata=dict(reference.metadata),
+                                ),
+                            )
+                        )
+                manifest = CheckpointManifest(
+                    schema_version=source_manifest.schema_version,
+                    checkpoint_id=source_manifest.checkpoint_id,
+                    sandbox_id=target_sandbox_id,
+                    created_at=source_manifest.created_at,
+                    runtime_name=source_manifest.runtime_name,
+                    runtime_version=source_manifest.runtime_version,
+                    process_artifacts=process_refs,
+                    filesystem_artifacts=filesystem_refs,
+                    metadata=dict(source_manifest.metadata),
+                ).with_integrity()
+                self.storage.put_manifest(manifest)
+
+            if chain_sharing_active:
+                # Plant ancestor symlinks for the whole parent chain so
+                # CRIU's chain walk during restore resolves into the
+                # source's bytes without copying. Walk via manifests because
+                # the copy plan short-circuits when the leaf carries both
+                # process+filesystem artifacts (the common incremental case).
+                try:
+                    cursor_id = manifests[checkpoint_id].parent_checkpoint_id
+                    seen: set[CheckpointId] = set()
+                    while cursor_id is not None and cursor_id not in seen:
+                        seen.add(cursor_id)
+                        self.runtime.link_ancestor_pre_dump(source_sandbox_id, target_sandbox_id, cursor_id)
+                        chain_links += 1
+                        parent_manifest = manifests.get(cursor_id)
+                        if parent_manifest is None:
+                            break
+                        chain_bytes_saved += sum(
+                            int(ref.size_bytes or 0) for ref in parent_manifest.process_artifacts
+                        )
+                        cursor_id = parent_manifest.parent_checkpoint_id
+                except Exception:
+                    logger.exception(
+                        "Failed to plant ancestor symlinks for chain sharing source=%s target=%s checkpoint=%s",
+                        source_sandbox_id,
+                        target_sandbox_id,
+                        checkpoint_id,
+                    )
+
+            with self._fork_lock:
+                self._fork_children.setdefault(source_sandbox_id, set()).add(target_sandbox_id)
+
+            inherited_checkpoint_at = manifests[checkpoint_id].created_at
+            upsert = getattr(self.inspector, "upsert_snapshot", None)
+            if callable(upsert):
+                upsert(
+                    SandboxSnapshot(
+                        sandbox_id=target_sandbox_id,
+                        runtime_name=self.runtime.name,
+                        is_running=False,
+                        process_changed=False,
+                        filesystem_changed=False,
+                        observed_at=utc_now(),
+                        last_checkpoint_at=inherited_checkpoint_at,
+                    )
+                )
+            self.scheduler.mark_checkpoint_complete(target_sandbox_id, inherited_checkpoint_at)
+
+            result = forking.ForkResult(
+                source_sandbox_id=source_sandbox_id,
+                target_sandbox_id=target_sandbox_id,
+                checkpoint_id=checkpoint_id,
+                filesystem_checkpoint_id=filesystem_checkpoint_id,
+                chain_shared=chain_sharing_active,
+                chain_links=chain_links,
+                chain_bytes_saved=chain_bytes_saved,
+            )
+            operation.finish(
+                status="succeeded",
+                attributes={
+                    "checkpoint_id": str(checkpoint_id),
+                    "filesystem_checkpoint_id": str(filesystem_checkpoint_id),
+                    "chain_shared": chain_sharing_active,
+                    "chain_links": chain_links,
+                },
+            )
+            logger.info(
+                "Forked sandbox source=%s target=%s checkpoint=%s chain_shared=%s links=%d bytes_saved=%d",
+                source_sandbox_id,
+                target_sandbox_id,
+                checkpoint_id,
+                chain_sharing_active,
+                chain_links,
+                chain_bytes_saved,
+            )
+            return result
+        except Exception:
+            operation.finish(status="failed")
+            raise
+
+    def release_fork(self, target_sandbox_id: SandboxId) -> None:
+        """Reverse fork_once's bookkeeping when a fork is destroyed."""
+        with self._fork_lock:
+            pin = self._fork_chain_pins.pop(target_sandbox_id, None)
+            for children in self._fork_children.values():
+                children.discard(target_sandbox_id)
+        if pin is None:
+            return
+        source_sandbox_id, leaf_checkpoint_id = pin
+        unpin_chain = getattr(self.storage, "unpin_chain", None)
+        if not callable(unpin_chain):
+            return
+        try:
+            unpin_chain(source_sandbox_id, leaf_checkpoint_id)
+        except Exception:
+            logger.exception(
+                "Failed to unpin chain for fork=%s source=%s leaf=%s",
+                target_sandbox_id,
+                source_sandbox_id,
+                leaf_checkpoint_id,
+            )
+
+    def prepare_source_destroy(self, source_sandbox_id: SandboxId) -> None:
+        """Before destroying a sandbox that has live forks, detach them:
+        promote one fork's filesystem clone so the source's dataset loses
+        its dependents, and replace chain-shared symlinks with real bytes
+        (storage artifacts and runtime pre-dump trees)."""
+        with self._fork_lock:
+            live_forks = sorted(self._fork_children.get(source_sandbox_id, set()))
+            pinned_forks = [fork for fork, (source, _) in self._fork_chain_pins.items() if source == source_sandbox_id]
+        if not live_forks and not pinned_forks:
+            return
+        if live_forks:
+            # Promoting one clone re-parents the source's snapshots (and any
+            # sibling clones) onto it; destroying the source then succeeds.
+            # Backends without clone-origin dependencies no-op here.
+            try:
+                self.runtime.promote_filesystem_dataset(live_forks[0])
+            except Exception:
+                logger.exception(
+                    "Failed to promote fork filesystem before source destroy source=%s fork=%s",
+                    source_sandbox_id,
+                    live_forks[0],
+                )
+        if pinned_forks:
+            materialize = getattr(self.storage, "materialize_linked_artifacts", None)
+            if callable(materialize):
+                try:
+                    materialize(source_sandbox_id)
+                except Exception:
+                    logger.exception("Failed to materialize linked storage artifacts for source=%s", source_sandbox_id)
+            for fork_id in pinned_forks:
+                try:
+                    self.runtime.materialize_linked_pre_dumps(fork_id)
+                except Exception:
+                    logger.exception("Failed to materialize linked pre-dumps for fork=%s", fork_id)
+        with self._fork_lock:
+            self._fork_children.pop(source_sandbox_id, None)
 
     def _wait_for_runtime_running(self, sandbox_id: SandboxId):
         for attempt in range(_RESTORE_RUNTIME_READY_ATTEMPTS):

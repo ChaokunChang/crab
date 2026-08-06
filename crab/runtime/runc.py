@@ -750,6 +750,24 @@ class RuncRuntime(Runtime):
         description = self.describe(sandbox_id)
         self._update_description(replace(description, status="running" if is_running else "stopped"))
 
+    def adopt_sandbox_description(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        runtime_name: str,
+        status: str,
+        metadata: dict[str, object],
+    ) -> None:
+        description = SandboxDescription(
+            sandbox_id=sandbox_id,
+            runtime_name=runtime_name,
+            status=status,
+            metadata=dict(metadata),
+        )
+        with self._lock:
+            self._items[sandbox_id] = description
+        self._persist(description)
+
     def prepare_for_restore(self, sandbox_id: SandboxId) -> None:
         self.delete_runtime(sandbox_id, force=True, ignore_missing=True)
 
@@ -1277,13 +1295,18 @@ class RuncRuntime(Runtime):
         self,
         sandbox_id: SandboxId,
         checkpoint_id: CheckpointId,
+        *,
+        lazy_pages: bool | None = None,
     ) -> RuntimeOperationStatus:
+        # Per-call override for fork-style restores that want a fast return
+        # (Sandbox.fork(lazy=True)) without flipping the configured default.
+        resolved_lazy_pages = self._restore_options.lazy_pages if lazy_pages is None else bool(lazy_pages)
         image_path = Path(self.process_checkpoint_location(sandbox_id, checkpoint_id) or "")
         work_path = self.process_work_path(sandbox_id, checkpoint_id)
         image_path.mkdir(parents=True, exist_ok=True)
         work_path.mkdir(parents=True, exist_ok=True)
         lazy_daemon_pid: int | None = None
-        if self._restore_options.lazy_pages:
+        if resolved_lazy_pages:
             lazy_daemon_pid = self._spawn_lazy_pages_daemon(
                 sandbox_id=sandbox_id,
                 checkpoint_id=checkpoint_id,
@@ -1296,7 +1319,7 @@ class RuncRuntime(Runtime):
         command.extend(
             ["--bundle", str(self.bundle_path_for(sandbox_id)), "--image-path", str(image_path), "--work-path", str(work_path)]
         )
-        command.extend(self._restore_optional_args())
+        command.extend(self._restore_optional_args(lazy_pages=resolved_lazy_pages))
         command.append(str(sandbox_id))
         try:
             return self._run_status(
@@ -1311,7 +1334,7 @@ class RuncRuntime(Runtime):
                     "work_path": str(work_path),
                     "bundle_path": str(self.bundle_path_for(sandbox_id)),
                     "state_root": str(self._paths.state_root),
-                    "lazy_pages": bool(self._restore_options.lazy_pages),
+                    "lazy_pages": resolved_lazy_pages,
                     "lazy_pages_daemon_pid": lazy_daemon_pid,
                 },
             )
@@ -2047,7 +2070,8 @@ class RuncRuntime(Runtime):
         args.extend(self._checkpoint_options.extra_args)
         return args
 
-    def _restore_optional_args(self) -> list[str]:
+    def _restore_optional_args(self, *, lazy_pages: bool | None = None) -> list[str]:
+        resolved_lazy_pages = self._restore_options.lazy_pages if lazy_pages is None else bool(lazy_pages)
         args: list[str] = []
         if self._restore_options.tcp_established:
             args.append("--tcp-established")
@@ -2055,7 +2079,7 @@ class RuncRuntime(Runtime):
             args.append("--shell-job")
         if self._restore_options.ext_unix_sk:
             args.append("--ext-unix-sk")
-        if self._restore_options.lazy_pages:
+        if resolved_lazy_pages:
             args.append("--lazy-pages")
         args.extend(self._restore_options.extra_args)
         return args

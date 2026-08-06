@@ -230,6 +230,22 @@ class Runtime(ABC):
         _ = path
         return False
 
+    def adopt_sandbox_description(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        runtime_name: str,
+        status: str,
+        metadata: dict[str, object],
+    ) -> None:
+        """Register a sandbox this runtime did not launch itself (a fork
+        materialized from another sandbox's checkpoint). Restore flows
+        (`prepare_for_restore`/`mark_restored`) require a description to
+        exist. Default: no-op for runtimes without persistent descriptions.
+        """
+        _ = (sandbox_id, runtime_name, status, metadata)
+        return None
+
     def destroy_filesystem_ref(self, fs_ref: str) -> None:
         """Storage retention hook: destroy a filesystem checkpoint by the
         opaque ``fs_ref`` recorded in its artifact payload. Routed to the
