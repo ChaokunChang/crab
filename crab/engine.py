@@ -30,6 +30,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
+import uuid
 import socket
 import subprocess
 import sys
@@ -54,6 +56,7 @@ from .interceptor import (
     SandboxResponseGateRegistry,
 )
 from .remote_inspector import HostInspectorServiceClient, RemoteSandboxInspector
+from . import forking
 from .runtime import (
     BtrfsProvider,
     RuncCheckpointOptions,
@@ -1358,6 +1361,68 @@ class Engine:
         except Exception:
             logger.exception("Failed to repair sandbox network lease: %s", sandbox_id)
             return False
+
+    def fork_sandbox(
+        self,
+        source_sandbox_id: SandboxId,
+        *,
+        count: int = 1,
+        lazy: bool = False,
+    ) -> list[SandboxId]:
+        """Fork a running sandbox `count` times via checkpoint+restore.
+
+        Each fork gets its own bundle (source config.json copied with
+        per-sandbox path rewrites), its own network lease when networking
+        is enabled, a checkpoint-state clone (CrabSystem.fork_once, with
+        incremental chain sharing when available), and a process restore —
+        lazily via CRIU lazy-pages when ``lazy=True``.
+        """
+        if count < 1:
+            raise ValueError("fork count must be >= 1")
+        system = self.system
+        runtime = self.runtime
+        source_bundle = runtime.bundle_path_for(source_sandbox_id)
+        paths = getattr(runtime, "paths", None)
+        if paths is None:
+            raise RuntimeError("fork is only supported on the runc runtime")
+
+        fork_ids: list[SandboxId] = []
+        for _ in range(count):
+            target_sandbox_id = SandboxId(f"{source_sandbox_id}-fork-{uuid.uuid4().hex[:8]}")
+            target_bundle = paths.bundle_root / str(target_sandbox_id)
+            target_bundle.mkdir(parents=True, exist_ok=True)
+            source_cfg = source_bundle / "config.json"
+            if source_cfg.is_file():
+                shutil.copy2(source_cfg, target_bundle / "config.json")
+            forking.replicate_bundle_config(
+                source_bundle,
+                target_bundle,
+                source_sandbox_id,
+                target_sandbox_id,
+            )
+            if self._network_manager is not None:
+                try:
+                    self.allocate_network_lease(target_sandbox_id)
+                except Exception:
+                    logger.exception("Failed to allocate network lease for fork %s", target_sandbox_id)
+
+            result = system.fork_once(
+                source_sandbox_id,
+                target_sandbox_id,
+                target_rootfs_path=target_bundle / "rootfs",
+            )
+            restore_result = system.restore_once(
+                target_sandbox_id,
+                result.checkpoint_id,
+                restore_metadata={"lazy_pages": True} if lazy else None,
+            )
+            if restore_result.status.value != "succeeded":
+                raise RuntimeError(
+                    f"fork restore failed for {target_sandbox_id}: status={restore_result.status.value}"
+                )
+            self.repair_network_lease(target_sandbox_id)
+            fork_ids.append(target_sandbox_id)
+        return fork_ids
 
     # ------------------------------------------------------------------
     # Sandbox registry — used so engine.stop() can clean up.

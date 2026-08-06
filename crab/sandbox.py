@@ -777,6 +777,21 @@ class Sandbox:
         if sandbox_id is None:
             return
         try:
+            # Fork bookkeeping: if this sandbox has live forks, replace
+            # chain-shared symlinks with real bytes first; if it *is* a
+            # fork, release its chain pin. Remote engines expose a system
+            # shim without these hooks — degrade gracefully.
+            system = getattr(self._engine, "system", None)
+            if system is not None:
+                prepare = getattr(system, "prepare_source_destroy", None)
+                if callable(prepare):
+                    prepare(sandbox_id)
+                release = getattr(system, "release_fork", None)
+                if callable(release):
+                    release(sandbox_id)
+        except Exception:
+            logger.exception("Fork bookkeeping failed during kill: id=%s", sandbox_id)
+        try:
             self._engine.runtime.delete(sandbox_id)
         except Exception:
             logger.exception("Sandbox kill failed: id=%s", sandbox_id)
@@ -818,25 +833,29 @@ class Sandbox:
         self._engine.repair_network_lease(self.sandbox_id)
         self._mark_inspector_running()
 
-    def fork(self, count: int = 1) -> list["Sandbox"]:
-        """Clone this sandbox via checkpoint+restore (CRIU+ZFS). Each fork is
-        an independent sandbox sharing initial state with the parent.
+    def fork(self, count: int = 1, *, lazy: bool = False) -> list["Sandbox"]:
+        """Clone this sandbox via checkpoint+restore. Each fork is an
+        independent, running sandbox sharing initial state with the parent
+        (fresh checkpoint at call time; incremental chain sharing applies
+        when the runtime supports it).
 
-        First-cut implementation: takes a fresh checkpoint, then for each
-        fork the engine spins up a new sandbox and restores from the
-        checkpoint. Operators may want to wire incremental forks (today's
-        chain-sharing) later — the SDK shape is forward-compatible.
+        With ``lazy=True`` the process restore uses CRIU lazy-pages: the
+        call returns as soon as metadata and the eager page set are in
+        place, and memory streams in on demand.
+
+        Note: forks share the parent's ``work_dir`` host mount (fork shares
+        initial state by design); pass a fresh work dir to a new sandbox if
+        isolation is needed.
         """
         if count < 1:
             raise ValueError("fork count must be >= 1")
-        # For first cut, mark fork as unsupported via a clear error. The
-        # underlying machinery exists in the harness but its integration
-        # with the bare SDK launch path needs follow-up.
-        raise NotImplementedError(
-            "Sandbox.fork() will be wired in a follow-up PR. The harness's "
-            "clone_checkpoint_to_fork machinery exists today; the SDK shape "
-            "is locked so call sites can adopt it now."
-        )
+        fork_ids = self._engine.fork_sandbox(self.sandbox_id, count=count, lazy=lazy)
+        forks: list[Sandbox] = []
+        for fork_id in fork_ids:
+            fork = Sandbox.connect(fork_id, engine=self._engine)
+            fork._mark_inspector_running()
+            forks.append(fork)
+        return forks
 
     # ------------------------------------------------------------------
     # Network
