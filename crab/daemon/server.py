@@ -37,6 +37,7 @@ from typing import Any, Callable
 
 from ..engine import Engine, EngineConfig
 from ..ids import SandboxId
+from ..models import SandboxSnapshot, utc_now
 from .transport import (
     DEFAULT_SOCKET_PERMS,
     default_socket_path,
@@ -128,6 +129,7 @@ class _Routes:
         # /shutdown can tear it down. The SDK Sandbox is the lifecycle
         # owner; this registry is a cheap mirror.
         self._daemon.register_sandbox(sandbox_id)
+        _seed_inspector_running(eng, sandbox_id)
         return {"ok": True, "sandbox_id": str(sandbox_id)}
 
     def exec_sandbox(self, body: dict[str, Any], *, sandbox_id: str) -> dict[str, Any]:
@@ -164,6 +166,15 @@ class _Routes:
     def kill_sandbox(self, body: dict[str, Any], *, sandbox_id: str) -> dict[str, Any]:
         eng = self._daemon.require_engine()
         sid = SandboxId(sandbox_id)
+        # Fork bookkeeping mirrors Sandbox.kill(): materialize chain-shared
+        # bytes for live forks of this sandbox, and release its own chain
+        # pin if it is a fork. In daemon mode the SDK's kill path runs
+        # against the _SystemShim (no-op hooks), so the daemon must do it.
+        try:
+            eng.system.prepare_source_destroy(sid)
+            eng.system.release_fork(sid)
+        except Exception:
+            logger.exception("fork bookkeeping failed for %s during kill", sid)
         try:
             eng.runtime.stop(sid)
         except Exception:
@@ -315,12 +326,39 @@ class _Routes:
             eng.repair_network_lease(sid)
         except Exception:
             logger.debug("repair_network_lease failed after restore", exc_info=True)
+        _seed_inspector_running(eng, sid)
         return {
             "ok": True,
             "sandbox_id": sandbox_id,
             "checkpoint_id": checkpoint_id,
             "status": getattr(result, "status", "succeeded"),
         }
+
+    def fork_sandbox(self, body: dict[str, Any], *, sandbox_id: str) -> dict[str, Any]:
+        """Fork a running sandbox N times (checkpoint + per-fork restore).
+
+        Runs the same local path the in-process Engine exposes; forks are
+        registered in the daemon registry so /sandboxes lists them and
+        shutdown tears them down."""
+        eng = self._daemon.require_engine()
+        sid = SandboxId(sandbox_id)
+        try:
+            count = int(body.get("count", 1))
+        except (TypeError, ValueError):
+            raise _BadRequest("fork count must be an integer") from None
+        if count < 1:
+            raise _BadRequest("fork count must be >= 1")
+        lazy = bool(body.get("lazy", False))
+        try:
+            fork_ids = eng.fork_sandbox(sid, count=count, lazy=lazy)
+        except (ValueError, RuntimeError) as exc:
+            raise _BadRequest(f"fork failed: {exc}") from exc
+        forks: list[dict[str, Any]] = []
+        for fork_id in fork_ids:
+            self._daemon.register_sandbox(fork_id)
+            _seed_inspector_running(eng, fork_id)
+            forks.append({"sandbox_id": str(fork_id)})
+        return {"ok": True, "sandbox_id": sandbox_id, "forks": forks}
 
     def update_host_inspector_filters(
         self, body: dict[str, Any], *, sandbox_id: str
@@ -338,6 +376,28 @@ class _Routes:
             ignored_path_prefixes=ignored_path_prefixes,
         )
         return {"ok": True, "applied": True}
+
+
+def _seed_inspector_running(engine: Engine, sandbox_id: SandboxId) -> None:
+    """Mirror the SDK's local `Sandbox._mark_inspector_running`.
+
+    In daemon mode the SDK side holds a no-op inspector shim, so the
+    daemon must seed its own engine's inspector after launch/restore/fork
+    — otherwise checkpoint flows fail with "sandbox snapshot not found"
+    and the scheduler's running-guard blocks checkpoints."""
+    try:
+        engine.system.inspector.upsert_snapshot(
+            SandboxSnapshot(
+                sandbox_id=sandbox_id,
+                runtime_name=engine.runtime.name,
+                is_running=True,
+                process_changed=False,
+                filesystem_changed=False,
+                observed_at=utc_now(),
+            )
+        )
+    except Exception:
+        logger.debug("failed to seed inspector snapshot for %s", sandbox_id, exc_info=True)
 
 
 def _serialize_description(description) -> dict[str, Any]:
@@ -432,6 +492,8 @@ def _build_handler(daemon: "DaemonServer"):
             "",
             routes.restore_checkpoint,
         ),
+        # Fork (checkpoint + restore into new sandboxes)
+        ("POST", "/sandboxes/{sandbox_id}/fork", "", routes.fork_sandbox),
     ]
 
     def _match(method: str, path: str):

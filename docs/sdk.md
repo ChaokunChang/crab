@@ -203,8 +203,9 @@ service behavior should be validated for each task.
   checkpoint+restore: each fork is an independent, running sandbox sharing
   the parent's state at fork time (incremental chain sharing applies when
   available). `lazy=True` restores with CRIU lazy-pages for a faster
-  return. Forks share the parent's `work_dir` host mount. Local (in-process
-  engine) only for now; daemon RPC lands in a follow-up.
+  return. Forks share the parent's `work_dir` host mount. Works both with
+  a local in-process engine and against the daemon (`crab sandbox fork`
+  from the CLI).
 - Daemon restart rehydration is not implemented.
 - Exec output is buffered; streaming and PTY support are not implemented.
 - `resources`, `timeout`, and `labels` constructor arguments are currently

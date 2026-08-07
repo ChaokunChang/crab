@@ -481,6 +481,29 @@ class RemoteEngine:
         # restore path falls back gracefully.
         return False
 
+    def fork_sandbox(
+        self,
+        source_sandbox_id: SandboxId,
+        *,
+        count: int = 1,
+        lazy: bool = False,
+    ) -> list[SandboxId]:
+        """Fork via the daemon. Mirrors `Engine.fork_sandbox`; the daemon
+        runs the whole checkpoint + clone + restore pipeline and returns
+        the new sandbox ids. Timeout scales with count the same way
+        checkpoint/restore calls are budgeted (300s each)."""
+        if count < 1:
+            raise ValueError("fork count must be >= 1")
+        response = self._client.post_json(
+            f"/sandboxes/{source_sandbox_id}/fork",
+            {"count": int(count), "lazy": bool(lazy)},
+            timeout_seconds=300.0 * count,
+        )
+        return [
+            SandboxId(str(entry["sandbox_id"]))
+            for entry in (response.get("forks") or [])
+        ]
+
     # ----- local sandbox registry (mirrors the in-process Engine) -----
 
     def _register_sandbox(self, sandbox: "Sandbox") -> None:
