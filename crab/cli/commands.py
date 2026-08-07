@@ -173,6 +173,27 @@ def _build_parser() -> argparse.ArgumentParser:
     p_exec.add_argument("--timeout", dest="exec_timeout", type=float, default=None)
     p_exec.set_defaults(func=_cmd_sandbox_exec)
 
+    p_fork = sandbox_sub.add_parser(
+        "fork",
+        help="Fork a running sandbox into N independent running copies "
+        "(checkpoint + restore). Prints one fork id per line.",
+    )
+    p_fork.add_argument("sandbox_id", metavar="SANDBOX_ID")
+    p_fork.add_argument(
+        "-n",
+        "--count",
+        type=int,
+        default=1,
+        help="Number of forks to create (default 1).",
+    )
+    p_fork.add_argument(
+        "--lazy",
+        action="store_true",
+        help="Restore with CRIU lazy-pages: return as soon as metadata is "
+        "in place and stream memory on demand.",
+    )
+    p_fork.set_defaults(func=_cmd_sandbox_fork)
+
     # ----- checkpoint group ----------------------------------------------
     # Checkpoints are first-class entities with their own ids; keep them
     # at the top level so the verbs read cleanly (`crab checkpoint ls`,
@@ -515,6 +536,30 @@ def _cmd_sandbox_run(args: argparse.Namespace) -> int:
             engine.stop()
         except Exception:
             pass
+
+
+def _cmd_sandbox_fork(args: argparse.Namespace) -> int:
+    if args.count < 1:
+        print("crab sandbox fork: --count must be >= 1", file=sys.stderr)
+        return 2
+    socket_path = _resolve_socket(args)
+    # Fork = one checkpoint + N clone/restores; budget the HTTP timeout
+    # the same way `checkpoint create` does, scaled by count.
+    client = DaemonClient(
+        socket_path,
+        timeout_seconds=max(args.timeout, 300.0 * args.count),
+    )
+    response = client.post_json(
+        f"/sandboxes/{args.sandbox_id}/fork",
+        {"count": int(args.count), "lazy": bool(args.lazy)},
+    )
+    forks = list(response.get("forks") or [])
+    if args.json:
+        print(json.dumps(forks, indent=2))
+        return 0
+    for fork in forks:
+        print(fork.get("sandbox_id", ""))
+    return 0
 
 
 def _cmd_checkpoint_ls(args: argparse.Namespace) -> int:

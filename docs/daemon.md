@@ -44,6 +44,7 @@ crab [--socket PATH] [--timeout SECONDS] [--json] <command>
   sandbox run [OPTIONS] IMAGE [-- COMMAND ...]
   sandbox ls
   sandbox exec SANDBOX_ID [OPTIONS] -- COMMAND ...
+  sandbox fork SANDBOX_ID [-n COUNT] [--lazy]
   sandbox stop|pause|resume SANDBOX_ID
   sandbox rm SANDBOX_ID [SANDBOX_ID ...]
 
