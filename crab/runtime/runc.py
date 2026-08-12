@@ -12,9 +12,9 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from threading import Lock
 
-from ..contracts import Runtime, TelemetrySink
+from ..contracts import ActionRecorder, Runtime, TelemetrySink
 from ..ids import CheckpointId, SandboxId
-from ..models import RuntimeCapabilities, RuntimeOperationStatus, SandboxDescription, SandboxExecResult, SandboxRuntimeState
+from ..models import RuntimeCapabilities, RuntimeOperationStatus, SandboxDescription, SandboxExecResult, SandboxRuntimeState, utc_now
 from ..remote_inspector import HostInspectorServiceClient
 from ..telemetry import NoopTelemetrySink, start_operation, telemetry_capture_command_output, telemetry_is_detailed
 from .base import CommandResult, CommandRunner, SubprocessCommandRunner
@@ -228,6 +228,7 @@ class RuncRuntime(Runtime):
         restore_options: RuncRestoreOptions | None = None,
         options: RuncRuntimeOptions | None = None,
         fs_provider: FilesystemProvider | None = None,
+        action_recorder: ActionRecorder | None = None,
     ) -> None:
         self._version = version
         resolved_options = options or RuncRuntimeOptions()
@@ -236,6 +237,9 @@ class RuncRuntime(Runtime):
         self._runtime_bin = runtime_bin
         self._host_inspector_client = host_inspector_client
         self._telemetry = telemetry or NoopTelemetrySink()
+        # Action journal sink (roadmap B1). Optional; recording failures are
+        # swallowed so journaling never breaks exec/launch.
+        self.action_recorder = action_recorder
         self._checkpoint_options = checkpoint_options or resolved_options.checkpoint
         self._restore_options = restore_options or resolved_options.restore
         self._zfs_prepare_timeout_seconds = float(resolved_options.zfs_prepare_timeout_seconds)
@@ -632,6 +636,11 @@ class RuncRuntime(Runtime):
             self._items[sandbox_id] = description
         self._persist(description)
         self._register_with_host_inspector(description)
+        self._record_lifecycle_action(
+            sandbox_id,
+            "launch",
+            metadata={"runtime_name": runtime_name, "bundle_path": str(bundle_path)},
+        )
         logger.info(
             "Launched runtime sandbox=%s bundle_path=%s rootfs_path=%s dataset=%s",
             sandbox_id,
@@ -963,6 +972,7 @@ class RuncRuntime(Runtime):
         command.append(str(sandbox_id))
         command.extend(argv)
         started = time.perf_counter()
+        started_at_iso = utc_now().isoformat()
         stdout_target = subprocess.PIPE if capture_output else subprocess.DEVNULL
         stderr_target = subprocess.PIPE if capture_output else subprocess.DEVNULL
         operation_context = start_operation(
@@ -995,6 +1005,21 @@ class RuncRuntime(Runtime):
             except subprocess.TimeoutExpired:
                 proc.kill()
                 stdout, stderr = proc.communicate()
+                self._record_exec_action(
+                    sandbox_id,
+                    argv=argv,
+                    cwd=cwd,
+                    env=env,
+                    user=user,
+                    timeout_s=timeout_s,
+                    capture_output=capture_output,
+                    returncode=None,
+                    duration_ms=(time.perf_counter() - started) * 1000.0,
+                    stdout=stdout,
+                    stderr=stderr,
+                    started_at=started_at_iso,
+                    timed_out=True,
+                )
                 raise
         finally:
             with self._active_execs_lock:
@@ -1008,6 +1033,20 @@ class RuncRuntime(Runtime):
         stdout = "" if completed.stdout is None else completed.stdout
         stderr = "" if completed.stderr is None else completed.stderr
         success = completed.returncode == 0
+        self._record_exec_action(
+            sandbox_id,
+            argv=argv,
+            cwd=cwd,
+            env=env,
+            user=user,
+            timeout_s=timeout_s,
+            capture_output=capture_output,
+            returncode=int(completed.returncode),
+            duration_ms=duration_ms,
+            stdout=stdout,
+            stderr=stderr,
+            started_at=started_at_iso,
+        )
         operation_context.finish(
             status="succeeded" if success else "failed",
             attributes=self._command_finish_attributes(
@@ -1057,6 +1096,62 @@ class RuncRuntime(Runtime):
             ),
         )
         return SandboxExecResult(args=tuple(command), returncode=int(completed.returncode), stdout=stdout, stderr=stderr)
+
+    def _record_exec_action(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        argv: list[str],
+        cwd: str | None,
+        env: dict[str, object] | None,
+        user: str | None,
+        timeout_s: float | None,
+        capture_output: bool,
+        returncode: int | None,
+        duration_ms: float,
+        stdout: str | None,
+        stderr: str | None,
+        started_at: str,
+        timed_out: bool = False,
+    ) -> None:
+        """Best-effort action-journal record; never breaks exec."""
+        recorder = self.action_recorder
+        if recorder is None:
+            return
+        try:
+            recorder.record_exec(
+                sandbox_id,
+                argv=argv,
+                cwd=cwd,
+                env=env,
+                user=user,
+                timeout_s=timeout_s,
+                capture_output=capture_output,
+                returncode=returncode,
+                duration_ms=duration_ms,
+                stdout=stdout,
+                stderr=stderr,
+                started_at=started_at,
+                finished_at=utc_now().isoformat(),
+                timed_out=timed_out,
+            )
+        except Exception:
+            logger.exception("Action journal record_exec failed for %s", sandbox_id)
+
+    def _record_lifecycle_action(
+        self,
+        sandbox_id: SandboxId,
+        event: str,
+        *,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        recorder = self.action_recorder
+        if recorder is None:
+            return
+        try:
+            recorder.record_lifecycle(sandbox_id, event, metadata=metadata)
+        except Exception:
+            logger.exception("Action journal record_lifecycle failed for %s", sandbox_id)
 
     def cancel_active_execs(self, sandbox_id: SandboxId, *, timeout_s: float = 2.0) -> int:
         """Terminate all in-flight `runc exec` subprocesses targeting

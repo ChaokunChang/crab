@@ -857,6 +857,26 @@ class Sandbox:
             forks.append(fork)
         return forks
 
+    def actions(self, *, kind: str | None = None, limit: int | None = None) -> list[dict]:
+        """Read this sandbox's action journal: every exec attempt (argv,
+        cwd, env, exit status, timing) plus lifecycle markers
+        (launch/checkpoint/restore/fork/destroy), oldest first.
+
+        Local (in-process engine) only for now; the daemon RPC surface
+        lands with the transaction API.
+        """
+        system = getattr(self._engine, "system", None)
+        journal = getattr(system, "journal", None)
+        if journal is None:
+            raise NotImplementedError(
+                "action journal is not available on this engine "
+                "(daemon-mode journal access lands with the txn API)"
+            )
+        records = journal.entries(self.sandbox_id, kind=kind)
+        if limit is not None and limit >= 0:
+            records = records[-limit:]
+        return [record.to_json() for record in records]
+
     # ------------------------------------------------------------------
     # Network
     # ------------------------------------------------------------------

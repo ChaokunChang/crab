@@ -501,6 +501,48 @@ class RequestInterceptorHook(ABC):
         raise NotImplementedError
 
 
+class ActionRecorder(ABC):
+    """Sink for the per-sandbox action journal (roadmap B1).
+
+    Implemented by `crab.journal.ActionJournal`; injected into runtimes so
+    they can record exec attempts and launch markers without importing
+    storage. Recording must never break the recorded operation — callers
+    wrap invocations defensively."""
+
+    @abstractmethod
+    def record_exec(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        argv: list[str],
+        cwd: str | None,
+        env: dict[str, object] | None,
+        user: str | None,
+        timeout_s: float | None,
+        capture_output: bool,
+        returncode: int | None,
+        duration_ms: float,
+        stdout: str | None,
+        stderr: str | None,
+        started_at: str,
+        finished_at: str,
+        timed_out: bool = False,
+        txn_id: str | None = None,
+    ) -> object:
+        raise NotImplementedError
+
+    @abstractmethod
+    def record_lifecycle(
+        self,
+        sandbox_id: SandboxId,
+        event: str,
+        *,
+        metadata: dict[str, object] | None = None,
+        txn_id: str | None = None,
+    ) -> object:
+        raise NotImplementedError
+
+
 class TelemetrySink(ABC):
     @abstractmethod
     def emit_event(self, name: str, attributes: dict[str, object]) -> None:

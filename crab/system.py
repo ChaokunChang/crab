@@ -32,6 +32,7 @@ from .models import (
     utc_now,
 )
 from . import forking
+from .journal import ActionJournal
 from .runtime import InMemoryRuntime, RuncRuntime, RuncRuntimeOptions
 from .scheduler import CRScheduler, InMemorySchedulerStateStore, SchedulerPolicy
 from .storage import LocalCheckpointManager
@@ -100,6 +101,7 @@ class CrabSystem:
     telemetry: TelemetrySink
     request_state_store: InMemoryRequestStateStore | None = None
     response_gate_registry: SandboxResponseGateRegistry | None = None
+    journal: ActionJournal | None = None
     relaunch_handler: Callable[[SandboxId, str, bool], None] | None = None
     extra_checkpoint_metadata_provider: Callable[[SandboxId], dict[str, object]] | None = None
     restore_metadata_handler: Callable[[SandboxId, CheckpointManifest], None] | None = None
@@ -237,6 +239,24 @@ class CrabSystem:
             attributes.update(extra)
         return attributes
 
+    def _journal_lifecycle(
+        self,
+        sandbox_id: SandboxId,
+        event: str,
+        *,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        """Best-effort lifecycle marker in the action journal (B1)."""
+        journal = self.journal
+        if journal is None:
+            return
+        try:
+            journal.record_lifecycle(sandbox_id, event, metadata=metadata)
+        except Exception:
+            logger.exception(
+                "Journal lifecycle record failed sandbox=%s event=%s", sandbox_id, event
+            )
+
     def checkpoint_once(self, sandbox_id: SandboxId, leave_running: bool=False) -> CheckpointResult:
         logger.info("Running manual checkpoint for sandbox %s", sandbox_id)
         operation = start_operation(
@@ -272,6 +292,15 @@ class CrabSystem:
                     process=job.checkpoint_process,
                     filesystem=job.checkpoint_filesystem,
                     at=result.finished_at,
+                )
+                self._journal_lifecycle(
+                    sandbox_id,
+                    "checkpoint",
+                    metadata={
+                        "checkpoint_id": str(result.checkpoint_id),
+                        "reason": "manual",
+                        "leave_running": bool(leave_running),
+                    },
                 )
         finally:
             if paused and self._should_resume_after_checkpoint(job, result):
@@ -405,6 +434,11 @@ class CrabSystem:
                 self.runtime.mark_restored(sandbox_id)
                 self._mark_sandbox_running(sandbox_id)
                 self.storage.handle_restore_complete(sandbox_id, result.checkpoint_id)
+                self._journal_lifecycle(
+                    sandbox_id,
+                    "restore",
+                    metadata={"checkpoint_id": str(restore_checkpoint_id)},
+                )
         logger.info(
             "Manual restore for sandbox %s checkpoint=%s finished with status=%s",
             sandbox_id,
@@ -666,6 +700,23 @@ class CrabSystem:
                     "chain_links": chain_links,
                 },
             )
+            self._journal_lifecycle(
+                source_sandbox_id,
+                "fork_source",
+                metadata={
+                    "target_sandbox_id": str(target_sandbox_id),
+                    "checkpoint_id": str(checkpoint_id),
+                    "chain_shared": chain_sharing_active,
+                },
+            )
+            self._journal_lifecycle(
+                target_sandbox_id,
+                "fork_created",
+                metadata={
+                    "source_sandbox_id": str(source_sandbox_id),
+                    "checkpoint_id": str(checkpoint_id),
+                },
+            )
             logger.info(
                 "Forked sandbox source=%s target=%s checkpoint=%s chain_shared=%s links=%d bytes_saved=%d",
                 source_sandbox_id,
@@ -707,6 +758,7 @@ class CrabSystem:
         promote one fork's filesystem clone so the source's dataset loses
         its dependents, and replace chain-shared symlinks with real bytes
         (storage artifacts and runtime pre-dump trees)."""
+        self._journal_lifecycle(source_sandbox_id, "destroy")
         with self._fork_lock:
             live_forks = sorted(self._fork_children.get(source_sandbox_id, set()))
             pinned_forks = [fork for fork, (source, _) in self._fork_chain_pins.items() if source == source_sandbox_id]
@@ -1344,6 +1396,15 @@ class CrabSystem:
                     process=job.checkpoint_process,
                     filesystem=job.checkpoint_filesystem,
                     at=result.finished_at,
+                )
+                self._journal_lifecycle(
+                    sandbox_id,
+                    "checkpoint",
+                    metadata={
+                        "checkpoint_id": str(result.checkpoint_id),
+                        "reason": decision.reason,
+                        "leave_running": bool(job.leave_running),
+                    },
                 )
             return result
         except BaseException as exc:
