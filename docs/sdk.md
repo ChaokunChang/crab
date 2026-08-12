@@ -206,6 +206,13 @@ service behavior should be validated for each task.
   return. Forks share the parent's `work_dir` host mount. Works both with
   a local in-process engine and against the daemon (`crab sandbox fork`
   from the CLI).
+- `Sandbox.actions(kind=None, limit=None)` reads the per-sandbox action
+  journal: every exec attempt (argv, cwd, env, exit status, timing;
+  stdout/stderr as size+sha256 only) plus lifecycle markers
+  (launch/checkpoint/restore/fork/destroy). Journals are JSONL files under
+  `{storage_root}/journal/` and record env values verbatim — treat them
+  with the same care as checkpoint images. Local (in-process engine) only
+  for now; disable recording with `EngineConfig(enable_action_journal=False)`.
 - Daemon restart rehydration is not implemented.
 - Exec output is buffered; streaming and PTY support are not implemented.
 - `resources`, `timeout`, and `labels` constructor arguments are currently

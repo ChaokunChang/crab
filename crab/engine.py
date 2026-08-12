@@ -48,6 +48,7 @@ from .contracts import Runtime
 from .executor import CRExecutor
 from .ids import SandboxId
 from .inspector import EBPFSandboxInspector
+from .journal import ActionJournal
 from .interceptor import (
     CrabRequestInterceptorServer,
     CompositeRequestInterceptorHook,
@@ -367,6 +368,11 @@ class EngineConfig:
     """For runc, create a small bridge/veth network when in-sandbox agents
     need deterministic LLM request attribution across multiple sandboxes."""
 
+    enable_action_journal: bool = True
+    """Record every sandbox exec + lifecycle marker into the per-sandbox
+    action journal under the storage root (roadmap B1). Cheap JSONL
+    appends; disable for runs that must avoid any extra I/O."""
+
     network_expected_sandboxes: int | None = None
     """Optional capacity hint for the bridge network allocator."""
 
@@ -459,6 +465,7 @@ class EngineConfig:
         forwarder = _optional_mapping(data.get("forwarder"), label="forwarder")
         logging_config = _optional_mapping(data.get("logging"), label="logging")
         host_inspector = _optional_mapping(data.get("host_inspector"), label="host_inspector")
+        journal_data = _optional_mapping(data.get("journal"), label="journal")
 
         default_workers = _as_int(data.get("max_workers"), default=None)
         executor_data = _optional_mapping(data.get("executor"), label="executor")
@@ -538,6 +545,10 @@ class EngineConfig:
             ),
             enable_sandbox_network=_as_bool(
                 network.get("enable_sandbox_network", data.get("enable_sandbox_network")),
+                default=True,
+            ),
+            enable_action_journal=_as_bool(
+                journal_data.get("enabled", data.get("enable_action_journal")),
                 default=True,
             ),
             network_expected_sandboxes=_as_int(
@@ -898,6 +909,12 @@ class Engine:
             host_inspector_client=self._host_inspector_client,
         )
         storage_cfg = cfg.storage_config or StorageConfig(root_dir=storage_root)
+        journal = None
+        if cfg.enable_action_journal:
+            journal = ActionJournal(storage_cfg.root_dir / storage_cfg.journal_dirname)
+            # The runtime records exec attempts + launch markers itself; the
+            # system records checkpoint/restore/fork/destroy markers.
+            runtime.action_recorder = journal
         storage = LocalCheckpointManager(
             storage_cfg,
             runtime_image_path_in_use=runtime.runtime_image_path_in_use,
@@ -952,6 +969,7 @@ class Engine:
             telemetry=telemetry,
             request_state_store=self._request_state_store,
             response_gate_registry=response_gate_registry,
+            journal=journal,
         )
 
     def _start_host_inspector_if_configured(self) -> None:
