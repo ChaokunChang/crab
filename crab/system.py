@@ -872,6 +872,52 @@ class CrabSystem:
             },
         )
 
+    # ----- observation staging (B1) -----------------------------------
+    # Thin facade over the response-gate registry's staging extension so
+    # the B2 transaction API has one system-level surface to drive. Each
+    # transition also lands in the action journal for the C3/C4 audit
+    # trail.
+
+    def begin_observation_staging(self, sandbox_id: SandboxId) -> None:
+        registry = self.response_gate_registry
+        if registry is None:
+            raise RuntimeError("response gate registry is not configured")
+        registry.begin_staging(sandbox_id)
+        self._journal_lifecycle(sandbox_id, "staging_begin")
+
+    def release_staged_observations(self, sandbox_id: SandboxId) -> int:
+        """Commit path: deliver everything staged."""
+        registry = self.response_gate_registry
+        if registry is None:
+            raise RuntimeError("response gate registry is not configured")
+        released = registry.release_staged(sandbox_id)
+        self._journal_lifecycle(
+            sandbox_id, "staging_commit", metadata={"released": released}
+        )
+        return released
+
+    def discard_staged_observations(self, sandbox_id: SandboxId) -> int:
+        """Abort path: drop everything staged (callers get 409)."""
+        registry = self.response_gate_registry
+        if registry is None:
+            raise RuntimeError("response gate registry is not configured")
+        discarded = registry.discard_staged(sandbox_id)
+        self._journal_lifecycle(
+            sandbox_id, "staging_abort", metadata={"discarded": discarded}
+        )
+        return discarded
+
+    def end_observation_staging(self, sandbox_id: SandboxId) -> int:
+        """Disarm; leftovers are delivered (fail-open)."""
+        registry = self.response_gate_registry
+        if registry is None:
+            raise RuntimeError("response gate registry is not configured")
+        leftover = registry.end_staging(sandbox_id)
+        self._journal_lifecycle(
+            sandbox_id, "staging_end", metadata={"delivered_leftover": leftover}
+        )
+        return leftover
+
     def notify_live_response_ready(
         self,
         sandbox_id: SandboxId,
