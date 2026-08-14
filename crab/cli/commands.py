@@ -236,6 +236,39 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     c_rm.set_defaults(func=_cmd_checkpoint_rm)
 
+    # ----- txn group ------------------------------------------------------
+    txn = sub.add_parser("txn", help="Manage sandbox transactions (snapshot-based).")
+    txn_sub = txn.add_subparsers(dest="txn_command", required=True)
+
+    t_begin = txn_sub.add_parser(
+        "begin",
+        help="Open a transaction: adaptive base checkpoint + staged "
+        "observations + auto-checkpoints suppressed. Prints the txn id.",
+    )
+    t_begin.add_argument("sandbox_id", metavar="SANDBOX_ID")
+    t_begin.add_argument("--label", default=None)
+    t_begin.set_defaults(func=_cmd_txn_begin)
+
+    t_commit = txn_sub.add_parser(
+        "commit",
+        help="Commit: deliver staged observations, drop a fresh base.",
+    )
+    t_commit.add_argument("sandbox_id", metavar="SANDBOX_ID")
+    t_commit.add_argument("txn_id", metavar="TXN_ID")
+    t_commit.set_defaults(func=_cmd_txn_commit)
+
+    t_abort = txn_sub.add_parser(
+        "abort",
+        help="Abort: drop staged observations, restore the base checkpoint.",
+    )
+    t_abort.add_argument("sandbox_id", metavar="SANDBOX_ID")
+    t_abort.add_argument("txn_id", metavar="TXN_ID")
+    t_abort.set_defaults(func=_cmd_txn_abort)
+
+    t_status = txn_sub.add_parser("status", help="Show the sandbox's active transaction.")
+    t_status.add_argument("sandbox_id", metavar="SANDBOX_ID")
+    t_status.set_defaults(func=_cmd_txn_status)
+
     # ----- restore (top-level, not under `checkpoint`) -------------------
     # `restore` acts on a sandbox (using one of its checkpoints), so it
     # reads more naturally as a top-level verb than as a nested
@@ -633,6 +666,78 @@ def _cmd_restore(args: argparse.Namespace) -> int:
     else:
         print(args.checkpoint_id)
     return 0 if response.get("status") in {"succeeded", "completed", None, ""} else 1
+
+
+def _cmd_txn_begin(args: argparse.Namespace) -> int:
+    socket_path = _resolve_socket(args)
+    # Begin may take a base checkpoint; budget like `checkpoint create`.
+    client = DaemonClient(socket_path, timeout_seconds=max(args.timeout, 300.0))
+    payload: dict[str, Any] = {}
+    if args.label is not None:
+        payload["label"] = args.label
+    response = client.post_json(f"/sandboxes/{args.sandbox_id}/txn", payload)
+    txn = response.get("txn") or {}
+    if args.json:
+        print(json.dumps(txn, indent=2))
+    else:
+        print(txn.get("txn_id", ""))
+    return 0
+
+
+def _cmd_txn_commit(args: argparse.Namespace) -> int:
+    socket_path = _resolve_socket(args)
+    client = DaemonClient(socket_path, timeout_seconds=max(args.timeout, 60.0))
+    response = client.post_json(
+        f"/sandboxes/{args.sandbox_id}/txn/{args.txn_id}/commit", {}
+    )
+    result = response.get("result") or {}
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(
+            f"committed {result.get('txn_id', '')} "
+            f"released={result.get('released_observations', 0)} "
+            f"base_dropped={result.get('base_dropped', False)}"
+        )
+    return 0
+
+
+def _cmd_txn_abort(args: argparse.Namespace) -> int:
+    socket_path = _resolve_socket(args)
+    # Abort restores the base checkpoint; budget like `restore`.
+    client = DaemonClient(socket_path, timeout_seconds=max(args.timeout, 300.0))
+    response = client.post_json(
+        f"/sandboxes/{args.sandbox_id}/txn/{args.txn_id}/abort", {}
+    )
+    result = response.get("result") or {}
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(
+            f"aborted {result.get('txn_id', '')} "
+            f"discarded={result.get('discarded_observations', 0)} "
+            f"restored={result.get('restored_checkpoint_id', '')}"
+        )
+    return 0
+
+
+def _cmd_txn_status(args: argparse.Namespace) -> int:
+    socket_path = _resolve_socket(args)
+    client = DaemonClient(socket_path, timeout_seconds=args.timeout)
+    response = client.get_json(f"/sandboxes/{args.sandbox_id}/txn")
+    txn = response.get("txn")
+    if args.json:
+        print(json.dumps(txn, indent=2))
+        return 0
+    if txn is None:
+        print("(no active transaction)")
+        return 0
+    print(
+        f"{txn.get('txn_id', '')} base={txn.get('base_checkpoint_id', '')} "
+        f"fresh={txn.get('base_was_fresh', False)} started={txn.get('started_at', '')}"
+        + (f" label={txn['label']}" if txn.get("label") else "")
+    )
+    return 0
 
 
 def _cmd_sandbox_exec(args: argparse.Namespace) -> int:

@@ -29,7 +29,7 @@ Paper = "https://arxiv.org/abs/2604.28138"
 [project.scripts]
 # Operator CLI — talks to the daemon over the Unix-domain socket.
 # Subcommands: daemon start/stop/status, info, sandbox run/ls/rm/exec/fork/stop/pause/resume,
-# checkpoint create/ls/rm/restore. See `crab --help`.
+# checkpoint create/ls/rm/restore, txn begin/commit/abort/status. See `crab --help`.
 crab = "crab.cli:main"
 
 # Daemon entry point. Equivalent to `python -m crab.daemon`.

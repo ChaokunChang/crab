@@ -888,8 +888,8 @@ class Sandbox:
         run in place (concurrent readers see them) — the airtight part is
         that no gated observation escapes an uncommitted txn.
 
-        Local (in-process engine) only for now; daemon RPC lands in the
-        follow-up PR.
+        Works with both a local in-process engine and the daemon
+        (`crab txn ...` from the CLI).
         """
         from .txn import Transaction
 

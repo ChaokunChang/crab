@@ -38,6 +38,7 @@ from typing import Any, Callable
 from ..engine import Engine, EngineConfig
 from ..ids import SandboxId
 from ..models import SandboxSnapshot, utc_now
+from ..txn import TxnAbortError, TxnActiveError, TxnError, TxnMismatchError
 from .transport import (
     DEFAULT_SOCKET_PERMS,
     default_socket_path,
@@ -166,15 +167,25 @@ class _Routes:
     def kill_sandbox(self, body: dict[str, Any], *, sandbox_id: str) -> dict[str, Any]:
         eng = self._daemon.require_engine()
         sid = SandboxId(sandbox_id)
-        # Fork bookkeeping mirrors Sandbox.kill(): materialize chain-shared
+        # Fork/txn bookkeeping mirrors Sandbox.kill(): release an open txn
+        # (discard staged observations, no restore), materialize chain-shared
         # bytes for live forks of this sandbox, and release its own chain
         # pin if it is a fork. In daemon mode the SDK's kill path runs
         # against the _SystemShim (no-op hooks), so the daemon must do it.
+        # Each step is independently best-effort: a failure in one must
+        # not skip the others.
+        try:
+            eng.system.release_txn(sid)
+        except Exception:
+            logger.exception("txn bookkeeping failed for %s during kill", sid)
         try:
             eng.system.prepare_source_destroy(sid)
+        except Exception:
+            logger.exception("fork source bookkeeping failed for %s during kill", sid)
+        try:
             eng.system.release_fork(sid)
         except Exception:
-            logger.exception("fork bookkeeping failed for %s during kill", sid)
+            logger.exception("fork release bookkeeping failed for %s during kill", sid)
         try:
             eng.runtime.stop(sid)
         except Exception:
@@ -360,6 +371,72 @@ class _Routes:
             forks.append({"sandbox_id": str(fork_id)})
         return {"ok": True, "sandbox_id": sandbox_id, "forks": forks}
 
+    # ----- transactions ----------------------------------------------
+
+    def begin_txn(self, body: dict[str, Any], *, sandbox_id: str) -> dict[str, Any]:
+        eng = self._daemon.require_engine()
+        sid = SandboxId(sandbox_id)
+        label_raw = body.get("label")
+        label = None if label_raw is None else str(label_raw)
+        try:
+            description = eng.system.begin_txn(sid, label=label)
+        except TxnActiveError as exc:
+            raise _TxnConflict("txn_active", str(exc)) from exc
+        except TxnError as exc:
+            raise _BadRequest(f"txn begin failed: {exc}") from exc
+        return {"ok": True, "txn": _serialize_txn(description)}
+
+    def commit_txn(
+        self, body: dict[str, Any], *, sandbox_id: str, txn_id: str
+    ) -> dict[str, Any]:
+        eng = self._daemon.require_engine()
+        sid = SandboxId(sandbox_id)
+        try:
+            result = eng.system.commit_txn(sid, txn_id)
+        except TxnMismatchError as exc:
+            raise _TxnConflict("txn_mismatch", str(exc)) from exc
+        except TxnError as exc:
+            raise _BadRequest(f"txn commit failed: {exc}") from exc
+        return {
+            "ok": True,
+            "result": {
+                "txn_id": result.txn_id,
+                "released_observations": result.released_observations,
+                "base_dropped": result.base_dropped,
+            },
+        }
+
+    def abort_txn(
+        self, body: dict[str, Any], *, sandbox_id: str, txn_id: str
+    ) -> dict[str, Any]:
+        eng = self._daemon.require_engine()
+        sid = SandboxId(sandbox_id)
+        try:
+            result = eng.system.abort_txn(sid, txn_id)
+        except TxnMismatchError as exc:
+            raise _TxnConflict("txn_mismatch", str(exc)) from exc
+        except TxnAbortError as exc:
+            # Restore failed; the txn stays open and abort is retryable.
+            raise _TxnConflict("txn_abort_failed", str(exc)) from exc
+        except TxnError as exc:
+            raise _BadRequest(f"txn abort failed: {exc}") from exc
+        return {
+            "ok": True,
+            "result": {
+                "txn_id": result.txn_id,
+                "discarded_observations": result.discarded_observations,
+                "restored_checkpoint_id": result.restored_checkpoint_id,
+            },
+        }
+
+    def current_txn(self, body: dict[str, Any], *, sandbox_id: str) -> dict[str, Any]:
+        eng = self._daemon.require_engine()
+        description = eng.system.current_txn(SandboxId(sandbox_id))
+        return {
+            "ok": True,
+            "txn": None if description is None else _serialize_txn(description),
+        }
+
     def update_host_inspector_filters(
         self, body: dict[str, Any], *, sandbox_id: str
     ) -> dict[str, Any]:
@@ -398,6 +475,17 @@ def _seed_inspector_running(engine: Engine, sandbox_id: SandboxId) -> None:
         )
     except Exception:
         logger.debug("failed to seed inspector snapshot for %s", sandbox_id, exc_info=True)
+
+
+def _serialize_txn(description) -> dict[str, Any]:
+    return {
+        "txn_id": description.txn_id,
+        "sandbox_id": description.sandbox_id,
+        "base_checkpoint_id": description.base_checkpoint_id,
+        "base_was_fresh": bool(description.base_was_fresh),
+        "started_at": description.started_at,
+        "label": description.label,
+    }
 
 
 def _serialize_description(description) -> dict[str, Any]:
@@ -442,6 +530,15 @@ def _jsonable(value: Any) -> Any:
 
 class _BadRequest(Exception):
     pass
+
+
+class _TxnConflict(Exception):
+    """409 with a machine-readable error_type so the SDK shim can raise
+    the matching Txn* exception on the client side."""
+
+    def __init__(self, error_type: str, message: str) -> None:
+        super().__init__(message)
+        self.error_type = error_type
 
 
 class _NotFound(Exception):
@@ -494,6 +591,11 @@ def _build_handler(daemon: "DaemonServer"):
         ),
         # Fork (checkpoint + restore into new sandboxes)
         ("POST", "/sandboxes/{sandbox_id}/fork", "", routes.fork_sandbox),
+        # Transactions (snapshot-based; see crab/txn.py)
+        ("GET", "/sandboxes/{sandbox_id}/txn", "", routes.current_txn),
+        ("POST", "/sandboxes/{sandbox_id}/txn", "", routes.begin_txn),
+        ("POST", "/sandboxes/{sandbox_id}/txn/{txn_id}/commit", "", routes.commit_txn),
+        ("POST", "/sandboxes/{sandbox_id}/txn/{txn_id}/abort", "", routes.abort_txn),
     ]
 
     def _match(method: str, path: str):
@@ -547,6 +649,11 @@ def _build_handler(daemon: "DaemonServer"):
                 self._send_json(HTTPStatus.OK, result)
             except _BadRequest as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+            except _TxnConflict as exc:
+                self._send_json(
+                    HTTPStatus.CONFLICT,
+                    {"ok": False, "error": str(exc), "error_type": exc.error_type},
+                )
             except _NotFound as exc:
                 self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": str(exc)})
             except KeyError as exc:
