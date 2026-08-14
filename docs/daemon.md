@@ -52,6 +52,11 @@ crab [--socket PATH] [--timeout SECONDS] [--json] <command>
   checkpoint ls SANDBOX_ID
   checkpoint rm SANDBOX_ID CHECKPOINT_ID [--cascade]
   restore SANDBOX_ID CHECKPOINT_ID
+
+  txn begin SANDBOX_ID [--label LABEL]
+  txn commit SANDBOX_ID TXN_ID
+  txn abort SANDBOX_ID TXN_ID
+  txn status SANDBOX_ID
 ```
 
 Run `crab <group> <command> --help` for the authoritative option list.

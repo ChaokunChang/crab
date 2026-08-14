@@ -32,10 +32,18 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Mapping
 
 from .contracts import Runtime
-from .daemon import DaemonClient
+from .daemon import DaemonClient, DaemonRequestError
 from .ids import CheckpointId, SandboxId
 from .models import JobStatus, SandboxDescription, SandboxExecResult, SandboxRuntimeState
 from .telemetry import NoopTelemetrySink
+from .txn import (
+    TxnAbortError,
+    TxnAbortResult,
+    TxnActiveError,
+    TxnCommitResult,
+    TxnDescription,
+    TxnMismatchError,
+)
 
 if TYPE_CHECKING:
     from .sandbox import Sandbox
@@ -153,6 +161,62 @@ class _SystemShim:
         )
         status = JobStatus(str(response.get("status") or JobStatus.SUCCEEDED.value))
         return SimpleNamespace(status=status, message="")
+
+    # ----- transactions (see crab/txn.py) ------------------------------
+    # Proxies mirror CrabSystem's txn surface so Sandbox.begin() stays
+    # transport-agnostic. 409 responses carry an `error_type` the daemon
+    # set from the original Txn* exception; map it back so SDK callers
+    # get identical exceptions in both modes.
+
+    def begin_txn(self, sandbox_id: SandboxId, *, label: str | None = None) -> TxnDescription:
+        payload: dict[str, Any] = {} if label is None else {"label": label}
+        try:
+            response = self._client.post_json(
+                f"/sandboxes/{sandbox_id}/txn",
+                payload,
+                timeout_seconds=300.0,  # begin may take a base checkpoint
+            )
+        except DaemonRequestError as exc:
+            raise _map_txn_error(exc) from exc
+        return _deserialize_txn(response["txn"])
+
+    def commit_txn(self, sandbox_id: SandboxId, txn_id: str) -> TxnCommitResult:
+        try:
+            response = self._client.post_json(
+                f"/sandboxes/{sandbox_id}/txn/{txn_id}/commit",
+                {},
+                timeout_seconds=60.0,
+            )
+        except DaemonRequestError as exc:
+            raise _map_txn_error(exc) from exc
+        raw = response["result"]
+        return TxnCommitResult(
+            txn_id=str(raw["txn_id"]),
+            released_observations=int(raw["released_observations"]),
+            base_dropped=bool(raw["base_dropped"]),
+        )
+
+    def abort_txn(self, sandbox_id: SandboxId, txn_id: str) -> TxnAbortResult:
+        try:
+            response = self._client.post_json(
+                f"/sandboxes/{sandbox_id}/txn/{txn_id}/abort",
+                {},
+                timeout_seconds=300.0,  # abort restores the base checkpoint
+            )
+        except DaemonRequestError as exc:
+            raise _map_txn_error(exc) from exc
+        raw = response["result"]
+        restored = raw.get("restored_checkpoint_id")
+        return TxnAbortResult(
+            txn_id=str(raw["txn_id"]),
+            discarded_observations=int(raw["discarded_observations"]),
+            restored_checkpoint_id=None if restored is None else str(restored),
+        )
+
+    def current_txn(self, sandbox_id: SandboxId) -> TxnDescription | None:
+        response = self._client.get_json(f"/sandboxes/{sandbox_id}/txn")
+        raw = response.get("txn")
+        return None if raw is None else _deserialize_txn(raw)
 
 
 class _ConfigShim:
@@ -559,6 +623,37 @@ def _make_jsonable(value: Any) -> Any:
         return value
     except (TypeError, ValueError):
         return str(value)
+
+
+def _deserialize_txn(payload: Mapping[str, Any]) -> TxnDescription:
+    base = payload.get("base_checkpoint_id")
+    label = payload.get("label")
+    return TxnDescription(
+        txn_id=str(payload["txn_id"]),
+        sandbox_id=str(payload["sandbox_id"]),
+        base_checkpoint_id=None if base is None else str(base),
+        base_was_fresh=bool(payload.get("base_was_fresh")),
+        started_at=str(payload.get("started_at") or ""),
+        label=None if label is None else str(label),
+    )
+
+
+def _map_txn_error(exc: DaemonRequestError) -> Exception:
+    """Rehydrate the daemon's 409 error_type into the matching Txn*
+    exception; anything unrecognized re-raises the transport error."""
+    try:
+        payload = json.loads(exc.body.decode("utf-8", errors="replace"))
+    except Exception:
+        payload = {}
+    error_type = payload.get("error_type") if isinstance(payload, dict) else None
+    message = str(payload.get("error")) if isinstance(payload, dict) and payload.get("error") else str(exc)
+    if error_type == "txn_active":
+        return TxnActiveError(message)
+    if error_type == "txn_mismatch":
+        return TxnMismatchError(message)
+    if error_type == "txn_abort_failed":
+        return TxnAbortError(message)
+    return exc
 
 
 def _deserialize_description(payload: Mapping[str, Any]) -> SandboxDescription:

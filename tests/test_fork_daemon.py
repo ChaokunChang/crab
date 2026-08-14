@@ -37,6 +37,9 @@ class _FakeSystem:
         self._log = log
         self.inspector = _FakeInspector(log)
 
+    def release_txn(self, sandbox_id) -> None:
+        self._log.append(("release_txn", str(sandbox_id)))
+
     def prepare_source_destroy(self, sandbox_id) -> None:
         self._log.append(("prepare_source_destroy", str(sandbox_id)))
 
@@ -155,8 +158,9 @@ class ForkRouteHandlerTests(unittest.TestCase):
     def test_kill_runs_fork_bookkeeping_before_delete(self) -> None:
         self.routes.kill_sandbox({}, sandbox_id="src")
         self.assertEqual(
-            self.engine.log[:3],
+            self.engine.log[:4],
             [
+                ("release_txn", "src"),
                 ("prepare_source_destroy", "src"),
                 ("release_fork", "src"),
                 ("stop", "src"),

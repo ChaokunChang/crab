@@ -212,8 +212,9 @@ service behavior should be validated for each task.
   checkpoint and arms observation staging; abort restores the base and
   drops staged LLM responses (gated callers get a 409); commit delivers
   them and drops a freshly-taken base. Weak isolation: txn actions run in
-  place. Auto-checkpoints are suppressed while a txn is open. Local
-  (in-process engine) only for now.
+  place. Auto-checkpoints are suppressed while a txn is open. Works both
+  with a local in-process engine and against the daemon (`crab txn
+  begin/commit/abort/status` from the CLI).
 - `Sandbox.actions(kind=None, limit=None)` reads the per-sandbox action
   journal: every exec attempt (argv, cwd, env, exit status, timing;
   stdout/stderr as size+sha256 only) plus lifecycle markers
