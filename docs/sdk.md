@@ -206,6 +206,14 @@ service behavior should be validated for each task.
   return. Forks share the parent's `work_dir` host mount. Works both with
   a local in-process engine and against the daemon (`crab sandbox fork`
   from the CLI).
+- `Sandbox.begin(label=None)` opens a snapshot-based transaction
+  (`with sandbox.begin() as txn:` commits on clean exit, aborts on
+  exception; `txn.exec/commit/abort`). Begin takes an adaptive base
+  checkpoint and arms observation staging; abort restores the base and
+  drops staged LLM responses (gated callers get a 409); commit delivers
+  them and drops a freshly-taken base. Weak isolation: txn actions run in
+  place. Auto-checkpoints are suppressed while a txn is open. Local
+  (in-process engine) only for now.
 - `Sandbox.actions(kind=None, limit=None)` reads the per-sandbox action
   journal: every exec attempt (argv, cwd, env, exit status, timing;
   stdout/stderr as size+sha256 only) plus lifecycle markers

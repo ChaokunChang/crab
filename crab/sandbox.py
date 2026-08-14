@@ -783,6 +783,9 @@ class Sandbox:
             # shim without these hooks — degrade gracefully.
             system = getattr(self._engine, "system", None)
             if system is not None:
+                release_txn = getattr(system, "release_txn", None)
+                if callable(release_txn):
+                    release_txn(sandbox_id)
                 prepare = getattr(system, "prepare_source_destroy", None)
                 if callable(prepare):
                     prepare(sandbox_id)
@@ -876,6 +879,42 @@ class Sandbox:
         if limit is not None and limit >= 0:
             records = records[-limit:]
         return [record.to_json() for record in records]
+
+    def begin(self, label: str | None = None) -> "Transaction":
+        """Open a transaction: adaptive base checkpoint + observation
+        staging armed + auto-checkpoints suppressed. Commit delivers the
+        staged observations and drops a fresh base; abort drops the
+        observations and restores the base. Weak isolation: txn actions
+        run in place (concurrent readers see them) — the airtight part is
+        that no gated observation escapes an uncommitted txn.
+
+        Local (in-process engine) only for now; daemon RPC lands in the
+        follow-up PR.
+        """
+        from .txn import Transaction
+
+        system = getattr(self._engine, "system", None)
+        begin_txn = getattr(system, "begin_txn", None)
+        if not callable(begin_txn):
+            raise NotImplementedError(
+                "transactions are not available on this engine "
+                "(daemon-mode txn RPC lands in a follow-up)"
+            )
+        description = begin_txn(self.sandbox_id, label=label)
+        return Transaction(self, description)
+
+    def current_txn(self) -> "Transaction | None":
+        """Reattach to this sandbox's active transaction, if any."""
+        from .txn import Transaction
+
+        system = getattr(self._engine, "system", None)
+        current = getattr(system, "current_txn", None)
+        if not callable(current):
+            return None
+        description = current(self.sandbox_id)
+        if description is None:
+            return None
+        return Transaction(self, description)
 
     # ------------------------------------------------------------------
     # Network

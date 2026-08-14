@@ -104,6 +104,10 @@ class ActionJournal:
         self._root.mkdir(parents=True, exist_ok=True)
         self._lock = Lock()
         self._next_seq: dict[str, int] = {}
+        # Active transaction per sandbox (B2): while set, records without
+        # an explicit txn_id are stamped with it — the journal reflects
+        # reality, not which API issued the action.
+        self._active_txn_ids: dict[str, str] = {}
 
     @property
     def root(self) -> Path:
@@ -111,6 +115,20 @@ class ActionJournal:
 
     def path_for(self, sandbox_id: SandboxId | str) -> Path:
         return self._root / f"{sandbox_id}.jsonl"
+
+    def set_active_txn(self, sandbox_id: SandboxId | str, txn_id: str | None) -> None:
+        """Set (or clear with None) the transaction id stamped onto this
+        sandbox's records while no explicit txn_id is provided."""
+        key = str(sandbox_id)
+        with self._lock:
+            if txn_id is None:
+                self._active_txn_ids.pop(key, None)
+            else:
+                self._active_txn_ids[key] = str(txn_id)
+
+    def active_txn(self, sandbox_id: SandboxId | str) -> str | None:
+        with self._lock:
+            return self._active_txn_ids.get(str(sandbox_id))
 
     # ------------------------------------------------------------------
     # ActionRecorder contract
@@ -233,6 +251,8 @@ class ActionJournal:
         key = str(sandbox_id)
         path = self.path_for(sandbox_id)
         with self._lock:
+            if txn_id is None:
+                txn_id = self._active_txn_ids.get(key)
             seq = self._resolve_next_seq(key, path)
             record = ActionRecord(
                 seq=seq,
