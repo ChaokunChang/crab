@@ -33,6 +33,16 @@ from .models import (
 )
 from . import forking
 from .journal import ActionJournal
+from .txn import (
+    TxnAbortError,
+    TxnAbortResult,
+    TxnActiveError,
+    TxnCommitResult,
+    TxnDescription,
+    TxnError,
+    TxnMismatchError,
+    new_txn_id,
+)
 from .runtime import InMemoryRuntime, RuncRuntime, RuncRuntimeOptions
 from .scheduler import CRScheduler, InMemorySchedulerStateStore, SchedulerPolicy
 from .storage import LocalCheckpointManager
@@ -131,6 +141,8 @@ class CrabSystem:
     _fork_lock: Lock = field(init=False, repr=False)
     _fork_chain_pins: dict[SandboxId, tuple[SandboxId, CheckpointId]] = field(init=False, repr=False)
     _fork_children: dict[SandboxId, set[SandboxId]] = field(init=False, repr=False)
+    _txn_lock: Lock = field(init=False, repr=False)
+    _active_txns: dict[SandboxId, TxnDescription | None] = field(init=False, repr=False)
 
     @property
     def sandbox_manager(self) -> Runtime:
@@ -154,6 +166,8 @@ class CrabSystem:
         self._fork_lock = Lock()
         self._fork_chain_pins = {}
         self._fork_children = {}
+        self._txn_lock = Lock()
+        self._active_txns = {}
 
     def start(self) -> None:
         with self._coordination_lock:
@@ -323,6 +337,9 @@ class CrabSystem:
         return result
 
     def checkpoint_if_due(self, sandbox_id: SandboxId) -> CheckpointResult | None:
+        if self._txn_active(sandbox_id):
+            logger.debug("Skipping checkpoint-if-due; txn active sandbox=%s", sandbox_id)
+            return None
         pending_request = self._next_pending_live_request(sandbox_id)
         try:
             logger.debug("Checking whether sandbox %s is due for checkpoint", sandbox_id)
@@ -872,6 +889,268 @@ class CrabSystem:
             },
         )
 
+    # ----- transactions (B2) -------------------------------------------
+    # Snapshot-based, weak isolation: actions run in place; abort rewinds
+    # to the base checkpoint; observation staging keeps gated responses
+    # from escaping an uncommitted txn. One active txn per sandbox.
+
+    def _txn_active(self, sandbox_id: SandboxId) -> bool:
+        with self._txn_lock:
+            return sandbox_id in self._active_txns
+
+    def begin_txn(self, sandbox_id: SandboxId, *, label: str | None = None) -> TxnDescription:
+        txn_id = new_txn_id()
+        with self._txn_lock:
+            existing = self._active_txns.get(sandbox_id)
+            if existing is not None:
+                raise TxnActiveError(
+                    f"transaction already active for {sandbox_id}: {existing.txn_id}"
+                )
+            if sandbox_id in self._active_txns:
+                raise TxnActiveError(f"transaction begin already in flight for {sandbox_id}")
+            # Reservation: suppresses auto-checkpoints and locks out
+            # concurrent begins while the base checkpoint runs.
+            self._active_txns[sandbox_id] = None
+        try:
+            base_checkpoint_id: CheckpointId | None = None
+            base_was_fresh = False
+            changed = True
+            try:
+                snapshot = self.inspector.inspect(sandbox_id)
+                changed = bool(snapshot.process_changed or snapshot.filesystem_changed)
+            except Exception:
+                changed = True
+            if not changed:
+                base_checkpoint_id = self._latest_full_checkpoint_id(sandbox_id)
+            if base_checkpoint_id is None:
+                result = self.checkpoint_once(sandbox_id, leave_running=True)
+                if result.status.value != "succeeded":
+                    raise TxnError(
+                        f"txn base checkpoint failed for {sandbox_id}: "
+                        f"status={result.status.value} message={result.message}"
+                    )
+                base_checkpoint_id = result.checkpoint_id
+                base_was_fresh = True
+            self.begin_observation_staging(sandbox_id)
+            journal = self.journal
+            if journal is not None:
+                try:
+                    journal.set_active_txn(sandbox_id, txn_id)
+                except Exception:
+                    logger.exception("Failed to set active txn on journal sandbox=%s", sandbox_id)
+            description = TxnDescription(
+                txn_id=txn_id,
+                sandbox_id=str(sandbox_id),
+                base_checkpoint_id=str(base_checkpoint_id),
+                base_was_fresh=base_was_fresh,
+                started_at=utc_now().isoformat(),
+                label=label,
+            )
+            with self._txn_lock:
+                self._active_txns[sandbox_id] = description
+            self._journal_lifecycle(
+                sandbox_id,
+                "txn_begin",
+                metadata={
+                    "txn_id": txn_id,
+                    "base_checkpoint_id": str(base_checkpoint_id),
+                    "base_was_fresh": base_was_fresh,
+                    **({"label": label} if label else {}),
+                },
+            )
+            self.telemetry.emit_event(
+                "txn.begin",
+                self._telemetry_attrs(
+                    sandbox_id,
+                    component="system",
+                    extra={
+                        "txn_id": txn_id,
+                        "base_checkpoint_id": str(base_checkpoint_id),
+                        "base_was_fresh": base_was_fresh,
+                    },
+                ),
+            )
+            logger.info(
+                "Began txn %s for sandbox %s base=%s fresh=%s",
+                txn_id,
+                sandbox_id,
+                base_checkpoint_id,
+                base_was_fresh,
+            )
+            return description
+        except Exception:
+            with self._txn_lock:
+                self._active_txns.pop(sandbox_id, None)
+            raise
+
+    def commit_txn(self, sandbox_id: SandboxId, txn_id: str) -> TxnCommitResult:
+        active = self._require_txn(sandbox_id, txn_id)
+        registry = self.response_gate_registry
+        if registry is not None:
+            # Anything still pending (armed but never checkpoint-released)
+            # moves into the staged buffer first.
+            registry.release(sandbox_id)
+        released = self.release_staged_observations(sandbox_id)
+        self.end_observation_staging(sandbox_id)
+        base_dropped = False
+        if active.base_was_fresh and active.base_checkpoint_id is not None:
+            try:
+                self.storage.delete_checkpoint(
+                    sandbox_id, CheckpointId(active.base_checkpoint_id), cascade=False
+                )
+                base_dropped = True
+            except Exception:
+                logger.warning(
+                    "Keeping txn base checkpoint after commit (delete failed) sandbox=%s ckpt=%s",
+                    sandbox_id,
+                    active.base_checkpoint_id,
+                    exc_info=True,
+                )
+        self._journal_lifecycle(
+            sandbox_id,
+            "txn_commit",
+            metadata={
+                "txn_id": active.txn_id,
+                "released": released,
+                "base_dropped": base_dropped,
+            },
+        )
+        self._clear_txn(sandbox_id)
+        self.telemetry.emit_event(
+            "txn.commit",
+            self._telemetry_attrs(
+                sandbox_id,
+                component="system",
+                extra={"txn_id": active.txn_id, "released": released, "base_dropped": base_dropped},
+            ),
+        )
+        logger.info(
+            "Committed txn %s for sandbox %s released=%d base_dropped=%s",
+            active.txn_id,
+            sandbox_id,
+            released,
+            base_dropped,
+        )
+        return TxnCommitResult(
+            txn_id=active.txn_id,
+            released_observations=released,
+            base_dropped=base_dropped,
+        )
+
+    def abort_txn(self, sandbox_id: SandboxId, txn_id: str) -> TxnAbortResult:
+        active = self._require_txn(sandbox_id, txn_id)
+        registry = self.response_gate_registry
+        if registry is not None:
+            registry.release(sandbox_id)
+        discarded = self.discard_staged_observations(sandbox_id)
+        assert active.base_checkpoint_id is not None
+        restore = self.restore_once(sandbox_id, CheckpointId(active.base_checkpoint_id))
+        if restore.status.value != "succeeded":
+            # Txn stays open: observations are already dropped (idempotent),
+            # the caller may retry abort.
+            raise TxnAbortError(
+                f"txn abort restore failed for {sandbox_id}: "
+                f"status={restore.status.value} message={restore.message}",
+                restore_result=restore,
+            )
+        self.end_observation_staging(sandbox_id)
+        self._journal_lifecycle(
+            sandbox_id,
+            "txn_abort",
+            metadata={
+                "txn_id": active.txn_id,
+                "discarded": discarded,
+                "restored_checkpoint_id": str(active.base_checkpoint_id),
+            },
+        )
+        self._clear_txn(sandbox_id)
+        self.telemetry.emit_event(
+            "txn.abort",
+            self._telemetry_attrs(
+                sandbox_id,
+                component="system",
+                extra={"txn_id": active.txn_id, "discarded": discarded},
+            ),
+        )
+        logger.info(
+            "Aborted txn %s for sandbox %s discarded=%d restored=%s",
+            active.txn_id,
+            sandbox_id,
+            discarded,
+            active.base_checkpoint_id,
+        )
+        return TxnAbortResult(
+            txn_id=active.txn_id,
+            discarded_observations=discarded,
+            restored_checkpoint_id=active.base_checkpoint_id,
+        )
+
+    def current_txn(self, sandbox_id: SandboxId) -> TxnDescription | None:
+        with self._txn_lock:
+            return self._active_txns.get(sandbox_id)
+
+    def release_txn(self, sandbox_id: SandboxId) -> None:
+        """Teardown hook (sandbox kill with an open txn): drop staged
+        observations and disarm — no restore, the sandbox is dying."""
+        with self._txn_lock:
+            active = self._active_txns.pop(sandbox_id, None)
+        if active is None:
+            return
+        try:
+            registry = self.response_gate_registry
+            if registry is not None:
+                registry.release(sandbox_id)
+                registry.discard_staged(sandbox_id)
+                registry.end_staging(sandbox_id)
+        except Exception:
+            logger.exception("Txn teardown staging cleanup failed sandbox=%s", sandbox_id)
+        journal = self.journal
+        if journal is not None:
+            try:
+                journal.set_active_txn(sandbox_id, None)
+            except Exception:
+                logger.debug("Failed to clear journal txn on teardown", exc_info=True)
+        logger.info("Released open txn %s during sandbox teardown %s", active.txn_id, sandbox_id)
+
+    def _require_txn(self, sandbox_id: SandboxId, txn_id: str) -> TxnDescription:
+        with self._txn_lock:
+            active = self._active_txns.get(sandbox_id)
+        if active is None:
+            raise TxnMismatchError(f"no active transaction for {sandbox_id}")
+        if active.txn_id != str(txn_id):
+            raise TxnMismatchError(
+                f"txn mismatch for {sandbox_id}: active={active.txn_id} given={txn_id}"
+            )
+        return active
+
+    def _clear_txn(self, sandbox_id: SandboxId) -> None:
+        journal = self.journal
+        if journal is not None:
+            try:
+                journal.set_active_txn(sandbox_id, None)
+            except Exception:
+                logger.debug("Failed to clear journal txn", exc_info=True)
+        with self._txn_lock:
+            self._active_txns.pop(sandbox_id, None)
+
+    def _latest_full_checkpoint_id(self, sandbox_id: SandboxId) -> CheckpointId | None:
+        """Newest checkpoint carrying both process and filesystem
+        artifacts — the only safe reuse target for a txn base."""
+        try:
+            checkpoint_ids = self.storage.list_checkpoints(sandbox_id)
+        except Exception:
+            return None
+        for checkpoint_id in reversed(list(checkpoint_ids)):
+            try:
+                manifest = self.storage.get_manifest(sandbox_id, checkpoint_id)
+            except Exception:
+                continue
+            if getattr(manifest, "process_artifacts", None) and getattr(
+                manifest, "filesystem_artifacts", None
+            ):
+                return checkpoint_id
+        return None
+
     # ----- observation staging (B1) -----------------------------------
     # Thin facade over the response-gate registry's staging extension so
     # the B2 transaction API has one system-level surface to drive. Each
@@ -966,6 +1245,9 @@ class CrabSystem:
             self._dispatch_pending_coordination()
 
     def _should_coordinate_live_request(self, sandbox_id: SandboxId, request_id: str | None) -> bool:
+        if self._txn_active(sandbox_id):
+            logger.debug("DIAG.coord.check.txn_active sandbox=%s", sandbox_id)
+            return False
         if self.request_state_store is None or self.response_gate_registry is None:
             logger.debug(
                 "DIAG.coord.check.no_store sandbox=%s",
@@ -1391,6 +1673,13 @@ class CrabSystem:
         *,
         pending_request: PendingSandboxResponse | None = None,
     ) -> CheckpointResult | None:
+        if self._txn_active(sandbox_id):
+            # Auto-checkpoints are suppressed inside a transaction: they
+            # would pollute the retention chain with doomed states and
+            # stage gated responses prematurely. Manual checkpoint_once
+            # remains allowed (explicit user intent).
+            logger.debug("Skipping scheduled checkpoint; txn active sandbox=%s", sandbox_id)
+            return None
         operation = start_operation(
             self.telemetry,
             "checkpoint.flow",
@@ -1938,6 +2227,13 @@ class CrabSystem:
                 self._refresh_interceptor_pending_state(sandbox_id)
 
     def _should_coordinate_any_pending_request(self, sandbox_id: SandboxId) -> bool:
+        if self._txn_active(sandbox_id):
+            # Inside a txn the coordination loop must not run at all: its
+            # finally-release would prematurely move armed responses into
+            # the staged buffer (losing per-request release granularity)
+            # while the actual checkpoint flow is suppressed anyway.
+            logger.debug("DIAG.coord.any.txn_active sandbox=%s", sandbox_id)
+            return False
         if self.request_state_store is None or self.response_gate_registry is None:
             return False
         if not self.request_state_store.get(sandbox_id).llm_request_in_flight:
