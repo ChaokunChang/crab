@@ -436,10 +436,55 @@ class MergeEntry:
 
 
 @dataclass(frozen=True)
+class ObservationReport:
+    """Outcome of ``CrabSystem.consolidate_observations`` (C3): how many
+    fork journal records were adopted into the source's journal as
+    ``kind="observation"`` rows. ``already_consolidated`` marks the
+    idempotence fast path (a prior run for the same fork exists and the
+    caller was not a manual re-run)."""
+
+    source_sandbox_id: SandboxId
+    fork_sandbox_id: SandboxId
+    policy: str
+    consolidated: int
+    skipped_duplicates: int
+    summary_written: bool = False
+    already_consolidated: bool = False
+    reason: str = "manual"
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "source_sandbox_id": str(self.source_sandbox_id),
+            "fork_sandbox_id": str(self.fork_sandbox_id),
+            "policy": self.policy,
+            "consolidated": self.consolidated,
+            "skipped_duplicates": self.skipped_duplicates,
+            "summary_written": self.summary_written,
+            "already_consolidated": self.already_consolidated,
+            "reason": self.reason,
+        }
+
+    @classmethod
+    def from_json(cls, payload: dict[str, object]) -> "ObservationReport":
+        return cls(
+            source_sandbox_id=SandboxId(str(payload["source_sandbox_id"])),
+            fork_sandbox_id=SandboxId(str(payload["fork_sandbox_id"])),
+            policy=str(payload["policy"]),
+            consolidated=int(payload.get("consolidated", 0)),
+            skipped_duplicates=int(payload.get("skipped_duplicates", 0)),
+            summary_written=bool(payload.get("summary_written", False)),
+            already_consolidated=bool(payload.get("already_consolidated", False)),
+            reason=str(payload.get("reason") or "manual"),
+        )
+
+
+@dataclass(frozen=True)
 class MergeReport:
     """Outcome of ``CrabSystem.merge_from_fork`` (C2). ``rolled_back``
     is True when an apply-phase failure was undone from the pre-merge
-    snapshot (the report then rides on ``MergeError``)."""
+    snapshot (the report then rides on ``MergeError``). ``observations``
+    carries the C3 consolidation report when the merge was asked to
+    adopt the fork's history."""
 
     source_sandbox_id: SandboxId
     fork_sandbox_id: SandboxId
@@ -449,9 +494,10 @@ class MergeReport:
     conflicted: tuple[MergeEntry, ...]
     skipped: tuple[MergeEntry, ...]
     rolled_back: bool = False
+    observations: "ObservationReport | None" = None
 
     def to_json(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "source_sandbox_id": str(self.source_sandbox_id),
             "fork_sandbox_id": str(self.fork_sandbox_id),
             "base_checkpoint_id": str(self.base_checkpoint_id),
@@ -461,12 +507,16 @@ class MergeReport:
             "skipped": [entry.to_json() for entry in self.skipped],
             "rolled_back": self.rolled_back,
         }
+        if self.observations is not None:
+            payload["observations"] = self.observations.to_json()
+        return payload
 
     @classmethod
     def from_json(cls, payload: dict[str, object]) -> "MergeReport":
         def entries(key: str) -> tuple[MergeEntry, ...]:
             return tuple(MergeEntry.from_json(entry) for entry in (payload.get(key) or []))
 
+        raw_observations = payload.get("observations")
         return cls(
             source_sandbox_id=SandboxId(str(payload["source_sandbox_id"])),
             fork_sandbox_id=SandboxId(str(payload["fork_sandbox_id"])),
@@ -476,6 +526,11 @@ class MergeReport:
             conflicted=entries("conflicted"),
             skipped=entries("skipped"),
             rolled_back=bool(payload.get("rolled_back", False)),
+            observations=(
+                None
+                if not isinstance(raw_observations, dict)
+                else ObservationReport.from_json(raw_observations)
+            ),
         )
 
 

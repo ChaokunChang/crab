@@ -93,11 +93,21 @@ class MergeDaemonRealTests(unittest.TestCase):
         paths = {entry["path"] for entry in entries}
         self.assertIn("/probe/fork-new.txt", paths)
 
-        report = parent.merge(fork)
+        report = parent.merge(fork, observations="append")
         self.assertIsInstance(report, MergeReport)
         self.assertIn("/probe/fork-new.txt", {entry.path for entry in report.applied})
         self.assertEqual(report.conflicted, ())
         self.assertEqual(self._run(parent, "cat /probe/fork-new.txt"), "fork-new")
+        # C3 over RPC: the merge adopted the fork's history and the
+        # journal read RPC serves it back.
+        self.assertIsNotNone(report.observations)
+        self.assertGreaterEqual(report.observations.consolidated, 1)
+        rows = parent.actions(kind="observation")
+        self.assertTrue(rows)
+        self.assertEqual(
+            {row["payload"]["fork_sandbox_id"] for row in rows},
+            {str(fork.sandbox_id)},
+        )
 
     def test_remote_merge_conflict_policy_and_typed_error(self) -> None:
         parent, fork = self._forked_pair()
@@ -146,6 +156,17 @@ class MergeDaemonRealTests(unittest.TestCase):
         )
         self.assertIn("conflicted=0", merge_out)
         self.assertEqual(self._run(parent, "cat /probe/cli-new.txt"), "cli-new")
+
+        # C3 CLI: consolidate the fork's history, then read it back.
+        consolidate_out = _cli(
+            ["sandbox", "consolidate", str(parent.sandbox_id), str(fork.sandbox_id)]
+        )
+        self.assertIn("consolidated=", consolidate_out)
+        actions_out = _cli(
+            ["sandbox", "actions", str(parent.sandbox_id), "--kind", "observation"]
+        )
+        self.assertIn("observation", actions_out)
+        self.assertIn(str(fork.sandbox_id), actions_out)
 
 
 if __name__ == "__main__":

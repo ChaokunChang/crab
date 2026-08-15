@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
 
 from .ids import CheckpointId, SandboxId
-from .models import JobStatus, MergeReport, SandboxExecResult, SandboxSnapshot, utc_now
+from .models import JobStatus, MergeReport, ObservationReport, SandboxExecResult, SandboxSnapshot, utc_now
 from .templates import SandboxTemplate
 
 if TYPE_CHECKING:
@@ -863,17 +863,17 @@ class Sandbox:
     def actions(self, *, kind: str | None = None, limit: int | None = None) -> list[dict]:
         """Read this sandbox's action journal: every exec attempt (argv,
         cwd, env, exit status, timing) plus lifecycle markers
-        (launch/checkpoint/restore/fork/destroy), oldest first.
+        (launch/checkpoint/restore/fork/destroy) and adopted fork history
+        (kind="observation", C3), oldest first.
 
-        Local (in-process engine) only for now; the daemon RPC surface
-        lands with the transaction API.
+        Works with both a local in-process engine and the daemon
+        (`crab sandbox actions` from the CLI).
         """
         system = getattr(self._engine, "system", None)
         journal = getattr(system, "journal", None)
         if journal is None:
             raise NotImplementedError(
-                "action journal is not available on this engine "
-                "(daemon-mode journal access lands with the txn API)"
+                "action journal is not available on this engine"
             )
         records = journal.entries(self.sandbox_id, kind=kind)
         if limit is not None and limit >= 0:
@@ -915,6 +915,8 @@ class Sandbox:
         policy: str = "fail_fast",
         ignore_prefixes: tuple[str, ...] | None = None,
         merger=None,
+        observations: str = "none",
+        observation_summarizer=None,
     ) -> MergeReport:
         """Three-way merge of a fork's filesystem changes back into this
         sandbox (C2): each fork-changed path applies iff this sandbox
@@ -939,12 +941,50 @@ class Sandbox:
                 "merge is not available on this engine"
             )
         fork_id = fork.sandbox_id if isinstance(fork, Sandbox) else SandboxId(str(fork))
+        kwargs = {}
+        if observations != "none":
+            kwargs["observations"] = observations
+        if observation_summarizer is not None:
+            kwargs["observation_summarizer"] = observation_summarizer
         return merge_from_fork(
             self.sandbox_id,
             fork_id,
             policy=policy,
             ignore_prefixes=ignore_prefixes,
             merger=merger,
+            **kwargs,
+        )
+
+    def consolidate_observations(
+        self,
+        fork: "Sandbox | str",
+        *,
+        policy: str = "append",
+        summarizer=None,
+    ) -> ObservationReport:
+        """Adopt a fork's journal history into this sandbox's journal
+        (C3): ``append`` copies every qualifying record with provenance,
+        ``dedupe`` skips execs this sandbox produced identically itself
+        since the fork point, ``none`` copies nothing (combine with
+        ``summarizer`` for a digest-only entry). Read the result back
+        via ``actions(kind="observation")``.
+
+        Works with both a local in-process engine and the daemon
+        (`crab sandbox consolidate` from the CLI); ``summarizer``
+        callables are local-only.
+        """
+        system = getattr(self._engine, "system", None)
+        consolidate = getattr(system, "consolidate_observations", None)
+        if not callable(consolidate):
+            raise NotImplementedError(
+                "observation consolidation is not available on this engine"
+            )
+        fork_id = fork.sandbox_id if isinstance(fork, Sandbox) else SandboxId(str(fork))
+        return consolidate(
+            self.sandbox_id,
+            fork_id,
+            policy=policy,
+            summarizer=summarizer,
         )
 
     def begin(self, label: str | None = None, *, isolation: str = "snapshot") -> "Transaction":

@@ -34,7 +34,8 @@ from typing import TYPE_CHECKING, Any, Mapping
 from .contracts import Runtime
 from .daemon import DaemonClient, DaemonRequestError
 from .ids import CheckpointId, SandboxId
-from .models import ChangesetResult, JobStatus, MergeReport, SandboxDescription, SandboxExecResult, SandboxRuntimeState
+from .models import ChangesetResult, JobStatus, MergeReport, ObservationReport, SandboxDescription, SandboxExecResult, SandboxRuntimeState
+from .journal import ActionRecord
 from .merging import MergeError, MergerHook
 from .telemetry import NoopTelemetrySink
 from .txn import (
@@ -129,6 +130,33 @@ class _RemoteStorageShim:
         self._entries.pop((str(sandbox_id), str(checkpoint_id)), None)
 
 
+class _JournalShim:
+    """`ActionJournal.entries()`-shaped reads over the daemon RPC so
+    `Sandbox.actions()` stays transport-agnostic (C3)."""
+
+    def __init__(self, client: DaemonClient) -> None:
+        self._client = client
+
+    def entries(
+        self,
+        sandbox_id: SandboxId | str,
+        *,
+        kind: str | None = None,
+        since_seq: int | None = None,
+    ) -> list[ActionRecord]:
+        payload: dict[str, Any] = {}
+        if kind is not None:
+            payload["kind"] = kind
+        if since_seq is not None:
+            payload["since_seq"] = int(since_seq)
+        response = self._client.post_json(
+            f"/sandboxes/{sandbox_id}/actions",
+            payload,
+            timeout_seconds=60.0,
+        )
+        return [ActionRecord.from_json(row) for row in (response.get("records") or [])]
+
+
 class _SystemShim:
     """`Engine.system`-shaped facade for SDK checkpoint operations."""
 
@@ -137,6 +165,7 @@ class _SystemShim:
         self.telemetry = NoopTelemetrySink()
         self.inspector = _LocalInspectorShim()
         self.storage = _RemoteStorageShim(client)
+        self.journal = _JournalShim(client)
 
     def checkpoint_once(self, sandbox_id: SandboxId, *, leave_running: bool = True):
         response = self._client.post_json(
@@ -203,11 +232,13 @@ class _SystemShim:
             raise _map_txn_error(exc) from exc
         raw = response["result"]
         promoted = raw.get("promoted_checkpoint_id")
+        consolidated = raw.get("observations_consolidated")
         return TxnCommitResult(
             txn_id=str(raw["txn_id"]),
             released_observations=int(raw["released_observations"]),
             base_dropped=bool(raw["base_dropped"]),
             promoted_checkpoint_id=None if promoted is None else str(promoted),
+            observations_consolidated=None if consolidated is None else int(consolidated),
         )
 
     def abort_txn(self, sandbox_id: SandboxId, txn_id: str) -> TxnAbortResult:
@@ -245,16 +276,25 @@ class _SystemShim:
         policy: str = "fail_fast",
         ignore_prefixes: tuple[str, ...] | None = None,
         merger: MergerHook | None = None,
+        observations: str = "none",
+        observation_summarizer=None,
     ) -> MergeReport:
         if merger is not None:
             raise NotImplementedError(
                 "custom merger hooks cannot cross the daemon RPC; "
                 "use a policy or run a local in-process engine"
             )
+        if observation_summarizer is not None:
+            raise NotImplementedError(
+                "summarizer hooks cannot cross the daemon RPC; "
+                "run a local in-process engine"
+            )
         payload: dict[str, Any] = {
             "fork_sandbox_id": str(fork_sandbox_id),
             "policy": policy,
         }
+        if observations != "none":
+            payload["observations"] = observations
         if ignore_prefixes is not None:
             payload["ignore_prefixes"] = [str(prefix) for prefix in ignore_prefixes]
         try:
@@ -289,6 +329,31 @@ class _SystemShim:
             timeout_seconds=300.0,
         )
         return ChangesetResult.from_json(response["changeset"])
+
+    def consolidate_observations(
+        self,
+        source_sandbox_id: SandboxId,
+        fork_sandbox_id: SandboxId,
+        *,
+        policy: str = "append",
+        summarizer=None,
+        reason: str = "manual",
+    ) -> ObservationReport:
+        if summarizer is not None:
+            raise NotImplementedError(
+                "summarizer hooks cannot cross the daemon RPC; "
+                "run a local in-process engine"
+            )
+        response = self._client.post_json(
+            f"/sandboxes/{source_sandbox_id}/observations/consolidate",
+            {
+                "fork_sandbox_id": str(fork_sandbox_id),
+                "policy": policy,
+                "reason": reason,
+            },
+            timeout_seconds=60.0,
+        )
+        return ObservationReport.from_json(response["report"])
 
 
 class _ConfigShim:

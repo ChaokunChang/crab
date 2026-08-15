@@ -86,6 +86,7 @@ class TxnCommitResult:
     released_observations: int
     base_dropped: bool
     promoted_checkpoint_id: str | None = None
+    observations_consolidated: int | None = None
 
 
 @dataclass(frozen=True)

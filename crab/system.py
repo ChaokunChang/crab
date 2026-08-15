@@ -27,6 +27,7 @@ from .models import (
     FailureCode,
     JobStatus,
     MergeReport,
+    ObservationReport,
     RecoveryEvent,
     RecoveryRecord,
     RestoreJob,
@@ -79,6 +80,13 @@ from .workers import (
 from .workers.composite import resolve_restore_manifest
 
 logger = logging.getLogger(__name__)
+
+# C3 observation consolidation: how a fork's journal history is adopted
+# into its source's journal. `SummarizerHook` receives the qualifying
+# fork records (`ActionRecord.to_json()` rows) and returns a digest
+# (str/dict) or None; local engine only — never crosses the daemon RPC.
+OBSERVATION_POLICIES: tuple[str, ...] = ("append", "dedupe", "none")
+SummarizerHook = Callable[[list], object]
 
 _CAPTURES_INFLIGHT_LLM = "captures_inflight_llm"
 _CAPTURED_REQUEST_ID = "captured_request_id"
@@ -1051,7 +1059,12 @@ class CrabSystem:
             raise
 
     def commit_txn(
-        self, sandbox_id: SandboxId, txn_id: str, *, force: bool = False
+        self,
+        sandbox_id: SandboxId,
+        txn_id: str,
+        *,
+        force: bool = False,
+        observations: str = "append",
     ) -> TxnCommitResult:
         active = self._require_txn(sandbox_id, txn_id)
         if active.isolation == "fork":
@@ -1060,7 +1073,7 @@ class CrabSystem:
                     f"fork-backed txn {active.txn_id} must be committed via its "
                     f"source sandbox {active.sandbox_id}"
                 )
-            return self._commit_fork_txn(active, force=force)
+            return self._commit_fork_txn(active, force=force, observations=observations)
         registry = self.response_gate_registry
         if registry is not None:
             # Anything still pending (armed but never checkpoint-released)
@@ -1327,7 +1340,14 @@ class CrabSystem:
                     self._active_txns.pop(fork_sandbox_id, None)
             raise
 
-    def _commit_fork_txn(self, active: TxnDescription, *, force: bool) -> TxnCommitResult:
+    def _commit_fork_txn(
+        self, active: TxnDescription, *, force: bool, observations: str = "append"
+    ) -> TxnCommitResult:
+        if observations not in OBSERVATION_POLICIES:
+            raise ValueError(
+                f"unknown observation policy: {observations!r} "
+                f"(expected one of {OBSERVATION_POLICIES})"
+            )
         source_id = SandboxId(active.sandbox_id)
         assert active.fork_sandbox_id is not None
         fork_id = SandboxId(active.fork_sandbox_id)
@@ -1432,6 +1452,25 @@ class CrabSystem:
                 registry.release(fork_id)
             released = self.release_staged_observations(fork_id)
             self.end_observation_staging(fork_id)
+            # Adopt the fork's action history (C3): the commit's meaning
+            # is "take the fork's work", and the fork is about to die.
+            # Consolidation failures never unwind the completed swap.
+            observations_consolidated: int | None = None
+            if observations != "none":
+                try:
+                    observation_report = self.consolidate_observations(
+                        source_id,
+                        fork_id,
+                        policy=observations,
+                        reason="txn_commit",
+                    )
+                    observations_consolidated = observation_report.consolidated
+                except Exception:
+                    logger.exception(
+                        "Observation consolidation after fork-txn commit failed source=%s fork=%s",
+                        source_id,
+                        fork_id,
+                    )
             self._journal_lifecycle(
                 source_id,
                 "txn_commit",
@@ -1442,6 +1481,7 @@ class CrabSystem:
                     "promoted_checkpoint_id": str(commit_checkpoint_id),
                     "released": released,
                     "forced": force,
+                    "observations_consolidated": observations_consolidated,
                 },
             )
             self._journal_lifecycle(
@@ -1486,6 +1526,7 @@ class CrabSystem:
                 released_observations=released,
                 base_dropped=False,
                 promoted_checkpoint_id=str(commit_checkpoint_id),
+                observations_consolidated=observations_consolidated,
             )
         except Exception:
             operation.finish(status="failed")
@@ -1807,15 +1848,24 @@ class CrabSystem:
         policy: str = "fail_fast",
         ignore_prefixes: tuple[str, ...] | None = None,
         merger: MergerHook | None = None,
+        observations: str = "none",
+        observation_summarizer: "SummarizerHook | None" = None,
     ) -> MergeReport:
         """Three-way merge of ``fork_sandbox_id``'s filesystem changes
         since its fork point back into ``source_sandbox_id`` (C2). Both
         sandboxes are paused for the window when running; apply-phase
         failures roll back path-by-path from a transient pre-merge
-        snapshot and surface as ``MergeError`` carrying the report."""
+        snapshot and surface as ``MergeError`` carrying the report.
+        ``observations`` (C3: none/append/dedupe) adopts the fork's
+        journal history into the source after a successful merge."""
         if policy not in MERGE_POLICIES:
             raise ValueError(
                 f"unknown merge policy: {policy!r} (expected one of {MERGE_POLICIES})"
+            )
+        if observations not in OBSERVATION_POLICIES:
+            raise ValueError(
+                f"unknown observation policy: {observations!r} "
+                f"(expected one of {OBSERVATION_POLICIES})"
             )
         prefixes = (
             DEFAULT_MERGE_IGNORE_PREFIXES if ignore_prefixes is None else tuple(ignore_prefixes)
@@ -1920,6 +1970,25 @@ class CrabSystem:
                 plan=plan,
                 applied=True,
             )
+            if observations != "none" and not plan.aborted:
+                # A merge that landed adopts the fork's history on
+                # request; consolidation failures never unwind the
+                # already-applied filesystem merge.
+                try:
+                    observation_report = self.consolidate_observations(
+                        source_sandbox_id,
+                        fork_sandbox_id,
+                        policy=observations,
+                        summarizer=observation_summarizer,
+                        reason="merge",
+                    )
+                    report = replace(report, observations=observation_report)
+                except Exception:
+                    logger.exception(
+                        "Observation consolidation after merge failed source=%s fork=%s",
+                        source_sandbox_id,
+                        fork_sandbox_id,
+                    )
             self._record_merge(report, succeeded=True)
             operation.finish(
                 status="succeeded",
@@ -2005,6 +2074,214 @@ class CrabSystem:
             len(report.skipped),
             report.rolled_back,
         )
+
+    # ----- observation consolidation (C3) ------------------------------
+    # "Observations" are journal records — the only durable, ordered,
+    # transportable account of what a fork did (staged LLM responses are
+    # deliver/drop-only metadata for live waiters and their bodies are
+    # never persisted). Consolidation copies a fork's qualifying records
+    # into the source journal as kind="observation" rows with provenance.
+
+    _OBSERVATION_LIFECYCLE_EVENTS = frozenset(
+        {"fork_created", "checkpoint", "restore", "merge", "merged_into"}
+    )
+
+    def consolidate_observations(
+        self,
+        source_sandbox_id: SandboxId,
+        fork_sandbox_id: SandboxId,
+        *,
+        policy: str = "append",
+        summarizer: SummarizerHook | None = None,
+        reason: str = "manual",
+    ) -> ObservationReport:
+        """Adopt ``fork_sandbox_id``'s journal history into
+        ``source_sandbox_id``'s journal (C3). ``append`` copies every
+        qualifying record in fork-seq order; ``dedupe`` skips exec
+        records the source produced identically itself since the fork
+        point; ``none`` copies nothing (useful with ``summarizer``,
+        which digests the qualifying records into one summary row).
+        Merge/commit-triggered runs are idempotent per (source, fork);
+        manual re-runs append again."""
+        if policy not in OBSERVATION_POLICIES:
+            raise ValueError(
+                f"unknown observation policy: {policy!r} "
+                f"(expected one of {OBSERVATION_POLICIES})"
+            )
+        journal = self.journal
+        if journal is None:
+            raise RuntimeError("observation consolidation requires the action journal")
+        if reason != "manual" and self._observations_already_consolidated(
+            source_sandbox_id, fork_sandbox_id
+        ):
+            logger.info(
+                "Observations already consolidated; skipping source=%s fork=%s reason=%s",
+                source_sandbox_id,
+                fork_sandbox_id,
+                reason,
+            )
+            return ObservationReport(
+                source_sandbox_id=source_sandbox_id,
+                fork_sandbox_id=fork_sandbox_id,
+                policy=policy,
+                consolidated=0,
+                skipped_duplicates=0,
+                already_consolidated=True,
+                reason=reason,
+            )
+        fork_records = journal.entries(fork_sandbox_id)
+        qualifying = [record for record in fork_records if self._qualifies_as_observation(record)]
+        dedupe_keys: set[tuple] | None = None
+        if policy == "dedupe":
+            dedupe_keys = self._source_exec_keys_since_fork(source_sandbox_id, fork_sandbox_id)
+        consolidated = 0
+        skipped_duplicates = 0
+        if policy != "none":
+            for record in qualifying:
+                if (
+                    dedupe_keys is not None
+                    and record.kind == "exec"
+                    and self._exec_identity(record.payload) in dedupe_keys
+                ):
+                    skipped_duplicates += 1
+                    continue
+                journal.record_observation(
+                    source_sandbox_id,
+                    payload={
+                        "fork_sandbox_id": str(fork_sandbox_id),
+                        "origin_seq": record.seq,
+                        "origin_kind": record.kind,
+                        "origin_txn_id": record.txn_id,
+                        "origin_started_at": record.started_at,
+                        "origin_finished_at": record.finished_at,
+                        "origin_payload": dict(record.payload),
+                        "reason": reason,
+                    },
+                )
+                consolidated += 1
+        summary_written = False
+        if summarizer is not None:
+            digest = summarizer([record.to_json() for record in qualifying])
+            if digest is not None:
+                journal.record_observation(
+                    source_sandbox_id,
+                    payload={
+                        "fork_sandbox_id": str(fork_sandbox_id),
+                        "origin_kind": "summary",
+                        "reason": reason,
+                        "summary": digest,
+                    },
+                )
+                summary_written = True
+        report = ObservationReport(
+            source_sandbox_id=source_sandbox_id,
+            fork_sandbox_id=fork_sandbox_id,
+            policy=policy,
+            consolidated=consolidated,
+            skipped_duplicates=skipped_duplicates,
+            summary_written=summary_written,
+            reason=reason,
+        )
+        self._journal_lifecycle(
+            source_sandbox_id,
+            "observations_consolidated",
+            metadata={
+                "fork_sandbox_id": str(fork_sandbox_id),
+                "policy": policy,
+                "consolidated": consolidated,
+                "skipped_duplicates": skipped_duplicates,
+                "summary_written": summary_written,
+                "reason": reason,
+            },
+        )
+        self.telemetry.emit_event(
+            "observations.consolidated",
+            self._telemetry_attrs(
+                source_sandbox_id,
+                component="system",
+                extra={
+                    "fork_sandbox_id": str(fork_sandbox_id),
+                    "policy": policy,
+                    "consolidated": consolidated,
+                    "skipped_duplicates": skipped_duplicates,
+                    "reason": reason,
+                },
+            ),
+        )
+        logger.info(
+            "Consolidated observations source=%s fork=%s policy=%s consolidated=%d skipped=%d reason=%s",
+            source_sandbox_id,
+            fork_sandbox_id,
+            policy,
+            consolidated,
+            skipped_duplicates,
+            reason,
+        )
+        return report
+
+    def _qualifies_as_observation(self, record) -> bool:
+        """exec records always qualify; lifecycle records only for the
+        allowlist (mechanics markers like staging_*/txn_*/changeset are
+        plumbing, not observations); adopted observation rows never
+        re-qualify (no recursive adoption)."""
+        if record.kind == "exec":
+            return True
+        if record.kind == "lifecycle":
+            return str(record.payload.get("event")) in self._OBSERVATION_LIFECYCLE_EVENTS
+        return False
+
+    @staticmethod
+    def _exec_identity(payload: dict) -> tuple:
+        return (
+            tuple(str(item) for item in (payload.get("argv") or ())),
+            payload.get("cwd"),
+            payload.get("returncode"),
+            payload.get("stdout_sha256"),
+            payload.get("stderr_sha256"),
+        )
+
+    def _source_exec_keys_since_fork(
+        self, source_sandbox_id: SandboxId, fork_sandbox_id: SandboxId
+    ) -> set[tuple]:
+        """Identity keys of the source's own exec records after the
+        matching fork_source marker (whole journal when the marker is
+        missing) — "the source already did this itself"."""
+        journal = self.journal
+        assert journal is not None
+        records = journal.entries(source_sandbox_id)
+        boundary = -1
+        for record in records:
+            if record.kind != "lifecycle":
+                continue
+            if record.payload.get("event") != "fork_source":
+                continue
+            metadata = record.payload.get("metadata") or {}
+            if str(metadata.get("target_sandbox_id")) == str(fork_sandbox_id):
+                boundary = record.seq
+                break
+        return {
+            self._exec_identity(record.payload)
+            for record in records
+            if record.kind == "exec" and record.seq > boundary
+        }
+
+    def _observations_already_consolidated(
+        self, source_sandbox_id: SandboxId, fork_sandbox_id: SandboxId
+    ) -> bool:
+        journal = self.journal
+        if journal is None:
+            return False
+        try:
+            records = journal.entries(source_sandbox_id, kind="lifecycle")
+        except Exception:
+            return False
+        for record in records:
+            if record.payload.get("event") != "observations_consolidated":
+                continue
+            metadata = record.payload.get("metadata") or {}
+            if str(metadata.get("fork_sandbox_id")) == str(fork_sandbox_id):
+                return True
+        return False
 
     # ----- observation staging (B1) -----------------------------------
     # Thin facade over the response-gate registry's staging extension so
