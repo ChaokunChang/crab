@@ -9,6 +9,7 @@ from .ids import CheckpointId, JobId, SandboxId
 from .models import (
     ArtifactPayload,
     ArtifactReference,
+    ChangesetEntry,
     CheckpointJob,
     CheckpointManifest,
     CheckpointResult,
@@ -318,6 +319,16 @@ class Runtime(ABC):
         *,
         target_rootfs_path: Path,
     ) -> str:
+        raise NotImplementedError
+
+    def changeset_since(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> list[ChangesetEntry]:
+        """Changed rootfs paths relative to the checkpoint's filesystem
+        snapshot, sorted by path (C1). Optional capability: runtimes
+        without a CoW filesystem provider do not implement it."""
         raise NotImplementedError
 
 

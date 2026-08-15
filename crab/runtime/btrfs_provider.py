@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import shlex
+import shutil
 import subprocess
 import uuid
 from dataclasses import replace
@@ -9,6 +11,8 @@ from pathlib import Path
 from ..ids import CheckpointId, SandboxId
 from ..models import RuntimeOperationStatus
 from .fs_provider import (
+    CHANGE_PRECEDENCE,
+    ChangesetEntry,
     DatasetResolver,
     FilesystemProvider,
     FsCommandExecutor,
@@ -20,6 +24,161 @@ logger = logging.getLogger(__name__)
 
 _FS_REF_PREFIX = "btrfs:"
 _TRASH_INFIX = ".trash-"
+_CHANGESET_INFIX = "@changeset-"
+_BTRFS_DUMP_CREATE_COMMANDS = {"mkfile", "mkdir", "mknod", "mkfifo", "mksock", "symlink"}
+_BTRFS_DUMP_MODIFY_COMMANDS = {
+    "write",
+    "update_extent",
+    "clone",
+    "truncate",
+    "fallocate",
+    "fileattr",
+    "chmod",
+    "chown",
+    "utimes",
+    "set_xattr",
+    "remove_xattr",
+}
+
+
+def _tokenize_dump_line(line: str) -> list[str]:
+    r"""Split a ``btrfs receive --dump`` line on unescaped spaces,
+    unescaping ``\ `` / ``\\`` sequences inside tokens as it goes."""
+    tokens: list[str] = []
+    current: list[str] = []
+    escaped = False
+    for char in line:
+        if escaped:
+            current.append(char)
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == " ":
+            if current:
+                tokens.append("".join(current))
+                current = []
+        else:
+            current.append(char)
+    if current:
+        tokens.append("".join(current))
+    return tokens
+
+
+def _dump_container_path(raw: str, snapshot_name: str) -> str | None:
+    """Strip the dump's ``./<snapshot name>`` prefix, yielding a
+    ``/``-rooted container path; None for paths outside the snapshot."""
+    prefix = f"./{snapshot_name}"
+    if not raw.startswith(prefix):
+        return None
+    remainder = raw[len(prefix):]
+    if remainder in ("", "/"):
+        return "/"
+    if not remainder.startswith("/"):
+        return None
+    trimmed = remainder.rstrip("/")
+    return trimmed if trimmed else "/"
+
+
+def parse_btrfs_receive_dump(stdout: str, *, snapshot_name: str) -> list[ChangesetEntry]:
+    r"""Parse ``btrfs receive --dump`` output of a ``send --no-data``
+    stream between the base checkpoint snapshot and a transient live
+    snapshot. Semantics pinned from real VM output:
+
+    - new files/dirs arrive as ``o<inode>-<gen>-0`` placeholders
+      (``mkfile``/``mkdir``) that a later ``rename`` materializes onto
+      the real path;
+    - a move of a pre-existing file is encoded as ``link <new>
+      dest=<old>`` (dest is subvolume-root-relative) plus ``unlink
+      <old>`` — the ``rename`` command is not used for it;
+    - spaces in paths are escaped as ``\ ``; every positional path is
+      prefixed with ``./<snapshot name>/``; the snapshot root's own
+      ``utimes`` churn is dropped as noise (matches the zfs parser).
+    """
+    created: set[str] = set()
+    modified: set[str] = set()
+    removed: set[str] = set()
+    renamed: dict[str, str] = {}
+    pending_links: dict[str, str] = {}
+
+    for line in stdout.splitlines():
+        tokens = _tokenize_dump_line(line)
+        if len(tokens) < 2:
+            continue
+        command = tokens[0]
+        path = _dump_container_path(tokens[1], snapshot_name)
+        if path is None or path == "/":
+            continue
+        args: dict[str, str] = {}
+        for token in tokens[2:]:
+            if "=" in token:
+                key, value = token.split("=", 1)
+                args[key] = value
+        if command in _BTRFS_DUMP_CREATE_COMMANDS:
+            created.add(path)
+        elif command == "rename":
+            dest_raw = args.get("dest")
+            dest = _dump_container_path(dest_raw, snapshot_name) if dest_raw is not None else None
+            if dest is None or dest == "/":
+                continue
+            if path in created:
+                # Placeholder (or in-window path) materialization.
+                created.discard(path)
+                if dest in removed:
+                    # Replaced a pre-existing path: net effect is a modify.
+                    removed.discard(dest)
+                    modified.add(dest)
+                else:
+                    created.add(dest)
+            else:
+                renamed[dest] = renamed.pop(path, path)
+                modified.discard(path)
+        elif command == "link":
+            target = args.get("dest")
+            if target is not None:
+                pending_links[path] = "/" + target
+        elif command == "unlink":
+            new_path = next((new for new, old in pending_links.items() if old == path), None)
+            if new_path is not None:
+                # link+unlink pair = move of a pre-existing file.
+                del pending_links[new_path]
+                if path in created:
+                    created.discard(path)
+                    created.add(new_path)
+                else:
+                    renamed[new_path] = renamed.pop(path, path)
+                    modified.discard(path)
+            elif path in created:
+                created.discard(path)  # transient: born and gone in-window
+            else:
+                removed.add(path)
+        elif command == "rmdir":
+            if path in created:
+                created.discard(path)
+            else:
+                removed.add(path)
+        elif command in _BTRFS_DUMP_MODIFY_COMMANDS:
+            if path not in created and path not in renamed:
+                modified.add(path)
+
+    # Unconsumed links are genuinely new hard-link names.
+    created.update(pending_links)
+
+    entries: dict[str, ChangesetEntry] = {}
+
+    def _fold(path: str, change: str, renamed_from: str | None = None) -> None:
+        existing = entries.get(path)
+        if existing is None or CHANGE_PRECEDENCE[change] >= CHANGE_PRECEDENCE[existing.change]:
+            entries[path] = ChangesetEntry(path=path, change=change, renamed_from=renamed_from)
+
+    for path in modified:
+        _fold(path, "modified")
+    for path in created:
+        _fold(path, "added")
+    for path, old_path in renamed.items():
+        _fold(path, "renamed", old_path)
+    for path in removed:
+        _fold(path, "removed")
+    return [entries[key] for key in sorted(entries)]
 
 
 class BtrfsProvider(FilesystemProvider):
@@ -220,7 +379,13 @@ class BtrfsProvider(FilesystemProvider):
         sandbox_id: SandboxId | None = None,
         timeout_seconds: float | None = None,
     ) -> None:
-        Path(dataset).parent.mkdir(parents=True, exist_ok=True)
+        dataset_path = Path(dataset)
+        dataset_path.parent.mkdir(parents=True, exist_ok=True)
+        if dataset_path.exists() and not self._subvolume_exists(dataset, operation=operation):
+            # Self-heal: a plain directory at the subvolume path is
+            # wreckage from an interrupted materialization (the path
+            # doubles as the mountpoint) and blocks `subvolume create`.
+            shutil.rmtree(dataset_path)
         self._run_command(
             [self._btrfs_bin, "subvolume", "create", dataset],
             operation=operation,
@@ -440,8 +605,79 @@ class BtrfsProvider(FilesystemProvider):
                 "mountpoint": str(target_rootfs_path),
             },
         )
+        # Materialize the fork-point snapshot on the fork's own subvolume
+        # (C1): gives changeset_since a local diff base, makes the fork
+        # manifests' stamped fs_ref real so retention can reclaim it, and
+        # keeps fork-point restores independent of the source's snapshots.
+        self._run_command(
+            [self._btrfs_bin, "subvolume", "snapshot", "-r", target_dataset, f"{target_dataset}@{checkpoint_id}"],
+            operation="sandbox.btrfs_fork_point_snapshot",
+            sandbox_id=target_sandbox_id,
+            checkpoint_id=checkpoint_id,
+            metadata={"subvolume": target_dataset, "snapshot": f"{target_dataset}@{checkpoint_id}"},
+        )
         self._bind_rootfs(target_dataset, target_rootfs_path, sandbox_id=target_sandbox_id)
         return target_dataset
+
+    def _changeset_snapshot_paths(self, dataset: str) -> list[str]:
+        base = Path(dataset)
+        try:
+            return sorted(str(path) for path in base.parent.glob(f"{base.name}{_CHANGESET_INFIX}*"))
+        except OSError:
+            return []
+
+    def changeset_since(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> list[ChangesetEntry]:
+        dataset = self._dataset_resolver(sandbox_id)
+        base_snapshot = f"{dataset}@{checkpoint_id}"
+        if not self.snapshot_exists(base_snapshot):
+            raise FileNotFoundError(f"changeset base snapshot missing: {base_snapshot}")
+        # Reclaim transient snapshots leaked by earlier crashed runs
+        # before making another; best-effort.
+        for stale in self._changeset_snapshot_paths(dataset):
+            self._run_command(
+                [self._btrfs_bin, "subvolume", "delete", stale],
+                operation="sandbox.btrfs_changeset_sweep",
+                sandbox_id=sandbox_id,
+                check=False,
+                metadata={"subvolume": dataset, "snapshot": stale},
+            )
+        tmp_snapshot = f"{dataset}{_CHANGESET_INFIX}{uuid.uuid4().hex[:8]}"
+        self._run_command(
+            [self._btrfs_bin, "subvolume", "snapshot", "-r", dataset, tmp_snapshot],
+            operation="sandbox.btrfs_changeset_snapshot",
+            sandbox_id=sandbox_id,
+            checkpoint_id=checkpoint_id,
+            metadata={"subvolume": dataset, "snapshot": tmp_snapshot},
+        )
+        try:
+            # find-new cannot see deletions; diff via a metadata-only send
+            # stream instead. A broken pipeline cannot silently yield an
+            # empty changeset: receive errors on empty/truncated input.
+            result = self._run_command(
+                [
+                    "sh",
+                    "-c",
+                    f"{shlex.quote(self._btrfs_bin)} send --no-data -p {shlex.quote(base_snapshot)} "
+                    f"{shlex.quote(tmp_snapshot)} | {shlex.quote(self._btrfs_bin)} receive --dump",
+                ],
+                operation="sandbox.changeset_since",
+                sandbox_id=sandbox_id,
+                checkpoint_id=checkpoint_id,
+                metadata={"dataset": dataset, "snapshot": base_snapshot, "tmp_snapshot": tmp_snapshot},
+            )
+            return parse_btrfs_receive_dump(result.stdout, snapshot_name=Path(tmp_snapshot).name)
+        finally:
+            self._run_command(
+                [self._btrfs_bin, "subvolume", "delete", tmp_snapshot],
+                operation="sandbox.btrfs_changeset_cleanup",
+                sandbox_id=sandbox_id,
+                check=False,
+                metadata={"subvolume": dataset, "snapshot": tmp_snapshot},
+            )
 
     def discard_partial_checkpoint(
         self,

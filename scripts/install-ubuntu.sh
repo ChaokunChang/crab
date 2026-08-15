@@ -212,6 +212,12 @@ if [[ ${FS_BACKEND} = zfs ]]; then
 else
   if [[ $(stat -f -c %T "${BTRFS_ROOT}" 2>/dev/null) = btrfs ]]; then
     log "Using existing btrfs filesystem at ${BTRFS_ROOT}"
+    # atime updates leak into `btrfs send` diffs as utimes-only noise;
+    # the changeset provider needs noatime for zfs-parity semantics.
+    if ! findmnt -no OPTIONS --target "${BTRFS_ROOT}" | grep -qw noatime; then
+      log "Remounting ${BTRFS_ROOT} with noatime (required for clean changesets)"
+      mount -o remount,noatime "${BTRFS_ROOT}" || die "failed to remount ${BTRFS_ROOT} with noatime"
+    fi
   else
     ((CREATE_POOL == 1)) || die "no btrfs filesystem mounted at ${BTRFS_ROOT}"
     # Same safety rule as the zpool flow: never adopt an existing backing
@@ -220,11 +226,11 @@ else
     log "Creating dedicated loop-backed btrfs filesystem at ${BTRFS_ROOT} (${BTRFS_SIZE})"
     install -d -m 0755 "$(dirname -- "${BTRFS_FILE}")" "${BTRFS_ROOT}"
     truncate -s "${BTRFS_SIZE}" "${BTRFS_FILE}"
-    if ! mkfs.btrfs -q "${BTRFS_FILE}" || ! mount -o loop "${BTRFS_FILE}" "${BTRFS_ROOT}"; then
+    if ! mkfs.btrfs -q "${BTRFS_FILE}" || ! mount -o loop,noatime "${BTRFS_FILE}" "${BTRFS_ROOT}"; then
       rm -f -- "${BTRFS_FILE}"
       die "failed to create btrfs filesystem at ${BTRFS_ROOT}"
     fi
-    grep -q "${BTRFS_FILE}" /etc/fstab ||       echo "${BTRFS_FILE} ${BTRFS_ROOT} btrfs loop 0 0" >>/etc/fstab
+    grep -q "${BTRFS_FILE}" /etc/fstab ||       echo "${BTRFS_FILE} ${BTRFS_ROOT} btrfs loop,noatime 0 0" >>/etc/fstab
   fi
 fi
 

@@ -330,6 +330,48 @@ class RestoreResult:
 
 
 @dataclass(frozen=True)
+class ChangesetEntry:
+    """One changed path in a sandbox rootfs relative to a checkpoint
+    snapshot (roadmap C1). ``path`` is container-absolute (rootfs-
+    relative, ``/``-rooted). ``change`` is one of ``added`` /
+    ``modified`` / ``removed`` / ``renamed``; renames carry the old
+    container path in ``renamed_from``. Providers report raw truth —
+    ignore policies belong to the merge layer (C2)."""
+
+    path: str
+    change: str
+    renamed_from: str | None = None
+
+    def to_json(self) -> dict[str, object]:
+        payload: dict[str, object] = {"path": self.path, "change": self.change}
+        if self.renamed_from is not None:
+            payload["renamed_from"] = self.renamed_from
+        return payload
+
+
+@dataclass(frozen=True)
+class ChangesetResult:
+    """Filesystem changeset of a sandbox relative to a base checkpoint
+    (``CrabSystem.changeset_since`` / ``fork_changeset``).
+    ``skipped_by_gate`` is True when the inspector's
+    ``filesystem_changed=False`` fast path proved the diff empty without
+    running a backend diff."""
+
+    sandbox_id: SandboxId
+    base_checkpoint_id: CheckpointId
+    entries: tuple[ChangesetEntry, ...]
+    skipped_by_gate: bool = False
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "sandbox_id": str(self.sandbox_id),
+            "base_checkpoint_id": str(self.base_checkpoint_id),
+            "entries": [entry.to_json() for entry in self.entries],
+            "skipped_by_gate": self.skipped_by_gate,
+        }
+
+
+@dataclass(frozen=True)
 class JobRecord:
     job_id: JobId
     job_type: JobType
