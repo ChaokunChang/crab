@@ -372,6 +372,65 @@ class ChangesetResult:
 
 
 @dataclass(frozen=True)
+class MergeEntry:
+    """One fork-changed path's fate in a merge (C2). ``resolution`` is
+    ``applied`` / ``conflicted`` / ``skipped``; ``reason`` explains
+    non-applied outcomes (``source_changed`` / ``dir_touch`` /
+    ``ignored`` / ``unresolved_text`` / ``merge_aborted``). ``merged``
+    marks content produced by the three-way text merge or a merger
+    hook rather than taken verbatim from the fork."""
+
+    path: str
+    change: str
+    resolution: str
+    reason: str | None = None
+    renamed_from: str | None = None
+    merged: bool = False
+
+    def to_json(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "path": self.path,
+            "change": self.change,
+            "resolution": self.resolution,
+        }
+        if self.reason is not None:
+            payload["reason"] = self.reason
+        if self.renamed_from is not None:
+            payload["renamed_from"] = self.renamed_from
+        if self.merged:
+            payload["merged"] = True
+        return payload
+
+
+@dataclass(frozen=True)
+class MergeReport:
+    """Outcome of ``CrabSystem.merge_from_fork`` (C2). ``rolled_back``
+    is True when an apply-phase failure was undone from the pre-merge
+    snapshot (the report then rides on ``MergeError``)."""
+
+    source_sandbox_id: SandboxId
+    fork_sandbox_id: SandboxId
+    base_checkpoint_id: CheckpointId
+    policy: str
+    applied: tuple[MergeEntry, ...]
+    conflicted: tuple[MergeEntry, ...]
+    skipped: tuple[MergeEntry, ...]
+    rolled_back: bool = False
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "source_sandbox_id": str(self.source_sandbox_id),
+            "fork_sandbox_id": str(self.fork_sandbox_id),
+            "base_checkpoint_id": str(self.base_checkpoint_id),
+            "policy": self.policy,
+            "applied": [entry.to_json() for entry in self.applied],
+            "conflicted": [entry.to_json() for entry in self.conflicted],
+            "skipped": [entry.to_json() for entry in self.skipped],
+            "rolled_back": self.rolled_back,
+        }
+
+
+@dataclass(frozen=True)
 class JobRecord:
     job_id: JobId
     job_type: JobType

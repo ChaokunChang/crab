@@ -1791,6 +1791,13 @@ class RuncRuntime(Runtime):
     ) -> list[ChangesetEntry]:
         return self._fs.changeset_since(sandbox_id, checkpoint_id)
 
+    def snapshot_content_root(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> Path:
+        return self._fs.snapshot_content_root(sandbox_id, checkpoint_id)
+
     def delete_runtime(
         self,
         sandbox_id: SandboxId,

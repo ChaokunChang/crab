@@ -679,6 +679,19 @@ class BtrfsProvider(FilesystemProvider):
                 metadata={"subvolume": dataset, "snapshot": tmp_snapshot},
             )
 
+    def snapshot_content_root(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> Path:
+        dataset = self._dataset_resolver(sandbox_id)
+        snapshot = f"{dataset}@{checkpoint_id}"
+        if not self.snapshot_exists(snapshot):
+            raise FileNotFoundError(f"snapshot missing: {snapshot}")
+        # Snapshots are read-only subvolumes stored flat next to the live
+        # one; the path itself is the content root.
+        return Path(snapshot)
+
     def discard_partial_checkpoint(
         self,
         sandbox_id: SandboxId,

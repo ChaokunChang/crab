@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
 
 from .ids import CheckpointId, SandboxId
-from .models import JobStatus, SandboxExecResult, SandboxSnapshot, utc_now
+from .models import JobStatus, MergeReport, SandboxExecResult, SandboxSnapshot, utc_now
 from .templates import SandboxTemplate
 
 if TYPE_CHECKING:
@@ -909,6 +909,45 @@ class Sandbox:
                 )
             result = changeset_since(self.sandbox_id, CheckpointId(str(since)))
         return [entry.to_json() for entry in result.entries]
+
+    def merge(
+        self,
+        fork: "Sandbox | str",
+        *,
+        policy: str = "fail_fast",
+        ignore_prefixes: tuple[str, ...] | None = None,
+        merger=None,
+    ) -> MergeReport:
+        """Three-way merge of a fork's filesystem changes back into this
+        sandbox (C2): each fork-changed path applies iff this sandbox
+        did not change it since the fork point; conflicts resolve per
+        ``policy`` — ``fail_fast`` (default: any conflict aborts before
+        a single write), ``prefer_fork``, ``prefer_source``, or
+        ``text_merge`` (in-repo line-based diff3; unresolved overlap
+        aborts like fail_fast). A ``merger`` callable
+        ``(path, base, source, fork) -> bytes | None`` gets first shot
+        at every conflict. Returns a ``MergeReport``; apply failures
+        raise ``MergeError`` carrying the report (``rolled_back=True``
+        after a clean path-level undo). The fork stays alive.
+
+        Local (in-process engine) only for now; the daemon RPC lands
+        with the C2 surface PR.
+        """
+        system = getattr(self._engine, "system", None)
+        merge_from_fork = getattr(system, "merge_from_fork", None)
+        if not callable(merge_from_fork):
+            raise NotImplementedError(
+                "merge is not available on this engine "
+                "(daemon-mode merge RPC lands with the C2 surface PR)"
+            )
+        fork_id = fork.sandbox_id if isinstance(fork, Sandbox) else SandboxId(str(fork))
+        return merge_from_fork(
+            self.sandbox_id,
+            fork_id,
+            policy=policy,
+            ignore_prefixes=ignore_prefixes,
+            merger=merger,
+        )
 
     def begin(self, label: str | None = None) -> "Transaction":
         """Open a transaction: adaptive base checkpoint + observation
