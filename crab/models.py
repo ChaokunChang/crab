@@ -348,6 +348,15 @@ class ChangesetEntry:
             payload["renamed_from"] = self.renamed_from
         return payload
 
+    @classmethod
+    def from_json(cls, payload: dict[str, object]) -> "ChangesetEntry":
+        renamed_from = payload.get("renamed_from")
+        return cls(
+            path=str(payload["path"]),
+            change=str(payload["change"]),
+            renamed_from=None if renamed_from is None else str(renamed_from),
+        )
+
 
 @dataclass(frozen=True)
 class ChangesetResult:
@@ -369,6 +378,17 @@ class ChangesetResult:
             "entries": [entry.to_json() for entry in self.entries],
             "skipped_by_gate": self.skipped_by_gate,
         }
+
+    @classmethod
+    def from_json(cls, payload: dict[str, object]) -> "ChangesetResult":
+        return cls(
+            sandbox_id=SandboxId(str(payload["sandbox_id"])),
+            base_checkpoint_id=CheckpointId(str(payload["base_checkpoint_id"])),
+            entries=tuple(
+                ChangesetEntry.from_json(entry) for entry in (payload.get("entries") or [])
+            ),
+            skipped_by_gate=bool(payload.get("skipped_by_gate", False)),
+        )
 
 
 @dataclass(frozen=True)
@@ -401,6 +421,19 @@ class MergeEntry:
             payload["merged"] = True
         return payload
 
+    @classmethod
+    def from_json(cls, payload: dict[str, object]) -> "MergeEntry":
+        reason = payload.get("reason")
+        renamed_from = payload.get("renamed_from")
+        return cls(
+            path=str(payload["path"]),
+            change=str(payload["change"]),
+            resolution=str(payload["resolution"]),
+            reason=None if reason is None else str(reason),
+            renamed_from=None if renamed_from is None else str(renamed_from),
+            merged=bool(payload.get("merged", False)),
+        )
+
 
 @dataclass(frozen=True)
 class MergeReport:
@@ -428,6 +461,22 @@ class MergeReport:
             "skipped": [entry.to_json() for entry in self.skipped],
             "rolled_back": self.rolled_back,
         }
+
+    @classmethod
+    def from_json(cls, payload: dict[str, object]) -> "MergeReport":
+        def entries(key: str) -> tuple[MergeEntry, ...]:
+            return tuple(MergeEntry.from_json(entry) for entry in (payload.get(key) or []))
+
+        return cls(
+            source_sandbox_id=SandboxId(str(payload["source_sandbox_id"])),
+            fork_sandbox_id=SandboxId(str(payload["fork_sandbox_id"])),
+            base_checkpoint_id=CheckpointId(str(payload["base_checkpoint_id"])),
+            policy=str(payload["policy"]),
+            applied=entries("applied"),
+            conflicted=entries("conflicted"),
+            skipped=entries("skipped"),
+            rolled_back=bool(payload.get("rolled_back", False)),
+        )
 
 
 @dataclass(frozen=True)

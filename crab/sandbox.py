@@ -885,27 +885,25 @@ class Sandbox:
         to a base checkpoint's filesystem snapshot. ``since=None``
         resolves this sandbox's fork point (``fork_created`` journal
         marker); pass a checkpoint id for an explicit base. Raw truth
-        from the filesystem backend — no ignore filtering (that lands
-        with C2).
+        from the filesystem backend — no ignore filtering (the merge
+        layer applies policies on top).
 
-        Local (in-process engine) only for now; the daemon RPC rides
-        with the C2 merge surface.
+        Works with both a local in-process engine and the daemon
+        (`crab sandbox changeset` from the CLI).
         """
         system = getattr(self._engine, "system", None)
         if since is None:
             fork_changeset = getattr(system, "fork_changeset", None)
             if not callable(fork_changeset):
                 raise NotImplementedError(
-                    "changesets are not available on this engine "
-                    "(daemon-mode changeset RPC lands with C2)"
+                    "changesets are not available on this engine"
                 )
             result = fork_changeset(self.sandbox_id)
         else:
             changeset_since = getattr(system, "changeset_since", None)
             if not callable(changeset_since):
                 raise NotImplementedError(
-                    "changesets are not available on this engine "
-                    "(daemon-mode changeset RPC lands with C2)"
+                    "changesets are not available on this engine"
                 )
             result = changeset_since(self.sandbox_id, CheckpointId(str(since)))
         return [entry.to_json() for entry in result.entries]
@@ -930,15 +928,15 @@ class Sandbox:
         raise ``MergeError`` carrying the report (``rolled_back=True``
         after a clean path-level undo). The fork stays alive.
 
-        Local (in-process engine) only for now; the daemon RPC lands
-        with the C2 surface PR.
+        Works with both a local in-process engine and the daemon
+        (`crab sandbox merge` from the CLI); custom ``merger`` hooks are
+        local-only and cannot cross the RPC boundary.
         """
         system = getattr(self._engine, "system", None)
         merge_from_fork = getattr(system, "merge_from_fork", None)
         if not callable(merge_from_fork):
             raise NotImplementedError(
-                "merge is not available on this engine "
-                "(daemon-mode merge RPC lands with the C2 surface PR)"
+                "merge is not available on this engine"
             )
         fork_id = fork.sandbox_id if isinstance(fork, Sandbox) else SandboxId(str(fork))
         return merge_from_fork(
