@@ -286,6 +286,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     t_begin.add_argument("sandbox_id", metavar="SANDBOX_ID")
     t_begin.add_argument("--label", default=None)
+    t_begin.add_argument(
+        "--isolation",
+        default="snapshot",
+        choices=["snapshot", "fork"],
+        help="snapshot (default): actions run in place, abort restores the "
+        "base; fork: actions run in a fork, commit promotes it back onto "
+        "this sandbox, abort just destroys it.",
+    )
     t_begin.set_defaults(func=_cmd_txn_begin)
 
     t_commit = txn_sub.add_parser(
@@ -294,6 +302,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     t_commit.add_argument("sandbox_id", metavar="SANDBOX_ID")
     t_commit.add_argument("txn_id", metavar="TXN_ID")
+    t_commit.add_argument(
+        "--force",
+        action="store_true",
+        help="Fork-backed txns only: promote even when the source changed "
+        "since the fork point (its writes are discarded).",
+    )
     t_commit.set_defaults(func=_cmd_txn_commit)
 
     t_abort = txn_sub.add_parser(
@@ -756,11 +770,15 @@ def _cmd_restore(args: argparse.Namespace) -> int:
 
 def _cmd_txn_begin(args: argparse.Namespace) -> int:
     socket_path = _resolve_socket(args)
-    # Begin may take a base checkpoint; budget like `checkpoint create`.
-    client = DaemonClient(socket_path, timeout_seconds=max(args.timeout, 300.0))
+    # Begin may take a base checkpoint (snapshot) or a full fork; budget
+    # like `sandbox fork` when isolation=fork.
+    floor = 600.0 if args.isolation == "fork" else 300.0
+    client = DaemonClient(socket_path, timeout_seconds=max(args.timeout, floor))
     payload: dict[str, Any] = {}
     if args.label is not None:
         payload["label"] = args.label
+    if args.isolation != "snapshot":
+        payload["isolation"] = args.isolation
     response = client.post_json(f"/sandboxes/{args.sandbox_id}/txn", payload)
     txn = response.get("txn") or {}
     if args.json:
@@ -772,19 +790,24 @@ def _cmd_txn_begin(args: argparse.Namespace) -> int:
 
 def _cmd_txn_commit(args: argparse.Namespace) -> int:
     socket_path = _resolve_socket(args)
-    client = DaemonClient(socket_path, timeout_seconds=max(args.timeout, 60.0))
+    # Fork-backed commits swap fs + processes; budget generously.
+    client = DaemonClient(socket_path, timeout_seconds=max(args.timeout, 600.0))
+    payload: dict[str, Any] = {"force": True} if args.force else {}
     response = client.post_json(
-        f"/sandboxes/{args.sandbox_id}/txn/{args.txn_id}/commit", {}
+        f"/sandboxes/{args.sandbox_id}/txn/{args.txn_id}/commit", payload
     )
     result = response.get("result") or {}
     if args.json:
         print(json.dumps(result, indent=2))
     else:
-        print(
+        line = (
             f"committed {result.get('txn_id', '')} "
             f"released={result.get('released_observations', 0)} "
             f"base_dropped={result.get('base_dropped', False)}"
         )
+        if result.get("promoted_checkpoint_id"):
+            line += f" promoted={result['promoted_checkpoint_id']}"
+        print(line)
     return 0
 
 

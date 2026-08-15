@@ -51,6 +51,7 @@ from .txn import (
     TxnAbortError,
     TxnAbortResult,
     TxnActiveError,
+    TxnCommitConflict,
     TxnCommitResult,
     TxnDescription,
     TxnError,
@@ -184,6 +185,12 @@ class CrabSystem:
         self._active_txns = {}
         self._merge_lock = Lock()
         self._active_merges: set[SandboxId] = set()
+        # Fork-backed txn hooks (B3): forking needs engine-level lease
+        # allocation + bundle replication + restore; teardown mirrors the
+        # SDK kill path. Registered by the Engine after construction.
+        self._fork_txn_fork: Callable[[SandboxId], SandboxId] | None = None
+        self._fork_txn_destroy: Callable[[SandboxId], None] | None = None
+        self._fork_txn_lease_repair: Callable[[SandboxId], None] | None = None
 
     def start(self) -> None:
         with self._coordination_lock:
@@ -589,84 +596,16 @@ class CrabSystem:
                         checkpoint_id,
                     )
 
-            chain_links = 0
-            chain_bytes_saved = 0
-            for copy_id, copy_process, copy_filesystem in copy_plan:
-                source_manifest = manifests[copy_id]
-                is_leaf = copy_id == checkpoint_id
-                link_this_entry = chain_sharing_active and copy_process and not is_leaf
-                process_refs = []
-                filesystem_refs = []
-                if copy_process:
-                    if link_this_entry:
-                        self.runtime.link_ancestor_pre_dump(source_sandbox_id, target_sandbox_id, copy_id)
-                    for reference in source_manifest.process_artifacts:
-                        payload = self.storage.get_artifact(source_sandbox_id, copy_id, reference)
-                        if link_this_entry:
-                            rewritten = forking.rewrite_process_artifact_linked(
-                                payload,
-                                target_sandbox_id=target_sandbox_id,
-                                checkpoint_id=copy_id,
-                                bundle_root=bundle_root,
-                                checkpoint_root=checkpoint_root,
-                            )
-                            chain_links += 1
-                            chain_bytes_saved += int(reference.size_bytes or 0)
-                        else:
-                            rewritten = forking.rewrite_process_artifact(
-                                payload,
-                                source_sandbox_id=source_sandbox_id,
-                                target_sandbox_id=target_sandbox_id,
-                                checkpoint_id=copy_id,
-                                bundle_root=bundle_root,
-                                checkpoint_root=checkpoint_root,
-                                preserve_symlinks=chain_sharing_active and is_leaf,
-                            )
-                        process_refs.append(
-                            self.storage.put_artifact(
-                                target_sandbox_id,
-                                copy_id,
-                                ArtifactPayload(
-                                    kind=reference.kind,
-                                    name=reference.name,
-                                    data=rewritten,
-                                    metadata=dict(reference.metadata),
-                                ),
-                            )
-                        )
-                if copy_filesystem:
-                    fork_fs_metadata = self.runtime.filesystem_checkpoint_metadata(target_sandbox_id, copy_id)
-                    for reference in source_manifest.filesystem_artifacts:
-                        payload = self.storage.get_artifact(source_sandbox_id, copy_id, reference)
-                        filesystem_refs.append(
-                            self.storage.put_artifact(
-                                target_sandbox_id,
-                                copy_id,
-                                ArtifactPayload(
-                                    kind=reference.kind,
-                                    name=reference.name,
-                                    data=forking.rewrite_filesystem_artifact(
-                                        payload,
-                                        target_sandbox_id=target_sandbox_id,
-                                        checkpoint_id=copy_id,
-                                        filesystem_metadata=fork_fs_metadata,
-                                    ),
-                                    metadata=dict(reference.metadata),
-                                ),
-                            )
-                        )
-                manifest = CheckpointManifest(
-                    schema_version=source_manifest.schema_version,
-                    checkpoint_id=source_manifest.checkpoint_id,
-                    sandbox_id=target_sandbox_id,
-                    created_at=source_manifest.created_at,
-                    runtime_name=source_manifest.runtime_name,
-                    runtime_version=source_manifest.runtime_version,
-                    process_artifacts=process_refs,
-                    filesystem_artifacts=filesystem_refs,
-                    metadata=dict(source_manifest.metadata),
-                ).with_integrity()
-                self.storage.put_manifest(manifest)
+            chain_links, chain_bytes_saved = self._copy_checkpoint_artifacts(
+                source_sandbox_id,
+                target_sandbox_id,
+                manifests=manifests,
+                copy_plan=copy_plan,
+                leaf_checkpoint_id=checkpoint_id,
+                bundle_root=bundle_root,
+                checkpoint_root=checkpoint_root,
+                chain_sharing_active=chain_sharing_active,
+            )
 
             if chain_sharing_active:
                 # Plant ancestor symlinks for the whole parent chain so
@@ -763,6 +702,104 @@ class CrabSystem:
         except Exception:
             operation.finish(status="failed")
             raise
+
+    def _copy_checkpoint_artifacts(
+        self,
+        source_sandbox_id: SandboxId,
+        target_sandbox_id: SandboxId,
+        *,
+        manifests: dict[CheckpointId, CheckpointManifest],
+        copy_plan,
+        leaf_checkpoint_id: CheckpointId,
+        bundle_root: Path,
+        checkpoint_root: Path,
+        chain_sharing_active: bool,
+    ) -> tuple[int, int]:
+        """Copy a checkpoint chain's manifests + artifacts onto another
+        sandbox id with path rewrites. With ``chain_sharing_active`` the
+        non-leaf process artifacts become symlink references into the
+        source's pre-dumps; without it everything is fully materialized
+        (fork-backed txn commits require this: the fork dies afterwards).
+        Returns ``(chain_links, chain_bytes_saved)``."""
+        chain_links = 0
+        chain_bytes_saved = 0
+        for copy_id, copy_process, copy_filesystem in copy_plan:
+            source_manifest = manifests[copy_id]
+            is_leaf = copy_id == leaf_checkpoint_id
+            link_this_entry = chain_sharing_active and copy_process and not is_leaf
+            process_refs = []
+            filesystem_refs = []
+            if copy_process:
+                if link_this_entry:
+                    self.runtime.link_ancestor_pre_dump(source_sandbox_id, target_sandbox_id, copy_id)
+                for reference in source_manifest.process_artifacts:
+                    payload = self.storage.get_artifact(source_sandbox_id, copy_id, reference)
+                    if link_this_entry:
+                        rewritten = forking.rewrite_process_artifact_linked(
+                            payload,
+                            target_sandbox_id=target_sandbox_id,
+                            checkpoint_id=copy_id,
+                            bundle_root=bundle_root,
+                            checkpoint_root=checkpoint_root,
+                        )
+                        chain_links += 1
+                        chain_bytes_saved += int(reference.size_bytes or 0)
+                    else:
+                        rewritten = forking.rewrite_process_artifact(
+                            payload,
+                            source_sandbox_id=source_sandbox_id,
+                            target_sandbox_id=target_sandbox_id,
+                            checkpoint_id=copy_id,
+                            bundle_root=bundle_root,
+                            checkpoint_root=checkpoint_root,
+                            preserve_symlinks=chain_sharing_active and is_leaf,
+                        )
+                    process_refs.append(
+                        self.storage.put_artifact(
+                            target_sandbox_id,
+                            copy_id,
+                            ArtifactPayload(
+                                kind=reference.kind,
+                                name=reference.name,
+                                data=rewritten,
+                                metadata=dict(reference.metadata),
+                            ),
+                        )
+                    )
+            if copy_filesystem:
+                fork_fs_metadata = self.runtime.filesystem_checkpoint_metadata(target_sandbox_id, copy_id)
+                for reference in source_manifest.filesystem_artifacts:
+                    payload = self.storage.get_artifact(source_sandbox_id, copy_id, reference)
+                    filesystem_refs.append(
+                        self.storage.put_artifact(
+                            target_sandbox_id,
+                            copy_id,
+                            ArtifactPayload(
+                                kind=reference.kind,
+                                name=reference.name,
+                                data=forking.rewrite_filesystem_artifact(
+                                    payload,
+                                    target_sandbox_id=target_sandbox_id,
+                                    checkpoint_id=copy_id,
+                                    filesystem_metadata=fork_fs_metadata,
+                                ),
+                                metadata=dict(reference.metadata),
+                            ),
+                        )
+                    )
+            manifest = CheckpointManifest(
+                schema_version=source_manifest.schema_version,
+                checkpoint_id=source_manifest.checkpoint_id,
+                sandbox_id=target_sandbox_id,
+                created_at=source_manifest.created_at,
+                runtime_name=source_manifest.runtime_name,
+                runtime_version=source_manifest.runtime_version,
+                process_artifacts=process_refs,
+                filesystem_artifacts=filesystem_refs,
+                metadata=dict(source_manifest.metadata),
+            ).with_integrity()
+            self.storage.put_manifest(manifest)
+        return chain_links, chain_bytes_saved
 
     def release_fork(self, target_sandbox_id: SandboxId) -> None:
         """Reverse fork_once's bookkeeping when a fork is destroyed."""
@@ -914,7 +951,15 @@ class CrabSystem:
         with self._txn_lock:
             return sandbox_id in self._active_txns
 
-    def begin_txn(self, sandbox_id: SandboxId, *, label: str | None = None) -> TxnDescription:
+    def begin_txn(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        label: str | None = None,
+        isolation: str = "snapshot",
+    ) -> TxnDescription:
+        if isolation not in ("snapshot", "fork"):
+            raise ValueError(f"unknown txn isolation: {isolation!r} (expected snapshot or fork)")
         txn_id = new_txn_id()
         with self._txn_lock:
             existing = self._active_txns.get(sandbox_id)
@@ -932,6 +977,8 @@ class CrabSystem:
                 raise TxnError(
                     f"merge in progress for {sandbox_id}; begin the transaction after it completes"
                 )
+            if isolation == "fork":
+                return self._begin_fork_txn(sandbox_id, txn_id, label)
             base_checkpoint_id: CheckpointId | None = None
             base_was_fresh = False
             changed = True
@@ -1003,8 +1050,17 @@ class CrabSystem:
                 self._active_txns.pop(sandbox_id, None)
             raise
 
-    def commit_txn(self, sandbox_id: SandboxId, txn_id: str) -> TxnCommitResult:
+    def commit_txn(
+        self, sandbox_id: SandboxId, txn_id: str, *, force: bool = False
+    ) -> TxnCommitResult:
         active = self._require_txn(sandbox_id, txn_id)
+        if active.isolation == "fork":
+            if active.sandbox_id != str(sandbox_id):
+                raise TxnMismatchError(
+                    f"fork-backed txn {active.txn_id} must be committed via its "
+                    f"source sandbox {active.sandbox_id}"
+                )
+            return self._commit_fork_txn(active, force=force)
         registry = self.response_gate_registry
         if registry is not None:
             # Anything still pending (armed but never checkpoint-released)
@@ -1059,6 +1115,13 @@ class CrabSystem:
 
     def abort_txn(self, sandbox_id: SandboxId, txn_id: str) -> TxnAbortResult:
         active = self._require_txn(sandbox_id, txn_id)
+        if active.isolation == "fork":
+            if active.sandbox_id != str(sandbox_id):
+                raise TxnMismatchError(
+                    f"fork-backed txn {active.txn_id} must be aborted via its "
+                    f"source sandbox {active.sandbox_id}"
+                )
+            return self._abort_fork_txn(active)
         registry = self.response_gate_registry
         if registry is not None:
             registry.release(sandbox_id)
@@ -1116,6 +1179,9 @@ class CrabSystem:
             active = self._active_txns.pop(sandbox_id, None)
         if active is None:
             return
+        if active.isolation == "fork":
+            self._release_fork_txn(sandbox_id, active)
+            return
         try:
             registry = self.response_gate_registry
             if registry is not None:
@@ -1152,6 +1218,421 @@ class CrabSystem:
                 logger.debug("Failed to clear journal txn", exc_info=True)
         with self._txn_lock:
             self._active_txns.pop(sandbox_id, None)
+
+    # ----- fork-backed transactions (B3) --------------------------------
+    # begin = fork (actions run there; the source stays clean and
+    # serving); commit = promote the fork's whole state back onto the
+    # source's own identity (dump fork -> materialized manifest copy ->
+    # clone fs over the source dataset -> CRIU restore under the source
+    # id -> zfs promote); abort = destroy the fork, never restore the
+    # source. The primary sandbox_id never changes, so leases, journals,
+    # storage paths and SDK handles all stay valid.
+
+    def configure_fork_txn_hooks(
+        self,
+        *,
+        fork: Callable[[SandboxId], SandboxId],
+        destroy: Callable[[SandboxId], None],
+        lease_repair: Callable[[SandboxId], None] | None = None,
+    ) -> None:
+        """Engine-owned hooks: forking needs lease allocation + bundle
+        replication + restore (Engine.fork_sandbox) and fork teardown
+        mirrors the SDK kill path — both live above the system."""
+        self._fork_txn_fork = fork
+        self._fork_txn_destroy = destroy
+        self._fork_txn_lease_repair = lease_repair
+
+    def _begin_fork_txn(
+        self, sandbox_id: SandboxId, txn_id: str, label: str | None
+    ) -> TxnDescription:
+        if self._fork_txn_fork is None or self._fork_txn_destroy is None:
+            raise TxnError(
+                "fork-backed transactions need an engine (fork hooks are not configured)"
+            )
+        fork_sandbox_id: SandboxId | None = None
+        try:
+            fork_sandbox_id = SandboxId(str(self._fork_txn_fork(sandbox_id)))
+            base_checkpoint_id = self._fork_point_checkpoint_id(fork_sandbox_id)
+            # Gated LLM responses inside the txn happen in the fork.
+            self.begin_observation_staging(fork_sandbox_id)
+            journal = self.journal
+            if journal is not None:
+                for tagged in (sandbox_id, fork_sandbox_id):
+                    try:
+                        journal.set_active_txn(tagged, txn_id)
+                    except Exception:
+                        logger.exception(
+                            "Failed to set active txn on journal sandbox=%s", tagged
+                        )
+            description = TxnDescription(
+                txn_id=txn_id,
+                sandbox_id=str(sandbox_id),
+                base_checkpoint_id=None if base_checkpoint_id is None else str(base_checkpoint_id),
+                base_was_fresh=False,
+                started_at=utc_now().isoformat(),
+                label=label,
+                isolation="fork",
+                fork_sandbox_id=str(fork_sandbox_id),
+            )
+            with self._txn_lock:
+                # Both ids map to the description: auto-checkpoints stay
+                # suppressed and merges locked out on either side.
+                self._active_txns[sandbox_id] = description
+                self._active_txns[fork_sandbox_id] = description
+            self._journal_lifecycle(
+                sandbox_id,
+                "txn_begin",
+                metadata={
+                    "txn_id": txn_id,
+                    "isolation": "fork",
+                    "fork_sandbox_id": str(fork_sandbox_id),
+                    "base_checkpoint_id": description.base_checkpoint_id,
+                    **({"label": label} if label else {}),
+                },
+            )
+            self.telemetry.emit_event(
+                "txn.begin",
+                self._telemetry_attrs(
+                    sandbox_id,
+                    component="system",
+                    extra={
+                        "txn_id": txn_id,
+                        "isolation": "fork",
+                        "fork_sandbox_id": str(fork_sandbox_id),
+                    },
+                ),
+            )
+            logger.info(
+                "Began fork-backed txn %s for sandbox %s fork=%s base=%s",
+                txn_id,
+                sandbox_id,
+                fork_sandbox_id,
+                description.base_checkpoint_id,
+            )
+            return description
+        except Exception:
+            if fork_sandbox_id is not None:
+                try:
+                    self.end_observation_staging(fork_sandbox_id)
+                except Exception:
+                    logger.debug("Fork txn staging cleanup failed", exc_info=True)
+                try:
+                    self._fork_txn_destroy(fork_sandbox_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to destroy fork after txn begin failure fork=%s",
+                        fork_sandbox_id,
+                    )
+                with self._txn_lock:
+                    self._active_txns.pop(fork_sandbox_id, None)
+            raise
+
+    def _commit_fork_txn(self, active: TxnDescription, *, force: bool) -> TxnCommitResult:
+        source_id = SandboxId(active.sandbox_id)
+        assert active.fork_sandbox_id is not None
+        fork_id = SandboxId(active.fork_sandbox_id)
+        operation = start_operation(
+            self.telemetry,
+            "txn.fork_commit",
+            self._telemetry_attrs(
+                source_id,
+                component="system",
+                extra={"txn_id": active.txn_id, "fork_sandbox_id": str(fork_id), "forced": force},
+            ),
+        )
+        try:
+            # 1. Dirty-source gate (C1): promoting over source-side writes
+            # would silently discard them.
+            if not force and active.base_checkpoint_id is not None:
+                source_changes = None
+                try:
+                    source_changes = self.changeset_since(
+                        source_id, CheckpointId(active.base_checkpoint_id)
+                    )
+                except FileNotFoundError:
+                    # The fork-point snapshot is gone from the source's
+                    # dataset: a previous commit attempt already swapped
+                    # the filesystem (mid-commit retry) — skip the check.
+                    logger.warning(
+                        "Fork-txn commit retry detected (fork-point snapshot missing); "
+                        "skipping dirty check sandbox=%s",
+                        source_id,
+                    )
+                if source_changes is not None and source_changes.entries:
+                    raise TxnCommitConflict(
+                        f"source {source_id} changed {len(source_changes.entries)} path(s) "
+                        "since the fork point; commit with force=True to discard them "
+                        "or abort the transaction"
+                    )
+            # 2. Dump the fork. It stays alive: a failed swap below is
+            # retryable against this same live fork.
+            checkpoint_result = self.checkpoint_once(fork_id, leave_running=True)
+            if checkpoint_result.status.value != "succeeded" or checkpoint_result.checkpoint_id is None:
+                raise TxnError(
+                    f"fork-txn commit checkpoint failed for {fork_id}: "
+                    f"status={checkpoint_result.status.value}; the txn stays open — retry commit"
+                )
+            commit_checkpoint_id = checkpoint_result.checkpoint_id
+            # 3. Replicate the checkpoint chain onto the source id, fully
+            # materialized (no symlinks into the fork: it dies afterwards).
+            filesystem_checkpoint_id = self._replicate_fork_checkpoint(
+                fork_id, source_id, commit_checkpoint_id
+            )
+            # ---- point of no return: the source container goes down and
+            # its dataset is replaced by the fork's committed snapshot.
+            try:
+                self.runtime.stop(source_id)
+            except Exception:
+                logger.debug("Source stop before fork-txn swap failed", exc_info=True)
+            try:
+                self.runtime.delete_runtime(source_id, force=True, ignore_missing=True)
+            except Exception:
+                logger.debug("Source runtime delete before fork-txn swap failed", exc_info=True)
+            # The fork is a clone of source@fork-point: promote it first
+            # so destroying the source dataset is not blocked by the
+            # dependency (zfs; btrfs promote is a no-op). This also
+            # unbinds/destroys the source's old rootfs mount so the clone
+            # lands on a clean mountpoint.
+            self.runtime.promote_filesystem_dataset(fork_id)
+            self.runtime.destroy_filesystem_dataset(source_id)
+            source_rootfs = Path(self.runtime.rootfs_path_for(source_id))
+            self.runtime.clone_filesystem_snapshot(
+                fork_id,
+                filesystem_checkpoint_id,
+                source_id,
+                target_rootfs_path=source_rootfs,
+            )
+            restore = self.restore_once(source_id, commit_checkpoint_id)
+            if restore.status.value != "succeeded":
+                raise TxnError(
+                    f"fork-txn commit restore failed for {source_id}: "
+                    f"status={restore.status.value} message={restore.message}; "
+                    "the fork is intact — retry commit"
+                )
+            if self._fork_txn_lease_repair is not None:
+                try:
+                    self._fork_txn_lease_repair(source_id)
+                except Exception:
+                    logger.exception("Lease repair after fork-txn commit failed sandbox=%s", source_id)
+            # Detach the source's new dataset from the fork's snapshot so
+            # the fork can die (zfs; btrfs promote is a no-op).
+            fork_retained = False
+            try:
+                self.runtime.promote_filesystem_dataset(source_id)
+            except Exception:
+                fork_retained = True
+                logger.exception(
+                    "Promote after fork-txn commit failed; keeping fork %s alive "
+                    "(the source dataset still depends on it)",
+                    fork_id,
+                )
+            # The committed observations flow now.
+            registry = self.response_gate_registry
+            if registry is not None:
+                registry.release(fork_id)
+            released = self.release_staged_observations(fork_id)
+            self.end_observation_staging(fork_id)
+            self._journal_lifecycle(
+                source_id,
+                "txn_commit",
+                metadata={
+                    "txn_id": active.txn_id,
+                    "isolation": "fork",
+                    "fork_sandbox_id": str(fork_id),
+                    "promoted_checkpoint_id": str(commit_checkpoint_id),
+                    "released": released,
+                    "forced": force,
+                },
+            )
+            self._journal_lifecycle(
+                fork_id,
+                "txn_fork_committed",
+                metadata={"txn_id": active.txn_id, "source_sandbox_id": str(source_id)},
+            )
+            self._clear_fork_txn(source_id, fork_id)
+            if not fork_retained:
+                try:
+                    self._fork_txn_destroy(fork_id)
+                except Exception:
+                    logger.exception("Failed to destroy fork after commit fork=%s", fork_id)
+            self.telemetry.emit_event(
+                "txn.commit",
+                self._telemetry_attrs(
+                    source_id,
+                    component="system",
+                    checkpoint_id=commit_checkpoint_id,
+                    extra={
+                        "txn_id": active.txn_id,
+                        "isolation": "fork",
+                        "released": released,
+                        "forced": force,
+                    },
+                ),
+            )
+            operation.finish(
+                status="succeeded",
+                attributes={"checkpoint_id": str(commit_checkpoint_id)},
+            )
+            logger.info(
+                "Committed fork-backed txn %s: promoted fork %s onto %s at %s released=%d",
+                active.txn_id,
+                fork_id,
+                source_id,
+                commit_checkpoint_id,
+                released,
+            )
+            return TxnCommitResult(
+                txn_id=active.txn_id,
+                released_observations=released,
+                base_dropped=False,
+                promoted_checkpoint_id=str(commit_checkpoint_id),
+            )
+        except Exception:
+            operation.finish(status="failed")
+            raise
+
+    def _replicate_fork_checkpoint(
+        self,
+        fork_id: SandboxId,
+        source_id: SandboxId,
+        commit_checkpoint_id: CheckpointId,
+    ) -> CheckpointId:
+        """Copy the fork's committed checkpoint chain onto the source id,
+        fully materialized (no symlinks into the fork — it dies after the
+        commit). Returns the filesystem checkpoint id to clone."""
+        paths = getattr(self.runtime, "paths", None)
+        bundle_root = None if paths is None else paths.bundle_root
+        checkpoint_root = None if paths is None else paths.checkpoint_root
+        if bundle_root is None or checkpoint_root is None:
+            raise TxnError("fork-txn commit requires a runtime exposing bundle/checkpoint roots")
+        manifests = {
+            cid: self.storage.get_manifest(fork_id, cid)
+            for cid in self.storage.list_checkpoints(fork_id)
+        }
+        copy_plan = forking.resolve_checkpoint_copy_plan(
+            list(manifests.keys()), manifests, commit_checkpoint_id
+        )
+        filesystem_checkpoint_id = next(
+            copy_id for copy_id, _, copy_filesystem in reversed(copy_plan) if copy_filesystem
+        )
+        self._copy_checkpoint_artifacts(
+            fork_id,
+            source_id,
+            manifests=manifests,
+            copy_plan=copy_plan,
+            leaf_checkpoint_id=commit_checkpoint_id,
+            bundle_root=bundle_root,
+            checkpoint_root=checkpoint_root,
+            chain_sharing_active=False,
+        )
+        return filesystem_checkpoint_id
+
+    def _abort_fork_txn(self, active: TxnDescription) -> TxnAbortResult:
+        source_id = SandboxId(active.sandbox_id)
+        assert active.fork_sandbox_id is not None
+        fork_id = SandboxId(active.fork_sandbox_id)
+        registry = self.response_gate_registry
+        if registry is not None:
+            registry.release(fork_id)
+        discarded = self.discard_staged_observations(fork_id)
+        self.end_observation_staging(fork_id)
+        self._journal_lifecycle(
+            source_id,
+            "txn_abort",
+            metadata={
+                "txn_id": active.txn_id,
+                "isolation": "fork",
+                "fork_sandbox_id": str(fork_id),
+                "discarded": discarded,
+                "restored_checkpoint_id": None,
+            },
+        )
+        self._journal_lifecycle(
+            fork_id,
+            "txn_fork_discarded",
+            metadata={"txn_id": active.txn_id, "source_sandbox_id": str(source_id)},
+        )
+        self._clear_fork_txn(source_id, fork_id)
+        # Best-effort teardown: the source is untouched either way; a
+        # leaked fork is an operational cleanup, not an open txn.
+        if self._fork_txn_destroy is not None:
+            try:
+                self._fork_txn_destroy(fork_id)
+            except Exception:
+                logger.exception("Failed to destroy fork on txn abort fork=%s", fork_id)
+        self.telemetry.emit_event(
+            "txn.abort",
+            self._telemetry_attrs(
+                source_id,
+                component="system",
+                extra={"txn_id": active.txn_id, "isolation": "fork", "discarded": discarded},
+            ),
+        )
+        logger.info(
+            "Aborted fork-backed txn %s for sandbox %s (fork %s destroyed, source untouched)",
+            active.txn_id,
+            source_id,
+            fork_id,
+        )
+        return TxnAbortResult(
+            txn_id=active.txn_id,
+            discarded_observations=discarded,
+            restored_checkpoint_id=None,
+        )
+
+    def _release_fork_txn(self, sandbox_id: SandboxId, active: TxnDescription) -> None:
+        """Teardown for a dying sandbox holding a fork-backed txn: clear
+        both registrations; when the *source* dies the orphaned fork is
+        destroyed too (a dying fork's own kill path finishes itself)."""
+        source_id = SandboxId(active.sandbox_id)
+        fork_id = None if active.fork_sandbox_id is None else SandboxId(active.fork_sandbox_id)
+        with self._txn_lock:
+            self._active_txns.pop(source_id, None)
+            if fork_id is not None:
+                self._active_txns.pop(fork_id, None)
+        if fork_id is not None:
+            try:
+                registry = self.response_gate_registry
+                if registry is not None:
+                    registry.release(fork_id)
+                    registry.discard_staged(fork_id)
+                    registry.end_staging(fork_id)
+            except Exception:
+                logger.exception("Fork-txn teardown staging cleanup failed fork=%s", fork_id)
+        journal = self.journal
+        if journal is not None:
+            targets = (source_id,) if fork_id is None else (source_id, fork_id)
+            for tagged in targets:
+                try:
+                    journal.set_active_txn(tagged, None)
+                except Exception:
+                    logger.debug("Failed to clear journal txn on teardown", exc_info=True)
+        if (
+            fork_id is not None
+            and str(sandbox_id) == str(source_id)
+            and self._fork_txn_destroy is not None
+        ):
+            try:
+                self._fork_txn_destroy(fork_id)
+            except Exception:
+                logger.exception("Failed to destroy orphaned txn fork=%s", fork_id)
+        logger.info(
+            "Released open fork-backed txn %s during sandbox teardown %s",
+            active.txn_id,
+            sandbox_id,
+        )
+
+    def _clear_fork_txn(self, source_id: SandboxId, fork_id: SandboxId) -> None:
+        journal = self.journal
+        if journal is not None:
+            for tagged in (source_id, fork_id):
+                try:
+                    journal.set_active_txn(tagged, None)
+                except Exception:
+                    logger.debug("Failed to clear journal txn", exc_info=True)
+        with self._txn_lock:
+            self._active_txns.pop(source_id, None)
+            self._active_txns.pop(fork_id, None)
 
     def _latest_full_checkpoint_id(self, sandbox_id: SandboxId) -> CheckpointId | None:
         """Newest checkpoint carrying both process and filesystem

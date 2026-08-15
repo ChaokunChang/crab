@@ -947,13 +947,16 @@ class Sandbox:
             merger=merger,
         )
 
-    def begin(self, label: str | None = None) -> "Transaction":
-        """Open a transaction: adaptive base checkpoint + observation
-        staging armed + auto-checkpoints suppressed. Commit delivers the
-        staged observations and drops a fresh base; abort drops the
-        observations and restores the base. Weak isolation: txn actions
-        run in place (concurrent readers see them) — the airtight part is
-        that no gated observation escapes an uncommitted txn.
+    def begin(self, label: str | None = None, *, isolation: str = "snapshot") -> "Transaction":
+        """Open a transaction. ``isolation="snapshot"`` (default, B2):
+        adaptive base checkpoint + observation staging armed +
+        auto-checkpoints suppressed; actions run in place (weak
+        isolation), commit delivers staged observations, abort restores
+        the base. ``isolation="fork"`` (B3): begin forks the sandbox and
+        ``txn.exec`` runs in the fork while this sandbox stays clean and
+        serving; commit promotes the fork's whole state (filesystem +
+        processes) back onto this sandbox's identity, abort just
+        destroys the fork.
 
         Works with both a local in-process engine and the daemon
         (`crab txn ...` from the CLI).
@@ -967,7 +970,8 @@ class Sandbox:
                 "transactions are not available on this engine "
                 "(daemon-mode txn RPC lands in a follow-up)"
             )
-        description = begin_txn(self.sandbox_id, label=label)
+        kwargs = {} if isolation == "snapshot" else {"isolation": isolation}
+        description = begin_txn(self.sandbox_id, label=label, **kwargs)
         return Transaction(self, description)
 
     def current_txn(self) -> "Transaction | None":

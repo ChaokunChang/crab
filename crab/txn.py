@@ -1,16 +1,19 @@
-"""Transaction API v1 (roadmap B2) — snapshot-based, weak isolation.
+"""Transaction API (roadmap B2 + B3).
 
-A transaction wraps a span of sandbox work between an adaptive base
-checkpoint and an explicit resolution:
+A transaction wraps a span of sandbox work between a base checkpoint
+and an explicit resolution. Two isolation modes:
 
-- ``commit`` delivers the staged observations and drops a freshly-taken
-  base checkpoint;
-- ``abort`` drops the staged observations (gated LLM callers get a 409)
-  and restores the sandbox to the base.
+- ``snapshot`` (B2, default): actions run *in place* on the sandbox;
+  commit delivers staged observations and drops a freshly-taken base;
+  abort drops observations and restores the base (concurrent readers
+  see the dirt while the txn is open).
+- ``fork`` (B3): begin forks the sandbox and actions run in the fork;
+  the source stays clean and serving. Commit promotes the fork's whole
+  state (filesystem + processes) back onto the source's identity;
+  abort just destroys the fork — the source is never restored.
 
-The sandbox executes txn actions *in place* (concurrent readers see the
-dirt — strong isolation is B3's fork-backed mode); the airtight part is
-observation staging: nothing gated escapes an uncommitted transaction.
+Either way the airtight part is observation staging: nothing gated
+escapes an uncommitted transaction.
 
 All transaction state lives in ``CrabSystem`` (one active txn per
 sandbox); the :class:`Transaction` object here is a thin SDK handle so
@@ -53,6 +56,12 @@ class TxnAbortError(TxnError):
         self.restore_result = restore_result
 
 
+class TxnCommitConflict(TxnError):
+    """Fork-backed commit refused: the source changed since the fork
+    point, so promoting the fork would silently discard those writes.
+    Commit with ``force=True`` to discard them, or abort the txn."""
+
+
 def new_txn_id() -> str:
     return f"txn-{uuid.uuid4().hex[:12]}"
 
@@ -67,6 +76,8 @@ class TxnDescription:
     base_was_fresh: bool
     started_at: str
     label: str | None = None
+    isolation: str = "snapshot"
+    fork_sandbox_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -74,6 +85,7 @@ class TxnCommitResult:
     txn_id: str
     released_observations: int
     base_dropped: bool
+    promoted_checkpoint_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -96,6 +108,7 @@ class Transaction:
         self._sandbox = sandbox
         self._description = description
         self._resolved: str | None = None
+        self._fork_sandbox: "Sandbox | None" = None
 
     @property
     def txn_id(self) -> str:
@@ -110,21 +123,44 @@ class Transaction:
         return self._description.label
 
     @property
+    def isolation(self) -> str:
+        return self._description.isolation
+
+    @property
+    def fork_sandbox_id(self) -> str | None:
+        """The fork actions run in (fork-backed txns only)."""
+        return self._description.fork_sandbox_id
+
+    @property
     def resolved(self) -> str | None:
         """None while open; "committed" or "aborted" afterwards."""
         return self._resolved
 
+    def _exec_target(self) -> "Sandbox":
+        fork_id = self._description.fork_sandbox_id
+        if fork_id is None:
+            return self._sandbox
+        if self._fork_sandbox is None:
+            from .sandbox import Sandbox
+
+            self._fork_sandbox = Sandbox.connect(fork_id, engine=self._sandbox._engine)
+        return self._fork_sandbox
+
     def exec(self, cmd=None, *, argv=None, **kwargs) -> "SandboxExecResult":
         """Sugar over ``sandbox.commands.run`` so txn code reads
-        ``txn.exec(...)``. Every exec during the txn is journal-tagged
+        ``txn.exec(...)``. Snapshot txns run in place; fork-backed txns
+        route to the fork. Every exec during the txn is journal-tagged
         with the txn_id regardless of which API issued it."""
         self._ensure_open()
-        return self._sandbox.commands.run(cmd, argv=argv, **kwargs)
+        return self._exec_target().commands.run(cmd, argv=argv, **kwargs)
 
-    def commit(self) -> TxnCommitResult:
+    def commit(self, *, force: bool = False) -> TxnCommitResult:
+        """``force`` only affects fork-backed txns: promote even when the
+        source changed since the fork point (its writes are discarded)."""
         self._ensure_open()
+        kwargs = {"force": True} if force else {}
         result = self._sandbox._engine.system.commit_txn(
-            self._sandbox.sandbox_id, self.txn_id
+            self._sandbox.sandbox_id, self.txn_id, **kwargs
         )
         self._resolved = "committed"
         return result
@@ -161,6 +197,7 @@ __all__ = [
     "TxnAbortError",
     "TxnAbortResult",
     "TxnActiveError",
+    "TxnCommitConflict",
     "TxnCommitResult",
     "TxnDescription",
     "TxnError",
