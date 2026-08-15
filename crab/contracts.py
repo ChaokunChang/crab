@@ -331,6 +331,17 @@ class Runtime(ABC):
         without a CoW filesystem provider do not implement it."""
         raise NotImplementedError
 
+    def snapshot_content_root(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> Path:
+        """Host-side directory exposing the read-only content of the
+        checkpoint's filesystem snapshot (C2 merge reads three-way base
+        and rollback content from it). Optional capability, mirroring
+        ``changeset_since``."""
+        raise NotImplementedError
+
 
 class ProcessCWorker(ABC):
     @abstractmethod

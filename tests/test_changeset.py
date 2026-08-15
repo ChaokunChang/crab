@@ -105,6 +105,38 @@ class ZfsDiffParserTests(unittest.TestCase):
             {"path": "/new", "change": "renamed", "renamed_from": "/old"},
         )
 
+    def test_inode_replacement_folds_to_modified(self) -> None:
+        # sed -i / editor saves write a temp file and rename it over the
+        # target: zfs diff reports the old inode removed plus a new one
+        # added at the same path (raw output pinned from the VM). The
+        # path survived with new content — that is a modification, and
+        # the btrfs parser already folds the same shape to modified.
+        stdout = (
+            "M\t/\t/tmp/zsed/probe\n"
+            "+\tF\t/tmp/zsed/probe/doc.txt\n"
+            "-\tF\t/tmp/zsed/probe/doc.txt\n"
+        )
+        entries = parse_zfs_diff(stdout, mountpoint="/tmp/zsed")
+        self.assertEqual(
+            [entry.to_json() for entry in entries],
+            [
+                {"path": "/probe", "change": "modified"},
+                {"path": "/probe/doc.txt", "change": "modified"},
+            ],
+        )
+
+    def test_rename_onto_existing_path_keeps_rename_identity(self) -> None:
+        for stdout in (
+            "R\tF\t/mnt/a.txt\t/mnt/b.txt\n-\tF\t/mnt/b.txt\n",
+            "-\tF\t/mnt/b.txt\nR\tF\t/mnt/a.txt\t/mnt/b.txt\n",
+        ):
+            entries = parse_zfs_diff(stdout, mountpoint="/mnt")
+            self.assertEqual(
+                [entry.to_json() for entry in entries],
+                [{"path": "/b.txt", "change": "renamed", "renamed_from": "/a.txt"}],
+                msg=f"order variant failed: {stdout!r}",
+            )
+
 
 # ----------------------------------------------------------------------
 # btrfs receive --dump parser (fixture pinned from real VM output)

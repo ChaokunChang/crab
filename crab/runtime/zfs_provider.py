@@ -77,6 +77,23 @@ def parse_zfs_diff(stdout: str, *, mountpoint: str) -> list[ChangesetEntry]:
             renamed_from = path
             path = target
         existing = entries.get(path)
+        if existing is not None:
+            kinds = {existing.change, change}
+            if kinds == {"added", "removed"}:
+                # A write-temp-then-rename save (sed -i, editors) or a
+                # delete-then-recreate shows up as the old inode removed
+                # plus a new inode added at the same path: the path
+                # survived with new content. btrfs's parser already
+                # folds this shape to modified; keep parity.
+                entries[path] = ChangesetEntry(path=path, change="modified")
+                continue
+            if kinds == {"renamed", "removed"}:
+                # A rename onto an existing path replaces its inode;
+                # keep the rename identity (the content moved in).
+                if existing.change != "renamed":
+                    existing = ChangesetEntry(path=path, change="renamed", renamed_from=renamed_from)
+                entries[path] = existing
+                continue
         if existing is None or CHANGE_PRECEDENCE[change] >= CHANGE_PRECEDENCE[existing.change]:
             entries[path] = ChangesetEntry(path=path, change=change, renamed_from=renamed_from)
     return [entries[key] for key in sorted(entries)]
@@ -545,6 +562,19 @@ class ZfsProvider(FilesystemProvider):
             metadata={"dataset": dataset, "snapshot": snapshot, "mountpoint": mountpoint},
         )
         return parse_zfs_diff(result.stdout, mountpoint=mountpoint)
+
+    def snapshot_content_root(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> Path:
+        dataset = self._dataset_resolver(sandbox_id)
+        snapshot = f"{dataset}@{checkpoint_id}"
+        if not self.snapshot_exists(snapshot):
+            raise FileNotFoundError(f"snapshot missing: {snapshot}")
+        # The .zfs control directory stays path-accessible under the
+        # default snapdir=hidden; the snapshot automounts on access.
+        return Path(str(self._rootfs_resolver(sandbox_id))) / ".zfs" / "snapshot" / str(checkpoint_id)
 
     def discard_partial_checkpoint(
         self,

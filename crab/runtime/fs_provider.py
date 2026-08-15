@@ -227,6 +227,17 @@ class FilesystemProvider(ABC):
         not exist on this sandbox's dataset."""
 
     @abstractmethod
+    def snapshot_content_root(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> Path:
+        """Host-side directory exposing the read-only file content of the
+        snapshot ``{dataset}@{checkpoint_id}`` (C2 merge reads three-way
+        bases and rollback content from it). Raises ``FileNotFoundError``
+        when the snapshot does not exist."""
+
+    @abstractmethod
     def destroy_snapshot_ref(self, fs_ref: str) -> None:
         """Best-effort destroy of a filesystem checkpoint by its opaque
         ``fs_ref`` (recorded in the checkpoint's artifact payload by

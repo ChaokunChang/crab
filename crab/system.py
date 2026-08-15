@@ -7,6 +7,7 @@ from pathlib import Path
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
 import time
+import uuid
 from typing import Callable
 
 from .config import ExecutorConfig, SchedulerConfig, StorageConfig, TelemetryConfig
@@ -25,6 +26,7 @@ from .models import (
     CheckpointResult,
     FailureCode,
     JobStatus,
+    MergeReport,
     RecoveryEvent,
     RecoveryRecord,
     RestoreJob,
@@ -35,6 +37,16 @@ from .models import (
 )
 from . import forking
 from .journal import ActionJournal
+from .merging import (
+    DEFAULT_MERGE_IGNORE_PREFIXES,
+    MERGE_POLICIES,
+    MergeApplyError,
+    MergeError,
+    MergerHook,
+    apply_plan,
+    build_report,
+    plan_merge,
+)
 from .txn import (
     TxnAbortError,
     TxnAbortResult,
@@ -170,6 +182,8 @@ class CrabSystem:
         self._fork_children = {}
         self._txn_lock = Lock()
         self._active_txns = {}
+        self._merge_lock = Lock()
+        self._active_merges: set[SandboxId] = set()
 
     def start(self) -> None:
         with self._coordination_lock:
@@ -914,6 +928,10 @@ class CrabSystem:
             # concurrent begins while the base checkpoint runs.
             self._active_txns[sandbox_id] = None
         try:
+            if self._merge_active(sandbox_id):
+                raise TxnError(
+                    f"merge in progress for {sandbox_id}; begin the transaction after it completes"
+                )
             base_checkpoint_id: CheckpointId | None = None
             base_was_fresh = False
             changed = True
@@ -1251,6 +1269,15 @@ class CrabSystem:
         return self.changeset_since(target_sandbox_id, checkpoint_id)
 
     def _fork_point_checkpoint_id(self, target_sandbox_id: SandboxId) -> CheckpointId | None:
+        origin = self._fork_origin(target_sandbox_id)
+        return None if origin is None else origin[1]
+
+    def _fork_origin(
+        self, target_sandbox_id: SandboxId
+    ) -> tuple[SandboxId | None, CheckpointId] | None:
+        """``(source_sandbox_id, checkpoint_id)`` from the newest
+        ``fork_created`` marker; the source may be None on markers
+        written before it was recorded."""
         journal = self.journal
         if journal is None:
             return None
@@ -1264,9 +1291,239 @@ class CrabSystem:
                 continue
             metadata = record.payload.get("metadata") or {}
             raw = metadata.get("checkpoint_id")
-            if raw:
-                return CheckpointId(str(raw))
+            if not raw:
+                continue
+            raw_source = metadata.get("source_sandbox_id")
+            source = SandboxId(str(raw_source)) if raw_source else None
+            return source, CheckpointId(str(raw))
         return None
+
+    # ----- filesystem merge (C2) ---------------------------------------
+    # Plan-then-apply three-way merge of a fork's changes back into its
+    # source. Classification/application live in crab/merging.py; this
+    # method owns guards, quiesce, the transient rollback snapshot, and
+    # journal/telemetry bookkeeping.
+
+    def _merge_active(self, sandbox_id: SandboxId) -> bool:
+        with self._merge_lock:
+            return sandbox_id in self._active_merges
+
+    def _pause_for_merge(self, sandbox_id: SandboxId) -> bool:
+        try:
+            status = str(self.runtime.describe(sandbox_id).status).lower()
+        except Exception:
+            return False
+        if status != "running":
+            return False
+        self.runtime.pause(sandbox_id)
+        return True
+
+    def merge_from_fork(
+        self,
+        source_sandbox_id: SandboxId,
+        fork_sandbox_id: SandboxId,
+        *,
+        policy: str = "fail_fast",
+        ignore_prefixes: tuple[str, ...] | None = None,
+        merger: MergerHook | None = None,
+    ) -> MergeReport:
+        """Three-way merge of ``fork_sandbox_id``'s filesystem changes
+        since its fork point back into ``source_sandbox_id`` (C2). Both
+        sandboxes are paused for the window when running; apply-phase
+        failures roll back path-by-path from a transient pre-merge
+        snapshot and surface as ``MergeError`` carrying the report."""
+        if policy not in MERGE_POLICIES:
+            raise ValueError(
+                f"unknown merge policy: {policy!r} (expected one of {MERGE_POLICIES})"
+            )
+        prefixes = (
+            DEFAULT_MERGE_IGNORE_PREFIXES if ignore_prefixes is None else tuple(ignore_prefixes)
+        )
+        origin = self._fork_origin(fork_sandbox_id)
+        if origin is None:
+            raise ValueError(
+                f"no fork_created journal marker for {fork_sandbox_id}; "
+                "merge_from_fork only works for sandboxes created by fork_once "
+                "with the action journal enabled"
+            )
+        marker_source, base_checkpoint_id = origin
+        if marker_source != source_sandbox_id:
+            raise ValueError(
+                f"{fork_sandbox_id} is not a fork of {source_sandbox_id} "
+                f"(fork_created marker names {marker_source})"
+            )
+        with self._merge_lock:
+            if self._active_merges & {source_sandbox_id, fork_sandbox_id}:
+                raise MergeError(
+                    f"merge already in progress involving {source_sandbox_id} or {fork_sandbox_id}"
+                )
+            self._active_merges.update((source_sandbox_id, fork_sandbox_id))
+        operation = start_operation(
+            self.telemetry,
+            "merge.flow",
+            self._telemetry_attrs(
+                source_sandbox_id,
+                component="system",
+                checkpoint_id=base_checkpoint_id,
+                extra={"fork_sandbox_id": str(fork_sandbox_id), "policy": policy},
+            ),
+        )
+        paused: list[SandboxId] = []
+        merge_snapshot_id: CheckpointId | None = None
+        try:
+            if self._txn_active(source_sandbox_id) or self._txn_active(fork_sandbox_id):
+                raise MergeError(
+                    "transaction active on source or fork; commit or abort it before merging"
+                )
+            # Quiesce: no writer may race the diffs or the apply window.
+            for sandbox_id in (fork_sandbox_id, source_sandbox_id):
+                if self._pause_for_merge(sandbox_id):
+                    paused.append(sandbox_id)
+            fork_result = self.changeset_since(fork_sandbox_id, base_checkpoint_id)
+            try:
+                source_result = self.changeset_since(source_sandbox_id, base_checkpoint_id)
+            except FileNotFoundError as exc:
+                raise MergeError(
+                    f"source lost its fork-point snapshot ({exc}); "
+                    "retention pruned the merge base"
+                ) from exc
+            source_root = Path(self.runtime.rootfs_path_for(source_sandbox_id))
+            fork_root = Path(self.runtime.rootfs_path_for(fork_sandbox_id))
+            base_root = Path(
+                self.runtime.snapshot_content_root(fork_sandbox_id, base_checkpoint_id)
+            )
+            plan = plan_merge(
+                fork_entries=fork_result.entries,
+                source_entries=source_result.entries,
+                policy=policy,
+                fork_root=fork_root,
+                source_root=source_root,
+                base_root=base_root,
+                ignore_prefixes=prefixes,
+                merger=merger,
+            )
+            if plan.ops:
+                merge_snapshot_id = CheckpointId(f"merge-{uuid.uuid4().hex[:8]}")
+                status = self.runtime.checkpoint_filesystem(source_sandbox_id, merge_snapshot_id)
+                if getattr(status, "executed", True) is False:
+                    raise MergeError(
+                        f"pre-merge snapshot failed: {getattr(status, 'reason', None)}"
+                    )
+                undo_root = Path(
+                    self.runtime.snapshot_content_root(source_sandbox_id, merge_snapshot_id)
+                )
+                try:
+                    apply_plan(
+                        plan,
+                        source_root=source_root,
+                        fork_root=fork_root,
+                        undo_root=undo_root,
+                    )
+                except MergeApplyError as exc:
+                    report = build_report(
+                        source_sandbox_id=source_sandbox_id,
+                        fork_sandbox_id=fork_sandbox_id,
+                        base_checkpoint_id=base_checkpoint_id,
+                        policy=policy,
+                        plan=plan,
+                        applied=False,
+                        rolled_back=exc.rolled_back,
+                    )
+                    self._record_merge(report, succeeded=False)
+                    raise MergeError(str(exc), report=report) from exc
+            report = build_report(
+                source_sandbox_id=source_sandbox_id,
+                fork_sandbox_id=fork_sandbox_id,
+                base_checkpoint_id=base_checkpoint_id,
+                policy=policy,
+                plan=plan,
+                applied=True,
+            )
+            self._record_merge(report, succeeded=True)
+            operation.finish(
+                status="succeeded",
+                attributes={
+                    "applied": len(report.applied),
+                    "conflicted": len(report.conflicted),
+                    "skipped": len(report.skipped),
+                    "aborted": plan.aborted,
+                },
+            )
+            return report
+        except Exception:
+            operation.finish(status="failed")
+            raise
+        finally:
+            if merge_snapshot_id is not None:
+                try:
+                    self.runtime.discard_partial_checkpoint(source_sandbox_id, merge_snapshot_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to discard transient merge snapshot sandbox=%s snapshot=%s",
+                        source_sandbox_id,
+                        merge_snapshot_id,
+                    )
+            for sandbox_id in paused:
+                try:
+                    self.runtime.resume(sandbox_id)
+                except Exception:
+                    logger.exception("Failed to resume after merge sandbox=%s", sandbox_id)
+            with self._merge_lock:
+                self._active_merges.difference_update((source_sandbox_id, fork_sandbox_id))
+
+    def _record_merge(self, report: MergeReport, *, succeeded: bool) -> None:
+        self._journal_lifecycle(
+            report.source_sandbox_id,
+            "merge",
+            metadata={
+                "fork_sandbox_id": str(report.fork_sandbox_id),
+                "base_checkpoint_id": str(report.base_checkpoint_id),
+                "policy": report.policy,
+                "applied": len(report.applied),
+                "conflicted": len(report.conflicted),
+                "skipped": len(report.skipped),
+                "rolled_back": report.rolled_back,
+                "succeeded": succeeded,
+            },
+        )
+        self._journal_lifecycle(
+            report.fork_sandbox_id,
+            "merged_into",
+            metadata={
+                "source_sandbox_id": str(report.source_sandbox_id),
+                "base_checkpoint_id": str(report.base_checkpoint_id),
+                "policy": report.policy,
+                "succeeded": succeeded,
+            },
+        )
+        self.telemetry.emit_event(
+            "merge.completed",
+            self._telemetry_attrs(
+                report.source_sandbox_id,
+                component="system",
+                checkpoint_id=report.base_checkpoint_id,
+                extra={
+                    "fork_sandbox_id": str(report.fork_sandbox_id),
+                    "policy": report.policy,
+                    "applied": len(report.applied),
+                    "conflicted": len(report.conflicted),
+                    "skipped": len(report.skipped),
+                    "rolled_back": report.rolled_back,
+                    "succeeded": succeeded,
+                },
+            ),
+        )
+        logger.info(
+            "Merge %s source=%s fork=%s policy=%s applied=%d conflicted=%d skipped=%d rolled_back=%s",
+            "succeeded" if succeeded else "failed",
+            report.source_sandbox_id,
+            report.fork_sandbox_id,
+            report.policy,
+            len(report.applied),
+            len(report.conflicted),
+            len(report.skipped),
+            report.rolled_back,
+        )
 
     # ----- observation staging (B1) -----------------------------------
     # Thin facade over the response-gate registry's staging extension so
@@ -1790,12 +2047,14 @@ class CrabSystem:
         *,
         pending_request: PendingSandboxResponse | None = None,
     ) -> CheckpointResult | None:
-        if self._txn_active(sandbox_id):
-            # Auto-checkpoints are suppressed inside a transaction: they
+        if self._txn_active(sandbox_id) or self._merge_active(sandbox_id):
+            # Auto-checkpoints are suppressed inside a transaction (they
             # would pollute the retention chain with doomed states and
-            # stage gated responses prematurely. Manual checkpoint_once
-            # remains allowed (explicit user intent).
-            logger.debug("Skipping scheduled checkpoint; txn active sandbox=%s", sandbox_id)
+            # stage gated responses prematurely) and inside a merge
+            # window (a mid-merge checkpoint would capture half-applied
+            # state and reset the inspector's change cursor). Manual
+            # checkpoint_once remains allowed (explicit user intent).
+            logger.debug("Skipping scheduled checkpoint; txn or merge active sandbox=%s", sandbox_id)
             return None
         operation = start_operation(
             self.telemetry,
@@ -2344,12 +2603,13 @@ class CrabSystem:
                 self._refresh_interceptor_pending_state(sandbox_id)
 
     def _should_coordinate_any_pending_request(self, sandbox_id: SandboxId) -> bool:
-        if self._txn_active(sandbox_id):
+        if self._txn_active(sandbox_id) or self._merge_active(sandbox_id):
             # Inside a txn the coordination loop must not run at all: its
             # finally-release would prematurely move armed responses into
             # the staged buffer (losing per-request release granularity)
-            # while the actual checkpoint flow is suppressed anyway.
-            logger.debug("DIAG.coord.any.txn_active sandbox=%s", sandbox_id)
+            # while the actual checkpoint flow is suppressed anyway. The
+            # same holds for a merge window.
+            logger.debug("DIAG.coord.any.txn_or_merge_active sandbox=%s", sandbox_id)
             return False
         if self.request_state_store is None or self.response_gate_registry is None:
             return False
