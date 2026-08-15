@@ -233,6 +233,43 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_changeset.set_defaults(func=_cmd_sandbox_changeset)
 
+    p_actions = sandbox_sub.add_parser(
+        "actions",
+        help="Read a sandbox's action journal (exec, lifecycle, and "
+        "adopted observation records), oldest first.",
+    )
+    p_actions.add_argument("sandbox_id", metavar="SANDBOX_ID")
+    p_actions.add_argument(
+        "--kind",
+        default=None,
+        choices=["exec", "lifecycle", "observation"],
+        help="Only records of this kind.",
+    )
+    p_actions.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Only the newest N records.",
+    )
+    p_actions.set_defaults(func=_cmd_sandbox_actions)
+
+    p_consolidate = sandbox_sub.add_parser(
+        "consolidate",
+        help="Adopt a fork's journal history into its source sandbox "
+        "(C3). Read it back with `crab sandbox actions --kind observation`.",
+    )
+    p_consolidate.add_argument("sandbox_id", metavar="SOURCE_ID")
+    p_consolidate.add_argument("fork_id", metavar="FORK_ID")
+    p_consolidate.add_argument(
+        "--policy",
+        default="append",
+        choices=["append", "dedupe", "none"],
+        help="append (default): copy every qualifying record; dedupe: "
+        "skip execs the source produced identically itself; none: "
+        "record the consolidation marker only.",
+    )
+    p_consolidate.set_defaults(func=_cmd_sandbox_consolidate)
+
     # ----- checkpoint group ----------------------------------------------
     # Checkpoints are first-class entities with their own ids; keep them
     # at the top level so the verbs read cleanly (`crab checkpoint ls`,
@@ -692,6 +729,66 @@ def _cmd_sandbox_changeset(args: argparse.Namespace) -> int:
         if entry.get("renamed_from"):
             suffix = f"\t(from {entry['renamed_from']})"
         print(f"{entry.get('change', '')}\t{entry.get('path', '')}{suffix}")
+    return 0
+
+
+def _summarize_action_record(record: dict[str, Any]) -> str:
+    kind = record.get("kind", "")
+    payload = record.get("payload") or {}
+    if kind == "exec":
+        argv = " ".join(payload.get("argv") or [])
+        return f"rc={payload.get('returncode')}\t{argv}"
+    if kind == "lifecycle":
+        return str(payload.get("event", ""))
+    if kind == "observation":
+        origin = payload.get("origin_kind", "")
+        fork = payload.get("fork_sandbox_id", "")
+        if origin == "exec":
+            inner = payload.get("origin_payload") or {}
+            detail = " ".join(inner.get("argv") or [])
+        elif origin == "summary":
+            detail = str(payload.get("summary", ""))[:80]
+        else:
+            detail = str((payload.get("origin_payload") or {}).get("event", ""))
+        return f"{origin}\tfrom={fork}\t{detail}"
+    return ""
+
+
+def _cmd_sandbox_actions(args: argparse.Namespace) -> int:
+    socket_path = _resolve_socket(args)
+    client = DaemonClient(socket_path, timeout_seconds=max(args.timeout, 60.0))
+    payload: dict[str, Any] = {}
+    if args.kind is not None:
+        payload["kind"] = args.kind
+    if args.limit is not None:
+        payload["limit"] = int(args.limit)
+    response = client.post_json(f"/sandboxes/{args.sandbox_id}/actions", payload)
+    records = list(response.get("records") or [])
+    if args.json:
+        print(json.dumps(records, indent=2))
+        return 0
+    for record in records:
+        print(f"{record.get('seq', '')}\t{record.get('kind', '')}\t{_summarize_action_record(record)}")
+    return 0
+
+
+def _cmd_sandbox_consolidate(args: argparse.Namespace) -> int:
+    socket_path = _resolve_socket(args)
+    client = DaemonClient(socket_path, timeout_seconds=max(args.timeout, 60.0))
+    payload: dict[str, Any] = {"fork_sandbox_id": args.fork_id, "policy": args.policy}
+    response = client.post_json(
+        f"/sandboxes/{args.sandbox_id}/observations/consolidate", payload
+    )
+    report = response.get("report") or {}
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return 0
+    print(
+        f"consolidated={report.get('consolidated', 0)} "
+        f"skipped_duplicates={report.get('skipped_duplicates', 0)} "
+        f"policy={report.get('policy', '')}"
+        + (" (already consolidated)" if report.get("already_consolidated") else "")
+    )
     return 0
 
 

@@ -137,6 +137,23 @@ class _ForkTxnRealMixin:
         self._assert_fork_gone(engine, txn.fork_sandbox_id)
         # The identity never changed: same sandbox handle keeps working.
         self.assertEqual(self._run(sandbox, "echo still-me"), "still-me")
+        # C3: the commit adopted the fork's action history — the txn's
+        # exec records are readable on the source with provenance.
+        observations = sandbox.actions(kind="observation")
+        self.assertTrue(observations, "commit did not consolidate the fork's history")
+        self.assertEqual(
+            {row["payload"]["fork_sandbox_id"] for row in observations},
+            {txn.fork_sandbox_id},
+        )
+        adopted_cmds = [
+            " ".join(row["payload"]["origin_payload"].get("argv") or [])
+            for row in observations
+            if row["payload"].get("origin_kind") == "exec"
+        ]
+        self.assertTrue(
+            any("fork-v2" in cmd for cmd in adopted_cmds),
+            f"txn exec not adopted: {adopted_cmds}",
+        )
 
     def test_abort_leaves_source_untouched(self) -> None:
         engine = self._engine()

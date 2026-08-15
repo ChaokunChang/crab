@@ -46,6 +46,10 @@ class ActionRecord:
         stdout_len/stdout_sha256, stderr_len/stderr_sha256.
     kind="lifecycle": event (launch/checkpoint/restore/fork_source/
         fork_created/destroy/...), plus event-specific metadata.
+    kind="observation": adopted history from a consolidated fork (C3):
+        fork_sandbox_id, origin_seq/kind/txn_id/timestamps,
+        origin_payload (verbatim), reason — or origin_kind="summary"
+        with a summarizer digest.
     """
 
     seq: int
@@ -196,6 +200,28 @@ class ActionJournal:
         return self._append(
             sandbox_id,
             kind="lifecycle",
+            payload=payload,
+            started_at=now,
+            finished_at=now,
+            txn_id=txn_id,
+        )
+
+    def record_observation(
+        self,
+        sandbox_id: SandboxId | str,
+        *,
+        payload: dict,
+        txn_id: str | None = None,
+    ) -> ActionRecord:
+        """Adopted history (C3): a record copied from another sandbox's
+        journal (typically a fork being consolidated). The payload keeps
+        the origin record verbatim under ``origin_payload`` plus
+        provenance fields (fork id, origin seq/kind/txn/timestamps) so
+        first-hand and adopted history stay distinguishable."""
+        now = utc_now().isoformat()
+        return self._append(
+            sandbox_id,
+            kind="observation",
             payload=payload,
             started_at=now,
             finished_at=now,

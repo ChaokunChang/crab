@@ -237,13 +237,26 @@ service behavior should be validated for each task.
   `MergeError` carrying the report after a path-level rollback from the
   pre-merge snapshot. Works both locally and against the daemon
   (`crab sandbox merge`); custom `merger` hooks are local-only.
+- `Sandbox.consolidate_observations(fork, policy="append",
+  summarizer=None)` adopts a fork's journal history into this sandbox's
+  journal as `kind="observation"` records with provenance (fork id,
+  origin seq/kind/txn): `append` copies every qualifying record,
+  `dedupe` skips execs the source produced identically itself since the
+  fork point, `none` copies nothing (combine with a local-only
+  `summarizer` callable for a digest entry). Fork-txn commits adopt the
+  fork's history automatically; `Sandbox.merge(fork,
+  observations="append"|"dedupe")` opts a merge in and nests the
+  resulting report under `MergeReport.observations`. Works both locally
+  and against the daemon (`crab sandbox consolidate`).
 - `Sandbox.actions(kind=None, limit=None)` reads the per-sandbox action
   journal: every exec attempt (argv, cwd, env, exit status, timing;
   stdout/stderr as size+sha256 only) plus lifecycle markers
-  (launch/checkpoint/restore/fork/destroy). Journals are JSONL files under
+  (launch/checkpoint/restore/fork/destroy) and adopted fork history
+  (`kind="observation"`, C3). Journals are JSONL files under
   `{storage_root}/journal/` and record env values verbatim — treat them
-  with the same care as checkpoint images. Local (in-process engine) only
-  for now; disable recording with `EngineConfig(enable_action_journal=False)`.
+  with the same care as checkpoint images. Works both locally and
+  against the daemon (`crab sandbox actions`); disable recording with
+  `EngineConfig(enable_action_journal=False)`.
 - Daemon restart rehydration is not implemented.
 - Exec output is buffered; streaming and PTY support are not implemented.
 - `resources`, `timeout`, and `labels` constructor arguments are currently

@@ -394,8 +394,12 @@ class _Routes:
         eng = self._daemon.require_engine()
         sid = SandboxId(sandbox_id)
         force = bool(body.get("force", False))
+        commit_kwargs: dict[str, Any] = {"force": force}
+        observations_raw = body.get("observations")
+        if observations_raw is not None:
+            commit_kwargs["observations"] = str(observations_raw)
         try:
-            result = eng.system.commit_txn(sid, txn_id, force=force)
+            result = eng.system.commit_txn(sid, txn_id, **commit_kwargs)
         except TxnMismatchError as exc:
             raise _TxnConflict("txn_mismatch", str(exc)) from exc
         except TxnCommitConflict as exc:
@@ -409,6 +413,7 @@ class _Routes:
                 "released_observations": result.released_observations,
                 "base_dropped": result.base_dropped,
                 "promoted_checkpoint_id": result.promoted_checkpoint_id,
+                "observations_consolidated": result.observations_consolidated,
             },
         }
 
@@ -456,6 +461,9 @@ class _Routes:
         if not fork_raw:
             raise _BadRequest("merge requires fork_sandbox_id")
         kwargs: dict[str, Any] = {"policy": str(body.get("policy") or "fail_fast")}
+        observations_raw = body.get("observations")
+        if observations_raw is not None:
+            kwargs["observations"] = str(observations_raw)
         prefixes_raw = body.get("ignore_prefixes")
         if prefixes_raw is not None:
             if not isinstance(prefixes_raw, list) or not all(
@@ -490,6 +498,47 @@ class _Routes:
         except (FileNotFoundError, ValueError) as exc:
             raise _BadRequest(f"changeset failed: {exc}") from exc
         return {"ok": True, "changeset": result.to_json()}
+
+    def consolidate_observations_sandbox(
+        self, body: dict[str, Any], *, sandbox_id: str
+    ) -> dict[str, Any]:
+        """Adopt a fork's journal history into this sandbox's journal
+        (C3). Summarizer hooks never cross the RPC boundary."""
+        eng = self._daemon.require_engine()
+        fork_raw = body.get("fork_sandbox_id")
+        if not fork_raw:
+            raise _BadRequest("consolidate requires fork_sandbox_id")
+        policy = str(body.get("policy") or "append")
+        try:
+            report = eng.system.consolidate_observations(
+                SandboxId(sandbox_id),
+                SandboxId(str(fork_raw)),
+                policy=policy,
+                reason=str(body.get("reason") or "manual"),
+            )
+        except (ValueError, RuntimeError) as exc:
+            raise _BadRequest(f"consolidate failed: {exc}") from exc
+        return {"ok": True, "report": report.to_json()}
+
+    def sandbox_actions(self, body: dict[str, Any], *, sandbox_id: str) -> dict[str, Any]:
+        """Read the sandbox's action journal (exec/lifecycle/observation
+        records). env values ride verbatim — same trust domain as the
+        daemon socket."""
+        eng = self._daemon.require_engine()
+        journal = getattr(eng.system, "journal", None)
+        if journal is None:
+            raise _BadRequest("action journal is not enabled on this daemon")
+        kind_raw = body.get("kind")
+        since_raw = body.get("since_seq")
+        records = journal.entries(
+            SandboxId(sandbox_id),
+            kind=None if not kind_raw else str(kind_raw),
+            since_seq=None if since_raw is None else int(since_raw),
+        )
+        limit_raw = body.get("limit")
+        if limit_raw is not None and int(limit_raw) >= 0:
+            records = records[-int(limit_raw):]
+        return {"ok": True, "records": [record.to_json() for record in records]}
 
     def update_host_inspector_filters(
         self, body: dict[str, Any], *, sandbox_id: str
@@ -665,6 +714,14 @@ def _build_handler(daemon: "DaemonServer"):
         # Filesystem merge + changesets (C2; see crab/merging.py)
         ("POST", "/sandboxes/{sandbox_id}/merge", "", routes.merge_sandbox),
         ("POST", "/sandboxes/{sandbox_id}/changeset", "", routes.changeset_sandbox),
+        # Observation consolidation + journal reads (C3)
+        (
+            "POST",
+            "/sandboxes/{sandbox_id}/observations/consolidate",
+            "",
+            routes.consolidate_observations_sandbox,
+        ),
+        ("POST", "/sandboxes/{sandbox_id}/actions", "", routes.sandbox_actions),
     ]
 
     def _match(method: str, path: str):
