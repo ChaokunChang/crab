@@ -70,6 +70,7 @@ from .runtime import (
 from .scheduler import CRScheduler, FaultToleranceCheckpointingPolicy, InMemorySchedulerStateStore
 from .sdk_llm_forwarder import SdkLLMForwarder, serve_sdk_llm_forwarder
 from .storage import LocalCheckpointManager
+from .models import SandboxSnapshot, utc_now
 from .system import CrabSystem, build_default_system
 from .telemetry import build_configured_telemetry_sink
 from .workers import (
@@ -955,7 +956,7 @@ class Engine:
         )
         response_gate_registry = SandboxResponseGateRegistry()
         scheduler_cfg = cfg.scheduler_config or SchedulerConfig()
-        return CrabSystem(
+        system = CrabSystem(
             scheduler=CRScheduler(
                 scheduler_cfg,
                 inspector,
@@ -973,6 +974,14 @@ class Engine:
             response_gate_registry=response_gate_registry,
             journal=journal,
         )
+        # Fork-backed txns (B3) need engine-level machinery (lease
+        # allocation, bundle replication, restore, kill-path teardown).
+        system.configure_fork_txn_hooks(
+            fork=self._fork_for_txn,
+            destroy=self._destroy_txn_fork,
+            lease_repair=self.repair_network_lease,
+        )
+        return system
 
     def _start_host_inspector_if_configured(self) -> None:
         cfg = self._config
@@ -1443,6 +1452,46 @@ class Engine:
             self.repair_network_lease(target_sandbox_id)
             fork_ids.append(target_sandbox_id)
         return fork_ids
+
+    def _fork_for_txn(self, source_sandbox_id: SandboxId) -> SandboxId:
+        """Fork hook for fork-backed transactions (B3): one fork via the
+        standard pipeline, inspector seeded the way Sandbox.fork does
+        (there is no SDK Sandbox object on this path)."""
+        [fork_id] = self.fork_sandbox(source_sandbox_id, count=1)
+        try:
+            self.system.inspector.upsert_snapshot(
+                SandboxSnapshot(
+                    sandbox_id=fork_id,
+                    runtime_name=self.runtime.name,
+                    is_running=True,
+                    process_changed=False,
+                    filesystem_changed=False,
+                    observed_at=utc_now(),
+                )
+            )
+        except Exception:
+            logger.debug("Failed to seed inspector for txn fork=%s", fork_id, exc_info=True)
+        return fork_id
+
+    def _destroy_txn_fork(self, fork_sandbox_id: SandboxId) -> None:
+        """Teardown hook mirroring Sandbox.kill's fork cleanup chain —
+        each step independently best-effort."""
+        try:
+            self.system.release_fork(fork_sandbox_id)
+        except Exception:
+            logger.exception("Txn fork release failed fork=%s", fork_sandbox_id)
+        try:
+            self.runtime.delete(fork_sandbox_id)
+        except Exception:
+            logger.exception("Txn fork runtime delete failed fork=%s", fork_sandbox_id)
+        try:
+            self.unregister_upstream(fork_sandbox_id)
+        except Exception:
+            logger.debug("Txn fork upstream cleanup failed", exc_info=True)
+        try:
+            self.release_network_lease(fork_sandbox_id)
+        except Exception:
+            logger.debug("Txn fork lease cleanup failed", exc_info=True)
 
     # ------------------------------------------------------------------
     # Sandbox registry — used so engine.stop() can clean up.

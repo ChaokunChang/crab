@@ -55,8 +55,8 @@ crab [--socket PATH] [--timeout SECONDS] [--json] <command>
   checkpoint rm SANDBOX_ID CHECKPOINT_ID [--cascade]
   restore SANDBOX_ID CHECKPOINT_ID
 
-  txn begin SANDBOX_ID [--label LABEL]
-  txn commit SANDBOX_ID TXN_ID
+  txn begin SANDBOX_ID [--label LABEL] [--isolation snapshot|fork]
+  txn commit SANDBOX_ID TXN_ID [--force]
   txn abort SANDBOX_ID TXN_ID
   txn status SANDBOX_ID
 ```

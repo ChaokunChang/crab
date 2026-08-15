@@ -39,7 +39,7 @@ from ..engine import Engine, EngineConfig
 from ..ids import SandboxId
 from ..merging import MergeError
 from ..models import SandboxSnapshot, utc_now
-from ..txn import TxnAbortError, TxnActiveError, TxnError, TxnMismatchError
+from ..txn import TxnAbortError, TxnActiveError, TxnCommitConflict, TxnError, TxnMismatchError
 from .transport import (
     DEFAULT_SOCKET_PERMS,
     default_socket_path,
@@ -379,11 +379,12 @@ class _Routes:
         sid = SandboxId(sandbox_id)
         label_raw = body.get("label")
         label = None if label_raw is None else str(label_raw)
+        isolation = str(body.get("isolation") or "snapshot")
         try:
-            description = eng.system.begin_txn(sid, label=label)
+            description = eng.system.begin_txn(sid, label=label, isolation=isolation)
         except TxnActiveError as exc:
             raise _TxnConflict("txn_active", str(exc)) from exc
-        except TxnError as exc:
+        except (TxnError, ValueError) as exc:
             raise _BadRequest(f"txn begin failed: {exc}") from exc
         return {"ok": True, "txn": _serialize_txn(description)}
 
@@ -392,10 +393,13 @@ class _Routes:
     ) -> dict[str, Any]:
         eng = self._daemon.require_engine()
         sid = SandboxId(sandbox_id)
+        force = bool(body.get("force", False))
         try:
-            result = eng.system.commit_txn(sid, txn_id)
+            result = eng.system.commit_txn(sid, txn_id, force=force)
         except TxnMismatchError as exc:
             raise _TxnConflict("txn_mismatch", str(exc)) from exc
+        except TxnCommitConflict as exc:
+            raise _TxnConflict("txn_commit_conflict", str(exc)) from exc
         except TxnError as exc:
             raise _BadRequest(f"txn commit failed: {exc}") from exc
         return {
@@ -404,6 +408,7 @@ class _Routes:
                 "txn_id": result.txn_id,
                 "released_observations": result.released_observations,
                 "base_dropped": result.base_dropped,
+                "promoted_checkpoint_id": result.promoted_checkpoint_id,
             },
         }
 
@@ -534,6 +539,8 @@ def _serialize_txn(description) -> dict[str, Any]:
         "base_was_fresh": bool(description.base_was_fresh),
         "started_at": description.started_at,
         "label": description.label,
+        "isolation": getattr(description, "isolation", "snapshot"),
+        "fork_sandbox_id": getattr(description, "fork_sandbox_id", None),
     }
 
 

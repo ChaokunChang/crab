@@ -41,6 +41,7 @@ from .txn import (
     TxnAbortError,
     TxnAbortResult,
     TxnActiveError,
+    TxnCommitConflict,
     TxnCommitResult,
     TxnDescription,
     TxnMismatchError,
@@ -169,32 +170,44 @@ class _SystemShim:
     # set from the original Txn* exception; map it back so SDK callers
     # get identical exceptions in both modes.
 
-    def begin_txn(self, sandbox_id: SandboxId, *, label: str | None = None) -> TxnDescription:
+    def begin_txn(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        label: str | None = None,
+        isolation: str = "snapshot",
+    ) -> TxnDescription:
         payload: dict[str, Any] = {} if label is None else {"label": label}
+        if isolation != "snapshot":
+            payload["isolation"] = isolation
         try:
             response = self._client.post_json(
                 f"/sandboxes/{sandbox_id}/txn",
                 payload,
-                timeout_seconds=300.0,  # begin may take a base checkpoint
+                timeout_seconds=600.0 if isolation == "fork" else 300.0,  # fork begin = checkpoint + clone + restore
             )
         except DaemonRequestError as exc:
             raise _map_txn_error(exc) from exc
         return _deserialize_txn(response["txn"])
 
-    def commit_txn(self, sandbox_id: SandboxId, txn_id: str) -> TxnCommitResult:
+    def commit_txn(
+        self, sandbox_id: SandboxId, txn_id: str, *, force: bool = False
+    ) -> TxnCommitResult:
         try:
             response = self._client.post_json(
                 f"/sandboxes/{sandbox_id}/txn/{txn_id}/commit",
-                {},
-                timeout_seconds=60.0,
+                {"force": True} if force else {},
+                timeout_seconds=600.0,  # fork-backed commit swaps fs + processes
             )
         except DaemonRequestError as exc:
             raise _map_txn_error(exc) from exc
         raw = response["result"]
+        promoted = raw.get("promoted_checkpoint_id")
         return TxnCommitResult(
             txn_id=str(raw["txn_id"]),
             released_observations=int(raw["released_observations"]),
             base_dropped=bool(raw["base_dropped"]),
+            promoted_checkpoint_id=None if promoted is None else str(promoted),
         )
 
     def abort_txn(self, sandbox_id: SandboxId, txn_id: str) -> TxnAbortResult:
@@ -687,6 +700,7 @@ def _make_jsonable(value: Any) -> Any:
 def _deserialize_txn(payload: Mapping[str, Any]) -> TxnDescription:
     base = payload.get("base_checkpoint_id")
     label = payload.get("label")
+    fork_sandbox_id = payload.get("fork_sandbox_id")
     return TxnDescription(
         txn_id=str(payload["txn_id"]),
         sandbox_id=str(payload["sandbox_id"]),
@@ -694,6 +708,8 @@ def _deserialize_txn(payload: Mapping[str, Any]) -> TxnDescription:
         base_was_fresh=bool(payload.get("base_was_fresh")),
         started_at=str(payload.get("started_at") or ""),
         label=None if label is None else str(label),
+        isolation=str(payload.get("isolation") or "snapshot"),
+        fork_sandbox_id=None if fork_sandbox_id is None else str(fork_sandbox_id),
     )
 
 
@@ -710,6 +726,8 @@ def _map_txn_error(exc: DaemonRequestError) -> Exception:
         return TxnActiveError(message)
     if error_type == "txn_mismatch":
         return TxnMismatchError(message)
+    if error_type == "txn_commit_conflict":
+        return TxnCommitConflict(message)
     if error_type == "txn_abort_failed":
         return TxnAbortError(message)
     return exc

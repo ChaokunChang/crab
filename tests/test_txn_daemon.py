@@ -47,14 +47,14 @@ class _FakeSystem:
         self.abort_error: Exception | None = None
         self.current: TxnDescription | None = None
 
-    def begin_txn(self, sandbox_id, *, label=None):
-        self.calls.append(("begin_txn", str(sandbox_id), label))
+    def begin_txn(self, sandbox_id, *, label=None, isolation="snapshot"):
+        self.calls.append(("begin_txn", str(sandbox_id), label, isolation))
         if self.begin_error is not None:
             raise self.begin_error
         return _description(str(sandbox_id))
 
-    def commit_txn(self, sandbox_id, txn_id):
-        self.calls.append(("commit_txn", str(sandbox_id), txn_id))
+    def commit_txn(self, sandbox_id, txn_id, *, force=False):
+        self.calls.append(("commit_txn", str(sandbox_id), txn_id, force))
         if self.commit_error is not None:
             raise self.commit_error
         return TxnCommitResult(txn_id=str(txn_id), released_observations=2, base_dropped=True)
@@ -133,7 +133,8 @@ class TxnRouteHandlerTests(unittest.TestCase):
         self.assertEqual(txn["base_checkpoint_id"], "ckpt-base")
         self.assertTrue(txn["base_was_fresh"])
         self.assertEqual(txn["label"], "demo")
-        self.assertIn(("begin_txn", "src", "demo"), self.engine.system.calls)
+        self.assertEqual(txn["isolation"], "snapshot")
+        self.assertIn(("begin_txn", "src", "demo", "snapshot"), self.engine.system.calls)
 
     def test_begin_active_maps_to_conflict(self) -> None:
         self.engine.system.begin_error = TxnActiveError("already active")
@@ -283,7 +284,8 @@ class SystemShimTxnTests(unittest.TestCase):
         self.assertEqual(commit.released_observations, 3)
         abort = engine.system.abort_txn(SandboxId("src"), "txn-9")
         self.assertEqual(abort.discarded_observations, 2)
-        self.assertEqual(client.requests[0]["timeout"], 60.0)
+        # Commit budgets for the heavier fork-backed swap since B3.
+        self.assertEqual(client.requests[0]["timeout"], 600.0)
         self.assertEqual(client.requests[1]["timeout"], 300.0)
 
     def test_conflict_maps_back_to_typed_errors(self) -> None:

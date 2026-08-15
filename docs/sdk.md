@@ -215,6 +215,13 @@ service behavior should be validated for each task.
   place. Auto-checkpoints are suppressed while a txn is open. Works both
   with a local in-process engine and against the daemon (`crab txn
   begin/commit/abort/status` from the CLI).
+- `Sandbox.begin(isolation="fork")` opens a fork-backed transaction
+  (strong isolation): begin forks the sandbox and `txn.exec` runs in the
+  fork while the source keeps serving its pre-txn state; commit promotes
+  the fork's whole filesystem *and process* state back onto the source's
+  unchanged identity (`commit(force=True)` overrides the dirty-source
+  gate and discards source-side writes made during the txn); abort just
+  destroys the fork — the source is never restored.
 - `Sandbox.changeset(since=None)` returns the changed rootfs paths
   (added/modified/removed/renamed) relative to a base checkpoint's
   filesystem snapshot; `since=None` diffs against the sandbox's fork
