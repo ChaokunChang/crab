@@ -37,6 +37,7 @@ from typing import Any, Callable
 
 from ..engine import Engine, EngineConfig
 from ..ids import SandboxId
+from ..merging import MergeError
 from ..models import SandboxSnapshot, utc_now
 from ..txn import TxnAbortError, TxnActiveError, TxnError, TxnMismatchError
 from .transport import (
@@ -437,6 +438,54 @@ class _Routes:
             "txn": None if description is None else _serialize_txn(description),
         }
 
+    # ----- filesystem merge / changesets (C2) -------------------------
+
+    def merge_sandbox(self, body: dict[str, Any], *, sandbox_id: str) -> dict[str, Any]:
+        """Three-way merge a fork's filesystem changes back into its
+        source. Refusals/failures surface as 409 with error_type
+        ``merge_error`` and the serialized report when one exists, so
+        the SDK shim can rehydrate an identical ``MergeError``."""
+        eng = self._daemon.require_engine()
+        sid = SandboxId(sandbox_id)
+        fork_raw = body.get("fork_sandbox_id")
+        if not fork_raw:
+            raise _BadRequest("merge requires fork_sandbox_id")
+        kwargs: dict[str, Any] = {"policy": str(body.get("policy") or "fail_fast")}
+        prefixes_raw = body.get("ignore_prefixes")
+        if prefixes_raw is not None:
+            if not isinstance(prefixes_raw, list) or not all(
+                isinstance(prefix, str) for prefix in prefixes_raw
+            ):
+                raise _BadRequest("ignore_prefixes must be a list of strings")
+            kwargs["ignore_prefixes"] = tuple(prefixes_raw)
+        try:
+            report = eng.system.merge_from_fork(sid, SandboxId(str(fork_raw)), **kwargs)
+        except MergeError as exc:
+            raise _MergeConflict(
+                str(exc),
+                report=None if exc.report is None else exc.report.to_json(),
+            ) from exc
+        except ValueError as exc:
+            raise _BadRequest(f"merge failed: {exc}") from exc
+        return {"ok": True, "report": report.to_json()}
+
+    def changeset_sandbox(self, body: dict[str, Any], *, sandbox_id: str) -> dict[str, Any]:
+        """Changed rootfs paths relative to a base checkpoint; without
+        ``since`` the sandbox's fork point is resolved (C1 semantics)."""
+        eng = self._daemon.require_engine()
+        sid = SandboxId(sandbox_id)
+        from ..ids import CheckpointId
+
+        since_raw = body.get("since")
+        try:
+            if since_raw:
+                result = eng.system.changeset_since(sid, CheckpointId(str(since_raw)))
+            else:
+                result = eng.system.fork_changeset(sid)
+        except (FileNotFoundError, ValueError) as exc:
+            raise _BadRequest(f"changeset failed: {exc}") from exc
+        return {"ok": True, "changeset": result.to_json()}
+
     def update_host_inspector_filters(
         self, body: dict[str, Any], *, sandbox_id: str
     ) -> dict[str, Any]:
@@ -541,6 +590,16 @@ class _TxnConflict(Exception):
         self.error_type = error_type
 
 
+class _MergeConflict(Exception):
+    """409 with error_type ``merge_error`` plus the serialized merge
+    report (when the failure produced one) so the SDK shim rehydrates a
+    ``MergeError`` with an intact ``report``."""
+
+    def __init__(self, message: str, *, report: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.report = report
+
+
 class _NotFound(Exception):
     pass
 
@@ -596,6 +655,9 @@ def _build_handler(daemon: "DaemonServer"):
         ("POST", "/sandboxes/{sandbox_id}/txn", "", routes.begin_txn),
         ("POST", "/sandboxes/{sandbox_id}/txn/{txn_id}/commit", "", routes.commit_txn),
         ("POST", "/sandboxes/{sandbox_id}/txn/{txn_id}/abort", "", routes.abort_txn),
+        # Filesystem merge + changesets (C2; see crab/merging.py)
+        ("POST", "/sandboxes/{sandbox_id}/merge", "", routes.merge_sandbox),
+        ("POST", "/sandboxes/{sandbox_id}/changeset", "", routes.changeset_sandbox),
     ]
 
     def _match(method: str, path: str):
@@ -654,6 +716,15 @@ def _build_handler(daemon: "DaemonServer"):
                     HTTPStatus.CONFLICT,
                     {"ok": False, "error": str(exc), "error_type": exc.error_type},
                 )
+            except _MergeConflict as exc:
+                payload: dict[str, Any] = {
+                    "ok": False,
+                    "error": str(exc),
+                    "error_type": "merge_error",
+                }
+                if exc.report is not None:
+                    payload["report"] = exc.report
+                self._send_json(HTTPStatus.CONFLICT, payload)
             except _NotFound as exc:
                 self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": str(exc)})
             except KeyError as exc:

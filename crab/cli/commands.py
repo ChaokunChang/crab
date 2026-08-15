@@ -194,6 +194,45 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_fork.set_defaults(func=_cmd_sandbox_fork)
 
+    p_merge = sandbox_sub.add_parser(
+        "merge",
+        help="Three-way merge a fork's filesystem changes back into its "
+        "source sandbox (C2). Conflicts resolve per --policy.",
+    )
+    p_merge.add_argument("sandbox_id", metavar="SOURCE_ID", help="Source sandbox id.")
+    p_merge.add_argument("fork_id", metavar="FORK_ID", help="Fork sandbox id to merge from.")
+    p_merge.add_argument(
+        "--policy",
+        default="fail_fast",
+        choices=["fail_fast", "prefer_fork", "prefer_source", "text_merge"],
+        help="Conflict policy (default fail_fast: any conflict aborts "
+        "before a single write).",
+    )
+    p_merge.add_argument(
+        "--ignore-prefix",
+        action="append",
+        dest="ignore_prefixes",
+        default=None,
+        metavar="PREFIX",
+        help="Override the default ignore prefixes (/tmp, /var/tmp, /run); "
+        "repeatable.",
+    )
+    p_merge.set_defaults(func=_cmd_sandbox_merge)
+
+    p_changeset = sandbox_sub.add_parser(
+        "changeset",
+        help="Changed rootfs paths relative to a base checkpoint "
+        "(defaults to the sandbox's fork point). One `change<TAB>path` per line.",
+    )
+    p_changeset.add_argument("sandbox_id", metavar="SANDBOX_ID")
+    p_changeset.add_argument(
+        "--since",
+        default=None,
+        metavar="CHECKPOINT_ID",
+        help="Base checkpoint id; omit to diff against the fork point.",
+    )
+    p_changeset.set_defaults(func=_cmd_sandbox_changeset)
+
     # ----- checkpoint group ----------------------------------------------
     # Checkpoints are first-class entities with their own ids; keep them
     # at the top level so the verbs read cleanly (`crab checkpoint ls`,
@@ -592,6 +631,53 @@ def _cmd_sandbox_fork(args: argparse.Namespace) -> int:
         return 0
     for fork in forks:
         print(fork.get("sandbox_id", ""))
+    return 0
+
+
+def _cmd_sandbox_merge(args: argparse.Namespace) -> int:
+    socket_path = _resolve_socket(args)
+    # Merge quiesces both sandboxes and runs two backend diffs plus the
+    # apply window; budget generously like fork does.
+    client = DaemonClient(socket_path, timeout_seconds=max(args.timeout, 600.0))
+    payload: dict[str, Any] = {
+        "fork_sandbox_id": args.fork_id,
+        "policy": args.policy,
+    }
+    if args.ignore_prefixes is not None:
+        payload["ignore_prefixes"] = list(args.ignore_prefixes)
+    response = client.post_json(f"/sandboxes/{args.sandbox_id}/merge", payload)
+    report = response.get("report") or {}
+    conflicted = list(report.get("conflicted") or [])
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        applied = list(report.get("applied") or [])
+        skipped = list(report.get("skipped") or [])
+        print(
+            f"applied={len(applied)} conflicted={len(conflicted)} "
+            f"skipped={len(skipped)} policy={report.get('policy', '')}"
+        )
+        for entry in conflicted:
+            print(f"conflict\t{entry.get('path', '')}\t{entry.get('reason', '')}")
+    # Conflicts mean the merge (fully or partially) did not land; make
+    # that visible to scripts via the exit code.
+    return 1 if conflicted else 0
+
+
+def _cmd_sandbox_changeset(args: argparse.Namespace) -> int:
+    socket_path = _resolve_socket(args)
+    client = DaemonClient(socket_path, timeout_seconds=max(args.timeout, 300.0))
+    payload: dict[str, Any] = {} if args.since is None else {"since": args.since}
+    response = client.post_json(f"/sandboxes/{args.sandbox_id}/changeset", payload)
+    changeset = response.get("changeset") or {}
+    if args.json:
+        print(json.dumps(changeset, indent=2))
+        return 0
+    for entry in changeset.get("entries") or []:
+        suffix = ""
+        if entry.get("renamed_from"):
+            suffix = f"\t(from {entry['renamed_from']})"
+        print(f"{entry.get('change', '')}\t{entry.get('path', '')}{suffix}")
     return 0
 
 

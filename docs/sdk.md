@@ -215,6 +215,21 @@ service behavior should be validated for each task.
   place. Auto-checkpoints are suppressed while a txn is open. Works both
   with a local in-process engine and against the daemon (`crab txn
   begin/commit/abort/status` from the CLI).
+- `Sandbox.changeset(since=None)` returns the changed rootfs paths
+  (added/modified/removed/renamed) relative to a base checkpoint's
+  filesystem snapshot; `since=None` diffs against the sandbox's fork
+  point. Raw truth from the CoW backend (`zfs diff` / `btrfs send`).
+  Works both locally and against the daemon (`crab sandbox changeset`).
+- `Sandbox.merge(fork, policy="fail_fast", ignore_prefixes=None,
+  merger=None)` three-way merges a fork's filesystem changes back into
+  the source: fork-side changes apply where the source did not touch the
+  same path since the fork point; conflicts resolve per policy
+  (`fail_fast` aborts before any write, `prefer_fork`, `prefer_source`,
+  `text_merge` runs a line-based diff3). Returns a `MergeReport`
+  (applied/conflicted/skipped, `rolled_back`); apply failures raise
+  `MergeError` carrying the report after a path-level rollback from the
+  pre-merge snapshot. Works both locally and against the daemon
+  (`crab sandbox merge`); custom `merger` hooks are local-only.
 - `Sandbox.actions(kind=None, limit=None)` reads the per-sandbox action
   journal: every exec attempt (argv, cwd, env, exit status, timing;
   stdout/stderr as size+sha256 only) plus lifecycle markers

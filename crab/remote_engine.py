@@ -34,7 +34,8 @@ from typing import TYPE_CHECKING, Any, Mapping
 from .contracts import Runtime
 from .daemon import DaemonClient, DaemonRequestError
 from .ids import CheckpointId, SandboxId
-from .models import JobStatus, SandboxDescription, SandboxExecResult, SandboxRuntimeState
+from .models import ChangesetResult, JobStatus, MergeReport, SandboxDescription, SandboxExecResult, SandboxRuntimeState
+from .merging import MergeError, MergerHook
 from .telemetry import NoopTelemetrySink
 from .txn import (
     TxnAbortError,
@@ -217,6 +218,64 @@ class _SystemShim:
         response = self._client.get_json(f"/sandboxes/{sandbox_id}/txn")
         raw = response.get("txn")
         return None if raw is None else _deserialize_txn(raw)
+
+    # ----- filesystem merge / changesets (C2) --------------------------
+    # Same transport-agnostic story as the txn proxies: Sandbox.merge and
+    # Sandbox.changeset duck-type onto these, and 409 merge_error bodies
+    # rehydrate into MergeError with the serialized report reattached.
+
+    def merge_from_fork(
+        self,
+        source_sandbox_id: SandboxId,
+        fork_sandbox_id: SandboxId,
+        *,
+        policy: str = "fail_fast",
+        ignore_prefixes: tuple[str, ...] | None = None,
+        merger: MergerHook | None = None,
+    ) -> MergeReport:
+        if merger is not None:
+            raise NotImplementedError(
+                "custom merger hooks cannot cross the daemon RPC; "
+                "use a policy or run a local in-process engine"
+            )
+        payload: dict[str, Any] = {
+            "fork_sandbox_id": str(fork_sandbox_id),
+            "policy": policy,
+        }
+        if ignore_prefixes is not None:
+            payload["ignore_prefixes"] = [str(prefix) for prefix in ignore_prefixes]
+        try:
+            response = self._client.post_json(
+                f"/sandboxes/{source_sandbox_id}/merge",
+                payload,
+                timeout_seconds=600.0,  # quiesce + two backend diffs + apply
+            )
+        except DaemonRequestError as exc:
+            raise _map_merge_error(exc) from exc
+        return MergeReport.from_json(response["report"])
+
+    def changeset_since(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+        *,
+        use_inspector_gate: bool = True,
+    ) -> ChangesetResult:
+        _ = use_inspector_gate  # gate policy is daemon-side
+        response = self._client.post_json(
+            f"/sandboxes/{sandbox_id}/changeset",
+            {"since": str(checkpoint_id)},
+            timeout_seconds=300.0,
+        )
+        return ChangesetResult.from_json(response["changeset"])
+
+    def fork_changeset(self, sandbox_id: SandboxId) -> ChangesetResult:
+        response = self._client.post_json(
+            f"/sandboxes/{sandbox_id}/changeset",
+            {},
+            timeout_seconds=300.0,
+        )
+        return ChangesetResult.from_json(response["changeset"])
 
 
 class _ConfigShim:
@@ -654,6 +713,27 @@ def _map_txn_error(exc: DaemonRequestError) -> Exception:
     if error_type == "txn_abort_failed":
         return TxnAbortError(message)
     return exc
+
+
+def _map_merge_error(exc: DaemonRequestError) -> Exception:
+    """Rehydrate the daemon's 409 merge_error into MergeError, restoring
+    the serialized report when the failure produced one; anything
+    unrecognized re-raises the transport error."""
+    try:
+        payload = json.loads(exc.body.decode("utf-8", errors="replace"))
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict) or payload.get("error_type") != "merge_error":
+        return exc
+    message = str(payload.get("error")) if payload.get("error") else str(exc)
+    report = None
+    raw_report = payload.get("report")
+    if isinstance(raw_report, dict):
+        try:
+            report = MergeReport.from_json(raw_report)
+        except Exception:
+            logger.exception("Failed to rehydrate merge report from daemon 409")
+    return MergeError(message, report=report)
 
 
 def _deserialize_description(payload: Mapping[str, Any]) -> SandboxDescription:
