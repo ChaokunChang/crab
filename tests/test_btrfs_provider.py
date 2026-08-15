@@ -188,6 +188,55 @@ class BtrfsProviderCommandMappingTests(unittest.TestCase):
             ],
         )
 
+    def test_create_dataset_reclaims_plain_directory_wreckage(self) -> None:
+        # An interrupted shared-base materialization can leave a plain
+        # directory at the subvolume path (it doubles as the mountpoint);
+        # create_dataset must reclaim it or `subvolume create` fails.
+        dataset_path = Path(self.dataset)
+        (dataset_path / "bin").mkdir(parents=True)
+        show = ("btrfs", "subvolume", "show", self.dataset)
+        self.executor.responses[show] = (1, "", "ERROR: Not a Btrfs subvolume")
+
+        self.provider.create_dataset(
+            self.dataset,
+            self.rootfs,
+            operation="sandbox.zfs_create",
+            sandbox_id=SandboxId("sbx-1"),
+        )
+
+        self.assertFalse(dataset_path.exists())
+        self.assertEqual(
+            self.executor.commands,
+            [
+                show,
+                ("btrfs", "subvolume", "create", self.dataset),
+                ("mount", "--bind", self.dataset, str(self.rootfs)),
+            ],
+        )
+
+    def test_create_dataset_leaves_existing_subvolume_alone(self) -> None:
+        # A real subvolume at the path is not wreckage: never rmtree it.
+        dataset_path = Path(self.dataset)
+        (dataset_path / "bin").mkdir(parents=True)
+        # `subvolume show` succeeds (default response), so the contents
+        # survive and creation proceeds against the existing path.
+        self.provider.create_dataset(
+            self.dataset,
+            self.rootfs,
+            operation="sandbox.zfs_create",
+            sandbox_id=SandboxId("sbx-1"),
+        )
+
+        self.assertTrue((dataset_path / "bin").exists())
+        self.assertEqual(
+            self.executor.commands,
+            [
+                ("btrfs", "subvolume", "show", self.dataset),
+                ("btrfs", "subvolume", "create", self.dataset),
+                ("mount", "--bind", self.dataset, str(self.rootfs)),
+            ],
+        )
+
     def test_shared_rootfs_details_uses_subvolume_path_as_mountpoint(self) -> None:
         dataset, mountpoint = self.provider.shared_rootfs_details("img-key", persist_across_runs=False)
         self.assertEqual(Path(dataset), mountpoint)

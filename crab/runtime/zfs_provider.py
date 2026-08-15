@@ -12,6 +12,8 @@ from ..ids import CheckpointId, SandboxId
 from ..models import RuntimeOperationStatus
 from .base import CommandResult
 from .fs_provider import (
+    CHANGE_PRECEDENCE,
+    ChangesetEntry,
     DatasetResolver,
     FilesystemProvider,
     FsCommandExecutor,
@@ -26,6 +28,58 @@ _DATASET_DESTROY_BUSY_RETRY_DELAY_S = 0.5
 _DATASET_PROMOTE_CONFLICT_RETRIES = 8
 _PROMOTE_CONFLICTING_SNAPSHOT_RE = re.compile(r"conflicting snapshot '([^']+)'")
 _FS_REF_PREFIX = "zfs:"
+_ZFS_DIFF_CHANGE_KINDS = {"+": "added", "M": "modified", "-": "removed", "R": "renamed"}
+_ZFS_OCTAL_ESCAPE_RE = re.compile(r"\\(\d{4})")
+
+
+def _decode_zfs_diff_path(raw: str) -> str:
+    r"""zfs diff escapes non-printable path bytes as 4-digit octal
+    (space => ``\0040``)."""
+    return _ZFS_OCTAL_ESCAPE_RE.sub(lambda match: chr(int(match.group(1), 8)), raw)
+
+
+def _container_path(raw: str, mountpoint: str) -> str | None:
+    """Strip the live mountpoint prefix, yielding a ``/``-rooted
+    container path; None when the path is outside the rootfs."""
+    trimmed = mountpoint.rstrip("/")
+    if raw.rstrip("/") == trimmed:
+        return "/"
+    if raw.startswith(trimmed + "/"):
+        return raw[len(trimmed):]
+    return None
+
+
+def parse_zfs_diff(stdout: str, *, mountpoint: str) -> list[ChangesetEntry]:
+    """Parse ``zfs diff -FH`` output (tab-separated: change, type, path
+    [, rename-target]). Format pinned from real VM output — rename rows
+    carry old and new as the 3rd and 4th tab fields. The rootfs root's
+    own mtime churn ("/") is dropped as noise."""
+    entries: dict[str, ChangesetEntry] = {}
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split("\t")
+        if len(fields) < 3:
+            continue
+        change = _ZFS_DIFF_CHANGE_KINDS.get(fields[0])
+        if change is None:
+            continue
+        path = _container_path(_decode_zfs_diff_path(fields[2]), mountpoint)
+        if path is None or path == "/":
+            continue
+        renamed_from: str | None = None
+        if change == "renamed":
+            if len(fields) < 4:
+                continue
+            target = _container_path(_decode_zfs_diff_path(fields[3]), mountpoint)
+            if target is None:
+                continue
+            renamed_from = path
+            path = target
+        existing = entries.get(path)
+        if existing is None or CHANGE_PRECEDENCE[change] >= CHANGE_PRECEDENCE[existing.change]:
+            entries[path] = ChangesetEntry(path=path, change=change, renamed_from=renamed_from)
+    return [entries[key] for key in sorted(entries)]
 
 
 class ZfsProvider(FilesystemProvider):
@@ -460,7 +514,37 @@ class ZfsProvider(FilesystemProvider):
             checkpoint_id=checkpoint_id,
             metadata={"source_dataset": source_dataset, "target_dataset": target_dataset, "mountpoint": str(target_rootfs_path)},
         )
+        # Materialize the fork-point snapshot on the fork's own dataset
+        # (C1): gives changeset_since a local diff base, makes the fork
+        # manifests' stamped fs_ref real so retention can reclaim it, and
+        # decouples fork-point restores from the source's lineage.
+        self._run_command(
+            [self._zfs_bin, "snapshot", f"{target_dataset}@{checkpoint_id}"],
+            operation="sandbox.zfs_fork_point_snapshot",
+            sandbox_id=target_sandbox_id,
+            checkpoint_id=checkpoint_id,
+            metadata={"dataset": target_dataset},
+        )
         return target_dataset
+
+    def changeset_since(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> list[ChangesetEntry]:
+        dataset = self._dataset_resolver(sandbox_id)
+        snapshot = f"{dataset}@{checkpoint_id}"
+        if not self.snapshot_exists(snapshot):
+            raise FileNotFoundError(f"changeset base snapshot missing: {snapshot}")
+        mountpoint = str(self._rootfs_resolver(sandbox_id))
+        result = self._run_command(
+            [self._zfs_bin, "diff", "-FH", snapshot, dataset],
+            operation="sandbox.changeset_since",
+            sandbox_id=sandbox_id,
+            checkpoint_id=checkpoint_id,
+            metadata={"dataset": dataset, "snapshot": snapshot, "mountpoint": mountpoint},
+        )
+        return parse_zfs_diff(result.stdout, mountpoint=mountpoint)
 
     def discard_partial_checkpoint(
         self,

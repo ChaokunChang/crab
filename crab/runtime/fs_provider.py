@@ -5,8 +5,12 @@ from pathlib import Path
 from typing import Protocol
 
 from ..ids import CheckpointId, SandboxId
-from ..models import RuntimeOperationStatus
+from ..models import ChangesetEntry, RuntimeOperationStatus
 from .base import CommandResult
+
+# When a backend reports several change kinds for one path, the highest
+# precedence wins (shared by every provider's parser).
+CHANGE_PRECEDENCE = {"removed": 3, "renamed": 2, "added": 1, "modified": 0}
 
 
 class FsCommandExecutor(Protocol):
@@ -210,6 +214,17 @@ class FilesystemProvider(ABC):
     ) -> None:
         """Best-effort removal of a checkpoint's filesystem snapshot after
         a partially failed composite checkpoint."""
+
+    @abstractmethod
+    def changeset_since(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> list[ChangesetEntry]:
+        """Authoritative changed-path set of the live dataset relative to
+        the local base snapshot ``{dataset}@{checkpoint_id}``, sorted by
+        path. Raises ``FileNotFoundError`` when the base snapshot does
+        not exist on this sandbox's dataset."""
 
     @abstractmethod
     def destroy_snapshot_ref(self, fs_ref: str) -> None:

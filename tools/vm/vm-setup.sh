@@ -48,9 +48,14 @@ if ! mountpoint -q "$BTRFS_MNT"; then
         mkfs.btrfs -q "$BTRFS_FILE"
     fi
     mkdir -p "$BTRFS_MNT"
-    mount -o loop "$BTRFS_FILE" "$BTRFS_MNT"
+    mount -o loop,noatime "$BTRFS_FILE" "$BTRFS_MNT"
     grep -q "$BTRFS_FILE" /etc/fstab || \
-        echo "$BTRFS_FILE $BTRFS_MNT btrfs loop 0 0" >> /etc/fstab
+        echo "$BTRFS_FILE $BTRFS_MNT btrfs loop,noatime 0 0" >> /etc/fstab
+elif ! findmnt -no OPTIONS "$BTRFS_MNT" | grep -qw noatime; then
+    # atime updates leak into `btrfs send` diffs as utimes-only noise;
+    # the changeset provider needs noatime for zfs-parity semantics.
+    mount -o remount,noatime "$BTRFS_MNT"
+    sed -i "s|^$BTRFS_FILE $BTRFS_MNT btrfs loop 0 0\$|$BTRFS_FILE $BTRFS_MNT btrfs loop,noatime 0 0|" /etc/fstab
 fi
 
 echo "==> setup complete"

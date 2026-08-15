@@ -14,7 +14,7 @@ from threading import Lock
 
 from ..contracts import ActionRecorder, Runtime, TelemetrySink
 from ..ids import CheckpointId, SandboxId
-from ..models import RuntimeCapabilities, RuntimeOperationStatus, SandboxDescription, SandboxExecResult, SandboxRuntimeState, utc_now
+from ..models import ChangesetEntry, RuntimeCapabilities, RuntimeOperationStatus, SandboxDescription, SandboxExecResult, SandboxRuntimeState, utc_now
 from ..remote_inspector import HostInspectorServiceClient
 from ..telemetry import NoopTelemetrySink, start_operation, telemetry_capture_command_output, telemetry_is_detailed
 from .base import CommandResult, CommandRunner, SubprocessCommandRunner
@@ -463,7 +463,11 @@ class RuncRuntime(Runtime):
                         dataset,
                         operation="sandbox.zfs_destroy_incomplete_shared_rootfs",
                     )
-                mountpoint.mkdir(parents=True, exist_ok=True)
+                if str(mountpoint) != dataset:
+                    # btrfs uses the subvolume path itself as the
+                    # mountpoint; pre-creating it as a plain directory
+                    # would break `btrfs subvolume create`.
+                    mountpoint.mkdir(parents=True, exist_ok=True)
                 self._fs.create_dataset(
                     dataset,
                     mountpoint,
@@ -1779,6 +1783,13 @@ class RuncRuntime(Runtime):
         checkpoint_id: CheckpointId,
     ) -> dict[str, object]:
         return self._fs.filesystem_checkpoint_metadata(sandbox_id, checkpoint_id)
+
+    def changeset_since(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> list[ChangesetEntry]:
+        return self._fs.changeset_since(sandbox_id, checkpoint_id)
 
     def delete_runtime(
         self,

@@ -880,6 +880,36 @@ class Sandbox:
             records = records[-limit:]
         return [record.to_json() for record in records]
 
+    def changeset(self, since: str | CheckpointId | None = None) -> list[dict]:
+        """Changed rootfs paths (added/modified/removed/renamed) relative
+        to a base checkpoint's filesystem snapshot. ``since=None``
+        resolves this sandbox's fork point (``fork_created`` journal
+        marker); pass a checkpoint id for an explicit base. Raw truth
+        from the filesystem backend — no ignore filtering (that lands
+        with C2).
+
+        Local (in-process engine) only for now; the daemon RPC rides
+        with the C2 merge surface.
+        """
+        system = getattr(self._engine, "system", None)
+        if since is None:
+            fork_changeset = getattr(system, "fork_changeset", None)
+            if not callable(fork_changeset):
+                raise NotImplementedError(
+                    "changesets are not available on this engine "
+                    "(daemon-mode changeset RPC lands with C2)"
+                )
+            result = fork_changeset(self.sandbox_id)
+        else:
+            changeset_since = getattr(system, "changeset_since", None)
+            if not callable(changeset_since):
+                raise NotImplementedError(
+                    "changesets are not available on this engine "
+                    "(daemon-mode changeset RPC lands with C2)"
+                )
+            result = changeset_since(self.sandbox_id, CheckpointId(str(since)))
+        return [entry.to_json() for entry in result.entries]
+
     def begin(self, label: str | None = None) -> "Transaction":
         """Open a transaction: adaptive base checkpoint + observation
         staging armed + auto-checkpoints suppressed. Commit delivers the

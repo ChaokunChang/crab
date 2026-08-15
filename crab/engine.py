@@ -396,7 +396,9 @@ class EngineConfig:
     btrfs_root: Path | None = None
     """Root of the btrfs filesystem holding sandbox subvolumes. Only
     used when `filesystem_backend == "btrfs"`. Defaults to
-    `/var/lib/crab/btrfs` (the installer's `--fs-backend btrfs` mount)."""
+    `/var/lib/crab/btrfs` (the installer's `--fs-backend btrfs` mount).
+    Mount it `noatime` (the installer does): with atime enabled, mere
+    reads leak into `btrfs send`-based changesets as utimes-only noise."""
 
     btrfs_qgroups_enabled: bool = False
     """Enable btrfs qgroups-backed per-snapshot byte stats (real

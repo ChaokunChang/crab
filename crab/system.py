@@ -18,6 +18,8 @@ from .remote_inspector import HostInspectorServiceClient, RemoteSandboxInspector
 from .interceptor import InMemoryRequestStateStore, RequestAwareSandboxInspector, SandboxResponseGateRegistry
 from .models import (
     ArtifactPayload,
+    ChangesetEntry,
+    ChangesetResult,
     CheckpointManifest,
     CheckpointJob,
     CheckpointResult,
@@ -1149,6 +1151,121 @@ class CrabSystem:
                 manifest, "filesystem_artifacts", None
             ):
                 return checkpoint_id
+        return None
+
+    # ----- filesystem changesets (C1) ----------------------------------
+    # The backend diff (zfs diff / btrfs send) is the source of truth;
+    # the inspector gate is only a fast path that may skip the diff when
+    # it can prove the answer is "nothing changed".
+
+    def _latest_filesystem_checkpoint_id(self, sandbox_id: SandboxId) -> CheckpointId | None:
+        """Newest checkpoint carrying filesystem artifacts — the boundary
+        where the inspector's filesystem cursor was last reset."""
+        try:
+            checkpoint_ids = self.storage.list_checkpoints(sandbox_id)
+        except Exception:
+            return None
+        for checkpoint_id in reversed(list(checkpoint_ids)):
+            try:
+                manifest = self.storage.get_manifest(sandbox_id, checkpoint_id)
+            except Exception:
+                continue
+            if getattr(manifest, "filesystem_artifacts", None):
+                return checkpoint_id
+        return None
+
+    def changeset_since(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+        *,
+        use_inspector_gate: bool = True,
+    ) -> ChangesetResult:
+        """Changed rootfs paths of ``sandbox_id`` relative to
+        ``checkpoint_id``'s filesystem snapshot (C1). The inspector gate
+        may skip the backend diff only when it proves nothing touched
+        the filesystem since the last filesystem checkpoint AND that
+        checkpoint is the requested base; anything less falls through to
+        the authoritative diff."""
+        skipped_by_gate = False
+        if use_inspector_gate:
+            filesystem_changed = True
+            try:
+                snapshot = self.inspector.inspect(sandbox_id)
+                filesystem_changed = bool(snapshot.filesystem_changed)
+            except Exception:
+                filesystem_changed = True
+            if not filesystem_changed and self._latest_filesystem_checkpoint_id(sandbox_id) == checkpoint_id:
+                skipped_by_gate = True
+        if skipped_by_gate:
+            entries: tuple[ChangesetEntry, ...] = ()
+        else:
+            entries = tuple(self.runtime.changeset_since(sandbox_id, checkpoint_id))
+        result = ChangesetResult(
+            sandbox_id=sandbox_id,
+            base_checkpoint_id=checkpoint_id,
+            entries=entries,
+            skipped_by_gate=skipped_by_gate,
+        )
+        self._journal_lifecycle(
+            sandbox_id,
+            "changeset",
+            metadata={
+                "base_checkpoint_id": str(checkpoint_id),
+                "entry_count": len(entries),
+                "skipped_by_gate": skipped_by_gate,
+            },
+        )
+        self.telemetry.emit_event(
+            "changeset.computed",
+            self._telemetry_attrs(
+                sandbox_id,
+                component="system",
+                checkpoint_id=checkpoint_id,
+                extra={
+                    "entry_count": len(entries),
+                    "skipped_by_gate": skipped_by_gate,
+                },
+            ),
+        )
+        logger.info(
+            "Computed changeset sandbox=%s base=%s entries=%d skipped_by_gate=%s",
+            sandbox_id,
+            checkpoint_id,
+            len(entries),
+            skipped_by_gate,
+        )
+        return result
+
+    def fork_changeset(self, target_sandbox_id: SandboxId) -> ChangesetResult:
+        """Changeset of a fork relative to its fork point (the source
+        checkpoint snapshot materialized on the fork's own dataset at
+        clone time)."""
+        checkpoint_id = self._fork_point_checkpoint_id(target_sandbox_id)
+        if checkpoint_id is None:
+            raise ValueError(
+                f"no fork_created journal marker for {target_sandbox_id}; "
+                "fork_changeset only works for sandboxes created by fork_once "
+                "with the action journal enabled"
+            )
+        return self.changeset_since(target_sandbox_id, checkpoint_id)
+
+    def _fork_point_checkpoint_id(self, target_sandbox_id: SandboxId) -> CheckpointId | None:
+        journal = self.journal
+        if journal is None:
+            return None
+        try:
+            records = journal.entries(target_sandbox_id, kind="lifecycle")
+        except Exception:
+            logger.exception("Failed to read journal for fork point sandbox=%s", target_sandbox_id)
+            return None
+        for record in reversed(records):
+            if record.payload.get("event") != "fork_created":
+                continue
+            metadata = record.payload.get("metadata") or {}
+            raw = metadata.get("checkpoint_id")
+            if raw:
+                return CheckpointId(str(raw))
         return None
 
     # ----- observation staging (B1) -----------------------------------
