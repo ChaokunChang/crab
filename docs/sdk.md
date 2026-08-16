@@ -244,9 +244,15 @@ service behavior should be validated for each task.
   diffed against the recorded returncode/stdout digest (deviations are
   counted; `stop_on_deviation=True` aborts at the first one; the fork
   stays alive); with none, the fork is **promoted** wholesale onto this
-  sandbox's identity (PR-C4.2 — `policy`/`observations`/`lazy_pages`/
-  `force` steer it). Returns a ProcessMergeReport. Works both locally
-  and against the daemon (`crab sandbox merge-processes`).
+  sandbox's identity: the source's fs changes since the fork point are
+  first applied onto the fork (`policy`: fail_fast /
+  prefer_incoming / prefer_existing / text_merge), then the fork —
+  files and processes — takes over via the B3 swap, restored with CRIU
+  lazy-pages unless `lazy_pages=False`, its history adopted per
+  `observations`, and the fork destroyed. `force=True` promotes over
+  live source processes (they die). Returns a ProcessMergeReport.
+  Works both locally and against the daemon
+  (`crab sandbox merge-processes`).
 - `Sandbox.consolidate_observations(fork, policy="append",
   summarizer=None)` adopts a fork's journal history into this sandbox's
   journal as `kind="observation"` records with provenance (fork id,

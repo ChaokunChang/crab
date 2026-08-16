@@ -283,7 +283,9 @@ class CommitForkTxnTests(ForkTxnSystemBase):
         mocks.replicate.assert_called_once_with(
             self.fork, self.source, CheckpointId("ckpt-commit")
         )
-        mocks.restore.assert_called_once_with(self.source, CheckpointId("ckpt-commit"))
+        mocks.restore.assert_called_once_with(
+            self.source, CheckpointId("ckpt-commit"), restore_metadata=None
+        )
         self.assertEqual(
             [(call[0], call[1]) for call in self.fake.calls],
             [

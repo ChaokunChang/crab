@@ -8,6 +8,7 @@ import contextlib
 import hashlib
 import io
 import json
+import shutil
 import tempfile
 import threading
 import unittest
@@ -44,6 +45,9 @@ from crab.process_merge import (
     ProcessMergeConflict,
     replay_fork_execs,
 )
+from crab.system import ForkPromotionError
+from crab.ids import CheckpointId
+from crab.models import ChangesetEntry, ChangesetResult, ObservationReport
 from crab.remote_engine import RemoteEngine
 from crab.sandbox import Sandbox
 from crab.scheduler import FaultToleranceCheckpointingPolicy
@@ -176,7 +180,7 @@ class _ScriptedExec:
         return SandboxExecResult(args=tuple(argv), returncode=returncode, stdout=stdout)
 
 
-class SystemMergeProcessesTests(unittest.TestCase):
+class _MergeProcessesHarness(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="crab_procmerge_")
         self.addCleanup(self._tmp.cleanup)
@@ -236,6 +240,8 @@ class SystemMergeProcessesTests(unittest.TestCase):
             metadata={"source_sandbox_id": str(self.source), "checkpoint_id": "base-1"},
         )
 
+
+class SystemMergeProcessesTests(_MergeProcessesHarness):
     def test_auto_resolves_replay_and_runs_fork_history(self) -> None:
         _record_exec(self.journal, self.fork, ["echo", "one"], stdout="out")
         _record_exec(self.journal, self.fork, ["echo", "two"], returncode=2, stdout="dev")
@@ -281,12 +287,26 @@ class SystemMergeProcessesTests(unittest.TestCase):
 
     def test_auto_resolves_promote_when_source_is_quiet(self) -> None:
         self.exec_fake.probe_stdout = "2\n"
-        with self.assertRaises(NotImplementedError):
-            self.system.merge_processes(self.source, self.fork)
+        with mock.patch.object(
+            self.system, "_promote_processes", return_value=mock.sentinel.report
+        ) as promote:
+            result = self.system.merge_processes(self.source, self.fork)
+        self.assertIs(result, mock.sentinel.report)
+        promote.assert_called_once()
+        self.assertEqual(promote.call_args.kwargs["base_checkpoint_id"], CheckpointId("base-1"))
 
-    def test_explicit_promote_points_at_c42(self) -> None:
-        with self.assertRaises(NotImplementedError):
+    def test_promote_with_live_source_processes_refuses_without_force(self) -> None:
+        self.exec_fake.probe_stdout = "5\n"
+        with self.assertRaises(ProcessMergeConflict):
             self.system.merge_processes(self.source, self.fork, strategy="promote")
+        with mock.patch.object(
+            self.system, "_promote_processes", return_value=mock.sentinel.report
+        ) as promote:
+            result = self.system.merge_processes(
+                self.source, self.fork, strategy="promote", force=True
+            )
+        self.assertIs(result, mock.sentinel.report)
+        promote.assert_called_once()
 
     def test_stop_on_deviation_reflected_in_report(self) -> None:
         _record_exec(self.journal, self.fork, ["boom"], returncode=0, stdout="out")
@@ -334,6 +354,257 @@ class SystemMergeProcessesTests(unittest.TestCase):
         self.system.journal = None
         with self.assertRaises(RuntimeError):
             self.system.merge_processes(self.source, self.fork)
+
+
+class PromoteForkOntoSourceTests(_MergeProcessesHarness):
+    """The shared B3/C4 swap primitive: sequence, lazy_pages, failure
+    semantics."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.runtime_calls: list[tuple] = []
+        self.promote_source_error: Exception | None = None
+        rt = self.fake_runtime
+        rt.stop = lambda sid: self.runtime_calls.append(("stop", str(sid)))
+        rt.delete_runtime = lambda sid, **kw: self.runtime_calls.append(
+            ("delete_runtime", str(sid))
+        )
+        rt.destroy_filesystem_dataset = lambda sid: self.runtime_calls.append(
+            ("destroy_fs", str(sid))
+        )
+        rt.rootfs_path_for = lambda sid: self.root / str(sid) / "rootfs"
+        rt.clone_filesystem_snapshot = (
+            lambda src, ckpt, dst, *, target_rootfs_path: self.runtime_calls.append(
+                ("clone", str(src), str(ckpt), str(dst))
+            )
+        )
+
+        def _promote(sid):
+            self.runtime_calls.append(("promote", str(sid)))
+            if self.promote_source_error is not None and str(sid) == str(self.source):
+                raise self.promote_source_error
+
+        rt.promote_filesystem_dataset = _promote
+        self.restore_mock = mock.patch.object(
+            self.system,
+            "restore_once",
+            return_value=SimpleNamespace(status=SimpleNamespace(value="succeeded"), message=""),
+        ).start()
+        self.addCleanup(mock.patch.stopall)
+        mock.patch.object(
+            self.system,
+            "checkpoint_once",
+            return_value=SimpleNamespace(
+                status=SimpleNamespace(value="succeeded"),
+                checkpoint_id=CheckpointId("ckpt-p"),
+            ),
+        ).start()
+        mock.patch.object(
+            self.system, "_replicate_fork_checkpoint", return_value=CheckpointId("ckpt-p")
+        ).start()
+
+    def test_swap_sequence_and_lazy_pages(self) -> None:
+        promoted, retained = self.system._promote_fork_onto_source(
+            self.source, self.fork, lazy_pages=True
+        )
+        self.assertEqual(promoted, CheckpointId("ckpt-p"))
+        self.assertFalse(retained)
+        self.restore_mock.assert_called_once_with(
+            self.source, CheckpointId("ckpt-p"), restore_metadata={"lazy_pages": True}
+        )
+        self.assertEqual(
+            self.runtime_calls,
+            [
+                ("stop", str(self.source)),
+                ("delete_runtime", str(self.source)),
+                ("promote", str(self.fork)),
+                ("destroy_fs", str(self.source)),
+                ("clone", str(self.fork), "ckpt-p", str(self.source)),
+                ("promote", str(self.source)),
+            ],
+        )
+
+    def test_eager_restore_by_default(self) -> None:
+        self.system._promote_fork_onto_source(self.source, self.fork)
+        self.restore_mock.assert_called_once_with(
+            self.source, CheckpointId("ckpt-p"), restore_metadata=None
+        )
+
+    def test_restore_failure_raises_promotion_error(self) -> None:
+        self.restore_mock.return_value = SimpleNamespace(
+            status=SimpleNamespace(value="failed"), message="boom"
+        )
+        with self.assertRaises(ForkPromotionError):
+            self.system._promote_fork_onto_source(self.source, self.fork)
+
+    def test_detach_failure_retains_fork(self) -> None:
+        self.promote_source_error = RuntimeError("promote boom")
+        _, retained = self.system._promote_fork_onto_source(self.source, self.fork)
+        self.assertTrue(retained)
+
+
+class ApplySourceChangesTests(_MergeProcessesHarness):
+    """Promotion prep: the C2 engine with swapped roots carries the
+    source's fs changes onto the fork."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.changesets: dict[str, list[ChangesetEntry]] = {}
+        rt = self.fake_runtime
+        rt.rootfs_path_for = lambda sid: self.root / str(sid) / "rootfs"
+        rt.changeset_since = lambda sid, ckpt: list(self.changesets.get(str(sid), []))
+        rt.snapshot_content_root = (
+            lambda sid, ckpt: self.root / str(sid) / "snapshots" / str(ckpt)
+        )
+
+        def _snapshot(sid, ckpt):
+            snap = self.root / str(sid) / "snapshots" / str(ckpt)
+            shutil.copytree(rt.rootfs_path_for(sid), snap)
+            return SimpleNamespace(executed=True, reason=None)
+
+        rt.checkpoint_filesystem = _snapshot
+        rt.discard_partial_checkpoint = lambda sid, ckpt: None
+        for sid in (self.source, self.fork):
+            (self.root / str(sid) / "rootfs").mkdir(parents=True)
+        # The base snapshot content root on the source's dataset.
+        (self.root / str(self.source) / "snapshots" / "base-1").mkdir(parents=True)
+
+    def _rootfs(self, sid) -> Path:
+        return self.root / str(sid) / "rootfs"
+
+    def _apply(self, policy="fail_fast"):
+        return self.system._apply_source_changes_to_fork(
+            self.source, self.fork, CheckpointId("base-1"), policy=policy
+        )
+
+    def test_incoming_changes_land_on_fork(self) -> None:
+        (self._rootfs(self.source) / "new.txt").write_text("from-source\n")
+        self.changesets[str(self.source)] = [ChangesetEntry(path="/new.txt", change="added")]
+
+        applied, conflicted = self._apply()
+
+        self.assertEqual((applied, conflicted), (1, 0))
+        self.assertEqual((self._rootfs(self.fork) / "new.txt").read_text(), "from-source\n")
+
+    def test_conflict_policies(self) -> None:
+        (self._rootfs(self.source) / "shared.txt").write_text("incoming\n")
+        (self._rootfs(self.fork) / "shared.txt").write_text("existing\n")
+        self.changesets[str(self.source)] = [
+            ChangesetEntry(path="/shared.txt", change="modified")
+        ]
+        self.changesets[str(self.fork)] = [
+            ChangesetEntry(path="/shared.txt", change="modified")
+        ]
+
+        with self.assertRaises(ProcessMergeConflict):
+            self._apply()
+        self.assertEqual((self._rootfs(self.fork) / "shared.txt").read_text(), "existing\n")
+
+        applied, conflicted = self._apply(policy="prefer_incoming")
+        self.assertEqual((applied, conflicted), (1, 0))
+        self.assertEqual((self._rootfs(self.fork) / "shared.txt").read_text(), "incoming\n")
+
+        (self._rootfs(self.fork) / "shared.txt").write_text("existing\n")
+        applied, conflicted = self._apply(policy="prefer_existing")
+        self.assertEqual(applied, 0)
+        self.assertEqual((self._rootfs(self.fork) / "shared.txt").read_text(), "existing\n")
+
+    def test_no_incoming_changes_short_circuits(self) -> None:
+        snapshot_calls = []
+        self.fake_runtime.checkpoint_filesystem = (
+            lambda sid, ckpt: snapshot_calls.append(str(sid))
+        )
+        self.assertEqual(self._apply(), (0, 0))
+        self.assertEqual(snapshot_calls, [])
+
+    def test_guards(self) -> None:
+        with self.assertRaises(ValueError):
+            self._apply(policy="prefer_fork")
+        self.changesets[str(self.source)] = [ChangesetEntry(path="/x", change="added")]
+
+        def _raise(sid, ckpt):
+            raise FileNotFoundError("snapshot missing")
+
+        self.fake_runtime.changeset_since = _raise
+        with self.assertRaises(ProcessMergeConflict):
+            self._apply()
+
+
+class PromoteOrchestrationTests(_MergeProcessesHarness):
+    def setUp(self) -> None:
+        super().setUp()
+        self.destroyed: list[str] = []
+        self.system.configure_fork_txn_hooks(
+            fork=lambda source_id: self.fork,
+            destroy=lambda fork_id: self.destroyed.append(str(fork_id)),
+        )
+        self.exec_fake.probe_stdout = "2\n"  # quiet source -> promote
+        self.apply_mock = mock.patch.object(
+            self.system, "_apply_source_changes_to_fork", return_value=(2, 0)
+        ).start()
+        self.promote_mock = mock.patch.object(
+            self.system,
+            "_promote_fork_onto_source",
+            return_value=(CheckpointId("ckpt-p"), False),
+        ).start()
+        self.addCleanup(mock.patch.stopall)
+        _record_exec(self.journal, self.fork, ["make", "thing"])
+
+    def test_full_promote_flow(self) -> None:
+        report = self.system.merge_processes(self.source, self.fork)
+
+        self.assertEqual(report.strategy, "promote")
+        self.assertEqual(report.promoted_checkpoint_id, "ckpt-p")
+        self.assertEqual(report.fs_applied, 2)
+        self.assertIsNotNone(report.observations)
+        self.assertEqual(report.observations.reason, "process_merge")
+        self.assertEqual(self.destroyed, [str(self.fork)])
+        self.apply_mock.assert_called_once_with(
+            self.source, self.fork, CheckpointId("base-1"), policy="fail_fast"
+        )
+        self.promote_mock.assert_called_once_with(
+            self.source, self.fork, lazy_pages=True
+        )
+        markers = [
+            record.payload["metadata"]
+            for record in self.journal.entries(self.source, kind="lifecycle")
+            if record.payload.get("event") == "process_promote"
+        ]
+        self.assertEqual(len(markers), 1)
+        self.assertEqual(markers[0]["promoted_checkpoint_id"], "ckpt-p")
+        round_trip = ProcessMergeReport.from_json(report.to_json())
+        self.assertEqual(round_trip, report)
+
+    def test_knob_passthrough_and_no_observations(self) -> None:
+        report = self.system.merge_processes(
+            self.source,
+            self.fork,
+            strategy="promote",
+            policy="prefer_incoming",
+            observations="none",
+            lazy_pages=False,
+        )
+        self.apply_mock.assert_called_once_with(
+            self.source, self.fork, CheckpointId("base-1"), policy="prefer_incoming"
+        )
+        self.promote_mock.assert_called_once_with(
+            self.source, self.fork, lazy_pages=False
+        )
+        self.assertIsNone(report.observations)
+
+    def test_fork_retained_skips_destroy(self) -> None:
+        self.promote_mock.return_value = (CheckpointId("ckpt-p"), True)
+        report = self.system.merge_processes(self.source, self.fork)
+        self.assertEqual(self.destroyed, [])
+        self.assertEqual(report.promoted_checkpoint_id, "ckpt-p")
+
+    def test_consolidation_failure_tolerated(self) -> None:
+        with mock.patch.object(
+            self.system, "consolidate_observations", side_effect=RuntimeError("obs boom")
+        ):
+            report = self.system.merge_processes(self.source, self.fork)
+        self.assertIsNone(report.observations)
+        self.assertEqual(report.promoted_checkpoint_id, "ckpt-p")
 
 
 class SandboxPlumbingTests(unittest.TestCase):
