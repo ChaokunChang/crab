@@ -23,10 +23,13 @@ logger = logging.getLogger(__name__)
 
 PROCESS_MERGE_STRATEGIES: tuple[str, ...] = ("auto", "replay", "promote")
 
-# Container-side process census. The probe's own shell counts, so the
-# quiescent baseline is 2 (container init + probe): anything above it
-# means background processes are present.
-PROCESS_PROBE_ARGV: tuple[str, ...] = ("sh", "-c", "ls -d /proc/[0-9]* | wc -l")
+# Container-side process census. Pure shell builtins (glob + positional
+# count) so the probe spawns no children of its own — a pipeline like
+# `ls | wc -l` shows up as three extra PIDs and races its own teardown.
+# The probe shell itself counts, so the quiescent baseline is 2
+# (container init + probe): anything above it means background
+# processes are present.
+PROCESS_PROBE_ARGV: tuple[str, ...] = ("sh", "-c", "set -- /proc/[0-9]*; echo $#")
 PROCESS_PROBE_BASELINE = 2
 
 

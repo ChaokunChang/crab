@@ -96,6 +96,22 @@ logger = logging.getLogger(__name__)
 OBSERVATION_POLICIES: tuple[str, ...] = ("append", "dedupe", "none")
 SummarizerHook = Callable[[list], object]
 
+# C4 promotion policies for the reverse fs apply (source changes onto
+# the fork before it takes over); direction-neutral names mapped onto
+# the C2 engine to avoid "prefer_fork" ambiguity in this context.
+PROMOTION_POLICIES: dict[str, str] = {
+    "fail_fast": "fail_fast",
+    "prefer_incoming": "prefer_fork",
+    "prefer_existing": "prefer_source",
+    "text_merge": "text_merge",
+}
+
+
+class ForkPromotionError(RuntimeError):
+    """The fork->source identity swap failed mid-flight. The fork is
+    intact and still holds the promoted state — the operation is
+    retryable against it."""
+
 _CAPTURES_INFLIGHT_LLM = "captures_inflight_llm"
 _CAPTURED_REQUEST_ID = "captured_request_id"
 _CAPTURED_REQUEST_GENERATION = "captured_request_generation"
@@ -1392,68 +1408,16 @@ class CrabSystem:
                         "since the fork point; commit with force=True to discard them "
                         "or abort the transaction"
                     )
-            # 2. Dump the fork. It stays alive: a failed swap below is
-            # retryable against this same live fork.
-            checkpoint_result = self.checkpoint_once(fork_id, leave_running=True)
-            if checkpoint_result.status.value != "succeeded" or checkpoint_result.checkpoint_id is None:
-                raise TxnError(
-                    f"fork-txn commit checkpoint failed for {fork_id}: "
-                    f"status={checkpoint_result.status.value}; the txn stays open — retry commit"
-                )
-            commit_checkpoint_id = checkpoint_result.checkpoint_id
-            # 3. Replicate the checkpoint chain onto the source id, fully
-            # materialized (no symlinks into the fork: it dies afterwards).
-            filesystem_checkpoint_id = self._replicate_fork_checkpoint(
-                fork_id, source_id, commit_checkpoint_id
-            )
-            # ---- point of no return: the source container goes down and
-            # its dataset is replaced by the fork's committed snapshot.
+            # 2-8. Promote the fork's whole state onto the source's own
+            # identity — shared with C4's promotion-based process merge.
+            # The fork stays alive until the swap is proven, so failures
+            # leave the txn open and commit retryable.
             try:
-                self.runtime.stop(source_id)
-            except Exception:
-                logger.debug("Source stop before fork-txn swap failed", exc_info=True)
-            try:
-                self.runtime.delete_runtime(source_id, force=True, ignore_missing=True)
-            except Exception:
-                logger.debug("Source runtime delete before fork-txn swap failed", exc_info=True)
-            # The fork is a clone of source@fork-point: promote it first
-            # so destroying the source dataset is not blocked by the
-            # dependency (zfs; btrfs promote is a no-op). This also
-            # unbinds/destroys the source's old rootfs mount so the clone
-            # lands on a clean mountpoint.
-            self.runtime.promote_filesystem_dataset(fork_id)
-            self.runtime.destroy_filesystem_dataset(source_id)
-            source_rootfs = Path(self.runtime.rootfs_path_for(source_id))
-            self.runtime.clone_filesystem_snapshot(
-                fork_id,
-                filesystem_checkpoint_id,
-                source_id,
-                target_rootfs_path=source_rootfs,
-            )
-            restore = self.restore_once(source_id, commit_checkpoint_id)
-            if restore.status.value != "succeeded":
-                raise TxnError(
-                    f"fork-txn commit restore failed for {source_id}: "
-                    f"status={restore.status.value} message={restore.message}; "
-                    "the fork is intact — retry commit"
+                commit_checkpoint_id, fork_retained = self._promote_fork_onto_source(
+                    source_id, fork_id
                 )
-            if self._fork_txn_lease_repair is not None:
-                try:
-                    self._fork_txn_lease_repair(source_id)
-                except Exception:
-                    logger.exception("Lease repair after fork-txn commit failed sandbox=%s", source_id)
-            # Detach the source's new dataset from the fork's snapshot so
-            # the fork can die (zfs; btrfs promote is a no-op).
-            fork_retained = False
-            try:
-                self.runtime.promote_filesystem_dataset(source_id)
-            except Exception:
-                fork_retained = True
-                logger.exception(
-                    "Promote after fork-txn commit failed; keeping fork %s alive "
-                    "(the source dataset still depends on it)",
-                    fork_id,
-                )
+            except ForkPromotionError as exc:
+                raise TxnError(f"{exc}; the txn stays open — retry commit") from exc
             # The committed observations flow now.
             registry = self.response_gate_registry
             if registry is not None:
@@ -1539,6 +1503,86 @@ class CrabSystem:
         except Exception:
             operation.finish(status="failed")
             raise
+
+    def _promote_fork_onto_source(
+        self,
+        source_id: SandboxId,
+        fork_id: SandboxId,
+        *,
+        lazy_pages: bool = False,
+    ) -> tuple[CheckpointId, bool]:
+        """Shared B3/C4 swap: promote the fork's whole state (filesystem
+        + processes) onto the source's unchanged identity. Returns
+        ``(promoted_checkpoint_id, fork_retained)``. The fork stays
+        alive until the swap is proven — failures raise
+        ``ForkPromotionError`` and are retryable against the live fork;
+        ``fork_retained=True`` means the final detach promote failed and
+        the fork must NOT be destroyed."""
+        # Dump the fork; it keeps running.
+        checkpoint_result = self.checkpoint_once(fork_id, leave_running=True)
+        if checkpoint_result.status.value != "succeeded" or checkpoint_result.checkpoint_id is None:
+            raise ForkPromotionError(
+                f"promotion checkpoint failed for {fork_id}: "
+                f"status={checkpoint_result.status.value}"
+            )
+        commit_checkpoint_id = checkpoint_result.checkpoint_id
+        # Replicate the checkpoint chain onto the source id, fully
+        # materialized (no symlinks into the fork: it dies afterwards).
+        filesystem_checkpoint_id = self._replicate_fork_checkpoint(
+            fork_id, source_id, commit_checkpoint_id
+        )
+        # ---- point of no return: the source container goes down and
+        # its dataset is replaced by the fork's committed snapshot.
+        try:
+            self.runtime.stop(source_id)
+        except Exception:
+            logger.debug("Source stop before promotion swap failed", exc_info=True)
+        try:
+            self.runtime.delete_runtime(source_id, force=True, ignore_missing=True)
+        except Exception:
+            logger.debug("Source runtime delete before promotion swap failed", exc_info=True)
+        # The fork is a clone of source@fork-point: promote it first so
+        # destroying the source dataset is not blocked by the dependency
+        # (zfs; btrfs promote is a no-op). destroy_filesystem_dataset
+        # also unbinds the source's old rootfs mount so the clone lands
+        # on a clean mountpoint.
+        self.runtime.promote_filesystem_dataset(fork_id)
+        self.runtime.destroy_filesystem_dataset(source_id)
+        source_rootfs = Path(self.runtime.rootfs_path_for(source_id))
+        self.runtime.clone_filesystem_snapshot(
+            fork_id,
+            filesystem_checkpoint_id,
+            source_id,
+            target_rootfs_path=source_rootfs,
+        )
+        restore = self.restore_once(
+            source_id,
+            commit_checkpoint_id,
+            restore_metadata={"lazy_pages": True} if lazy_pages else None,
+        )
+        if restore.status.value != "succeeded":
+            raise ForkPromotionError(
+                f"promotion restore failed for {source_id}: "
+                f"status={restore.status.value} message={restore.message}; the fork is intact"
+            )
+        if self._fork_txn_lease_repair is not None:
+            try:
+                self._fork_txn_lease_repair(source_id)
+            except Exception:
+                logger.exception("Lease repair after promotion failed sandbox=%s", source_id)
+        # Detach the source's new dataset from the fork's snapshot so
+        # the fork can die (zfs; btrfs promote is a no-op).
+        fork_retained = False
+        try:
+            self.runtime.promote_filesystem_dataset(source_id)
+        except Exception:
+            fork_retained = True
+            logger.exception(
+                "Detach promote after promotion failed; keeping fork %s alive "
+                "(the source dataset still depends on it)",
+                fork_id,
+            )
+        return commit_checkpoint_id, fork_retained
 
     def _replicate_fork_checkpoint(
         self,
@@ -2294,8 +2338,10 @@ class CrabSystem:
     # ----- process merge (C4) ------------------------------------------
     # The process half of consolidation. "replay" re-runs the fork's
     # journaled execs on a source that keeps its own live processes;
-    # "promote" (PR-C4.2) rides B3's swap machinery; "auto" resolves
-    # from a container-side process census on the source.
+    # "promote" applies the source's fs changes onto the fork and then
+    # promotes the fork — processes and all — onto the source's
+    # identity via the shared B3 swap (lazy-pages by default); "auto"
+    # resolves from a container-side process census on the source.
 
     def _count_source_processes(self, sandbox_id: SandboxId) -> int:
         """Container-side PID census. The probe's own shell counts, so
@@ -2335,9 +2381,13 @@ class CrabSystem:
         when the source runs background processes (a promotion would
         kill them) and ``promote`` otherwise. Replay re-executes the
         fork's journal exec records on the source verbatim and reports
-        deviations against the recorded outcomes; ``promote`` (with the
-        ``policy``/``observations``/``lazy_pages``/``force`` knobs)
-        lands with PR-C4.2."""
+        deviations against the recorded outcomes. Promote brings the
+        fork up to date with the source's fs changes (``policy``:
+        fail_fast / prefer_incoming / prefer_existing / text_merge),
+        promotes it wholesale onto the source's identity (lazy-pages
+        restore unless ``lazy_pages=False``), adopts its history per
+        ``observations`` and destroys it; ``force=True`` promotes over
+        live source processes (they die)."""
         if strategy not in PROCESS_MERGE_STRATEGIES:
             raise ValueError(
                 f"unknown process merge strategy: {strategy!r} "
@@ -2377,9 +2427,20 @@ class CrabSystem:
                 fork_sandbox_id,
             )
         if resolved == "promote":
-            raise NotImplementedError(
-                "process merge strategy 'promote' lands with PR-C4.2; "
-                "use strategy='replay' for now"
+            if has_background and not force:
+                raise ProcessMergeConflict(
+                    f"source {source_sandbox_id} runs background processes "
+                    f"(census={source_processes}); promotion would kill them — "
+                    "use strategy='replay', or force=True to accept the loss"
+                )
+            return self._promote_processes(
+                source_sandbox_id,
+                fork_sandbox_id,
+                base_checkpoint_id=CheckpointId(str(_base_checkpoint_id)),
+                policy=policy,
+                observations=observations,
+                lazy_pages=lazy_pages,
+                source_processes=source_processes,
             )
         operation = start_operation(
             self.telemetry,
@@ -2453,6 +2514,212 @@ class CrabSystem:
         except Exception:
             operation.finish(status="failed")
             raise
+
+    def _apply_source_changes_to_fork(
+        self,
+        source_id: SandboxId,
+        fork_id: SandboxId,
+        base_checkpoint_id: CheckpointId,
+        *,
+        policy: str,
+    ) -> tuple[int, int]:
+        """Promotion prep (C4): bring the fork up to date with the
+        source's filesystem changes since the fork point so nothing of
+        the source's work is lost when the fork takes over. The C2
+        plan/apply engine runs with swapped roots; ``prefer_incoming``
+        keeps the source's version on conflicts, ``prefer_existing`` the
+        fork's. Returns ``(applied, conflicted)``; ``fail_fast``
+        conflicts raise ProcessMergeConflict before any write, apply
+        failures roll back path-level from a transient snapshot on the
+        fork's dataset."""
+        engine_policy = PROMOTION_POLICIES.get(policy)
+        if engine_policy is None:
+            raise ValueError(
+                f"unknown promotion policy: {policy!r} "
+                f"(expected one of {tuple(PROMOTION_POLICIES)})"
+            )
+        try:
+            incoming = self.changeset_since(source_id, base_checkpoint_id)
+        except FileNotFoundError as exc:
+            raise ProcessMergeConflict(
+                f"source lost its fork-point snapshot ({exc}); "
+                "cannot compute the changes to carry over"
+            ) from exc
+        if not incoming.entries:
+            return 0, 0
+        existing = self.changeset_since(fork_id, base_checkpoint_id)
+        source_root = Path(self.runtime.rootfs_path_for(source_id))
+        fork_root = Path(self.runtime.rootfs_path_for(fork_id))
+        base_root = Path(self.runtime.snapshot_content_root(source_id, base_checkpoint_id))
+        # Direction swap: the "fork side" of the engine is whoever's
+        # changes are being applied — here the source's, onto the fork.
+        plan = plan_merge(
+            fork_entries=incoming.entries,
+            source_entries=existing.entries,
+            policy=engine_policy,
+            fork_root=source_root,
+            source_root=fork_root,
+            base_root=base_root,
+        )
+        if plan.aborted:
+            raise ProcessMergeConflict(
+                f"promotion blocked: {len(plan.conflicted)} conflicting path(s) between "
+                "the source's and the fork's changes; use policy='prefer_incoming' or "
+                "'prefer_existing', or resolve manually"
+            )
+        applied = len(plan.entries_to_apply)
+        conflicted = len(plan.conflicted)
+        if plan.ops:
+            snapshot_id = CheckpointId(f"merge-{uuid.uuid4().hex[:8]}")
+            status = self.runtime.checkpoint_filesystem(fork_id, snapshot_id)
+            if getattr(status, "executed", True) is False:
+                raise ProcessMergeConflict(
+                    f"pre-apply snapshot failed on the fork: {getattr(status, 'reason', None)}"
+                )
+            try:
+                undo_root = Path(self.runtime.snapshot_content_root(fork_id, snapshot_id))
+                try:
+                    apply_plan(
+                        plan,
+                        source_root=fork_root,
+                        fork_root=source_root,
+                        undo_root=undo_root,
+                    )
+                except MergeApplyError as exc:
+                    raise ProcessMergeConflict(
+                        f"promotion fs apply failed and was rolled back: {exc}"
+                    ) from exc
+            finally:
+                try:
+                    self.runtime.discard_partial_checkpoint(fork_id, snapshot_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to discard promotion prep snapshot fork=%s", fork_id
+                    )
+        return applied, conflicted
+
+    def _promote_processes(
+        self,
+        source_id: SandboxId,
+        fork_id: SandboxId,
+        *,
+        base_checkpoint_id: CheckpointId,
+        policy: str,
+        observations: str,
+        lazy_pages: bool,
+        source_processes: int,
+    ) -> ProcessMergeReport:
+        operation = start_operation(
+            self.telemetry,
+            "process_merge.flow",
+            self._telemetry_attrs(
+                source_id,
+                component="system",
+                extra={
+                    "fork_sandbox_id": str(fork_id),
+                    "strategy": "promote",
+                    "source_processes": source_processes,
+                    "lazy_pages": lazy_pages,
+                },
+            ),
+        )
+        paused: list[SandboxId] = []
+        try:
+            # Quiesce both sides for the reverse apply window (the swap
+            # afterwards dumps the live fork and stops the source itself).
+            for sandbox_id in (fork_id, source_id):
+                if self._pause_for_merge(sandbox_id):
+                    paused.append(sandbox_id)
+            fs_applied, fs_conflicted = self._apply_source_changes_to_fork(
+                source_id, fork_id, base_checkpoint_id, policy=policy
+            )
+            for sandbox_id in paused:
+                try:
+                    self.runtime.resume(sandbox_id)
+                except Exception:
+                    logger.exception("Failed to resume before promotion sandbox=%s", sandbox_id)
+            paused = []
+            promoted_checkpoint_id, fork_retained = self._promote_fork_onto_source(
+                source_id, fork_id, lazy_pages=lazy_pages
+            )
+            # Adopt the fork's history (B3 commit semantics: the fork is
+            # consumed); failures never unwind the completed swap.
+            observation_report = None
+            if observations != "none":
+                try:
+                    observation_report = self.consolidate_observations(
+                        source_id, fork_id, policy=observations, reason="process_merge"
+                    )
+                except Exception:
+                    logger.exception(
+                        "Observation consolidation after promotion failed source=%s fork=%s",
+                        source_id,
+                        fork_id,
+                    )
+            self._journal_lifecycle(
+                source_id,
+                "process_promote",
+                metadata={
+                    "fork_sandbox_id": str(fork_id),
+                    "promoted_checkpoint_id": str(promoted_checkpoint_id),
+                    "fs_applied": fs_applied,
+                    "fs_conflicted": fs_conflicted,
+                    "lazy_pages": lazy_pages,
+                    "fork_retained": fork_retained,
+                },
+            )
+            self.telemetry.emit_event(
+                "process_merge.completed",
+                self._telemetry_attrs(
+                    source_id,
+                    component="system",
+                    checkpoint_id=promoted_checkpoint_id,
+                    extra={
+                        "fork_sandbox_id": str(fork_id),
+                        "strategy": "promote",
+                        "fs_applied": fs_applied,
+                        "fs_conflicted": fs_conflicted,
+                        "lazy_pages": lazy_pages,
+                    },
+                ),
+            )
+            if not fork_retained and self._fork_txn_destroy is not None:
+                try:
+                    self._fork_txn_destroy(fork_id)
+                except Exception:
+                    logger.exception("Failed to destroy fork after promotion fork=%s", fork_id)
+            logger.info(
+                "Promoted fork %s onto %s at %s (fs_applied=%d, lazy_pages=%s)",
+                fork_id,
+                source_id,
+                promoted_checkpoint_id,
+                fs_applied,
+                lazy_pages,
+            )
+            report = ProcessMergeReport(
+                source_sandbox_id=source_id,
+                fork_sandbox_id=fork_id,
+                strategy="promote",
+                source_processes=source_processes,
+                promoted_checkpoint_id=str(promoted_checkpoint_id),
+                fs_applied=fs_applied,
+                fs_conflicted=fs_conflicted,
+                observations=observation_report,
+            )
+            operation.finish(
+                status="succeeded",
+                attributes={"checkpoint_id": str(promoted_checkpoint_id)},
+            )
+            return report
+        except Exception:
+            operation.finish(status="failed")
+            raise
+        finally:
+            for sandbox_id in paused:
+                try:
+                    self.runtime.resume(sandbox_id)
+                except Exception:
+                    logger.exception("Failed to resume after promotion sandbox=%s", sandbox_id)
 
     # ----- observation staging (B1) -----------------------------------
     # Thin facade over the response-gate registry's staging extension so
