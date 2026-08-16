@@ -206,6 +206,27 @@ class ActionJournal:
             txn_id=txn_id,
         )
 
+    def record_egress(
+        self,
+        sandbox_id: SandboxId | str,
+        *,
+        payload: dict,
+        txn_id: str | None = None,
+    ) -> ActionRecord:
+        """Effect ledger (D1): one record per completed egress flow with
+        the host/destination/protocol facts the proxy could observe
+        without decrypting anything. The journal is the ledger's only
+        store, so flows inherit ordering and the active-txn stamp."""
+        now = utc_now().isoformat()
+        return self._append(
+            sandbox_id,
+            kind="egress",
+            payload=payload,
+            started_at=now,
+            finished_at=now,
+            txn_id=txn_id,
+        )
+
     def record_observation(
         self,
         sandbox_id: SandboxId | str,

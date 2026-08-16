@@ -267,12 +267,25 @@ service behavior should be validated for each task.
 - `Sandbox.actions(kind=None, limit=None)` reads the per-sandbox action
   journal: every exec attempt (argv, cwd, env, exit status, timing;
   stdout/stderr as size+sha256 only) plus lifecycle markers
-  (launch/checkpoint/restore/fork/destroy) and adopted fork history
-  (`kind="observation"`, C3). Journals are JSONL files under
+  (launch/checkpoint/restore/fork/destroy), adopted fork history
+  (`kind="observation"`, C3) and egress flows (`kind="egress"`, D1).
+  Journals are JSONL files under
   `{storage_root}/journal/` and record env values verbatim — treat them
   with the same care as checkpoint images. Works both locally and
   against the daemon (`crab sandbox actions`); disable recording with
   `EngineConfig(enable_action_journal=False)`.
+- **Egress interception (D1)** is opt-in via
+  `EngineConfig(enable_egress_proxy=True)` (config: `egress.enabled`),
+  and requires `runtime="runc"` with `enable_sandbox_network=True` —
+  the bridge netns is the redirect hook point, so enabling it also puts
+  sandboxes in that netns. Every outbound TCP connection is redirected
+  into a host-side transparent proxy that records one journal row per
+  flow: host (HTTP `Host` header or TLS SNI), destination ip/port,
+  scheme (`http`/`tls`/`tcp`), method/path for plaintext HTTP, byte
+  counts and duration. Nothing is decrypted (no CA injection in v1) and
+  bytes are spliced untouched. Host-bound traffic is never redirected,
+  so the LLM interceptor path is unaffected. Flows opened inside a
+  transaction carry its `txn_id`.
 - Daemon restart rehydration is not implemented.
 - Exec output is buffered; streaming and PTY support are not implemented.
 - `resources`, `timeout`, and `labels` constructor arguments are currently

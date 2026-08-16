@@ -374,6 +374,17 @@ class EngineConfig:
     action journal under the storage root (roadmap B1). Cheap JSONL
     appends; disable for runs that must avoid any extra I/O."""
 
+    enable_egress_proxy: bool = False
+    """Route all sandbox TCP egress through the host-side transparent
+    proxy and record every flow in the effect ledger (roadmap D1).
+    Off by default: it rewires the sandbox's outbound path. Requires
+    runtime="runc", enable_sandbox_network=True and the action journal
+    (the ledger's store). Host-bound traffic is never redirected, so the
+    LLM interceptor path is unaffected."""
+
+    egress_proxy_port: int = 0
+    """Port for the egress proxy; 0 picks a free one."""
+
     network_expected_sandboxes: int | None = None
     """Optional capacity hint for the bridge network allocator."""
 
@@ -469,6 +480,7 @@ class EngineConfig:
         logging_config = _optional_mapping(data.get("logging"), label="logging")
         host_inspector = _optional_mapping(data.get("host_inspector"), label="host_inspector")
         journal_data = _optional_mapping(data.get("journal"), label="journal")
+        egress = _optional_mapping(data.get("egress"), label="egress")
 
         default_workers = _as_int(data.get("max_workers"), default=None)
         executor_data = _optional_mapping(data.get("executor"), label="executor")
@@ -554,6 +566,15 @@ class EngineConfig:
                 journal_data.get("enabled", data.get("enable_action_journal")),
                 default=True,
             ),
+            enable_egress_proxy=_as_bool(
+                egress.get("enabled", data.get("enable_egress_proxy")),
+                default=False,
+            ),
+            egress_proxy_port=_as_int(
+                egress.get("port", data.get("egress_proxy_port")),
+                default=0,
+            )
+            or 0,
             network_expected_sandboxes=_as_int(
                 network.get("expected_sandboxes", data.get("network_expected_sandboxes")),
                 default=None,
@@ -666,6 +687,7 @@ class Engine:
         self._forwarder_thread: threading.Thread | None = None
         self._forwarder_base_url: str | None = None
         self._network_manager = None
+        self._egress_proxy: Any = None
         self._host_inspector_client: HostInspectorServiceClient | None = None
         self._host_inspector_process: subprocess.Popen[str] | None = None
         self._host_inspector_server: Any = None
@@ -763,9 +785,14 @@ class Engine:
 
                 network_manager = BenchmarkNetworkManager()
                 network_manager.configure(expected_sandboxes=cfg.network_expected_sandboxes)
-                if cfg.enable_interceptor:
+                if cfg.enable_interceptor or cfg.enable_egress_proxy:
                     network_manager.ensure_bridge()
                 self._network_manager = network_manager
+            elif cfg.enable_egress_proxy:
+                raise RuntimeError(
+                    "enable_egress_proxy requires runtime='runc' with "
+                    "enable_sandbox_network=True (the bridge is the redirect hook point)"
+                )
 
             if cfg.runtime == "runc":
                 self._start_host_inspector_if_configured()
@@ -832,6 +859,25 @@ class Engine:
                     cfg.runtime,
                     storage_root,
                 )
+
+            if cfg.enable_egress_proxy:
+                # All sandbox TCP egress lands here (bridge REDIRECT);
+                # host-bound flows are excluded by the rule, so the
+                # interceptor path above is untouched.
+                from .egress import EgressProxyServer
+
+                manager = self._network_manager
+                assert manager is not None  # guarded above
+                proxy = EgressProxyServer(
+                    journal=getattr(self._system, "journal", None),
+                    sandbox_id_resolver=manager.resolve_sandbox_id,
+                    host="0.0.0.0",
+                    port=cfg.egress_proxy_port,
+                )
+                proxy.start()
+                manager.enable_egress_redirect(proxy.port)
+                self._egress_proxy = proxy
+                logger.info("Egress interception active: proxy_port=%d", proxy.port)
 
             self._system.start()
             self._started = True
@@ -1168,6 +1214,17 @@ class Engine:
             except Exception:
                 logger.debug("Best-effort sandbox kill failed during engine stop", exc_info=True)
         with self._lock:
+            if self._egress_proxy is not None:
+                if self._network_manager is not None:
+                    try:
+                        self._network_manager.disable_egress_redirect()
+                    except Exception:
+                        logger.exception("Egress redirect teardown failed")
+                try:
+                    self._egress_proxy.stop()
+                except Exception:
+                    logger.exception("Egress proxy stop failed")
+                self._egress_proxy = None
             if self._interceptor is not None:
                 try:
                     self._interceptor.stop()
