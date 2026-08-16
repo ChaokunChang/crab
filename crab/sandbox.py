@@ -454,13 +454,16 @@ class Sandbox:
     def _requires_network_namespace(self) -> bool:
         if self._network_requested is not None:
             return bool(self._network_requested)
-        if (
-            self._engine.runtime.name == "runc"
-            and self._engine.config.enable_sandbox_network
-            and self._engine.config.enable_interceptor
-        ):
-            return True
-        return False
+        config = self._engine.config
+        if self._engine.runtime.name != "runc" or not config.enable_sandbox_network:
+            return False
+        # The bridge netns is what makes both features possible: request
+        # attribution for the interceptor, and the REDIRECT hook point for
+        # egress interception (D1) — without it the sandbox shares the
+        # host's network and its egress bypasses the proxy entirely.
+        return bool(
+            config.enable_interceptor or getattr(config, "enable_egress_proxy", False)
+        )
 
     def _network_launch_metadata(self, lease) -> dict[str, object]:
         if lease is None:

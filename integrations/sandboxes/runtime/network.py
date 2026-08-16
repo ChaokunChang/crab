@@ -117,6 +117,7 @@ class BenchmarkNetworkManager:
         self._ip_to_sandbox: dict[str, SandboxId] = {}
         self._lock = threading.Lock()
         self._nat_rules_configured = False
+        self._egress_redirect_port: int | None = None
 
     @property
     def bridge_ip(self) -> str:
@@ -220,6 +221,66 @@ class BenchmarkNetworkManager:
                 check=True,
             )
         self._nat_rules_configured = True
+
+    def enable_egress_redirect(self, proxy_port: int) -> None:
+        """Redirect all sandbox-originated TCP egress into the host-side
+        egress proxy (roadmap D1). Traffic aimed at the host itself is
+        excluded, so the LLM interceptor/forwarder/daemon paths stay
+        byte-identical — that exclusion is what makes "LLM interception
+        unchanged" a property of the rule rather than a hope.
+
+        Idempotent; must be called after ``ensure_bridge``.
+        """
+        with self._lock:
+            bridge_name = self._bridge_name
+            if bridge_name is None:
+                raise RuntimeError("egress redirect requires the bridge (call ensure_bridge first)")
+            if self._egress_redirect_port == int(proxy_port):
+                return
+            rule = self._egress_redirect_rule(bridge_name, int(proxy_port))
+            if subprocess.run(
+                ["iptables", "-t", "nat", "-C", *rule],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ).returncode != 0:
+                subprocess.run(["iptables", "-t", "nat", "-A", *rule], check=True)
+            self._egress_redirect_port = int(proxy_port)
+        logger.info(
+            "Enabled egress redirect bridge=%s proxy_port=%d (host-bound traffic excluded)",
+            bridge_name,
+            int(proxy_port),
+        )
+
+    def disable_egress_redirect(self) -> None:
+        with self._lock:
+            bridge_name = self._bridge_name
+            port = self._egress_redirect_port
+            self._egress_redirect_port = None
+        if bridge_name is None or port is None:
+            return
+        subprocess.run(
+            ["iptables", "-t", "nat", "-D", *self._egress_redirect_rule(bridge_name, port)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def _egress_redirect_rule(self, bridge_name: str, proxy_port: int) -> list[str]:
+        return [
+            "PREROUTING",
+            "-i",
+            bridge_name,
+            "-p",
+            "tcp",
+            "!",
+            "-d",
+            self._bridge_ip,
+            "-j",
+            "REDIRECT",
+            "--to-ports",
+            str(proxy_port),
+        ]
 
     def allocate_lease(self, sandbox_id: SandboxId) -> BenchmarkNetworkLease:
         self.ensure_bridge()
@@ -384,6 +445,7 @@ class BenchmarkNetworkManager:
         )
 
     def cleanup(self) -> None:
+        self.disable_egress_redirect()
         with self._lock:
             sandbox_ids = list(self._leases)
             bridge_name = self._bridge_name
