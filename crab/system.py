@@ -28,6 +28,7 @@ from .models import (
     JobStatus,
     MergeReport,
     ObservationReport,
+    ProcessMergeReport,
     RecoveryEvent,
     RecoveryRecord,
     RestoreJob,
@@ -38,6 +39,13 @@ from .models import (
 )
 from . import forking
 from .journal import ActionJournal
+from .process_merge import (
+    PROCESS_MERGE_STRATEGIES,
+    PROCESS_PROBE_ARGV,
+    PROCESS_PROBE_BASELINE,
+    ProcessMergeConflict,
+    replay_fork_execs,
+)
 from .merging import (
     DEFAULT_MERGE_IGNORE_PREFIXES,
     MERGE_POLICIES,
@@ -2282,6 +2290,169 @@ class CrabSystem:
             if str(metadata.get("fork_sandbox_id")) == str(fork_sandbox_id):
                 return True
         return False
+
+    # ----- process merge (C4) ------------------------------------------
+    # The process half of consolidation. "replay" re-runs the fork's
+    # journaled execs on a source that keeps its own live processes;
+    # "promote" (PR-C4.2) rides B3's swap machinery; "auto" resolves
+    # from a container-side process census on the source.
+
+    def _count_source_processes(self, sandbox_id: SandboxId) -> int:
+        """Container-side PID census. The probe's own shell counts, so
+        the quiescent baseline is PROCESS_PROBE_BASELINE (init+probe)."""
+        result = self.runtime.exec(
+            sandbox_id,
+            list(PROCESS_PROBE_ARGV),
+            capture_output=True,
+        )
+        returncode = getattr(result, "returncode", 1)
+        if returncode != 0:
+            raise RuntimeError(
+                f"process census failed for {sandbox_id}: rc={returncode} "
+                f"stderr={getattr(result, 'stderr', '')!r}"
+            )
+        try:
+            return int(str(getattr(result, "stdout", "")).strip())
+        except ValueError as exc:
+            raise RuntimeError(
+                f"process census returned garbage for {sandbox_id}: "
+                f"{getattr(result, 'stdout', '')!r}"
+            ) from exc
+
+    def merge_processes(
+        self,
+        source_sandbox_id: SandboxId,
+        fork_sandbox_id: SandboxId,
+        *,
+        strategy: str = "auto",
+        policy: str = "fail_fast",
+        observations: str = "append",
+        stop_on_deviation: bool = False,
+        lazy_pages: bool = True,
+        force: bool = False,
+    ) -> ProcessMergeReport:
+        """Process-half of consolidation (C4). ``auto`` picks ``replay``
+        when the source runs background processes (a promotion would
+        kill them) and ``promote`` otherwise. Replay re-executes the
+        fork's journal exec records on the source verbatim and reports
+        deviations against the recorded outcomes; ``promote`` (with the
+        ``policy``/``observations``/``lazy_pages``/``force`` knobs)
+        lands with PR-C4.2."""
+        if strategy not in PROCESS_MERGE_STRATEGIES:
+            raise ValueError(
+                f"unknown process merge strategy: {strategy!r} "
+                f"(expected one of {PROCESS_MERGE_STRATEGIES})"
+            )
+        _ = (policy, observations, lazy_pages, force)  # promote knobs (PR-C4.2)
+        journal = self.journal
+        if journal is None:
+            raise RuntimeError("process merge requires the action journal")
+        origin = self._fork_origin(fork_sandbox_id)
+        if origin is None:
+            raise ValueError(
+                f"no fork_created journal marker for {fork_sandbox_id}; "
+                "merge_processes only works for sandboxes created by fork_once "
+                "with the action journal enabled"
+            )
+        marker_source, _base_checkpoint_id = origin
+        if marker_source != source_sandbox_id:
+            raise ValueError(
+                f"{fork_sandbox_id} is not a fork of {source_sandbox_id} "
+                f"(fork_created marker names {marker_source})"
+            )
+        if self._txn_active(source_sandbox_id) or self._txn_active(fork_sandbox_id):
+            raise ProcessMergeConflict(
+                "transaction active on source or fork; resolve it before merging processes"
+            )
+        source_processes = self._count_source_processes(source_sandbox_id)
+        has_background = source_processes > PROCESS_PROBE_BASELINE
+        resolved = strategy
+        if strategy == "auto":
+            resolved = "replay" if has_background else "promote"
+            logger.info(
+                "Process merge auto-resolved to %s (source processes=%d) source=%s fork=%s",
+                resolved,
+                source_processes,
+                source_sandbox_id,
+                fork_sandbox_id,
+            )
+        if resolved == "promote":
+            raise NotImplementedError(
+                "process merge strategy 'promote' lands with PR-C4.2; "
+                "use strategy='replay' for now"
+            )
+        operation = start_operation(
+            self.telemetry,
+            "process_merge.flow",
+            self._telemetry_attrs(
+                source_sandbox_id,
+                component="system",
+                extra={
+                    "fork_sandbox_id": str(fork_sandbox_id),
+                    "strategy": resolved,
+                    "source_processes": source_processes,
+                },
+            ),
+        )
+        try:
+            records = journal.entries(fork_sandbox_id, kind="exec")
+
+            def _source_exec(argv, **kwargs):
+                return self.runtime.exec(source_sandbox_id, argv, **kwargs)
+
+            entries, stopped_early = replay_fork_execs(
+                _source_exec, records, stop_on_deviation=stop_on_deviation
+            )
+            deviations = sum(1 for entry in entries if entry.deviated)
+            report = ProcessMergeReport(
+                source_sandbox_id=source_sandbox_id,
+                fork_sandbox_id=fork_sandbox_id,
+                strategy="replay",
+                source_processes=source_processes,
+                replayed=tuple(entries),
+                deviations=deviations,
+                stopped_early=stopped_early,
+            )
+            self._journal_lifecycle(
+                source_sandbox_id,
+                "process_replay",
+                metadata={
+                    "fork_sandbox_id": str(fork_sandbox_id),
+                    "replayed": len(entries),
+                    "deviations": deviations,
+                    "stopped_early": stopped_early,
+                },
+            )
+            self.telemetry.emit_event(
+                "process_merge.completed",
+                self._telemetry_attrs(
+                    source_sandbox_id,
+                    component="system",
+                    extra={
+                        "fork_sandbox_id": str(fork_sandbox_id),
+                        "strategy": "replay",
+                        "replayed": len(entries),
+                        "deviations": deviations,
+                        "stopped_early": stopped_early,
+                    },
+                ),
+            )
+            logger.info(
+                "Replayed fork execs source=%s fork=%s replayed=%d deviations=%d stopped_early=%s",
+                source_sandbox_id,
+                fork_sandbox_id,
+                len(entries),
+                deviations,
+                stopped_early,
+            )
+            operation.finish(
+                status="succeeded",
+                attributes={"replayed": len(entries), "deviations": deviations},
+            )
+            return report
+        except Exception:
+            operation.finish(status="failed")
+            raise
 
     # ----- observation staging (B1) -----------------------------------
     # Thin facade over the response-gate registry's staging extension so

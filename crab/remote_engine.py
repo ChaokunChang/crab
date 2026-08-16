@@ -34,9 +34,10 @@ from typing import TYPE_CHECKING, Any, Mapping
 from .contracts import Runtime
 from .daemon import DaemonClient, DaemonRequestError
 from .ids import CheckpointId, SandboxId
-from .models import ChangesetResult, JobStatus, MergeReport, ObservationReport, SandboxDescription, SandboxExecResult, SandboxRuntimeState
+from .models import ChangesetResult, JobStatus, MergeReport, ObservationReport, ProcessMergeReport, SandboxDescription, SandboxExecResult, SandboxRuntimeState
 from .journal import ActionRecord
 from .merging import MergeError, MergerHook
+from .process_merge import ProcessMergeConflict
 from .telemetry import NoopTelemetrySink
 from .txn import (
     TxnAbortError,
@@ -354,6 +355,37 @@ class _SystemShim:
             timeout_seconds=60.0,
         )
         return ObservationReport.from_json(response["report"])
+
+    def merge_processes(
+        self,
+        source_sandbox_id: SandboxId,
+        fork_sandbox_id: SandboxId,
+        *,
+        strategy: str = "auto",
+        policy: str = "fail_fast",
+        observations: str = "append",
+        stop_on_deviation: bool = False,
+        lazy_pages: bool = True,
+        force: bool = False,
+    ) -> ProcessMergeReport:
+        payload: dict[str, Any] = {
+            "fork_sandbox_id": str(fork_sandbox_id),
+            "strategy": strategy,
+            "policy": policy,
+            "observations": observations,
+            "stop_on_deviation": bool(stop_on_deviation),
+            "lazy_pages": bool(lazy_pages),
+            "force": bool(force),
+        }
+        try:
+            response = self._client.post_json(
+                f"/sandboxes/{source_sandbox_id}/processes/merge",
+                payload,
+                timeout_seconds=600.0,  # replay runs the fork's whole exec history
+            )
+        except DaemonRequestError as exc:
+            raise _map_process_merge_error(exc) from exc
+        return ProcessMergeReport.from_json(response["report"])
 
 
 class _ConfigShim:
@@ -817,6 +849,19 @@ def _map_merge_error(exc: DaemonRequestError) -> Exception:
         except Exception:
             logger.exception("Failed to rehydrate merge report from daemon 409")
     return MergeError(message, report=report)
+
+
+def _map_process_merge_error(exc: DaemonRequestError) -> Exception:
+    """Rehydrate the daemon's 409 process_merge_conflict into the typed
+    exception; anything unrecognized re-raises the transport error."""
+    try:
+        payload = json.loads(exc.body.decode("utf-8", errors="replace"))
+    except Exception:
+        payload = {}
+    if isinstance(payload, dict) and payload.get("error_type") == "process_merge_conflict":
+        message = str(payload.get("error")) if payload.get("error") else str(exc)
+        return ProcessMergeConflict(message)
+    return exc
 
 
 def _deserialize_description(payload: Mapping[str, Any]) -> SandboxDescription:
