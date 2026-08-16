@@ -48,6 +48,7 @@ crab [--socket PATH] [--timeout SECONDS] [--json] <command>
   sandbox merge SOURCE_ID FORK_ID [--policy POLICY] [--ignore-prefix PREFIX]
   sandbox changeset SANDBOX_ID [--since CHECKPOINT_ID]
   sandbox consolidate SOURCE_ID FORK_ID [--policy append|dedupe|none]
+  sandbox merge-processes SOURCE_ID FORK_ID [--strategy auto|replay|promote]
   sandbox actions SANDBOX_ID [--kind KIND] [--limit N]
   sandbox stop|pause|resume SANDBOX_ID
   sandbox rm SANDBOX_ID [SANDBOX_ID ...]

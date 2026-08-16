@@ -270,6 +270,47 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_consolidate.set_defaults(func=_cmd_sandbox_consolidate)
 
+    p_merge_procs = sandbox_sub.add_parser(
+        "merge-processes",
+        help="Process-half of consolidation (C4): replay a fork's "
+        "journaled execs on its source, or promote the fork wholesale "
+        "(auto picks based on the source's live processes).",
+    )
+    p_merge_procs.add_argument("sandbox_id", metavar="SOURCE_ID")
+    p_merge_procs.add_argument("fork_id", metavar="FORK_ID")
+    p_merge_procs.add_argument(
+        "--strategy",
+        default="auto",
+        choices=["auto", "replay", "promote"],
+        help="auto (default): replay when the source runs background "
+        "processes, promote otherwise.",
+    )
+    p_merge_procs.add_argument(
+        "--policy",
+        default="fail_fast",
+        help="Promotion only: conflict policy for the reverse fs apply.",
+    )
+    p_merge_procs.add_argument(
+        "--stop-on-deviation",
+        action="store_true",
+        dest="stop_on_deviation",
+        help="Replay only: abort at the first deviating command.",
+    )
+    p_merge_procs.add_argument(
+        "--no-lazy-pages",
+        action="store_false",
+        dest="lazy_pages",
+        default=True,
+        help="Promotion only: restore eagerly instead of via lazy-pages.",
+    )
+    p_merge_procs.add_argument(
+        "--force",
+        action="store_true",
+        help="Promotion only: proceed even when the source runs "
+        "background processes (they die).",
+    )
+    p_merge_procs.set_defaults(func=_cmd_sandbox_merge_processes)
+
     # ----- checkpoint group ----------------------------------------------
     # Checkpoints are first-class entities with their own ids; keep them
     # at the top level so the verbs read cleanly (`crab checkpoint ls`,
@@ -790,6 +831,47 @@ def _cmd_sandbox_consolidate(args: argparse.Namespace) -> int:
         + (" (already consolidated)" if report.get("already_consolidated") else "")
     )
     return 0
+
+
+def _cmd_sandbox_merge_processes(args: argparse.Namespace) -> int:
+    socket_path = _resolve_socket(args)
+    # Replay runs the fork's whole exec history; budget generously.
+    client = DaemonClient(socket_path, timeout_seconds=max(args.timeout, 600.0))
+    payload: dict[str, Any] = {
+        "fork_sandbox_id": args.fork_id,
+        "strategy": args.strategy,
+        "policy": args.policy,
+        "stop_on_deviation": bool(args.stop_on_deviation),
+        "lazy_pages": bool(args.lazy_pages),
+        "force": bool(args.force),
+    }
+    response = client.post_json(
+        f"/sandboxes/{args.sandbox_id}/processes/merge", payload
+    )
+    report = response.get("report") or {}
+    deviations = int(report.get("deviations", 0))
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        line = (
+            f"strategy={report.get('strategy', '')} "
+            f"replayed={len(report.get('replayed') or [])} "
+            f"deviations={deviations}"
+        )
+        if report.get("stopped_early"):
+            line += " (stopped early)"
+        if report.get("promoted_checkpoint_id"):
+            line += f" promoted={report['promoted_checkpoint_id']}"
+        print(line)
+        for entry in report.get("replayed") or []:
+            if entry.get("deviated"):
+                print(
+                    f"deviation\tseq={entry.get('origin_seq')}"
+                    f"\trc={entry.get('returncode')} (expected {entry.get('expected_returncode')})"
+                    f"\t{' '.join(entry.get('argv') or [])}"
+                )
+    # Deviations mean the source may not have converged; surface to scripts.
+    return 1 if deviations else 0
 
 
 def _cmd_checkpoint_ls(args: argparse.Namespace) -> int:

@@ -535,6 +535,108 @@ class MergeReport:
 
 
 @dataclass(frozen=True)
+class ReplayEntry:
+    """One replayed fork exec (C4): the source re-ran the journaled
+    command and its outcome is diffed against the recorded one.
+    ``stdout_matched`` is None when the original run captured no
+    output; ``deviated`` = returncode mismatch or a stdout digest
+    mismatch where a digest exists."""
+
+    origin_seq: int
+    argv: tuple[str, ...]
+    returncode: int | None
+    expected_returncode: int | None
+    stdout_matched: bool | None = None
+    deviated: bool = False
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "origin_seq": self.origin_seq,
+            "argv": list(self.argv),
+            "returncode": self.returncode,
+            "expected_returncode": self.expected_returncode,
+            "stdout_matched": self.stdout_matched,
+            "deviated": self.deviated,
+        }
+
+    @classmethod
+    def from_json(cls, payload: dict[str, object]) -> "ReplayEntry":
+        returncode = payload.get("returncode")
+        expected = payload.get("expected_returncode")
+        stdout_matched = payload.get("stdout_matched")
+        return cls(
+            origin_seq=int(payload["origin_seq"]),
+            argv=tuple(str(item) for item in (payload.get("argv") or [])),
+            returncode=None if returncode is None else int(returncode),
+            expected_returncode=None if expected is None else int(expected),
+            stdout_matched=None if stdout_matched is None else bool(stdout_matched),
+            deviated=bool(payload.get("deviated", False)),
+        )
+
+
+@dataclass(frozen=True)
+class ProcessMergeReport:
+    """Outcome of ``CrabSystem.merge_processes`` (C4). ``strategy`` is
+    the resolved strategy (``auto`` never appears here);
+    ``source_processes`` is the probed PID count on the source.
+    Promotion fields stay at their defaults on the replay path and
+    vice versa."""
+
+    source_sandbox_id: SandboxId
+    fork_sandbox_id: SandboxId
+    strategy: str
+    source_processes: int
+    replayed: tuple[ReplayEntry, ...] = ()
+    deviations: int = 0
+    stopped_early: bool = False
+    promoted_checkpoint_id: str | None = None
+    fs_applied: int = 0
+    fs_conflicted: int = 0
+    observations: "ObservationReport | None" = None
+
+    def to_json(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "source_sandbox_id": str(self.source_sandbox_id),
+            "fork_sandbox_id": str(self.fork_sandbox_id),
+            "strategy": self.strategy,
+            "source_processes": self.source_processes,
+            "replayed": [entry.to_json() for entry in self.replayed],
+            "deviations": self.deviations,
+            "stopped_early": self.stopped_early,
+            "promoted_checkpoint_id": self.promoted_checkpoint_id,
+            "fs_applied": self.fs_applied,
+            "fs_conflicted": self.fs_conflicted,
+        }
+        if self.observations is not None:
+            payload["observations"] = self.observations.to_json()
+        return payload
+
+    @classmethod
+    def from_json(cls, payload: dict[str, object]) -> "ProcessMergeReport":
+        promoted = payload.get("promoted_checkpoint_id")
+        raw_observations = payload.get("observations")
+        return cls(
+            source_sandbox_id=SandboxId(str(payload["source_sandbox_id"])),
+            fork_sandbox_id=SandboxId(str(payload["fork_sandbox_id"])),
+            strategy=str(payload["strategy"]),
+            source_processes=int(payload.get("source_processes", 0)),
+            replayed=tuple(
+                ReplayEntry.from_json(entry) for entry in (payload.get("replayed") or [])
+            ),
+            deviations=int(payload.get("deviations", 0)),
+            stopped_early=bool(payload.get("stopped_early", False)),
+            promoted_checkpoint_id=None if promoted is None else str(promoted),
+            fs_applied=int(payload.get("fs_applied", 0)),
+            fs_conflicted=int(payload.get("fs_conflicted", 0)),
+            observations=(
+                None
+                if not isinstance(raw_observations, dict)
+                else ObservationReport.from_json(raw_observations)
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class JobRecord:
     job_id: JobId
     job_type: JobType

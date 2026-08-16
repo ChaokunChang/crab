@@ -38,6 +38,7 @@ from typing import Any, Callable
 from ..engine import Engine, EngineConfig
 from ..ids import SandboxId
 from ..merging import MergeError
+from ..process_merge import ProcessMergeConflict
 from ..models import SandboxSnapshot, utc_now
 from ..txn import TxnAbortError, TxnActiveError, TxnCommitConflict, TxnError, TxnMismatchError
 from .transport import (
@@ -540,6 +541,37 @@ class _Routes:
             records = records[-int(limit_raw):]
         return {"ok": True, "records": [record.to_json() for record in records]}
 
+    def merge_processes_sandbox(
+        self, body: dict[str, Any], *, sandbox_id: str
+    ) -> dict[str, Any]:
+        """Process-half of consolidation (C4): replay the fork's execs
+        on the source, or (PR-C4.2) promote the fork wholesale.
+        Refusals surface as 409 error_type=process_merge_conflict."""
+        eng = self._daemon.require_engine()
+        fork_raw = body.get("fork_sandbox_id")
+        if not fork_raw:
+            raise _BadRequest("merge-processes requires fork_sandbox_id")
+        kwargs: dict[str, Any] = {
+            "strategy": str(body.get("strategy") or "auto"),
+            "stop_on_deviation": bool(body.get("stop_on_deviation", False)),
+            "force": bool(body.get("force", False)),
+        }
+        if body.get("policy") is not None:
+            kwargs["policy"] = str(body["policy"])
+        if body.get("observations") is not None:
+            kwargs["observations"] = str(body["observations"])
+        if body.get("lazy_pages") is not None:
+            kwargs["lazy_pages"] = bool(body["lazy_pages"])
+        try:
+            report = eng.system.merge_processes(
+                SandboxId(sandbox_id), SandboxId(str(fork_raw)), **kwargs
+            )
+        except ProcessMergeConflict as exc:
+            raise _TxnConflict("process_merge_conflict", str(exc)) from exc
+        except (ValueError, RuntimeError, NotImplementedError) as exc:
+            raise _BadRequest(f"merge-processes failed: {exc}") from exc
+        return {"ok": True, "report": report.to_json()}
+
     def update_host_inspector_filters(
         self, body: dict[str, Any], *, sandbox_id: str
     ) -> dict[str, Any]:
@@ -722,6 +754,8 @@ def _build_handler(daemon: "DaemonServer"):
             routes.consolidate_observations_sandbox,
         ),
         ("POST", "/sandboxes/{sandbox_id}/actions", "", routes.sandbox_actions),
+        # Process merge (C4)
+        ("POST", "/sandboxes/{sandbox_id}/processes/merge", "", routes.merge_processes_sandbox),
     ]
 
     def _match(method: str, path: str):

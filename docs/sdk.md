@@ -237,6 +237,16 @@ service behavior should be validated for each task.
   `MergeError` carrying the report after a path-level rollback from the
   pre-merge snapshot. Works both locally and against the daemon
   (`crab sandbox merge`); custom `merger` hooks are local-only.
+- `Sandbox.merge_processes(fork, strategy="auto", ...)` is the process
+  half of consolidation (C4). `auto` probes this sandbox's live
+  processes: with background processes running, the fork's journaled
+  execs are **replayed** here verbatim and every command's outcome is
+  diffed against the recorded returncode/stdout digest (deviations are
+  counted; `stop_on_deviation=True` aborts at the first one; the fork
+  stays alive); with none, the fork is **promoted** wholesale onto this
+  sandbox's identity (PR-C4.2 — `policy`/`observations`/`lazy_pages`/
+  `force` steer it). Returns a ProcessMergeReport. Works both locally
+  and against the daemon (`crab sandbox merge-processes`).
 - `Sandbox.consolidate_observations(fork, policy="append",
   summarizer=None)` adopts a fork's journal history into this sandbox's
   journal as `kind="observation"` records with provenance (fork id,

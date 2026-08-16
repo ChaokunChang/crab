@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
 
 from .ids import CheckpointId, SandboxId
-from .models import JobStatus, MergeReport, ObservationReport, SandboxExecResult, SandboxSnapshot, utc_now
+from .models import JobStatus, MergeReport, ObservationReport, ProcessMergeReport, SandboxExecResult, SandboxSnapshot, utc_now
 from .templates import SandboxTemplate
 
 if TYPE_CHECKING:
@@ -985,6 +985,47 @@ class Sandbox:
             fork_id,
             policy=policy,
             summarizer=summarizer,
+        )
+
+    def merge_processes(
+        self,
+        fork: "Sandbox | str",
+        *,
+        strategy: str = "auto",
+        policy: str = "fail_fast",
+        observations: str = "append",
+        stop_on_deviation: bool = False,
+        lazy_pages: bool = True,
+        force: bool = False,
+    ) -> ProcessMergeReport:
+        """Process-half of consolidation (C4). ``strategy="auto"``
+        resolves from a process census on this sandbox: with live
+        background processes the fork's journaled execs are **replayed**
+        here verbatim (deviations against the recorded outcomes are
+        counted; ``stop_on_deviation`` aborts at the first one); without
+        any, the fork is **promoted** wholesale onto this sandbox's
+        identity (PR-C4.2 — ``policy``/``observations``/``lazy_pages``/
+        ``force`` steer that path). Returns a ProcessMergeReport.
+
+        Works with both a local in-process engine and the daemon
+        (`crab sandbox merge-processes` from the CLI).
+        """
+        system = getattr(self._engine, "system", None)
+        merge_processes = getattr(system, "merge_processes", None)
+        if not callable(merge_processes):
+            raise NotImplementedError(
+                "process merge is not available on this engine"
+            )
+        fork_id = fork.sandbox_id if isinstance(fork, Sandbox) else SandboxId(str(fork))
+        return merge_processes(
+            self.sandbox_id,
+            fork_id,
+            strategy=strategy,
+            policy=policy,
+            observations=observations,
+            stop_on_deviation=stop_on_deviation,
+            lazy_pages=lazy_pages,
+            force=force,
         )
 
     def begin(self, label: str | None = None, *, isolation: str = "snapshot") -> "Transaction":
