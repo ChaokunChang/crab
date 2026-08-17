@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
 
 from .ids import CheckpointId, SandboxId
-from .models import JobStatus, MergeReport, ObservationReport, ProcessMergeReport, SandboxExecResult, SandboxSnapshot, utc_now
+from .models import EgressLedger, JobStatus, MergeReport, ObservationReport, ProcessMergeReport, SandboxExecResult, SandboxSnapshot, utc_now
 from .templates import SandboxTemplate
 
 if TYPE_CHECKING:
@@ -989,6 +989,21 @@ class Sandbox:
             policy=policy,
             summarizer=summarizer,
         )
+
+    def egress(self, *, txn_id: str | None = None, since_seq: int | None = None) -> EgressLedger:
+        """Effect ledger (D1): every outbound flow this sandbox opened,
+        classified as ``idempotent_read`` / ``mutating`` / ``opaque``
+        (encrypted and raw flows are opaque — the proxy sees the host,
+        not the method). Pass ``txn_id`` to scope the view to one
+        transaction. Requires ``EngineConfig(enable_egress_proxy=True)``
+        for flows to exist; works locally and against the daemon
+        (`crab sandbox egress`).
+        """
+        system = getattr(self._engine, "system", None)
+        egress_ledger = getattr(system, "egress_ledger", None)
+        if not callable(egress_ledger):
+            raise NotImplementedError("the effect ledger is not available on this engine")
+        return egress_ledger(self.sandbox_id, txn_id=txn_id, since_seq=since_seq)
 
     def merge_processes(
         self,

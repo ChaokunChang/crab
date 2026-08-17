@@ -311,6 +311,24 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_merge_procs.set_defaults(func=_cmd_sandbox_merge_processes)
 
+    p_egress = sandbox_sub.add_parser(
+        "egress",
+        help="Show the sandbox's effect ledger: recorded outbound flows "
+        "with their effect class (idempotent_read/mutating/opaque).",
+    )
+    p_egress.add_argument("sandbox_id")
+    p_egress.add_argument(
+        "--txn", dest="txn_id", default=None, help="Scope to one transaction."
+    )
+    p_egress.add_argument(
+        "--since-seq",
+        dest="since_seq",
+        type=int,
+        default=None,
+        help="Only flows recorded after this journal sequence number.",
+    )
+    p_egress.set_defaults(func=_cmd_sandbox_egress)
+
     # ----- checkpoint group ----------------------------------------------
     # Checkpoints are first-class entities with their own ids; keep them
     # at the top level so the verbs read cleanly (`crab checkpoint ls`,
@@ -872,6 +890,36 @@ def _cmd_sandbox_merge_processes(args: argparse.Namespace) -> int:
                 )
     # Deviations mean the source may not have converged; surface to scripts.
     return 1 if deviations else 0
+
+
+def _cmd_sandbox_egress(args: argparse.Namespace) -> int:
+    socket_path = _resolve_socket(args)
+    client = DaemonClient(socket_path, timeout_seconds=max(args.timeout, 60.0))
+    payload: dict[str, Any] = {}
+    if args.txn_id:
+        payload["txn_id"] = args.txn_id
+    if args.since_seq is not None:
+        payload["since_seq"] = args.since_seq
+    response = client.post_json(f"/sandboxes/{args.sandbox_id}/egress", payload)
+    ledger = response.get("ledger") or {}
+    if args.json:
+        print(json.dumps(ledger, indent=2))
+        return 0
+    print(
+        f"total={ledger.get('total', 0)} "
+        f"reads={ledger.get('idempotent_reads', 0)} "
+        f"mutating={ledger.get('mutating', 0)} "
+        f"opaque={ledger.get('opaque', 0)}"
+    )
+    for flow in ledger.get("flows") or []:
+        target = f"{flow.get('host')}:{flow.get('dst_port')}"
+        verb = flow.get("method") or flow.get("scheme")
+        detail = flow.get("path") or ""
+        print(
+            f"{flow.get('seq')}\t{flow.get('classification')}\t{verb}\t{target}\t{detail}"
+            + (f"\ttxn={flow['txn_id']}" if flow.get("txn_id") else "")
+        )
+    return 0
 
 
 def _cmd_checkpoint_ls(args: argparse.Namespace) -> int:

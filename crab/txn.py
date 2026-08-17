@@ -94,6 +94,11 @@ class TxnAbortResult:
     txn_id: str
     discarded_observations: int
     restored_checkpoint_id: str | None
+    mutating_egress: int = 0
+    """Outbound mutating flows already fired during this txn (D1). The
+    filesystem rollback cannot undo them; the count surfaces to scripts
+    and callers so they know the abort was not total. Blocking/deferring
+    is D3's charter."""
 
 
 class Transaction:

@@ -14,13 +14,15 @@ interceptor path stays byte-identical; TCP only.
 """
 from __future__ import annotations
 
+import fnmatch
 import logging
 import socket
 import socketserver
 import struct
 import threading
 import time
-from typing import Callable
+from dataclasses import dataclass
+from typing import Callable, Sequence
 
 from .ids import SandboxId
 
@@ -37,6 +39,75 @@ _HTTP_METHODS = frozenset(
 )
 
 SandboxIdResolver = Callable[[str], "SandboxId | None"]
+
+# Effect classes (D1.2). Without TLS interception the method of an
+# encrypted request is invisible, so TLS/raw flows are "opaque" — the
+# roadmap's explicit degraded mode. D2 (record/replay) owns bodies.
+CLASSIFICATION_IDEMPOTENT_READ = "idempotent_read"
+CLASSIFICATION_MUTATING = "mutating"
+CLASSIFICATION_OPAQUE = "opaque"
+EGRESS_CLASSIFICATIONS: tuple[str, ...] = (
+    CLASSIFICATION_IDEMPOTENT_READ,
+    CLASSIFICATION_MUTATING,
+    CLASSIFICATION_OPAQUE,
+)
+
+_READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
+_MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+@dataclass(frozen=True)
+class EgressRule:
+    """Host-scoped classification override, e.g. mark a known read-only
+    internal API's TLS traffic as ``idempotent_read`` even though the
+    proxy cannot see the method."""
+
+    host_glob: str
+    classify: str
+
+    def __post_init__(self) -> None:
+        if self.classify not in EGRESS_CLASSIFICATIONS:
+            raise ValueError(
+                f"unknown egress classification: {self.classify!r} "
+                f"(expected one of {EGRESS_CLASSIFICATIONS})"
+            )
+
+    def matches(self, host: str) -> bool:
+        return fnmatch.fnmatch(host.lower(), self.host_glob.lower())
+
+    @classmethod
+    def from_json(cls, payload: dict) -> "EgressRule":
+        return cls(
+            host_glob=str(payload.get("host_glob") or payload.get("host") or "*"),
+            classify=str(payload["classify"]),
+        )
+
+
+def classify_flow(payload: dict, rules: Sequence[EgressRule] = ()) -> str:
+    """Effect class for one flow payload. Protocol-level default first
+    (HTTP method table; everything encrypted or unrecognized is opaque),
+    then the first matching host rule wins — rules exist precisely to
+    refine what the protocol cannot reveal.
+
+    Pure and re-derivable: stored rows can be reclassified later without
+    replaying traffic.
+    """
+    method = payload.get("method")
+    if isinstance(method, str):
+        upper = method.upper()
+        if upper in _MUTATING_METHODS:
+            default = CLASSIFICATION_MUTATING
+        elif upper in _READ_METHODS:
+            default = CLASSIFICATION_IDEMPOTENT_READ
+        else:
+            default = CLASSIFICATION_OPAQUE
+    else:
+        default = CLASSIFICATION_OPAQUE
+    host = str(payload.get("host") or "")
+    for rule in rules:
+        if rule.matches(host):
+            return rule.classify
+    return default
 
 
 def parse_original_dst(packed: bytes) -> tuple[str, int]:
@@ -217,10 +288,8 @@ class _EgressHandler(socketserver.BaseRequestHandler):
                 "bytes_out": bytes_out,
                 "bytes_in": bytes_in,
                 "duration_ms": round((time.monotonic() - started) * 1000, 3),
-                # PR-D1.2 fills this in; the field exists from day one so
-                # stored rows never need a schema migration.
-                "classification": "unclassified",
             }
+            payload["classification"] = classify_flow(payload, server.rules)
             server.recorder.record(sandbox_id, payload)
 
 
@@ -269,12 +338,14 @@ class EgressProxyServer(socketserver.ThreadingTCPServer):
         port: int = 0,
         head_timeout_seconds: float = 2.0,
         connect_timeout_seconds: float = 10.0,
+        rules: Sequence[EgressRule] = (),
     ) -> None:
         """``host`` should be the bridge's own address: REDIRECT rewrites
         each flow's destination to it, so binding there receives all
         redirected traffic without exposing the proxy elsewhere."""
         super().__init__((host, port), _EgressHandler)
         self.recorder = EgressFlowRecorder(journal)
+        self.rules = tuple(rules)
         self._sandbox_id_resolver = sandbox_id_resolver
         self.head_timeout_seconds = head_timeout_seconds
         self.connect_timeout_seconds = connect_timeout_seconds
@@ -315,8 +386,14 @@ class EgressProxyServer(socketserver.ThreadingTCPServer):
 
 __all__ = [
     "SO_ORIGINAL_DST",
+    "CLASSIFICATION_IDEMPOTENT_READ",
+    "CLASSIFICATION_MUTATING",
+    "CLASSIFICATION_OPAQUE",
+    "EGRESS_CLASSIFICATIONS",
     "EgressFlowRecorder",
     "EgressProxyServer",
+    "EgressRule",
+    "classify_flow",
     "original_destination",
     "parse_original_dst",
     "sniff_http_head",

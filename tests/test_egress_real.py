@@ -183,7 +183,15 @@ class EgressRealTests(unittest.TestCase):
             self.assertIn(self.host_ip, flow["host"])  # Host header carries ip:port
             self.assertGreater(flow["bytes_out"], 0)
             self.assertGreater(flow["bytes_in"], 0)
-            self.assertEqual(flow["classification"], "unclassified")  # PR-D1.2
+        self.assertEqual(by_path["/read"]["classification"], "idempotent_read")
+        self.assertEqual(by_path["/write"]["classification"], "mutating")
+
+        # The ledger view (D1.2) reads the same rows with counts.
+        ledger = sandbox.egress()
+        self.assertGreaterEqual(ledger.total, 2)
+        self.assertGreaterEqual(ledger.idempotent_reads, 1)
+        self.assertGreaterEqual(ledger.mutating, 1)
+        self.assertIn(self.host_ip, " ".join(ledger.hosts))
 
     def test_tls_sni_and_raw_tcp_are_recorded(self) -> None:
         sandbox = Sandbox(image=self._IMAGE, engine=self.engine)
@@ -228,10 +236,28 @@ class EgressRealTests(unittest.TestCase):
             f"python3 -c \"import urllib.request;urllib.request.urlopen(urllib.request.Request('{base}/in-txn', data=b'x', method='POST')).read()\""
         )
         self._flows(sandbox, expected=1)
+        # Scoped ledger view sees exactly this txn's mutating flow.
+        scoped = sandbox.egress(txn_id=txn.txn_id)
+        self.assertEqual(scoped.mutating, 1)
+        self.assertEqual(scoped.flows[0].path, "/in-txn")
+        self.assertEqual(scoped.flows[0].txn_id, txn.txn_id)
         txn.commit()
         rows = [row for row in sandbox.actions(kind="egress") if row["payload"].get("path") == "/in-txn"]
         self.assertTrue(rows, "in-txn flow missing from the ledger")
         self.assertEqual(rows[0]["txn_id"], txn.txn_id)
+
+    def test_abort_reports_mutating_egress_it_cannot_undo(self) -> None:
+        sandbox = Sandbox(image=self._IMAGE, engine=self.engine)
+        self.addCleanup(sandbox.kill)
+        base = f"http://{self.host_ip}:{self.external.port}"
+        txn = sandbox.begin("egress-abort")
+        txn.exec(
+            f"python3 -c \"import urllib.request;urllib.request.urlopen(urllib.request.Request('{base}/fired', data=b'x', method='POST')).read()\""
+        )
+        self._flows(sandbox, expected=1)
+        result = txn.abort()
+        # The filesystem rolled back; the POST already left the machine.
+        self.assertEqual(result.mutating_egress, 1)
 
     def test_redirect_rule_is_scoped_and_removed(self) -> None:
         # The proxy must listen on the bridge address only: REDIRECT

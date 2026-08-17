@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Any, Mapping
 from .contracts import Runtime
 from .daemon import DaemonClient, DaemonRequestError
 from .ids import CheckpointId, SandboxId
-from .models import ChangesetResult, JobStatus, MergeReport, ObservationReport, ProcessMergeReport, SandboxDescription, SandboxExecResult, SandboxRuntimeState
+from .models import ChangesetResult, EgressLedger, JobStatus, MergeReport, ObservationReport, ProcessMergeReport, SandboxDescription, SandboxExecResult, SandboxRuntimeState
 from .journal import ActionRecord
 from .merging import MergeError, MergerHook
 from .process_merge import ProcessMergeConflict
@@ -355,6 +355,23 @@ class _SystemShim:
             timeout_seconds=60.0,
         )
         return ObservationReport.from_json(response["report"])
+
+    def egress_ledger(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        txn_id: str | None = None,
+        since_seq: int | None = None,
+    ) -> EgressLedger:
+        payload: dict[str, Any] = {}
+        if txn_id:
+            payload["txn_id"] = str(txn_id)
+        if since_seq is not None:
+            payload["since_seq"] = int(since_seq)
+        response = self._client.post_json(
+            f"/sandboxes/{sandbox_id}/egress", payload, timeout_seconds=60.0
+        )
+        return EgressLedger.from_json(response["ledger"])
 
     def merge_processes(
         self,

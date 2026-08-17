@@ -637,6 +637,122 @@ class ProcessMergeReport:
 
 
 @dataclass(frozen=True)
+class EgressFlow:
+    """One recorded outbound connection (D1). ``method``/``path`` are
+    only known for plaintext HTTP; encrypted flows carry the SNI host
+    and nothing more (no MITM). ``txn_id`` is the transaction that was
+    active when the flow completed."""
+
+    seq: int
+    host: str
+    dst_ip: str
+    dst_port: int
+    scheme: str
+    classification: str
+    method: str | None = None
+    path: str | None = None
+    bytes_out: int = 0
+    bytes_in: int = 0
+    duration_ms: float = 0.0
+    txn_id: str | None = None
+    recorded_at: str | None = None
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "seq": self.seq,
+            "host": self.host,
+            "dst_ip": self.dst_ip,
+            "dst_port": self.dst_port,
+            "scheme": self.scheme,
+            "classification": self.classification,
+            "method": self.method,
+            "path": self.path,
+            "bytes_out": self.bytes_out,
+            "bytes_in": self.bytes_in,
+            "duration_ms": self.duration_ms,
+            "txn_id": self.txn_id,
+            "recorded_at": self.recorded_at,
+        }
+
+    @classmethod
+    def from_json(cls, payload: dict[str, object]) -> "EgressFlow":
+        method = payload.get("method")
+        path = payload.get("path")
+        txn_id = payload.get("txn_id")
+        recorded_at = payload.get("recorded_at")
+        return cls(
+            seq=int(payload.get("seq", 0)),
+            host=str(payload.get("host", "")),
+            dst_ip=str(payload.get("dst_ip", "")),
+            dst_port=int(payload.get("dst_port", 0)),
+            scheme=str(payload.get("scheme", "tcp")),
+            classification=str(payload.get("classification", "opaque")),
+            method=None if method is None else str(method),
+            path=None if path is None else str(path),
+            bytes_out=int(payload.get("bytes_out", 0)),
+            bytes_in=int(payload.get("bytes_in", 0)),
+            duration_ms=float(payload.get("duration_ms", 0.0)),
+            txn_id=None if txn_id is None else str(txn_id),
+            recorded_at=None if recorded_at is None else str(recorded_at),
+        )
+
+
+@dataclass(frozen=True)
+class EgressLedger:
+    """Effect ledger view (D1): the sandbox's recorded egress flows,
+    optionally scoped to one transaction, with per-class counts."""
+
+    sandbox_id: SandboxId
+    flows: tuple[EgressFlow, ...] = ()
+    txn_id: str | None = None
+
+    @property
+    def total(self) -> int:
+        return len(self.flows)
+
+    @property
+    def idempotent_reads(self) -> int:
+        return sum(1 for flow in self.flows if flow.classification == "idempotent_read")
+
+    @property
+    def mutating(self) -> int:
+        return sum(1 for flow in self.flows if flow.classification == "mutating")
+
+    @property
+    def opaque(self) -> int:
+        return sum(1 for flow in self.flows if flow.classification == "opaque")
+
+    @property
+    def hosts(self) -> tuple[str, ...]:
+        seen: dict[str, None] = {}
+        for flow in self.flows:
+            seen.setdefault(flow.host, None)
+        return tuple(seen)
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "sandbox_id": str(self.sandbox_id),
+            "txn_id": self.txn_id,
+            "flows": [flow.to_json() for flow in self.flows],
+            "total": self.total,
+            "idempotent_reads": self.idempotent_reads,
+            "mutating": self.mutating,
+            "opaque": self.opaque,
+        }
+
+    @classmethod
+    def from_json(cls, payload: dict[str, object]) -> "EgressLedger":
+        txn_id = payload.get("txn_id")
+        return cls(
+            sandbox_id=SandboxId(str(payload["sandbox_id"])),
+            flows=tuple(
+                EgressFlow.from_json(row) for row in (payload.get("flows") or [])
+            ),
+            txn_id=None if txn_id is None else str(txn_id),
+        )
+
+
+@dataclass(frozen=True)
 class JobRecord:
     job_id: JobId
     job_type: JobType

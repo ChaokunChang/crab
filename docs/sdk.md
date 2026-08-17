@@ -286,6 +286,23 @@ service behavior should be validated for each task.
   bytes are spliced untouched. Host-bound traffic is never redirected,
   so the LLM interceptor path is unaffected. Flows opened inside a
   transaction carry its `txn_id`.
+- `Sandbox.egress(txn_id=None, since_seq=None)` returns the
+  **effect ledger** (D1): the recorded flows plus counts
+  (`total`/`idempotent_reads`/`mutating`/`opaque`) and `hosts`. Each
+  flow is classified from what the proxy could see — GET/HEAD/OPTIONS/
+  TRACE are `idempotent_read`, POST/PUT/PATCH/DELETE are `mutating`,
+  and everything encrypted, tunnelled or raw is `opaque`. Deployments
+  refine the opaque cases with host rules:
+  `EngineConfig(egress_rules=({"host_glob": "*.internal.example",
+  "classify": "idempotent_read"},))` (config: `egress.rules`); the
+  first matching rule wins over the protocol default. Pass `txn_id` to
+  scope the view. Classification is a pure function of the stored row,
+  so history can be reclassified without replaying traffic. Works
+  locally and against the daemon (`crab sandbox egress`).
+- `TxnAbortResult.mutating_egress` counts the mutating flows the
+  transaction already fired: the filesystem rollback cannot undo them,
+  so the abort reports rather than hides them (holding or rejecting
+  such requests is D3).
 - Daemon restart rehydration is not implemented.
 - Exec output is buffered; streaming and PTY support are not implemented.
 - `resources`, `timeout`, and `labels` constructor arguments are currently

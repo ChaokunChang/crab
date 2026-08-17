@@ -27,6 +27,8 @@ from .models import (
     FailureCode,
     JobStatus,
     MergeReport,
+    EgressFlow,
+    EgressLedger,
     ObservationReport,
     ProcessMergeReport,
     RecoveryEvent,
@@ -1184,25 +1186,32 @@ class CrabSystem:
             },
         )
         self._clear_txn(sandbox_id)
+        mutating_egress = self._mutating_egress_in_txn(sandbox_id, active.txn_id)
         self.telemetry.emit_event(
             "txn.abort",
             self._telemetry_attrs(
                 sandbox_id,
                 component="system",
-                extra={"txn_id": active.txn_id, "discarded": discarded},
+                extra={
+                    "txn_id": active.txn_id,
+                    "discarded": discarded,
+                    "mutating_egress": mutating_egress,
+                },
             ),
         )
         logger.info(
-            "Aborted txn %s for sandbox %s discarded=%d restored=%s",
+            "Aborted txn %s for sandbox %s discarded=%d restored=%s mutating_egress=%d",
             active.txn_id,
             sandbox_id,
             discarded,
             active.base_checkpoint_id,
+            mutating_egress,
         )
         return TxnAbortResult(
             txn_id=active.txn_id,
             discarded_observations=discarded,
             restored_checkpoint_id=active.base_checkpoint_id,
+            mutating_egress=mutating_egress,
         )
 
     def current_txn(self, sandbox_id: SandboxId) -> TxnDescription | None:
@@ -1653,24 +1662,35 @@ class CrabSystem:
                 self._fork_txn_destroy(fork_id)
             except Exception:
                 logger.exception("Failed to destroy fork on txn abort fork=%s", fork_id)
+        # The fork's own flows died with it, but flows the fork fired at
+        # the world did not — report them like the snapshot path does.
+        mutating_egress = self._mutating_egress_in_txn(fork_id, active.txn_id)
         self.telemetry.emit_event(
             "txn.abort",
             self._telemetry_attrs(
                 source_id,
                 component="system",
-                extra={"txn_id": active.txn_id, "isolation": "fork", "discarded": discarded},
+                extra={
+                    "txn_id": active.txn_id,
+                    "isolation": "fork",
+                    "discarded": discarded,
+                    "mutating_egress": mutating_egress,
+                },
             ),
         )
         logger.info(
-            "Aborted fork-backed txn %s for sandbox %s (fork %s destroyed, source untouched)",
+            "Aborted fork-backed txn %s for sandbox %s (fork %s destroyed, source untouched) "
+            "mutating_egress=%d",
             active.txn_id,
             source_id,
             fork_id,
+            mutating_egress,
         )
         return TxnAbortResult(
             txn_id=active.txn_id,
             discarded_observations=discarded,
             restored_checkpoint_id=None,
+            mutating_egress=mutating_egress,
         )
 
     def _release_fork_txn(self, sandbox_id: SandboxId, active: TxnDescription) -> None:
@@ -2334,6 +2354,45 @@ class CrabSystem:
             if str(metadata.get("fork_sandbox_id")) == str(fork_sandbox_id):
                 return True
         return False
+
+    # ----- effect ledger (D1) ------------------------------------------
+
+    def egress_ledger(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        txn_id: str | None = None,
+        since_seq: int | None = None,
+    ) -> EgressLedger:
+        """The sandbox's recorded egress flows (journal ``kind="egress"``
+        rows), optionally scoped to one transaction. Requires the action
+        journal — it is the ledger's only store."""
+        journal = self.journal
+        if journal is None:
+            raise RuntimeError("the effect ledger requires the action journal")
+        flows: list[EgressFlow] = []
+        for record in journal.entries(sandbox_id, kind="egress", since_seq=since_seq):
+            if txn_id is not None and record.txn_id != txn_id:
+                continue
+            payload = dict(record.payload)
+            payload["seq"] = record.seq
+            payload["txn_id"] = record.txn_id
+            payload["recorded_at"] = record.finished_at or record.started_at
+            flows.append(EgressFlow.from_json(payload))
+        return EgressLedger(sandbox_id=sandbox_id, flows=tuple(flows), txn_id=txn_id)
+
+    def _mutating_egress_in_txn(self, sandbox_id: SandboxId, txn_id: str) -> int:
+        """Mutating flows this txn already fired at the world. Rolling back
+        the filesystem cannot undo them, so aborts report the count
+        instead of pretending the abort was total (blocking/deferring is
+        D3's charter)."""
+        if self.journal is None:
+            return 0
+        try:
+            return self.egress_ledger(sandbox_id, txn_id=txn_id).mutating
+        except Exception:
+            logger.debug("Failed to read the effect ledger for %s", sandbox_id, exc_info=True)
+            return 0
 
     # ----- process merge (C4) ------------------------------------------
     # The process half of consolidation. "replay" re-runs the fork's
