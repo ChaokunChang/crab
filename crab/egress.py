@@ -24,7 +24,21 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Sequence
 
+from .cassettes import (
+    DEFAULT_MAX_BODY_BYTES,
+    DEFAULT_RECORDABLE_STATUSES,
+    DEFAULT_VARYING_HEADERS,
+    PARTIAL_STATUS,
+    REDIRECT_STATUSES,
+    RESPONSE_HEADER_DENY_LIST,
+    CassetteEntry,
+    filter_headers,
+    request_key,
+    sha256_hex,
+)
+from .http_wire import ResponseAssembler, parse_head
 from .ids import SandboxId
+from .models import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +226,112 @@ class EgressFlowRecorder:
             logger.debug("Failed to record egress flow", exc_info=True)
 
 
+class CassetteRecorder:
+    """Turns a completed plaintext exchange into a cassette (D2).
+
+    Returns the journal index fields for the flow, or None when the
+    exchange is not recordable — an unparsable, oversized or
+    uninteresting response degrades to "no cassette", never to a broken
+    flow. Credentials are stripped before anything is written.
+    """
+
+    def __init__(
+        self,
+        store,
+        *,
+        max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
+        record_errors: bool = False,
+        record_partial: bool = False,
+        varying_headers: Sequence[str] = DEFAULT_VARYING_HEADERS,
+    ) -> None:
+        self._store = store
+        self.max_body_bytes = int(max_body_bytes)
+        self.record_errors = bool(record_errors)
+        self.record_partial = bool(record_partial)
+        self.varying_headers = tuple(varying_headers)
+
+    def _recordable_status(self, status: int) -> bool:
+        if status in DEFAULT_RECORDABLE_STATUSES or status in REDIRECT_STATUSES:
+            return True
+        if status == PARTIAL_STATUS:
+            # Ranged reads need the Range header in the key, or a second
+            # range would be served the first one's bytes.
+            return self.record_partial and "range" in {
+                name.lower() for name in self.varying_headers
+            }
+        return self.record_errors and 400 <= status < 600
+
+    def record_exchange(
+        self,
+        *,
+        sandbox_id,
+        request_head: bytes,
+        host: str,
+        port: int,
+        method: str,
+        path: str,
+        assembler: ResponseAssembler,
+        bytes_in: int,
+    ) -> dict | None:
+        request = parse_head(request_head)
+        if request is None:
+            return None
+        request_body = request.rest
+        request_body_digest = sha256_hex(request_body)
+        key = request_key(
+            method=method,
+            host=host,
+            port=port,
+            path=path,
+            body_sha256=request_body_digest,
+            headers=list(request.headers),
+            varying_headers=self.varying_headers,
+        )
+        if assembler.truncated:
+            # Visible in the ledger, never replayable.
+            return {
+                "recorded": False,
+                "request_key": key,
+                "truncated": True,
+            }
+        parsed = assembler.result()
+        if parsed is None:
+            return None
+        _response_head, status, reason, body = parsed
+        if not self._recordable_status(status):
+            return None
+        entry = CassetteEntry(
+            request_key=key,
+            method=method.upper(),
+            host=host,
+            port=int(port),
+            path=path,
+            status=status,
+            reason=reason,
+            response_headers=tuple(
+                filter_headers(list(_response_head.headers), RESPONSE_HEADER_DENY_LIST)
+            ),
+            body=body,
+            body_sha256=sha256_hex(body),
+            request_body_sha256=request_body_digest,
+            bytes_in=bytes_in,
+            recorded_at=utc_now().isoformat(),
+            origin_sandbox_id=str(sandbox_id),
+        )
+        try:
+            self._store.put(sandbox_id, entry)
+        except Exception:
+            logger.debug("Failed to write cassette", exc_info=True)
+            return None
+        return {
+            "recorded": True,
+            "request_key": key,
+            "response_sha256": entry.body_sha256,
+            "status": status,
+            "truncated": False,
+        }
+
+
 class _EgressHandler(socketserver.BaseRequestHandler):
     def handle(self) -> None:  # noqa: C901 - straight-line proxy flow
         server: "EgressProxyServer" = self.server  # type: ignore[assignment]
@@ -233,6 +353,7 @@ class _EgressHandler(socketserver.BaseRequestHandler):
         host = ""
         bytes_out = 0
         bytes_in = 0
+        record_meta: dict | None = None
         upstream: socket.socket | None = None
         try:
             client.settimeout(server.head_timeout_seconds)
@@ -257,9 +378,33 @@ class _EgressHandler(socketserver.BaseRequestHandler):
             if head:
                 upstream.sendall(head)
                 bytes_out += len(head)
-            out_extra, in_extra = _splice(client, upstream)
+            # Recording gate (D2): plaintext HTTP idempotent reads only.
+            # The class is computed once here from the same classify_flow
+            # the ledger uses, so "recordable" has one definition.
+            recorder = server.cassette_recorder
+            assembler = None
+            if recorder is not None and scheme == "http":
+                probe = {"host": host or dst_ip, "method": method, "scheme": scheme}
+                if classify_flow(probe, server.rules) == CLASSIFICATION_IDEMPOTENT_READ:
+                    assembler = ResponseAssembler(limit=recorder.max_body_bytes)
+            out_extra, in_extra = _splice(
+                client,
+                upstream,
+                on_inbound=None if assembler is None else assembler.feed,
+            )
             bytes_out += out_extra
             bytes_in += in_extra
+            if assembler is not None:
+                record_meta = recorder.record_exchange(
+                    sandbox_id=sandbox_id,
+                    request_head=head,
+                    host=host or dst_ip,
+                    port=dst_port,
+                    method=method or "GET",
+                    path=path or "/",
+                    assembler=assembler,
+                    bytes_in=bytes_in,
+                )
         except OSError as exc:
             logger.debug(
                 "Egress flow to %s:%s failed: %s", dst_ip, dst_port, exc, exc_info=True
@@ -290,15 +435,27 @@ class _EgressHandler(socketserver.BaseRequestHandler):
                 "duration_ms": round((time.monotonic() - started) * 1000, 3),
             }
             payload["classification"] = classify_flow(payload, server.rules)
+            if record_meta:
+                # The journal stays the index: key + digest + status only,
+                # never the body (that lives in the cassette store).
+                payload.update(record_meta)
             server.recorder.record(sandbox_id, payload)
 
 
-def _splice(left: socket.socket, right: socket.socket) -> tuple[int, int]:
+def _splice(
+    left: socket.socket,
+    right: socket.socket,
+    *,
+    on_inbound: Callable[[bytes], None] | None = None,
+) -> tuple[int, int]:
     """Pump bytes both ways until either side closes. Returns
-    ``(left->right, right->left)`` byte counts."""
+    ``(left->right, right->left)`` byte counts. ``on_inbound`` tees the
+    upstream->client direction for recording; it never alters what the
+    client receives."""
     counters = [0, 0]
 
     def pump(src: socket.socket, dst: socket.socket, slot: int) -> None:
+        tee = on_inbound if slot == 1 else None
         try:
             while True:
                 chunk = src.recv(_SPLICE_CHUNK)
@@ -306,6 +463,11 @@ def _splice(left: socket.socket, right: socket.socket) -> tuple[int, int]:
                     break
                 dst.sendall(chunk)
                 counters[slot] += len(chunk)
+                if tee is not None:
+                    try:
+                        tee(chunk)
+                    except Exception:
+                        logger.debug("Egress recording tee failed", exc_info=True)
         except OSError:
             pass
         finally:
@@ -339,12 +501,14 @@ class EgressProxyServer(socketserver.ThreadingTCPServer):
         head_timeout_seconds: float = 2.0,
         connect_timeout_seconds: float = 10.0,
         rules: Sequence[EgressRule] = (),
+        cassette_recorder: "CassetteRecorder | None" = None,
     ) -> None:
         """``host`` should be the bridge's own address: REDIRECT rewrites
         each flow's destination to it, so binding there receives all
         redirected traffic without exposing the proxy elsewhere."""
         super().__init__((host, port), _EgressHandler)
         self.recorder = EgressFlowRecorder(journal)
+        self.cassette_recorder = cassette_recorder
         self.rules = tuple(rules)
         self._sandbox_id_resolver = sandbox_id_resolver
         self.head_timeout_seconds = head_timeout_seconds
@@ -390,6 +554,7 @@ __all__ = [
     "CLASSIFICATION_MUTATING",
     "CLASSIFICATION_OPAQUE",
     "EGRESS_CLASSIFICATIONS",
+    "CassetteRecorder",
     "EgressFlowRecorder",
     "EgressProxyServer",
     "EgressRule",

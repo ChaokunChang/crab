@@ -391,6 +391,27 @@ class EngineConfig:
     Encrypted flows are ``opaque`` by default because the proxy cannot
     see the method; rules are how a deployment states what it knows."""
 
+    enable_egress_recording: bool = False
+    """Record request/response bodies for plaintext HTTP idempotent reads
+    into per-sandbox cassettes (roadmap D2), so replays can serve them
+    back. Requires the egress proxy. Off by default: it persists response
+    bodies to disk. HTTPS is never recorded (no TLS interception in v1)."""
+
+    egress_recording_max_body_bytes: int = 1024 * 1024
+    """Per-body cap; larger exchanges are marked truncated and are never
+    replayable."""
+
+    egress_recording_record_errors: bool = False
+    """Also record 4xx/5xx responses."""
+
+    egress_recording_varying_headers: tuple = ("accept", "accept-encoding")
+    """Request headers that participate in the cassette key. Add ``range``
+    (together with ``egress_recording_record_partial``) for ranged reads."""
+
+    egress_recording_record_partial: bool = False
+    """Record 206 responses. Only meaningful with ``range`` among the
+    varying headers, or different ranges would collide on one cassette."""
+
     network_expected_sandboxes: int | None = None
     """Optional capacity hint for the bridge network allocator."""
 
@@ -487,6 +508,7 @@ class EngineConfig:
         host_inspector = _optional_mapping(data.get("host_inspector"), label="host_inspector")
         journal_data = _optional_mapping(data.get("journal"), label="journal")
         egress = _optional_mapping(data.get("egress"), label="egress")
+        recording = _optional_mapping(egress.get("recording"), label="egress.recording")
 
         default_workers = _as_int(data.get("max_workers"), default=None)
         executor_data = _optional_mapping(data.get("executor"), label="executor")
@@ -582,6 +604,29 @@ class EngineConfig:
             )
             or 0,
             egress_rules=tuple(egress.get("rules", data.get("egress_rules")) or ()),
+            enable_egress_recording=_as_bool(
+                recording.get("enabled", data.get("enable_egress_recording")),
+                default=False,
+            ),
+            egress_recording_max_body_bytes=_as_int(
+                recording.get("max_body_bytes", data.get("egress_recording_max_body_bytes")),
+                default=1024 * 1024,
+            )
+            or 1024 * 1024,
+            egress_recording_record_errors=_as_bool(
+                recording.get("record_errors", data.get("egress_recording_record_errors")),
+                default=False,
+            ),
+            egress_recording_varying_headers=tuple(
+                recording.get(
+                    "varying_headers", data.get("egress_recording_varying_headers")
+                )
+                or ("accept", "accept-encoding")
+            ),
+            egress_recording_record_partial=_as_bool(
+                recording.get("record_partial", data.get("egress_recording_record_partial")),
+                default=False,
+            ),
             network_expected_sandboxes=_as_int(
                 network.get("expected_sandboxes", data.get("network_expected_sandboxes")),
                 default=None,
@@ -787,6 +832,11 @@ class Engine:
             ):
                 path.mkdir(parents=True, exist_ok=True)
 
+            if cfg.enable_egress_recording and not cfg.enable_egress_proxy:
+                raise RuntimeError(
+                    "enable_egress_recording requires enable_egress_proxy=True "
+                    "(the proxy is what sees the exchanges)"
+                )
             if cfg.enable_egress_proxy and not cfg.enable_action_journal:
                 # The journal is the effect ledger's only store: without it
                 # the proxy would forward every flow and record none, which
@@ -879,7 +929,7 @@ class Engine:
                 # All sandbox TCP egress lands here (bridge REDIRECT);
                 # host-bound flows are excluded by the rule, so the
                 # interceptor path above is untouched.
-                from .egress import EgressProxyServer, EgressRule
+                from .egress import CassetteRecorder, EgressProxyServer, EgressRule
 
                 manager = self._network_manager
                 assert manager is not None  # guarded above
@@ -887,6 +937,24 @@ class Engine:
                     rule if isinstance(rule, EgressRule) else EgressRule.from_json(dict(rule))
                     for rule in cfg.egress_rules
                 )
+                cassette_recorder = None
+                if cfg.enable_egress_recording:
+                    from .cassettes import CassetteStore
+
+                    storage_cfg = cfg.storage_config or StorageConfig(root_dir=storage_root)
+                    store = CassetteStore(
+                        Path(storage_cfg.root_dir) / storage_cfg.cassettes_dirname
+                    )
+                    cassette_recorder = CassetteRecorder(
+                        store,
+                        max_body_bytes=cfg.egress_recording_max_body_bytes,
+                        record_errors=cfg.egress_recording_record_errors,
+                        record_partial=cfg.egress_recording_record_partial,
+                        varying_headers=cfg.egress_recording_varying_headers,
+                    )
+                    # The system owns the store for replay (D2.2) and for
+                    # pruning a sandbox's cassettes when it is destroyed.
+                    self._system.cassette_store = store
                 proxy = EgressProxyServer(
                     journal=getattr(self._system, "journal", None),
                     sandbox_id_resolver=manager.resolve_sandbox_id,
@@ -896,6 +964,7 @@ class Engine:
                     host=manager.bridge_ip,
                     port=cfg.egress_proxy_port,
                     rules=rules,
+                    cassette_recorder=cassette_recorder,
                 )
                 proxy.start()
                 manager.enable_egress_redirect(proxy.port)

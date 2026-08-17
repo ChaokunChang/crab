@@ -6,7 +6,9 @@ with the host/method/scheme the proxy could observe. Self-skipping
 outside the crab-dev VM."""
 from __future__ import annotations
 
+import base64
 import http.server
+import json
 import os
 import shutil
 import socket
@@ -384,6 +386,111 @@ class EgressLlmUnchangedRealTests(unittest.TestCase):
             any("127.0.0.1" in host for host in ledger_hosts),
             f"interceptor traffic was redirected into the proxy: {ledger_hosts}",
         )
+
+
+class EgressRecordingRealTests(unittest.TestCase):
+    """D2.1 E2E: an idempotent read's bodies land in a cassette on disk,
+    credentials do not, and mutating flows are never recorded."""
+
+    _IMAGE = "python:3.11-slim"
+
+    def setUp(self) -> None:
+        if not _real_stack_available():
+            self.skipTest("docker/runc/criu/zfs/iptables/root not available")
+        self.host_ip = _host_lan_ip()
+        if self.host_ip is None:
+            self.skipTest("no global-scope host address for the external service")
+        self._tmp = tempfile.TemporaryDirectory(prefix="crab_rec_e2e_")
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.external = _ExternalHTTPServer()
+        self.addCleanup(self.external.close)
+        self.engine = Engine.start(
+            EngineConfig(
+                runtime="runc",
+                enable_sandbox_network=True,
+                enable_interceptor=False,
+                enable_egress_proxy=True,
+                enable_egress_recording=True,
+                storage_root=self.root / "storage",
+                runtime_root=self.root / "runtime",
+            )
+        )
+        self.addCleanup(self.engine.stop)
+        self.cassettes = self.root / "storage" / "cassettes"
+
+    def _run(self, sandbox: Sandbox, script: str) -> str:
+        result = sandbox.commands.run(script)
+        self.assertEqual(result.returncode, 0, msg=f"command failed: {script!r}: {result.stderr}")
+        return result.stdout.strip()
+
+    def _recorded_flows(self, sandbox: Sandbox, *, timeout: float = 20.0) -> list:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            flows = [flow for flow in sandbox.egress().flows if flow.recorded]
+            if flows:
+                return flows
+            time.sleep(0.25)
+        self.fail(f"no recorded flows: {[f.to_json() for f in sandbox.egress().flows]}")
+
+    def test_read_bodies_are_recorded_writes_are_not(self) -> None:
+        sandbox = Sandbox(image=self._IMAGE, engine=self.engine)
+        self.addCleanup(sandbox.kill)
+        base = f"http://{self.host_ip}:{self.external.port}"
+
+        # An idempotent read carrying a credential header.
+        self.assertIn(
+            "external-ok",
+            self._run(
+                sandbox,
+                "python3 -c \"import urllib.request;"
+                f"req=urllib.request.Request('{base}/read', headers={{'Authorization':'Bearer super-secret'}});"
+                "print(urllib.request.urlopen(req).read().decode())\"",
+            ),
+        )
+        # A write, which must never be recorded.
+        self._run(
+            sandbox,
+            f"python3 -c \"import urllib.request;urllib.request.urlopen(urllib.request.Request('{base}/write', data=b'x', method='POST')).read()\"",
+        )
+
+        [recorded] = self._recorded_flows(sandbox)
+        self.assertEqual(recorded.path, "/read")
+        self.assertEqual(recorded.status, 200)
+        self.assertFalse(recorded.truncated)
+        ledger = sandbox.egress()
+        self.assertEqual(ledger.recorded, 1)      # the POST is absent
+        self.assertGreaterEqual(ledger.mutating, 1)
+        self.assertEqual(ledger.replayed, 0)      # nothing served yet (D2.2)
+
+        # The body is on disk (base64-encoded), the credential is not.
+        entries = list(self.cassettes.rglob("*.json"))
+        self.assertTrue(entries, "no cassette written")
+        blob = "\n".join(path.read_text(encoding="utf-8") for path in entries)
+        self.assertNotIn("super-secret", blob)
+        self.assertNotIn("/write", blob)
+        stored = [json.loads(path.read_text(encoding="utf-8")) for path in entries]
+        bodies = [base64.b64decode(entry["body_b64"]) for entry in stored]
+        self.assertIn(b"external-ok", bodies)
+        header_names = {
+            name.lower() for entry in stored for name, _ in entry["response_headers"]
+        }
+        self.assertNotIn("authorization", header_names)
+        self.assertNotIn("set-cookie", header_names)
+
+    def test_cassettes_are_pruned_when_the_sandbox_dies(self) -> None:
+        sandbox = Sandbox(image=self._IMAGE, engine=self.engine)
+        base = f"http://{self.host_ip}:{self.external.port}"
+        self._run(
+            sandbox,
+            f"python3 -c \"import urllib.request;urllib.request.urlopen('{base}/read').read()\"",
+        )
+        self._recorded_flows(sandbox)
+        bucket = self.cassettes / str(sandbox.sandbox_id)
+        self.assertTrue(bucket.is_dir())
+        sandbox.kill()
+        # Replay must therefore happen before the recording sandbox dies.
+        self.assertFalse(bucket.exists())
 
 
 if __name__ == "__main__":

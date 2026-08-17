@@ -656,6 +656,15 @@ class EgressFlow:
     duration_ms: float = 0.0
     txn_id: str | None = None
     recorded_at: str | None = None
+    recorded: bool = False
+    """A cassette holds this exchange's bodies (D2). Truncated exchanges
+    stay False — they are visible but never replayable."""
+    request_key: str | None = None
+    status: int | None = None
+    truncated: bool = False
+    replayed_from_seq: int | None = None
+    """Set when this flow was served from a cassette instead of the
+    network, pointing at the recording's journal seq."""
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -672,6 +681,11 @@ class EgressFlow:
             "duration_ms": self.duration_ms,
             "txn_id": self.txn_id,
             "recorded_at": self.recorded_at,
+            "recorded": self.recorded,
+            "request_key": self.request_key,
+            "status": self.status,
+            "truncated": self.truncated,
+            "replayed_from_seq": self.replayed_from_seq,
         }
 
     @classmethod
@@ -680,6 +694,9 @@ class EgressFlow:
         path = payload.get("path")
         txn_id = payload.get("txn_id")
         recorded_at = payload.get("recorded_at")
+        request_key = payload.get("request_key")
+        status = payload.get("status")
+        replayed_from = payload.get("replayed_from_seq")
         return cls(
             seq=int(payload.get("seq", 0)),
             host=str(payload.get("host", "")),
@@ -694,6 +711,12 @@ class EgressFlow:
             duration_ms=float(payload.get("duration_ms", 0.0)),
             txn_id=None if txn_id is None else str(txn_id),
             recorded_at=None if recorded_at is None else str(recorded_at),
+            # Absent from D1-era rows; defaults keep them deserializable.
+            recorded=bool(payload.get("recorded", False)),
+            request_key=None if request_key is None else str(request_key),
+            status=None if status is None else int(status),
+            truncated=bool(payload.get("truncated", False)),
+            replayed_from_seq=None if replayed_from is None else int(replayed_from),
         )
 
 
@@ -729,6 +752,14 @@ class EgressLedger:
             seen.setdefault(flow.host, None)
         return tuple(seen)
 
+    @property
+    def recorded(self) -> int:
+        return sum(1 for flow in self.flows if flow.recorded)
+
+    @property
+    def replayed(self) -> int:
+        return sum(1 for flow in self.flows if flow.replayed_from_seq is not None)
+
     def to_json(self) -> dict[str, object]:
         return {
             "sandbox_id": str(self.sandbox_id),
@@ -738,6 +769,8 @@ class EgressLedger:
             "idempotent_reads": self.idempotent_reads,
             "mutating": self.mutating,
             "opaque": self.opaque,
+            "recorded": self.recorded,
+            "replayed": self.replayed,
         }
 
     @classmethod

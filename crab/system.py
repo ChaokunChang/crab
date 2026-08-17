@@ -167,6 +167,10 @@ class CrabSystem:
     ledger is read, so changing them re-classifies history too — the
     stored row keeps the class it was recorded with, the view reflects
     the current rules."""
+    cassette_store: object | None = None
+    """Recorded egress bodies (D2), assigned by the engine when recording
+    is enabled. Pruned per sandbox on destroy, so a fork's cassettes must
+    be replayed before the fork is killed."""
     relaunch_handler: Callable[[SandboxId, str, bool], None] | None = None
     extra_checkpoint_metadata_provider: Callable[[SandboxId], dict[str, object]] | None = None
     restore_metadata_handler: Callable[[SandboxId, CheckpointManifest], None] | None = None
@@ -869,6 +873,16 @@ class CrabSystem:
         its dependents, and replace chain-shared symlinks with real bytes
         (storage artifacts and runtime pre-dump trees)."""
         self._journal_lifecycle(source_sandbox_id, "destroy")
+        # Recorded egress bodies die with the sandbox (D2): replay must
+        # happen while the recording sandbox is still alive.
+        store = self.cassette_store
+        if store is not None:
+            try:
+                store.prune(source_sandbox_id)
+            except Exception:
+                logger.debug(
+                    "Failed to prune cassettes for %s", source_sandbox_id, exc_info=True
+                )
         with self._fork_lock:
             live_forks = sorted(self._fork_children.get(source_sandbox_id, set()))
             pinned_forks = [fork for fork, (source, _) in self._fork_chain_pins.items() if source == source_sandbox_id]

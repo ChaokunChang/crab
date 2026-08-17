@@ -302,6 +302,24 @@ service behavior should be validated for each task.
   existed are classified retroactively); the stored journal row is
   never rewritten. Works locally and against the daemon
   (`crab sandbox egress`).
+- **Egress recording (D2)** is opt-in via
+  `EngineConfig(enable_egress_recording=True)` (config:
+  `egress.recording.enabled`) and requires the egress proxy. For
+  **plaintext HTTP idempotent reads only** — HTTPS bodies are never
+  recorded (no TLS interception), so this covers `http://` traffic and
+  hosts a rule marks as `idempotent_read`. Each recorded exchange lands
+  in a per-sandbox cassette under
+  `{storage_root}/cassettes/<sandbox_id>/`, content-addressed, and the
+  ledger flow gains `recorded`, `request_key`, `status` and `truncated`.
+  Responses larger than `egress.recording.max_body_bytes` (default 1
+  MiB) are marked `truncated` and are never replayable; `4xx`/`5xx` need
+  `record_errors`; `206` needs both `record_partial` and `range` among
+  `varying_headers` (otherwise two ranges would collide on one
+  cassette). `Authorization`/`Cookie`/`X-Api-Key` request headers and
+  `Set-Cookie` responses are dropped before writing — but credentials
+  passed in a **query string** are stored (same exposure as the
+  journal's `path`), so treat cassettes like checkpoint images.
+  Cassettes are pruned when the sandbox is destroyed.
 - `TxnAbortResult.mutating_egress` counts the mutating flows the
   transaction already fired: the filesystem rollback cannot undo them,
   so the abort reports rather than hides them (holding or rejecting

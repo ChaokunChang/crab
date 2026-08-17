@@ -327,6 +327,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Only flows recorded after this journal sequence number.",
     )
+    p_egress.add_argument(
+        "--recorded",
+        action="store_true",
+        help="Only flows whose bodies were recorded into a cassette.",
+    )
     p_egress.set_defaults(func=_cmd_sandbox_egress)
 
     # ----- checkpoint group ----------------------------------------------
@@ -902,22 +907,37 @@ def _cmd_sandbox_egress(args: argparse.Namespace) -> int:
         payload["since_seq"] = args.since_seq
     response = client.post_json(f"/sandboxes/{args.sandbox_id}/egress", payload)
     ledger = response.get("ledger") or {}
+    flows = ledger.get("flows") or []
+    if getattr(args, "recorded", False):
+        flows = [flow for flow in flows if flow.get("recorded")]
     if args.json:
-        print(json.dumps(ledger, indent=2))
+        print(json.dumps({**ledger, "flows": flows}, indent=2))
         return 0
     print(
         f"total={ledger.get('total', 0)} "
         f"reads={ledger.get('idempotent_reads', 0)} "
         f"mutating={ledger.get('mutating', 0)} "
-        f"opaque={ledger.get('opaque', 0)}"
+        f"opaque={ledger.get('opaque', 0)} "
+        f"recorded={ledger.get('recorded', 0)} "
+        f"replayed={ledger.get('replayed', 0)}"
     )
-    for flow in ledger.get("flows") or []:
+    for flow in flows:
         target = f"{flow.get('host')}:{flow.get('dst_port')}"
         verb = flow.get("method") or flow.get("scheme")
         detail = flow.get("path") or ""
+        marks = []
+        if flow.get("recorded"):
+            marks.append(f"rec:{flow.get('status')}")
+        if flow.get("truncated"):
+            marks.append("truncated")
+        if flow.get("replayed_from_seq") is not None:
+            marks.append(f"replayed<-{flow['replayed_from_seq']}")
+        if flow.get("txn_id"):
+            marks.append(f"txn={flow['txn_id']}")
+        suffix = ("\t" + " ".join(marks)) if marks else ""
         print(
             f"{flow.get('seq')}\t{flow.get('classification')}\t{verb}\t{target}\t{detail}"
-            + (f"\ttxn={flow['txn_id']}" if flow.get("txn_id") else "")
+            + suffix
         )
     return 0
 
