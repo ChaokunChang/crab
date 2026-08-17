@@ -780,6 +780,14 @@ class Engine:
             ):
                 path.mkdir(parents=True, exist_ok=True)
 
+            if cfg.enable_egress_proxy and not cfg.enable_action_journal:
+                # The journal is the effect ledger's only store: without it
+                # the proxy would forward every flow and record none, which
+                # looks exactly like working interception.
+                raise RuntimeError(
+                    "enable_egress_proxy requires enable_action_journal=True "
+                    "(the journal is the effect ledger's only store)"
+                )
             if cfg.runtime == "runc" and cfg.enable_sandbox_network:
                 from integrations.sandboxes.runtime.network import BenchmarkNetworkManager
 
@@ -871,7 +879,10 @@ class Engine:
                 proxy = EgressProxyServer(
                     journal=getattr(self._system, "journal", None),
                     sandbox_id_resolver=manager.resolve_sandbox_id,
-                    host="0.0.0.0",
+                    # REDIRECT rewrites the destination to the bridge's own
+                    # address, so binding there catches every redirected
+                    # flow without exposing the proxy on other interfaces.
+                    host=manager.bridge_ip,
                     port=cfg.egress_proxy_port,
                 )
                 proxy.start()

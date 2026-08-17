@@ -265,11 +265,14 @@ class EgressProxyServer(socketserver.ThreadingTCPServer):
         *,
         journal=None,
         sandbox_id_resolver: SandboxIdResolver | None = None,
-        host: str = "0.0.0.0",
+        host: str = "127.0.0.1",
         port: int = 0,
         head_timeout_seconds: float = 2.0,
         connect_timeout_seconds: float = 10.0,
     ) -> None:
+        """``host`` should be the bridge's own address: REDIRECT rewrites
+        each flow's destination to it, so binding there receives all
+        redirected traffic without exposing the proxy elsewhere."""
         super().__init__((host, port), _EgressHandler)
         self.recorder = EgressFlowRecorder(journal)
         self._sandbox_id_resolver = sandbox_id_resolver
@@ -300,7 +303,10 @@ class EgressProxyServer(socketserver.ThreadingTCPServer):
         logger.info("Egress proxy listening on port %d", self.port)
 
     def stop(self) -> None:
-        self.shutdown()
+        # shutdown() waits for the serve_forever loop to acknowledge, so it
+        # would hang forever on a server that was never started.
+        if self._thread is not None:
+            self.shutdown()
         self.server_close()
         if self._thread is not None:
             self._thread.join(timeout=5.0)

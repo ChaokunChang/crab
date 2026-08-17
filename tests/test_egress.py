@@ -350,6 +350,31 @@ class ConfigGateTests(unittest.TestCase):
                 Engine.start(cfg)
             self.assertIn("enable_egress_proxy requires", str(ctx.exception))
 
+    def test_requires_the_action_journal(self) -> None:
+        from crab.engine import Engine, EngineConfig
+
+        with tempfile.TemporaryDirectory(prefix="crab_egress_cfg_") as tmp:
+            cfg = EngineConfig(
+                runtime="in-memory",
+                enable_interceptor=False,
+                enable_sandbox_network=True,
+                enable_egress_proxy=True,
+                enable_action_journal=False,
+                storage_root=Path(tmp) / "storage",
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                Engine.start(cfg)
+            # Without the ledger's store the proxy would forward everything
+            # and record nothing — indistinguishable from working.
+            self.assertIn("enable_action_journal", str(ctx.exception))
+
+    def test_default_bind_is_loopback_not_wildcard(self) -> None:
+        from crab.egress import EgressProxyServer
+
+        proxy = EgressProxyServer()
+        self.addCleanup(proxy.stop)
+        self.assertEqual(proxy.server_address[0], "127.0.0.1")
+
 
 if __name__ == "__main__":
     unittest.main()
