@@ -257,6 +257,8 @@ class _SystemShim:
             txn_id=str(raw["txn_id"]),
             discarded_observations=int(raw["discarded_observations"]),
             restored_checkpoint_id=None if restored is None else str(restored),
+            # Absent from pre-D1 daemons; 0 is the honest default there.
+            mutating_egress=int(raw.get("mutating_egress") or 0),
         )
 
     def current_txn(self, sandbox_id: SandboxId) -> TxnDescription | None:

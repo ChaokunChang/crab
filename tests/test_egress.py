@@ -848,5 +848,118 @@ class LedgerCliTests(_CliHarness, unittest.TestCase):
         self.assertEqual(requests[-1]["payload"], {"txn_id": "txn-4"})
 
 
+class LedgerReclassificationTests(unittest.TestCase):
+    """Classification is re-derived when the ledger is read, so rule
+    changes and rows written before D1.2 are reflected in the view."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="crab_reclass_")
+        self.addCleanup(self._tmp.cleanup)
+        self.journal = ActionJournal(Path(self._tmp.name) / "journal")
+        self.sandbox_id = SandboxId("sbx-reclass")
+        self.system = _minimal_system(self.journal)
+
+    def test_rows_recorded_before_classification_are_classified_on_read(self) -> None:
+        # A D1.1-era row: the field exists but carries the placeholder.
+        self.journal.record_egress(
+            self.sandbox_id,
+            payload=_flow_payload(method="POST", classification="unclassified"),
+        )
+        ledger = self.system.egress_ledger(self.sandbox_id)
+        self.assertEqual(ledger.flows[0].classification, "mutating")
+        self.assertEqual(ledger.mutating, 1)
+
+    def test_rule_changes_apply_to_history(self) -> None:
+        self.journal.record_egress(
+            self.sandbox_id,
+            payload=_flow_payload(
+                host="reports.internal.example", scheme="tls", method=None, path=None,
+                classification="opaque",
+            ),
+        )
+        self.assertEqual(self.system.egress_ledger(self.sandbox_id).opaque, 1)
+
+        # The deployment learns this host is read-only; history follows.
+        self.system.egress_rules = (
+            EgressRule(host_glob="*.internal.example", classify="idempotent_read"),
+        )
+        ledger = self.system.egress_ledger(self.sandbox_id)
+        self.assertEqual(ledger.idempotent_reads, 1)
+        self.assertEqual(ledger.opaque, 0)
+
+    def test_stored_row_is_left_untouched(self) -> None:
+        self.journal.record_egress(
+            self.sandbox_id,
+            payload=_flow_payload(method="DELETE", classification="unclassified"),
+        )
+        self.system.egress_ledger(self.sandbox_id)
+        [record] = self.journal.entries(self.sandbox_id, kind="egress")
+        self.assertEqual(record.payload["classification"], "unclassified")
+
+
+class AbortMutatingEgressTransportTests(unittest.TestCase):
+    """The count must survive the daemon hop: computing it locally and
+    dropping it on the wire would make remote aborts silently report 0."""
+
+    def test_daemon_serializes_the_count(self) -> None:
+        from types import SimpleNamespace
+
+        from crab.daemon.server import _Routes
+        from crab.txn import TxnAbortResult
+
+        class _System:
+            def abort_txn(self, sandbox_id, txn_id):
+                return TxnAbortResult(
+                    txn_id=txn_id,
+                    discarded_observations=2,
+                    restored_checkpoint_id="ckpt-1",
+                    mutating_egress=3,
+                )
+
+        class _Daemon:
+            def require_engine(self):
+                return SimpleNamespace(system=_System())
+
+            def register_sandbox(self, sandbox_id) -> None:
+                pass
+
+            def unregister_sandbox(self, sandbox_id) -> None:
+                pass
+
+        response = _Routes(_Daemon()).abort_txn({}, sandbox_id="sbx-1", txn_id="txn-1")
+        self.assertEqual(response["result"]["mutating_egress"], 3)
+
+    def test_shim_reads_it_and_tolerates_older_daemons(self) -> None:
+        from crab.remote_engine import RemoteEngine
+
+        client = _FakeDaemonClient()
+        engine = RemoteEngine(client, info={"runtime": "runc", "default_image": "ubuntu:22.04"})
+        path = "/sandboxes/sbx-1/txn/txn-1/abort"
+        client.responses[path] = {
+            "ok": True,
+            "result": {
+                "txn_id": "txn-1",
+                "discarded_observations": 0,
+                "restored_checkpoint_id": None,
+                "mutating_egress": 4,
+            },
+        }
+        self.assertEqual(
+            engine.system.abort_txn(SandboxId("sbx-1"), "txn-1").mutating_egress, 4
+        )
+        # A pre-D1 daemon omits the field entirely.
+        client.responses[path] = {
+            "ok": True,
+            "result": {
+                "txn_id": "txn-1",
+                "discarded_observations": 0,
+                "restored_checkpoint_id": None,
+            },
+        }
+        self.assertEqual(
+            engine.system.abort_txn(SandboxId("sbx-1"), "txn-1").mutating_egress, 0
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

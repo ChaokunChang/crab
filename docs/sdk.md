@@ -296,9 +296,12 @@ service behavior should be validated for each task.
   `EngineConfig(egress_rules=({"host_glob": "*.internal.example",
   "classify": "idempotent_read"},))` (config: `egress.rules`); the
   first matching rule wins over the protocol default. Pass `txn_id` to
-  scope the view. Classification is a pure function of the stored row,
-  so history can be reclassified without replaying traffic. Works
-  locally and against the daemon (`crab sandbox egress`).
+  scope the view. Classification is a pure function of the stored row
+  and is **re-derived on every read**, so changing `egress_rules`
+  reclassifies history too (and rows recorded before classification
+  existed are classified retroactively); the stored journal row is
+  never rewritten. Works locally and against the daemon
+  (`crab sandbox egress`).
 - `TxnAbortResult.mutating_egress` counts the mutating flows the
   transaction already fired: the filesystem rollback cannot undo them,
   so the abort reports rather than hides them (holding or rejecting

@@ -899,6 +899,9 @@ class Engine:
                 )
                 proxy.start()
                 manager.enable_egress_redirect(proxy.port)
+                # The ledger re-derives classification when read, so the
+                # query side needs the same rules as the recording side.
+                self._system.egress_rules = rules
                 self._egress_proxy = proxy
                 logger.info("Egress interception active: proxy_port=%d", proxy.port)
 
