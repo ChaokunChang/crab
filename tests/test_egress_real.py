@@ -234,6 +234,20 @@ class EgressRealTests(unittest.TestCase):
         self.assertEqual(rows[0]["txn_id"], txn.txn_id)
 
     def test_redirect_rule_is_scoped_and_removed(self) -> None:
+        # The proxy must listen on the bridge address only: REDIRECT
+        # rewrites destinations to it, and a wildcard bind would expose
+        # the proxy to anything that can reach this host.
+        bridge_ip = self.engine._network_manager.bridge_ip
+        listen_addr = self.engine._egress_proxy.server_address
+        self.assertEqual(listen_addr[0], bridge_ip)
+        listeners = subprocess.run(
+            ["ss", "-ltn"], capture_output=True, text=True, check=False
+        ).stdout
+        self.assertNotIn(
+            f"0.0.0.0:{listen_addr[1]}",
+            listeners,
+            "egress proxy is bound on every interface",
+        )
         rules = subprocess.run(
             ["iptables", "-t", "nat", "-S", "PREROUTING"],
             capture_output=True, text=True, check=True,
