@@ -40,6 +40,7 @@ from .models import (
     utc_now,
 )
 from . import forking
+from .egress import classify_flow
 from .journal import ActionJournal
 from .process_merge import (
     PROCESS_MERGE_STRATEGIES,
@@ -161,6 +162,11 @@ class CrabSystem:
     request_state_store: InMemoryRequestStateStore | None = None
     response_gate_registry: SandboxResponseGateRegistry | None = None
     journal: ActionJournal | None = None
+    egress_rules: tuple = ()
+    """Host-scoped egress classification overrides (D1). Applied when the
+    ledger is read, so changing them re-classifies history too — the
+    stored row keeps the class it was recorded with, the view reflects
+    the current rules."""
     relaunch_handler: Callable[[SandboxId, str, bool], None] | None = None
     extra_checkpoint_metadata_provider: Callable[[SandboxId], dict[str, object]] | None = None
     restore_metadata_handler: Callable[[SandboxId, CheckpointManifest], None] | None = None
@@ -2378,6 +2384,10 @@ class CrabSystem:
             payload["seq"] = record.seq
             payload["txn_id"] = record.txn_id
             payload["recorded_at"] = record.finished_at or record.started_at
+            # Re-derive rather than trust the stored class: classification
+            # is a pure function of the row, so rule changes (and rows
+            # written before classification existed) are reflected here.
+            payload["classification"] = classify_flow(payload, self.egress_rules)
             flows.append(EgressFlow.from_json(payload))
         return EgressLedger(sandbox_id=sandbox_id, flows=tuple(flows), txn_id=txn_id)
 

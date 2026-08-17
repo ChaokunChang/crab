@@ -438,6 +438,9 @@ class _Routes:
                 "txn_id": result.txn_id,
                 "discarded_observations": result.discarded_observations,
                 "restored_checkpoint_id": result.restored_checkpoint_id,
+                # Mutating egress the abort could not undo (D1); omitting it
+                # would make remote aborts silently report zero.
+                "mutating_egress": getattr(result, "mutating_egress", 0),
             },
         }
 
