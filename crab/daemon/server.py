@@ -541,6 +541,22 @@ class _Routes:
             records = records[-int(limit_raw):]
         return {"ok": True, "records": [record.to_json() for record in records]}
 
+    def sandbox_egress(self, body: dict[str, Any], *, sandbox_id: str) -> dict[str, Any]:
+        """Effect ledger view (D1): recorded egress flows, optionally
+        scoped to one transaction."""
+        eng = self._daemon.require_engine()
+        txn_raw = body.get("txn_id")
+        since_raw = body.get("since_seq")
+        try:
+            ledger = eng.system.egress_ledger(
+                SandboxId(sandbox_id),
+                txn_id=None if not txn_raw else str(txn_raw),
+                since_seq=None if since_raw is None else int(since_raw),
+            )
+        except RuntimeError as exc:
+            raise _BadRequest(f"egress ledger unavailable: {exc}") from exc
+        return {"ok": True, "ledger": ledger.to_json()}
+
     def merge_processes_sandbox(
         self, body: dict[str, Any], *, sandbox_id: str
     ) -> dict[str, Any]:
@@ -754,6 +770,8 @@ def _build_handler(daemon: "DaemonServer"):
             routes.consolidate_observations_sandbox,
         ),
         ("POST", "/sandboxes/{sandbox_id}/actions", "", routes.sandbox_actions),
+        # Effect ledger (D1)
+        ("POST", "/sandboxes/{sandbox_id}/egress", "", routes.sandbox_egress),
         # Process merge (C4)
         ("POST", "/sandboxes/{sandbox_id}/processes/merge", "", routes.merge_processes_sandbox),
     ]

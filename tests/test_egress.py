@@ -4,6 +4,8 @@ loopback sockets, no netfilter), the bridge redirect rule shape, and
 the engine config gates. Host-runnable."""
 from __future__ import annotations
 
+import contextlib
+import io
 import socket
 import struct
 import tempfile
@@ -111,9 +113,10 @@ class _EchoUpstream:
         self._thread.join(timeout=2.0)
 
 
-class ProxyFlowTests(unittest.TestCase):
+class _ProxyHarness:
     """Drives the proxy over loopback with SO_ORIGINAL_DST patched (no
-    netfilter needed to prove the flow/record behavior)."""
+    netfilter needed to prove the flow/record behavior). Mixin, not a
+    TestCase, so subclasses do not re-collect its tests."""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="crab_egress_")
@@ -180,7 +183,7 @@ class ProxyFlowTests(unittest.TestCase):
         self.assertEqual(flow["path"], "/v1/orders")
         self.assertEqual(flow["host"], "api.example.com")
         self.assertEqual(flow["dst_port"], self.upstream.port)
-        self.assertEqual(flow["classification"], "unclassified")  # PR-D1.2 fills this
+        self.assertEqual(flow["classification"], "mutating")  # POST
         self.assertGreater(flow["bytes_out"], 0)
         self.assertGreater(flow["bytes_in"], 0)
 
@@ -225,6 +228,10 @@ class ProxyFlowTests(unittest.TestCase):
         broken.record_egress.side_effect = RuntimeError("disk on fire")
         EgressFlowRecorder(broken).record(self.sandbox_id, {"host": "x"})
         EgressFlowRecorder(None).record(self.sandbox_id, {"host": "x"})
+
+
+class ProxyFlowTests(_ProxyHarness, unittest.TestCase):
+    pass
 
 
 class RedirectRuleTests(unittest.TestCase):
@@ -374,6 +381,471 @@ class ConfigGateTests(unittest.TestCase):
         proxy = EgressProxyServer()
         self.addCleanup(proxy.stop)
         self.assertEqual(proxy.server_address[0], "127.0.0.1")
+
+
+# ---------------------------------------------------------------------------
+# D1.2: classification + effect ledger
+# ---------------------------------------------------------------------------
+
+from crab.egress import EgressRule, classify_flow
+from crab.ids import SandboxId as _SandboxId
+from crab.models import EgressFlow, EgressLedger
+
+
+def _flow_payload(**overrides) -> dict:
+    payload = {
+        "host": "api.example.com",
+        "dst_ip": "203.0.113.7",
+        "dst_port": 443,
+        "scheme": "http",
+        "method": "GET",
+        "path": "/things",
+        "bytes_out": 120,
+        "bytes_in": 340,
+        "duration_ms": 4.2,
+    }
+    payload.update(overrides)
+    return payload
+
+
+class _CliHarness:
+    """CLI driver over a stubbed daemon client; mixin so subclasses do
+    not re-collect these tests."""
+
+    def _run_cli(self, argv: list[str], responses: dict) -> tuple[int, str, list]:
+        requests: list[dict] = []
+
+        class _CliClient:
+            def __init__(self, socket_path, *, timeout_seconds):
+                requests.append({"socket": str(socket_path), "timeout": timeout_seconds})
+
+            def post_json(self, path, payload=None, *, timeout_seconds=None):
+                requests.append({"path": path, "payload": payload})
+                return responses[path]
+
+            def get_json(self, path, *, timeout_seconds=None):
+                return responses[path]
+
+        stdout = io.StringIO()
+        from crab.cli import commands
+
+        with mock.patch.object(commands, "DaemonClient", _CliClient):
+            with contextlib.redirect_stdout(stdout):
+                rc = commands.main(argv)
+        return rc, stdout.getvalue(), requests
+
+
+class _FakeDaemonClient:
+    """Records requests and replays canned responses (or raises)."""
+
+    def __init__(self) -> None:
+        self.requests: list[dict] = []
+        self.responses: dict = {}
+
+    def post_json(self, path, payload=None, *, timeout_seconds=None):
+        self.requests.append(
+            {"path": path, "payload": payload, "timeout": timeout_seconds}
+        )
+        response = self.responses.get(path)
+        if isinstance(response, Exception):
+            raise response
+        return response or {"ok": True}
+
+    def get_json(self, path, *, timeout_seconds=None):
+        return self.responses.get(path) or {"ok": True}
+
+
+class ClassificationTests(unittest.TestCase):
+    def test_http_method_table(self) -> None:
+        for method in ("GET", "HEAD", "OPTIONS", "TRACE"):
+            self.assertEqual(
+                classify_flow(_flow_payload(method=method)), "idempotent_read"
+            )
+        for method in ("POST", "PUT", "PATCH", "DELETE"):
+            self.assertEqual(classify_flow(_flow_payload(method=method)), "mutating")
+        # Lowercase from a sloppy client still classifies.
+        self.assertEqual(classify_flow(_flow_payload(method="post")), "mutating")
+
+    def test_encrypted_and_raw_flows_are_opaque(self) -> None:
+        self.assertEqual(
+            classify_flow(_flow_payload(scheme="tls", method=None, path=None)), "opaque"
+        )
+        self.assertEqual(
+            classify_flow(_flow_payload(scheme="tcp", method=None, path=None)), "opaque"
+        )
+        # CONNECT tunnels reveal nothing about the tunnelled request.
+        self.assertEqual(classify_flow(_flow_payload(method="CONNECT")), "opaque")
+
+    def test_host_rules_override_the_protocol_default(self) -> None:
+        rules = (
+            EgressRule(host_glob="*.internal.example", classify="idempotent_read"),
+            EgressRule(host_glob="payments.example.com", classify="mutating"),
+        )
+        # TLS to a known read-only internal API: rule refines what the
+        # protocol cannot reveal.
+        self.assertEqual(
+            classify_flow(
+                _flow_payload(host="reports.internal.example", scheme="tls", method=None),
+                rules,
+            ),
+            "idempotent_read",
+        )
+        # A rule also overrides an explicit GET.
+        self.assertEqual(
+            classify_flow(_flow_payload(host="payments.example.com", method="GET"), rules),
+            "mutating",
+        )
+        # Non-matching hosts keep the protocol default.
+        self.assertEqual(
+            classify_flow(_flow_payload(host="api.example.com", method="POST"), rules),
+            "mutating",
+        )
+
+    def test_first_matching_rule_wins_and_matching_is_case_insensitive(self) -> None:
+        rules = (
+            EgressRule(host_glob="*.EXAMPLE.com", classify="opaque"),
+            EgressRule(host_glob="api.example.com", classify="mutating"),
+        )
+        self.assertEqual(classify_flow(_flow_payload(method="GET"), rules), "opaque")
+
+    def test_rule_validation_and_json(self) -> None:
+        with self.assertRaises(ValueError):
+            EgressRule(host_glob="*", classify="write")
+        rule = EgressRule.from_json({"host_glob": "*.x", "classify": "mutating"})
+        self.assertEqual((rule.host_glob, rule.classify), ("*.x", "mutating"))
+
+    def test_classification_is_rederivable_from_stored_rows(self) -> None:
+        stored = _flow_payload(method="DELETE", classification="idempotent_read")
+        # Reclassifying a stored row ignores the old verdict.
+        self.assertEqual(classify_flow(stored), "mutating")
+
+
+class ProxyClassificationTests(_ProxyHarness, unittest.TestCase):
+    """The proxy stamps the class at record time, rules included."""
+
+    def test_recorded_flow_carries_its_class(self) -> None:
+        self._talk(b"DELETE /things/1 HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+        [flow] = self._flows()
+        self.assertEqual(flow["classification"], "mutating")
+
+    def test_proxy_applies_host_rules(self) -> None:
+        self.proxy.rules = (
+            EgressRule(host_glob="api.example.com", classify="idempotent_read"),
+        )
+        self._talk(b"POST /things HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+        [flow] = self._flows()
+        self.assertEqual(flow["classification"], "idempotent_read")
+
+
+class LedgerModelTests(unittest.TestCase):
+    def _ledger(self) -> EgressLedger:
+        return EgressLedger(
+            sandbox_id=_SandboxId("sbx-1"),
+            flows=(
+                EgressFlow(
+                    seq=1, host="a.example", dst_ip="10.0.0.1", dst_port=80,
+                    scheme="http", classification="idempotent_read", method="GET",
+                    path="/", bytes_out=10, bytes_in=20,
+                ),
+                EgressFlow(
+                    seq=2, host="a.example", dst_ip="10.0.0.1", dst_port=80,
+                    scheme="http", classification="mutating", method="POST",
+                    path="/w", txn_id="txn-1",
+                ),
+                EgressFlow(
+                    seq=3, host="b.example", dst_ip="10.0.0.2", dst_port=443,
+                    scheme="tls", classification="opaque",
+                ),
+            ),
+        )
+
+    def test_counts_and_hosts(self) -> None:
+        ledger = self._ledger()
+        self.assertEqual(ledger.total, 3)
+        self.assertEqual(ledger.idempotent_reads, 1)
+        self.assertEqual(ledger.mutating, 1)
+        self.assertEqual(ledger.opaque, 1)
+        self.assertEqual(ledger.hosts, ("a.example", "b.example"))
+
+    def test_round_trip(self) -> None:
+        ledger = self._ledger()
+        restored = EgressLedger.from_json(ledger.to_json())
+        self.assertEqual(restored, ledger)
+        payload = ledger.to_json()
+        self.assertEqual(payload["mutating"], 1)  # counts are serialized too
+
+
+class SystemLedgerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="crab_ledger_")
+        self.addCleanup(self._tmp.cleanup)
+        self.journal = ActionJournal(Path(self._tmp.name) / "journal")
+        self.sandbox_id = SandboxId("sbx-ledger")
+        self.system = _minimal_system(self.journal)
+
+    def _record(self, **overrides) -> None:
+        payload = _flow_payload(**overrides)
+        payload.setdefault("classification", classify_flow(payload))
+        self.journal.record_egress(self.sandbox_id, payload=payload)
+
+    def test_reads_flows_with_counts_and_provenance(self) -> None:
+        self._record(method="GET", path="/a")
+        self._record(method="POST", path="/b")
+        ledger = self.system.egress_ledger(self.sandbox_id)
+        self.assertEqual((ledger.total, ledger.idempotent_reads, ledger.mutating), (2, 1, 1))
+        self.assertEqual([flow.seq for flow in ledger.flows], [0, 1])  # journal seq starts at 0
+        self.assertTrue(all(flow.recorded_at for flow in ledger.flows))
+        self.assertIsNone(ledger.txn_id)
+
+    def test_txn_scoping_and_since_seq(self) -> None:
+        self._record(method="GET", path="/before")
+        self.journal.set_active_txn(self.sandbox_id, "txn-7")
+        self._record(method="POST", path="/in-txn")
+        self.journal.set_active_txn(self.sandbox_id, None)
+        self._record(method="GET", path="/after")
+
+        scoped = self.system.egress_ledger(self.sandbox_id, txn_id="txn-7")
+        self.assertEqual(scoped.total, 1)
+        self.assertEqual(scoped.mutating, 1)
+        self.assertEqual(scoped.flows[0].path, "/in-txn")
+        self.assertEqual(scoped.flows[0].txn_id, "txn-7")
+        self.assertEqual(scoped.txn_id, "txn-7")
+
+        # since_seq is exclusive; rows are seq 0/1/2 here.
+        tail = self.system.egress_ledger(self.sandbox_id, since_seq=1)
+        self.assertEqual([flow.path for flow in tail.flows], ["/after"])
+
+    def test_requires_the_journal(self) -> None:
+        self.system.journal = None
+        with self.assertRaises(RuntimeError):
+            self.system.egress_ledger(self.sandbox_id)
+
+    def test_mutating_egress_helper_is_failure_tolerant(self) -> None:
+        self.journal.set_active_txn(self.sandbox_id, "txn-9")
+        self._record(method="PUT", path="/x")
+        self.journal.set_active_txn(self.sandbox_id, None)
+        self.assertEqual(self.system._mutating_egress_in_txn(self.sandbox_id, "txn-9"), 1)
+        self.assertEqual(self.system._mutating_egress_in_txn(self.sandbox_id, "txn-none"), 0)
+        with mock.patch.object(
+            self.system, "egress_ledger", side_effect=RuntimeError("boom")
+        ):
+            self.assertEqual(self.system._mutating_egress_in_txn(self.sandbox_id, "txn-9"), 0)
+        self.system.journal = None
+        self.assertEqual(self.system._mutating_egress_in_txn(self.sandbox_id, "txn-9"), 0)
+
+
+def _minimal_system(journal):
+    """Real CrabSystem wired to a real journal with stub collaborators —
+    the ledger only touches the journal."""
+    from types import SimpleNamespace
+
+    from crab import (
+        CRExecutor,
+        CRScheduler,
+        CrabSystem,
+        EBPFSandboxInspector,
+        ExecutorConfig,
+        InMemorySchedulerStateStore,
+        InMemoryTelemetrySink,
+        LocalCheckpointManager,
+        SchedulerConfig,
+        StorageConfig,
+    )
+    from crab.interceptor import SandboxResponseGateRegistry
+    from crab.scheduler import FaultToleranceCheckpointingPolicy
+
+    root = journal.root.parent
+    runtime = SimpleNamespace(name="runc")
+    telemetry = InMemoryTelemetrySink()
+    storage = LocalCheckpointManager(
+        StorageConfig(root_dir=root / "storage"), destroy_filesystem_ref=lambda ref: None
+    )
+    executor = CRExecutor(ExecutorConfig(max_workers=1), None, None, telemetry)
+    cfg = SchedulerConfig(require_change_signal=True)
+    scheduler = CRScheduler(
+        cfg,
+        EBPFSandboxInspector(),
+        runtime,
+        InMemorySchedulerStateStore(),
+        telemetry,
+        FaultToleranceCheckpointingPolicy(cfg),
+    )
+    return CrabSystem(
+        scheduler=scheduler,
+        executor=executor,
+        storage=storage,
+        inspector=EBPFSandboxInspector(),
+        runtime=runtime,
+        telemetry=telemetry,
+        response_gate_registry=SandboxResponseGateRegistry(),
+        journal=journal,
+    )
+
+
+class SandboxEgressPlumbingTests(unittest.TestCase):
+    def test_delegates_with_scoping(self) -> None:
+        from crab.sandbox import Sandbox
+
+        calls: list = []
+
+        class _System:
+            def egress_ledger(self, sandbox_id, *, txn_id=None, since_seq=None):
+                calls.append((str(sandbox_id), txn_id, since_seq))
+                return EgressLedger(sandbox_id=sandbox_id)
+
+        class _Engine:
+            system = _System()
+
+            def _register_sandbox(self, sandbox) -> None:
+                pass
+
+        sandbox = Sandbox.connect("sbx-1", engine=_Engine())
+        ledger = sandbox.egress(txn_id="txn-3", since_seq=5)
+        self.assertEqual(ledger.total, 0)
+        self.assertEqual(calls, [("sbx-1", "txn-3", 5)])
+
+    def test_bare_engine_raises(self) -> None:
+        from crab.sandbox import Sandbox
+
+        class _Bare:
+            system = object()
+
+            def _register_sandbox(self, sandbox) -> None:
+                pass
+
+        with self.assertRaises(NotImplementedError):
+            Sandbox.connect("sbx-1", engine=_Bare()).egress()
+
+
+class _LedgerDaemonSystem:
+    def __init__(self) -> None:
+        self.calls: list = []
+        self.error: Exception | None = None
+
+    def egress_ledger(self, sandbox_id, *, txn_id=None, since_seq=None):
+        self.calls.append((str(sandbox_id), txn_id, since_seq))
+        if self.error is not None:
+            raise self.error
+        return EgressLedger(
+            sandbox_id=SandboxId(str(sandbox_id)),
+            flows=(
+                EgressFlow(
+                    seq=1, host="api.example.com", dst_ip="10.0.0.9", dst_port=443,
+                    scheme="http", classification="mutating", method="POST", path="/w",
+                    txn_id=txn_id,
+                ),
+            ),
+            txn_id=txn_id,
+        )
+
+
+class LedgerDaemonTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from types import SimpleNamespace
+
+        from crab.daemon.server import _Routes
+
+        self.engine = SimpleNamespace(system=_LedgerDaemonSystem())
+
+        class _Daemon:
+            def __init__(self, engine):
+                self._engine = engine
+
+            def require_engine(self):
+                return self._engine
+
+            def register_sandbox(self, sandbox_id) -> None:
+                pass
+
+            def unregister_sandbox(self, sandbox_id) -> None:
+                pass
+
+        self.daemon_cls = _Daemon
+        self.routes = _Routes(_Daemon(self.engine))
+
+    def test_route_serializes_and_scopes(self) -> None:
+        response = self.routes.sandbox_egress(
+            {"txn_id": "txn-2", "since_seq": 4}, sandbox_id="sbx-1"
+        )
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["ledger"]["mutating"], 1)
+        self.assertEqual(self.engine.system.calls, [("sbx-1", "txn-2", 4)])
+
+    def test_missing_journal_is_a_bad_request(self) -> None:
+        from crab.daemon.server import _BadRequest
+
+        self.engine.system.error = RuntimeError("the effect ledger requires the journal")
+        with self.assertRaises(_BadRequest):
+            self.routes.sandbox_egress({}, sandbox_id="sbx-1")
+
+    def test_dispatch_over_socket(self) -> None:
+        from crab.daemon.server import _build_handler
+        from crab.daemon.transport import DaemonClient, serve_unix_socket
+
+        tmp = tempfile.TemporaryDirectory(prefix="crab_ledgerd_")
+        self.addCleanup(tmp.cleanup)
+        socket_path = Path(tmp.name) / "crab.sock"
+        server = serve_unix_socket(socket_path, _build_handler(self.daemon_cls(self.engine)))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        client = DaemonClient(socket_path, timeout_seconds=10.0)
+        response = client.post_json("/sandboxes/sbx-1/egress", {})
+        self.assertEqual(response["ledger"]["total"], 1)
+
+
+class LedgerShimTests(unittest.TestCase):
+    def test_payload_and_rehydration(self) -> None:
+        from crab.remote_engine import RemoteEngine
+
+        client = _FakeDaemonClient()
+        ledger = EgressLedger(
+            sandbox_id=SandboxId("sbx-1"),
+            flows=(
+                EgressFlow(
+                    seq=2, host="a.example", dst_ip="10.0.0.1", dst_port=80,
+                    scheme="http", classification="idempotent_read", method="GET", path="/",
+                ),
+            ),
+        )
+        client.responses["/sandboxes/sbx-1/egress"] = {"ok": True, "ledger": ledger.to_json()}
+        engine = RemoteEngine(client, info={"runtime": "runc", "default_image": "ubuntu:22.04"})
+        restored = engine.system.egress_ledger(SandboxId("sbx-1"), txn_id="txn-1", since_seq=2)
+        self.assertIsInstance(restored.flows[0], EgressFlow)
+        self.assertEqual(restored.idempotent_reads, 1)
+        self.assertEqual(
+            client.requests[0]["payload"], {"txn_id": "txn-1", "since_seq": 2}
+        )
+        # No scoping -> empty body (the daemon defaults to everything).
+        engine.system.egress_ledger(SandboxId("sbx-1"))
+        self.assertEqual(client.requests[1]["payload"], {})
+
+
+class LedgerCliTests(_CliHarness, unittest.TestCase):
+    def test_egress_summary_and_rows(self) -> None:
+        ledger = EgressLedger(
+            sandbox_id=SandboxId("sbx-1"),
+            flows=(
+                EgressFlow(
+                    seq=1, host="api.example.com", dst_ip="10.0.0.1", dst_port=443,
+                    scheme="http", classification="mutating", method="POST", path="/orders",
+                    txn_id="txn-4",
+                ),
+                EgressFlow(
+                    seq=2, host="secure.example.com", dst_ip="10.0.0.2", dst_port=443,
+                    scheme="tls", classification="opaque",
+                ),
+            ),
+        )
+        rc, out, requests = self._run_cli(
+            ["sandbox", "egress", "sbx-1", "--txn", "txn-4"],
+            {"/sandboxes/sbx-1/egress": {"ok": True, "ledger": ledger.to_json()}},
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("total=2 reads=0 mutating=1 opaque=1", out)
+        self.assertIn("1\tmutating\tPOST\tapi.example.com:443\t/orders\ttxn=txn-4", out)
+        self.assertIn("2\topaque\ttls\tsecure.example.com:443", out)
+        self.assertEqual(requests[-1]["payload"], {"txn_id": "txn-4"})
 
 
 if __name__ == "__main__":

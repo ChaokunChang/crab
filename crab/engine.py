@@ -385,6 +385,12 @@ class EngineConfig:
     egress_proxy_port: int = 0
     """Port for the egress proxy; 0 picks a free one."""
 
+    egress_rules: tuple = ()
+    """Host-scoped classification overrides for the effect ledger, e.g.
+    ``({"host_glob": "*.internal.example", "classify": "idempotent_read"},)``.
+    Encrypted flows are ``opaque`` by default because the proxy cannot
+    see the method; rules are how a deployment states what it knows."""
+
     network_expected_sandboxes: int | None = None
     """Optional capacity hint for the bridge network allocator."""
 
@@ -575,6 +581,7 @@ class EngineConfig:
                 default=0,
             )
             or 0,
+            egress_rules=tuple(egress.get("rules", data.get("egress_rules")) or ()),
             network_expected_sandboxes=_as_int(
                 network.get("expected_sandboxes", data.get("network_expected_sandboxes")),
                 default=None,
@@ -872,10 +879,14 @@ class Engine:
                 # All sandbox TCP egress lands here (bridge REDIRECT);
                 # host-bound flows are excluded by the rule, so the
                 # interceptor path above is untouched.
-                from .egress import EgressProxyServer
+                from .egress import EgressProxyServer, EgressRule
 
                 manager = self._network_manager
                 assert manager is not None  # guarded above
+                rules = tuple(
+                    rule if isinstance(rule, EgressRule) else EgressRule.from_json(dict(rule))
+                    for rule in cfg.egress_rules
+                )
                 proxy = EgressProxyServer(
                     journal=getattr(self._system, "journal", None),
                     sandbox_id_resolver=manager.resolve_sandbox_id,
@@ -884,6 +895,7 @@ class Engine:
                     # flow without exposing the proxy on other interfaces.
                     host=manager.bridge_ip,
                     port=cfg.egress_proxy_port,
+                    rules=rules,
                 )
                 proxy.start()
                 manager.enable_egress_redirect(proxy.port)
