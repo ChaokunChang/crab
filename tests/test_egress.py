@@ -963,3 +963,198 @@ class AbortMutatingEgressTransportTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# D2.1: recording through the proxy
+# ---------------------------------------------------------------------------
+
+from crab.cassettes import CassetteStore
+from crab.egress import CassetteRecorder
+
+
+class ProxyRecordingTests(_ProxyHarness, unittest.TestCase):
+    """The tee path: a real (loopback) exchange must land in a cassette
+    and leave its index fields on the journal row."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store = CassetteStore(Path(self._tmp.name) / "cassettes")
+        self.proxy.cassette_recorder = CassetteRecorder(self.store)
+
+    def test_idempotent_read_is_recorded_end_to_end(self) -> None:
+        self.upstream.response = (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello world"
+        )
+        body = self._talk(b"GET /things HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+        self.assertIn(b"hello world", body)  # client still got the real bytes
+
+        [flow] = self._flows()
+        self.assertTrue(flow["recorded"])
+        self.assertEqual(flow["status"], 200)
+        self.assertFalse(flow["truncated"])
+        entry = self.store.get(self.sandbox_id, flow["request_key"])
+        self.assertEqual(entry.body, b"hello world")
+        self.assertEqual(entry.method, "GET")
+        self.assertEqual(entry.path, "/things")
+
+    def test_mutating_flow_is_never_recorded(self) -> None:
+        self._talk(b"POST /things HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+        [flow] = self._flows()
+        self.assertEqual(flow["classification"], "mutating")
+        self.assertNotIn("request_key", flow)
+        self.assertEqual(self.store.count(self.sandbox_id), 0)
+
+    def test_host_rules_can_make_a_read_recordable(self) -> None:
+        # TLS-like opaque case: a rule declares the host read-only, so the
+        # same gate that classifies also enables recording.
+        self.proxy.rules = (
+            EgressRule(host_glob="api.example.com", classify="idempotent_read"),
+        )
+        self.upstream.response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"
+        self._talk(b"POST /things HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+        [flow] = self._flows()
+        self.assertTrue(flow["recorded"])
+
+    def test_oversized_response_is_marked_truncated_and_not_stored(self) -> None:
+        self.proxy.cassette_recorder = CassetteRecorder(self.store, max_body_bytes=32)
+        self.upstream.response = (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 200\r\n\r\n" + b"x" * 200
+        )
+        self._talk(b"GET /big HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+        [flow] = self._flows()
+        self.assertFalse(flow["recorded"])
+        self.assertTrue(flow["truncated"])
+        self.assertEqual(self.store.count(self.sandbox_id), 0)
+
+    def test_recording_off_leaves_flows_untouched(self) -> None:
+        self.proxy.cassette_recorder = None
+        self._talk(b"GET /things HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+        [flow] = self._flows()
+        self.assertNotIn("recorded", flow)
+        self.assertEqual(self.store.count(self.sandbox_id), 0)
+
+
+class RecordingConfigTests(unittest.TestCase):
+    def test_defaults_off_and_nested_parsing(self) -> None:
+        from crab.engine import EngineConfig
+
+        self.assertFalse(EngineConfig().enable_egress_recording)
+        cfg = EngineConfig.from_mapping(
+            {
+                "egress": {
+                    "enabled": True,
+                    "recording": {
+                        "enabled": True,
+                        "max_body_bytes": 2048,
+                        "record_errors": True,
+                        "varying_headers": ["accept", "range"],
+                        "record_partial": True,
+                    },
+                }
+            }
+        )
+        self.assertTrue(cfg.enable_egress_recording)
+        self.assertEqual(cfg.egress_recording_max_body_bytes, 2048)
+        self.assertTrue(cfg.egress_recording_record_errors)
+        self.assertEqual(cfg.egress_recording_varying_headers, ("accept", "range"))
+        self.assertTrue(cfg.egress_recording_record_partial)
+
+    def test_recording_requires_the_proxy(self) -> None:
+        from crab.engine import Engine, EngineConfig
+
+        with tempfile.TemporaryDirectory(prefix="crab_rec_cfg_") as tmp:
+            cfg = EngineConfig(
+                runtime="in-memory",
+                enable_interceptor=False,
+                enable_sandbox_network=False,
+                enable_egress_proxy=False,
+                enable_egress_recording=True,
+                storage_root=Path(tmp) / "storage",
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                Engine.start(cfg)
+            self.assertIn("enable_egress_recording requires", str(ctx.exception))
+
+    def test_cassettes_dirname_is_validated(self) -> None:
+        from crab.config import StorageConfig
+
+        self.assertEqual(StorageConfig(root_dir=Path("/tmp")).cassettes_dirname, "cassettes")
+        with self.assertRaises(ValueError):
+            StorageConfig(root_dir=Path("/tmp"), cassettes_dirname="")
+
+
+class LedgerRecordingFieldsTests(unittest.TestCase):
+    def test_counters_and_defaults(self) -> None:
+        recorded = EgressFlow(
+            seq=1, host="a", dst_ip="10.0.0.1", dst_port=80, scheme="http",
+            classification="idempotent_read", method="GET", path="/",
+            recorded=True, request_key="k", status=200,
+        )
+        replayed = EgressFlow(
+            seq=2, host="a", dst_ip="10.0.0.1", dst_port=80, scheme="http",
+            classification="idempotent_read", method="GET", path="/",
+            recorded=True, request_key="k", status=200, replayed_from_seq=1,
+        )
+        plain = EgressFlow(
+            seq=3, host="a", dst_ip="10.0.0.1", dst_port=80, scheme="http",
+            classification="mutating", method="POST", path="/w",
+        )
+        ledger = EgressLedger(
+            sandbox_id=SandboxId("sbx-1"), flows=(recorded, replayed, plain)
+        )
+        self.assertEqual(ledger.recorded, 2)
+        self.assertEqual(ledger.replayed, 1)
+        payload = ledger.to_json()
+        self.assertEqual((payload["recorded"], payload["replayed"]), (2, 1))
+        self.assertEqual(EgressLedger.from_json(payload), ledger)
+
+    def test_d1_era_rows_deserialize_with_defaults(self) -> None:
+        legacy = {
+            "seq": 7, "host": "a", "dst_ip": "10.0.0.1", "dst_port": 80,
+            "scheme": "http", "classification": "idempotent_read",
+            "method": "GET", "path": "/", "bytes_out": 1, "bytes_in": 2,
+            "duration_ms": 1.0, "txn_id": None, "recorded_at": None,
+        }
+        flow = EgressFlow.from_json(legacy)
+        self.assertFalse(flow.recorded)
+        self.assertIsNone(flow.request_key)
+        self.assertIsNone(flow.status)
+        self.assertFalse(flow.truncated)
+        self.assertIsNone(flow.replayed_from_seq)
+
+
+class RecordedCliTests(_CliHarness, unittest.TestCase):
+    def _ledger(self) -> EgressLedger:
+        return EgressLedger(
+            sandbox_id=SandboxId("sbx-1"),
+            flows=(
+                EgressFlow(
+                    seq=1, host="api.example.com", dst_ip="10.0.0.1", dst_port=80,
+                    scheme="http", classification="idempotent_read", method="GET",
+                    path="/things", recorded=True, request_key="k1", status=200,
+                ),
+                EgressFlow(
+                    seq=2, host="api.example.com", dst_ip="10.0.0.1", dst_port=80,
+                    scheme="http", classification="mutating", method="POST", path="/w",
+                ),
+            ),
+        )
+
+    def test_summary_reports_recorded_counts(self) -> None:
+        rc, out, _ = self._run_cli(
+            ["sandbox", "egress", "sbx-1"],
+            {"/sandboxes/sbx-1/egress": {"ok": True, "ledger": self._ledger().to_json()}},
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("recorded=1 replayed=0", out)
+        self.assertIn("rec:200", out)
+
+    def test_recorded_filter_hides_unrecorded_flows(self) -> None:
+        rc, out, _ = self._run_cli(
+            ["sandbox", "egress", "sbx-1", "--recorded"],
+            {"/sandboxes/sbx-1/egress": {"ok": True, "ledger": self._ledger().to_json()}},
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("/things", out)
+        self.assertNotIn("POST", out)
