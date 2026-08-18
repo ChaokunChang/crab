@@ -37,6 +37,12 @@ EFFECT_POLICIES: tuple[str, ...] = ("allow", "defer", "reject", "seal")
 UNLISTED_BEHAVIORS: tuple[str, ...] = ("reject", "allow")
 OPAQUE_BEHAVIORS: tuple[str, ...] = ("allow", "reject", "seal")
 
+# Whole-queue ceilings (the per-entry body cap lives on the proxy). Every
+# queued entry keeps its body in memory until commit, so a transaction
+# must not be able to grow the queue without bound.
+DEFAULT_MAX_QUEUE_BYTES = 16 * 1024 * 1024
+DEFAULT_MAX_QUEUE_ENTRIES = 256
+
 # What the gate decided for one flow; the proxy turns this into wire
 # bytes and the journal records it verbatim.
 DECISION_PASS = "pass"
@@ -44,18 +50,30 @@ DECISION_DEFER = "defer"
 DECISION_REJECT = "reject"
 DECISION_SEAL = "seal"
 
-DEFERRED_RESPONSE = (
-    b"HTTP/1.1 202 Accepted\r\n"
-    b"X-Crab-Effect: deferred\r\n"
-    b"Content-Length: 0\r\n"
-    b"Connection: close\r\n\r\n"
-)
-REJECTED_RESPONSE = (
-    b"HTTP/1.1 503 Service Unavailable\r\n"
-    b"X-Crab-Effect: rejected\r\n"
-    b"Content-Length: 41\r\n"
-    b"Connection: close\r\n\r\n"
-    b"crab: mutating egress refused by txn policy\n"
+def _synthetic_response(status_line: bytes, effect: bytes, body: bytes) -> bytes:
+    """Build a well-formed synthetic response.
+
+    Content-Length is computed, never hand-counted: the first cut of the
+    503 declared 41 for a 44-byte body, and lenient clients hid it behind
+    ``Connection: close`` while a strict one would have mis-parsed or hung
+    waiting for the missing bytes.
+    """
+    return (
+        status_line
+        + b"\r\nX-Crab-Effect: "
+        + effect
+        + b"\r\nContent-Length: "
+        + str(len(body)).encode("ascii")
+        + b"\r\nConnection: close\r\n\r\n"
+        + body
+    )
+
+
+DEFERRED_RESPONSE = _synthetic_response(b"HTTP/1.1 202 Accepted", b"deferred", b"")
+REJECTED_RESPONSE = _synthetic_response(
+    b"HTTP/1.1 503 Service Unavailable",
+    b"rejected",
+    b"crab: mutating egress refused by txn policy\n",
 )
 
 
@@ -114,6 +132,12 @@ class EffectSession:
     rules: tuple[EffectRule, ...] = ()
     txn_id: str | None = None
     queue: list = field(default_factory=list)
+    # Queue ceilings: a per-entry body cap alone cannot stop a loop that
+    # posts a thousand allow-listed writes, and every entry holds its
+    # body in the daemon's memory.
+    max_queue_bytes: int = DEFAULT_MAX_QUEUE_BYTES
+    max_queue_entries: int = DEFAULT_MAX_QUEUE_ENTRIES
+    queued_bytes: int = 0
     deferred: int = 0
     rejected: int = 0
     passed: int = 0
@@ -142,6 +166,8 @@ class EffectGate:
         opaque_effects: str = "allow",
         rules=(),
         txn_id: str | None = None,
+        max_queue_bytes: int = DEFAULT_MAX_QUEUE_BYTES,
+        max_queue_entries: int = DEFAULT_MAX_QUEUE_ENTRIES,
     ) -> EffectSession:
         if policy not in EFFECT_POLICIES:
             raise ValueError(
@@ -163,6 +189,8 @@ class EffectGate:
             opaque_effects=opaque_effects,
             rules=tuple(rules),
             txn_id=txn_id,
+            max_queue_bytes=int(max_queue_bytes),
+            max_queue_entries=int(max_queue_entries),
         )
         with self._lock:
             self._sessions[str(sandbox_id)] = session
@@ -188,6 +216,7 @@ class EffectGate:
             if session is None:
                 return []
             queued, session.queue = session.queue, []
+            session.queued_bytes = 0
             return queued
 
     def counters(self, sandbox_id) -> tuple[int, int, int, bool]:
@@ -251,14 +280,32 @@ class EffectGate:
             return DECISION_PASS, session
 
     def enqueue(self, sandbox_id, request: DeferredRequest) -> int:
-        """Queue a deferred write; returns its 1-based position."""
+        """Queue a deferred write; returns its 1-based position, 0 when no
+        session is armed, or -1 when the queue is full (the caller then
+        refuses — dropping the write silently would be worse)."""
         with self._lock:
             session = self._sessions.get(str(sandbox_id))
             if session is None:
                 return 0
+            size = len(request.body)
+            if (
+                len(session.queue) >= session.max_queue_entries
+                or session.queued_bytes + size > session.max_queue_bytes
+            ):
+                session.rejected += 1
+                return -1
             session.queue.append(request)
+            session.queued_bytes += size
             session.deferred += 1
             return len(session.queue)
+
+    def queue_size(self, sandbox_id) -> tuple[int, int]:
+        """``(entries, bytes)`` currently queued."""
+        with self._lock:
+            session = self._sessions.get(str(sandbox_id))
+            if session is None:
+                return (0, 0)
+            return (len(session.queue), session.queued_bytes)
 
 
 def build_deferred_request(
@@ -321,6 +368,8 @@ __all__ = [
     "DECISION_PASS",
     "DECISION_REJECT",
     "DECISION_SEAL",
+    "DEFAULT_MAX_QUEUE_BYTES",
+    "DEFAULT_MAX_QUEUE_ENTRIES",
     "DEFERRED_RESPONSE",
     "EFFECT_POLICIES",
     "OPAQUE_BEHAVIORS",

@@ -609,6 +609,19 @@ class _EgressHandler(socketserver.BaseRequestHandler):
                         enqueued_at=utc_now().isoformat(),
                     )
                     position = gate.enqueue(sandbox_id, queued)
+                    if position <= 0:
+                        # position == -1: the txn's queue hit its ceiling.
+                        # position == 0: the session closed between the
+                        # decision and the enqueue (commit/abort raced us).
+                        # Either way the write was NOT queued, so answering
+                        # 202 would be a lie — refuse instead.
+                        client.sendall(REJECTED_RESPONSE)
+                        bytes_in = len(REJECTED_RESPONSE)
+                        record_meta = {
+                            "effect": "rejected",
+                            "effect_reason": "queue_full" if position < 0 else "session_closed",
+                        }
+                        return
                     client.sendall(DEFERRED_RESPONSE)
                     bytes_in = len(DEFERRED_RESPONSE)
                     record_meta = {
