@@ -176,6 +176,41 @@ def rewrite_filesystem_artifact(
     return json.dumps(data, sort_keys=True, indent=2).encode("utf-8")
 
 
+def retarget_bundle_network_namespace(target_bundle_dir: Path, netns_path: str) -> bool:
+    """Point the fork's spec at its own network namespace.
+
+    The fork's config.json is copied from the source, so without this it
+    keeps the *source's* netns path: the fork then shares the source's
+    network stack and its egress is attributed to the source (which also
+    made the fork's allocated lease dead weight). Returns True when the
+    spec was changed.
+    """
+    config_path = target_bundle_dir / "config.json"
+    if not config_path.is_file():
+        return False
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    namespaces = config.get("linux", {}).get("namespaces")
+    if not isinstance(namespaces, list):
+        return False
+    changed = False
+    for namespace in namespaces:
+        if isinstance(namespace, dict) and namespace.get("type") == "network":
+            if namespace.get("path") != netns_path:
+                namespace["path"] = netns_path
+                changed = True
+    if not changed:
+        return False
+    try:
+        config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    except OSError:
+        logger.warning("Failed to retarget fork network namespace", exc_info=True)
+        return False
+    return True
+
+
 def replicate_bundle_config(
     source_bundle_dir: Path,
     target_bundle_dir: Path,

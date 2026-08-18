@@ -283,3 +283,65 @@ class ForkOnceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ForkNetworkNamespaceRetargetTests(unittest.TestCase):
+    """A fork must run in its own netns: inheriting the source's spec made
+    it share the source's network stack, so its egress was attributed to
+    the source and its own lease went unused (found by a D2 E2E)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="crab_fork_netns_")
+        self.addCleanup(self._tmp.cleanup)
+        self.bundle = Path(self._tmp.name) / "bundle"
+        self.bundle.mkdir()
+
+    def _write(self, namespaces) -> Path:
+        config = {"linux": {"namespaces": namespaces}, "process": {"args": ["sh"]}}
+        path = self.bundle / "config.json"
+        path.write_text(json.dumps(config), encoding="utf-8")
+        return path
+
+    def test_rewrites_only_the_network_namespace(self) -> None:
+        path = self._write(
+            [
+                {"type": "pid"},
+                {"type": "network", "path": "/var/run/netns/ts-source"},
+                {"type": "mount"},
+            ]
+        )
+        changed = forking.retarget_bundle_network_namespace(
+            self.bundle, "/var/run/netns/ts-fork"
+        )
+        self.assertTrue(changed)
+        namespaces = json.loads(path.read_text(encoding="utf-8"))["linux"]["namespaces"]
+        self.assertEqual(
+            namespaces,
+            [
+                {"type": "pid"},
+                {"type": "network", "path": "/var/run/netns/ts-fork"},
+                {"type": "mount"},
+            ],
+        )
+
+    def test_no_change_when_already_correct_or_absent(self) -> None:
+        self._write([{"type": "network", "path": "/var/run/netns/ts-fork"}])
+        self.assertFalse(
+            forking.retarget_bundle_network_namespace(self.bundle, "/var/run/netns/ts-fork")
+        )
+        # Host networking (no network namespace entry) is left alone.
+        self._write([{"type": "pid"}])
+        self.assertFalse(
+            forking.retarget_bundle_network_namespace(self.bundle, "/var/run/netns/ts-fork")
+        )
+
+    def test_missing_or_broken_config_is_tolerated(self) -> None:
+        empty = Path(self._tmp.name) / "empty"
+        empty.mkdir()
+        self.assertFalse(
+            forking.retarget_bundle_network_namespace(empty, "/var/run/netns/ts-fork")
+        )
+        (self.bundle / "config.json").write_text("{not json", encoding="utf-8")
+        self.assertFalse(
+            forking.retarget_bundle_network_namespace(self.bundle, "/var/run/netns/ts-fork")
+        )

@@ -650,6 +650,7 @@ class SandboxPlumbingTests(unittest.TestCase):
                         "stop_on_deviation": True,
                         "lazy_pages": False,
                         "force": True,
+                        "egress_replay": "cassette_first",
                     },
                 )
             ],
@@ -831,6 +832,7 @@ class ShimTests(unittest.TestCase):
                 "stop_on_deviation": True,
                 "lazy_pages": True,
                 "force": False,
+                "egress_replay": "cassette_first",
             },
         )
 

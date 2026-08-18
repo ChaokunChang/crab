@@ -21,7 +21,7 @@ import socketserver
 import struct
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Sequence
 
 from .cassettes import (
@@ -36,7 +36,7 @@ from .cassettes import (
     request_key,
     sha256_hex,
 )
-from .http_wire import ResponseAssembler, parse_head
+from .http_wire import ResponseAssembler, parse_head, serialize_response
 from .ids import SandboxId
 from .models import utc_now
 
@@ -50,6 +50,16 @@ _HEAD_PEEK_BYTES = 2048
 _SPLICE_CHUNK = 65536
 _HTTP_METHODS = frozenset(
     {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT"}
+)
+
+# Sent under cassette_only when nothing matches: hermetic replay must
+# fail loudly instead of quietly reaching the network.
+_REPLAY_MISS_RESPONSE = (
+    b"HTTP/1.1 504 Gateway Timeout\r\n"
+    b"X-Crab-Replay: miss\r\n"
+    b"Content-Length: 24\r\n"
+    b"Connection: close\r\n\r\n"
+    b"crab: no cassette match\n"
 )
 
 SandboxIdResolver = Callable[[str], "SandboxId | None"]
@@ -332,6 +342,92 @@ class CassetteRecorder:
         }
 
 
+REPLAY_POLICIES: tuple[str, ...] = ("none", "cassette_first", "cassette_only")
+
+
+@dataclass
+class ReplaySession:
+    """One sandbox's replay window (D2). ``cassette_source`` is the bucket
+    to read: for C4 the reads happened in the *fork* while the replay runs
+    on the *source*, so without redirecting the lookup every request
+    misses and hits the network instead."""
+
+    policy: str
+    cassette_source: str
+    served: int = 0
+    missed: int = 0
+    passed_through: int = 0
+    hosts: set = field(default_factory=set)
+
+
+class CassetteReplayer:
+    """Serves recorded responses in place of live requests.
+
+    The replay gate is re-evaluated here with the *current* rules rather
+    than trusting the row's stored class — a host reclassified as
+    mutating/opaque must stop being served even though its cassettes are
+    still on disk (the same read-time re-derivation D1.2 established).
+    Mutating and opaque flows always pass through: swallowing a write
+    here would pre-empt D3 and hide a real side effect.
+    """
+
+    def __init__(self, store) -> None:
+        self._store = store
+        self._sessions: dict[str, ReplaySession] = {}
+        self._lock = threading.Lock()
+
+    def begin(self, sandbox_id, *, policy: str, cassette_source=None) -> ReplaySession:
+        if policy not in REPLAY_POLICIES or policy == "none":
+            raise ValueError(
+                f"unknown replay policy: {policy!r} "
+                f"(expected one of {REPLAY_POLICIES[1:]})"
+            )
+        session = ReplaySession(
+            policy=policy,
+            cassette_source=str(cassette_source or sandbox_id),
+        )
+        with self._lock:
+            self._sessions[str(sandbox_id)] = session
+        return session
+
+    def end(self, sandbox_id) -> ReplaySession | None:
+        with self._lock:
+            return self._sessions.pop(str(sandbox_id), None)
+
+    def session_for(self, sandbox_id) -> ReplaySession | None:
+        with self._lock:
+            return self._sessions.get(str(sandbox_id))
+
+    def lookup(
+        self,
+        session: ReplaySession,
+        *,
+        request_head: bytes,
+        host: str,
+        port: int,
+        method: str,
+        path: str,
+        varying_headers: Sequence[str],
+    ) -> CassetteEntry | None:
+        request = parse_head(request_head)
+        if request is None:
+            return None
+        key = request_key(
+            method=method,
+            host=host,
+            port=port,
+            path=path,
+            body_sha256=sha256_hex(request.rest),
+            headers=list(request.headers),
+            varying_headers=varying_headers,
+        )
+        entry = self._store.get(session.cassette_source, key)
+        if entry is None or entry.truncated:
+            # A partial response is worse than a live one.
+            return None
+        return entry
+
+
 class _EgressHandler(socketserver.BaseRequestHandler):
     def handle(self) -> None:  # noqa: C901 - straight-line proxy flow
         server: "EgressProxyServer" = self.server  # type: ignore[assignment]
@@ -371,6 +467,55 @@ class _EgressHandler(socketserver.BaseRequestHandler):
                 if sni is not None:
                     scheme = "tls"
                     host = sni
+            # ---- replay (D2): a cassette hit never opens an upstream
+            # connection. The gate is recomputed here with the current
+            # rules, and only reads are eligible — mutating and opaque
+            # flows always pass through to the real world.
+            replayer = server.cassette_replayer
+            session = None if replayer is None or sandbox_id is None else replayer.session_for(sandbox_id)
+            if session is not None:
+                eligible = scheme == "http" and classify_flow(
+                    {"host": host or dst_ip, "method": method, "scheme": scheme},
+                    server.rules,
+                ) == CLASSIFICATION_IDEMPOTENT_READ
+                if eligible:
+                    entry = replayer.lookup(
+                        session,
+                        request_head=head,
+                        host=host or dst_ip,
+                        port=dst_port,
+                        method=method or "GET",
+                        path=path or "/",
+                        varying_headers=server.replay_varying_headers,
+                    )
+                    if entry is not None:
+                        wire = serialize_response(
+                            status=entry.status,
+                            reason=entry.reason,
+                            headers=list(entry.response_headers),
+                            body=entry.body,
+                        )
+                        client.sendall(wire)
+                        bytes_in = len(wire)
+                        session.served += 1
+                        session.hosts.add(entry.host)
+                        record_meta = {
+                            "recorded": True,
+                            "request_key": entry.request_key,
+                            "response_sha256": entry.body_sha256,
+                            "status": entry.status,
+                            "replayed": True,
+                            "replayed_from_seq": entry.origin_seq,
+                            "replayed_from": session.cassette_source,
+                        }
+                        return  # finally still writes the journal row
+                    session.missed += 1
+                    if session.policy == "cassette_only":
+                        client.sendall(_REPLAY_MISS_RESPONSE)
+                        record_meta = {"replay_miss": True}
+                        return
+                else:
+                    session.passed_through += 1
             upstream = socket.create_connection(
                 (dst_ip, dst_port), timeout=server.connect_timeout_seconds
             )
@@ -502,6 +647,8 @@ class EgressProxyServer(socketserver.ThreadingTCPServer):
         connect_timeout_seconds: float = 10.0,
         rules: Sequence[EgressRule] = (),
         cassette_recorder: "CassetteRecorder | None" = None,
+        cassette_replayer: "CassetteReplayer | None" = None,
+        replay_varying_headers: Sequence[str] = DEFAULT_VARYING_HEADERS,
     ) -> None:
         """``host`` should be the bridge's own address: REDIRECT rewrites
         each flow's destination to it, so binding there receives all
@@ -509,6 +656,8 @@ class EgressProxyServer(socketserver.ThreadingTCPServer):
         super().__init__((host, port), _EgressHandler)
         self.recorder = EgressFlowRecorder(journal)
         self.cassette_recorder = cassette_recorder
+        self.cassette_replayer = cassette_replayer
+        self.replay_varying_headers = tuple(replay_varying_headers)
         self.rules = tuple(rules)
         self._sandbox_id_resolver = sandbox_id_resolver
         self.head_timeout_seconds = head_timeout_seconds
@@ -555,6 +704,9 @@ __all__ = [
     "CLASSIFICATION_OPAQUE",
     "EGRESS_CLASSIFICATIONS",
     "CassetteRecorder",
+    "CassetteReplayer",
+    "REPLAY_POLICIES",
+    "ReplaySession",
     "EgressFlowRecorder",
     "EgressProxyServer",
     "EgressRule",

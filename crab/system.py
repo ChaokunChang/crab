@@ -30,6 +30,7 @@ from .models import (
     EgressFlow,
     EgressLedger,
     ObservationReport,
+    EgressReplayReport,
     ProcessMergeReport,
     RecoveryEvent,
     RecoveryRecord,
@@ -171,6 +172,9 @@ class CrabSystem:
     """Recorded egress bodies (D2), assigned by the engine when recording
     is enabled. Pruned per sandbox on destroy, so a fork's cassettes must
     be replayed before the fork is killed."""
+    cassette_replayer: object | None = None
+    """Serves recorded reads during a replay window (D2), assigned by the
+    engine alongside the proxy."""
     relaunch_handler: Callable[[SandboxId, str, bool], None] | None = None
     extra_checkpoint_metadata_provider: Callable[[SandboxId], dict[str, object]] | None = None
     restore_metadata_handler: Callable[[SandboxId, CheckpointManifest], None] | None = None
@@ -2405,6 +2409,73 @@ class CrabSystem:
             flows.append(EgressFlow.from_json(payload))
         return EgressLedger(sandbox_id=sandbox_id, flows=tuple(flows), txn_id=txn_id)
 
+    def begin_egress_replay(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        policy: str = "cassette_first",
+        cassette_source: SandboxId | str | None = None,
+    ) -> None:
+        """Serve this sandbox's recorded reads from cassettes instead of
+        the network (D2). ``cassette_source`` selects whose bucket to read
+        — C4 replays a fork's commands on the source, so the lookup must
+        follow the fork that made the reads. Writes and encrypted flows
+        always pass through regardless."""
+        replayer = self.cassette_replayer
+        if replayer is None:
+            raise RuntimeError(
+                "egress replay requires the egress proxy with recording enabled"
+            )
+        replayer.begin(
+            sandbox_id,
+            policy=policy,
+            cassette_source=None if cassette_source is None else str(cassette_source),
+        )
+        logger.info(
+            "Egress replay armed sandbox=%s policy=%s cassette_source=%s",
+            sandbox_id,
+            policy,
+            cassette_source or sandbox_id,
+        )
+
+    def end_egress_replay(self, sandbox_id: SandboxId) -> EgressReplayReport | None:
+        replayer = self.cassette_replayer
+        if replayer is None:
+            return None
+        session = replayer.end(sandbox_id)
+        if session is None:
+            return None
+        report = EgressReplayReport(
+            sandbox_id=sandbox_id,
+            policy=session.policy,
+            cassette_source=session.cassette_source,
+            served=session.served,
+            missed=session.missed,
+            passed_through=session.passed_through,
+            hosts=tuple(sorted(session.hosts)),
+        )
+        self.telemetry.emit_event(
+            "egress_replay.completed",
+            self._telemetry_attrs(
+                sandbox_id,
+                component="system",
+                extra={
+                    "policy": report.policy,
+                    "served": report.served,
+                    "missed": report.missed,
+                    "cassette_source": report.cassette_source,
+                },
+            ),
+        )
+        logger.info(
+            "Egress replay finished sandbox=%s served=%d missed=%d passed_through=%d",
+            sandbox_id,
+            report.served,
+            report.missed,
+            report.passed_through,
+        )
+        return report
+
     def _mutating_egress_in_txn(self, sandbox_id: SandboxId, txn_id: str) -> int:
         """Mutating flows this txn already fired at the world. Rolling back
         the filesystem cannot undo them, so aborts report the count
@@ -2459,6 +2530,7 @@ class CrabSystem:
         stop_on_deviation: bool = False,
         lazy_pages: bool = True,
         force: bool = False,
+        egress_replay: str = "cassette_first",
     ) -> ProcessMergeReport:
         """Process-half of consolidation (C4). ``auto`` picks ``replay``
         when the source runs background processes (a promotion would
@@ -2544,9 +2616,32 @@ class CrabSystem:
             def _source_exec(argv, **kwargs):
                 return self.runtime.exec(source_sandbox_id, argv, **kwargs)
 
-            entries, stopped_early = replay_fork_execs(
-                _source_exec, records, stop_on_deviation=stop_on_deviation
-            )
+            # Serve the fork's recorded reads from its own cassettes (D2):
+            # the fork made the requests, the source re-runs the commands,
+            # so the lookup has to follow the fork's bucket. Writes still
+            # reach the world — replay is a read cache, not an effect gate.
+            replay_armed = False
+            if egress_replay != "none" and self.cassette_replayer is not None:
+                try:
+                    self.begin_egress_replay(
+                        source_sandbox_id,
+                        policy=egress_replay,
+                        cassette_source=fork_sandbox_id,
+                    )
+                    replay_armed = True
+                except Exception:
+                    logger.exception(
+                        "Failed to arm egress replay for %s; replaying live",
+                        source_sandbox_id,
+                    )
+            try:
+                entries, stopped_early = replay_fork_execs(
+                    _source_exec, records, stop_on_deviation=stop_on_deviation
+                )
+            finally:
+                replay_report = (
+                    self.end_egress_replay(source_sandbox_id) if replay_armed else None
+                )
             deviations = sum(1 for entry in entries if entry.deviated)
             report = ProcessMergeReport(
                 source_sandbox_id=source_sandbox_id,
@@ -2556,6 +2651,7 @@ class CrabSystem:
                 replayed=tuple(entries),
                 deviations=deviations,
                 stopped_early=stopped_early,
+                egress_replay=replay_report,
             )
             self._journal_lifecycle(
                 source_sandbox_id,

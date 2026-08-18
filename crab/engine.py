@@ -938,8 +938,10 @@ class Engine:
                     for rule in cfg.egress_rules
                 )
                 cassette_recorder = None
+                cassette_replayer = None
                 if cfg.enable_egress_recording:
                     from .cassettes import CassetteStore
+                    from .egress import CassetteReplayer
 
                     storage_cfg = cfg.storage_config or StorageConfig(root_dir=storage_root)
                     store = CassetteStore(
@@ -952,9 +954,11 @@ class Engine:
                         record_partial=cfg.egress_recording_record_partial,
                         varying_headers=cfg.egress_recording_varying_headers,
                     )
-                    # The system owns the store for replay (D2.2) and for
+                    cassette_replayer = CassetteReplayer(store)
+                    # The system owns both for replay windows (D2) and for
                     # pruning a sandbox's cassettes when it is destroyed.
                     self._system.cassette_store = store
+                    self._system.cassette_replayer = cassette_replayer
                 proxy = EgressProxyServer(
                     journal=getattr(self._system, "journal", None),
                     sandbox_id_resolver=manager.resolve_sandbox_id,
@@ -965,6 +969,8 @@ class Engine:
                     port=cfg.egress_proxy_port,
                     rules=rules,
                     cassette_recorder=cassette_recorder,
+                    cassette_replayer=cassette_replayer,
+                    replay_varying_headers=cfg.egress_recording_varying_headers,
                 )
                 proxy.start()
                 manager.enable_egress_redirect(proxy.port)
@@ -1583,7 +1589,15 @@ class Engine:
             )
             if self._network_manager is not None:
                 try:
-                    self.allocate_network_lease(target_sandbox_id)
+                    lease = self.allocate_network_lease(target_sandbox_id)
+                    # The spec was copied from the source, so it still names
+                    # the source's netns: without retargeting, the fork
+                    # shares the source's network stack and its egress is
+                    # attributed to the source.
+                    if lease is not None:
+                        forking.retarget_bundle_network_namespace(
+                            target_bundle, str(lease.namespace_path)
+                        )
                 except Exception:
                     logger.exception("Failed to allocate network lease for fork %s", target_sandbox_id)
 

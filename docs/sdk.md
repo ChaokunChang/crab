@@ -320,6 +320,26 @@ service behavior should be validated for each task.
   passed in a **query string** are stored (same exposure as the
   journal's `path`), so treat cassettes like checkpoint images.
   Cassettes are pruned when the sandbox is destroyed.
+- `Sandbox.replay_egress(policy="cassette_first", cassette_source=None)`
+  is a context manager that serves recorded reads from cassettes instead
+  of the network (D2). A hit never opens an upstream connection;
+  `cassette_first` falls through to the network on a miss, while
+  `cassette_only` answers a miss with `504` + `X-Crab-Replay: miss` for
+  hermetic replay. **Mutating and encrypted/raw flows always pass through
+  in both modes** — replay is a read cache, not an effect gate (holding
+  writes is D3). Eligibility is re-evaluated at replay time with the
+  current `egress_rules`, so a host reclassified as `mutating`/`opaque`
+  stops being served even though its cassettes remain on disk.
+  `cassette_source` reads another sandbox's bucket — pass the fork whose
+  reads you are re-running. On exit the context yields
+  `.report` (`EgressReplayReport`: served/missed/passed_through/hosts).
+  Ledger flows gain `replayed` and `replayed_from`.
+- `merge_processes(strategy="replay")` **defaults to
+  `egress_replay="cassette_first"` with the fork as the cassette source**,
+  which is what makes replayed commands deterministic; pass
+  `egress_replay="none"` for live traffic. The report nests the replay
+  outcome under `egress_replay`. Replay the fork's cassettes **before**
+  killing the fork — destroying it prunes them.
 - `TxnAbortResult.mutating_egress` counts the mutating flows the
   transaction already fired: the filesystem rollback cannot undo them,
   so the abort reports rather than hides them (holding or rejecting

@@ -593,6 +593,7 @@ class ProcessMergeReport:
     fs_applied: int = 0
     fs_conflicted: int = 0
     observations: "ObservationReport | None" = None
+    egress_replay: "EgressReplayReport | None" = None
 
     def to_json(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -609,12 +610,15 @@ class ProcessMergeReport:
         }
         if self.observations is not None:
             payload["observations"] = self.observations.to_json()
+        if self.egress_replay is not None:
+            payload["egress_replay"] = self.egress_replay.to_json()
         return payload
 
     @classmethod
     def from_json(cls, payload: dict[str, object]) -> "ProcessMergeReport":
         promoted = payload.get("promoted_checkpoint_id")
         raw_observations = payload.get("observations")
+        raw_replay = payload.get("egress_replay")
         return cls(
             source_sandbox_id=SandboxId(str(payload["source_sandbox_id"])),
             fork_sandbox_id=SandboxId(str(payload["fork_sandbox_id"])),
@@ -632,6 +636,11 @@ class ProcessMergeReport:
                 None
                 if not isinstance(raw_observations, dict)
                 else ObservationReport.from_json(raw_observations)
+            ),
+            egress_replay=(
+                None
+                if not isinstance(raw_replay, dict)
+                else EgressReplayReport.from_json(raw_replay)
             ),
         )
 
@@ -662,9 +671,14 @@ class EgressFlow:
     request_key: str | None = None
     status: int | None = None
     truncated: bool = False
+    replayed: bool = False
+    """Served from a cassette instead of the network (D2)."""
     replayed_from_seq: int | None = None
-    """Set when this flow was served from a cassette instead of the
-    network, pointing at the recording's journal seq."""
+    """The recording's journal seq when known. Recording happens before
+    its own journal row exists, so this stays None for cassettes written
+    by the proxy; ``replayed`` is the authoritative flag."""
+    replayed_from: str | None = None
+    """Which sandbox's cassette bucket answered (a fork, for C4)."""
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -685,7 +699,9 @@ class EgressFlow:
             "request_key": self.request_key,
             "status": self.status,
             "truncated": self.truncated,
+            "replayed": self.replayed,
             "replayed_from_seq": self.replayed_from_seq,
+            "replayed_from": self.replayed_from,
         }
 
     @classmethod
@@ -716,7 +732,13 @@ class EgressFlow:
             request_key=None if request_key is None else str(request_key),
             status=None if status is None else int(status),
             truncated=bool(payload.get("truncated", False)),
+            replayed=bool(payload.get("replayed", False)),
             replayed_from_seq=None if replayed_from is None else int(replayed_from),
+            replayed_from=(
+                None
+                if payload.get("replayed_from") is None
+                else str(payload["replayed_from"])
+            ),
         )
 
 
@@ -758,7 +780,7 @@ class EgressLedger:
 
     @property
     def replayed(self) -> int:
-        return sum(1 for flow in self.flows if flow.replayed_from_seq is not None)
+        return sum(1 for flow in self.flows if flow.replayed)
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -782,6 +804,46 @@ class EgressLedger:
                 EgressFlow.from_json(row) for row in (payload.get("flows") or [])
             ),
             txn_id=None if txn_id is None else str(txn_id),
+        )
+
+
+@dataclass(frozen=True)
+class EgressReplayReport:
+    """Outcome of a replay window (D2). ``served`` flows never touched the
+    network; ``missed`` ones found no cassette (and under
+    ``cassette_only`` got a 504 instead of live traffic);
+    ``passed_through`` counts flows replay never claims — writes and
+    encrypted/raw traffic always reach the real world."""
+
+    sandbox_id: SandboxId
+    policy: str
+    cassette_source: str
+    served: int = 0
+    missed: int = 0
+    passed_through: int = 0
+    hosts: tuple[str, ...] = ()
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "sandbox_id": str(self.sandbox_id),
+            "policy": self.policy,
+            "cassette_source": self.cassette_source,
+            "served": self.served,
+            "missed": self.missed,
+            "passed_through": self.passed_through,
+            "hosts": list(self.hosts),
+        }
+
+    @classmethod
+    def from_json(cls, payload: dict[str, object]) -> "EgressReplayReport":
+        return cls(
+            sandbox_id=SandboxId(str(payload["sandbox_id"])),
+            policy=str(payload.get("policy", "cassette_first")),
+            cassette_source=str(payload.get("cassette_source", "")),
+            served=int(payload.get("served", 0)),
+            missed=int(payload.get("missed", 0)),
+            passed_through=int(payload.get("passed_through", 0)),
+            hosts=tuple(str(host) for host in (payload.get("hosts") or [])),
         )
 
 

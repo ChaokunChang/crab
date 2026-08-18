@@ -27,6 +27,7 @@ sandboxes — the daemon stays running across SDK process exits.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import shlex
 import socket
@@ -1005,6 +1006,45 @@ class Sandbox:
             raise NotImplementedError("the effect ledger is not available on this engine")
         return egress_ledger(self.sandbox_id, txn_id=txn_id, since_seq=since_seq)
 
+    def replay_egress(
+        self,
+        *,
+        policy: str = "cassette_first",
+        cassette_source: "Sandbox | str | None" = None,
+    ):
+        """Context manager serving this sandbox's recorded reads from
+        cassettes instead of the network (D2). ``cassette_source`` reads
+        another sandbox's bucket — pass the fork whose reads you are
+        re-running. ``policy="cassette_only"`` turns a miss into a 504
+        instead of live traffic. Writes and encrypted flows always pass
+        through. Yields nothing; the report is returned on exit via
+        ``.report``.
+        """
+        system = getattr(self._engine, "system", None)
+        begin = getattr(system, "begin_egress_replay", None)
+        end = getattr(system, "end_egress_replay", None)
+        if not callable(begin) or not callable(end):
+            raise NotImplementedError("egress replay is not available on this engine")
+        source = (
+            cassette_source.sandbox_id
+            if isinstance(cassette_source, Sandbox)
+            else cassette_source
+        )
+
+        class _ReplayWindow:
+            report = None
+
+        @contextlib.contextmanager
+        def _window():
+            handle = _ReplayWindow()
+            begin(self.sandbox_id, policy=policy, cassette_source=source)
+            try:
+                yield handle
+            finally:
+                handle.report = end(self.sandbox_id)
+
+        return _window()
+
     def merge_processes(
         self,
         fork: "Sandbox | str",
@@ -1015,6 +1055,7 @@ class Sandbox:
         stop_on_deviation: bool = False,
         lazy_pages: bool = True,
         force: bool = False,
+        egress_replay: str = "cassette_first",
     ) -> ProcessMergeReport:
         """Process-half of consolidation (C4). ``strategy="auto"``
         resolves from a process census on this sandbox: with live
@@ -1044,6 +1085,7 @@ class Sandbox:
             stop_on_deviation=stop_on_deviation,
             lazy_pages=lazy_pages,
             force=force,
+            egress_replay=egress_replay,
         )
 
     def begin(self, label: str | None = None, *, isolation: str = "snapshot") -> "Transaction":

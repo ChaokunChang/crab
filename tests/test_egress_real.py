@@ -493,5 +493,120 @@ class EgressRecordingRealTests(unittest.TestCase):
         self.assertFalse(bucket.exists())
 
 
+class EgressReplayRealTests(unittest.TestCase):
+    """D2.2 E2E: the decisive proof is stopping the origin server and
+    still getting the body — it can only have come from a cassette."""
+
+    _IMAGE = "python:3.11-slim"
+
+    def setUp(self) -> None:
+        if not _real_stack_available():
+            self.skipTest("docker/runc/criu/zfs/iptables/root not available")
+        self.host_ip = _host_lan_ip()
+        if self.host_ip is None:
+            self.skipTest("no global-scope host address for the external service")
+        self._tmp = tempfile.TemporaryDirectory(prefix="crab_replay_e2e_")
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.external = _ExternalHTTPServer()
+        self.port = self.external.port
+        self.engine = Engine.start(
+            EngineConfig(
+                runtime="runc",
+                enable_sandbox_network=True,
+                enable_interceptor=False,
+                enable_egress_proxy=True,
+                enable_egress_recording=True,
+                storage_root=self.root / "storage",
+                runtime_root=self.root / "runtime",
+            )
+        )
+        self.addCleanup(self.engine.stop)
+
+    def _run(self, sandbox: Sandbox, script: str):
+        return sandbox.commands.run(script)
+
+    def _ok(self, sandbox: Sandbox, script: str) -> str:
+        result = self._run(sandbox, script)
+        self.assertEqual(result.returncode, 0, msg=f"command failed: {script!r}: {result.stderr}")
+        return result.stdout.strip()
+
+    def _fetch(self, path: str) -> str:
+        return (
+            "python3 -c \"import urllib.request;"
+            f"print(urllib.request.urlopen('http://{self.host_ip}:{self.port}{path}', timeout=10).read().decode())\""
+        )
+
+    def _wait_recorded(self, sandbox: Sandbox, *, timeout: float = 20.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if any(flow.recorded for flow in sandbox.egress().flows):
+                return
+            time.sleep(0.25)
+        self.fail("nothing was recorded")
+
+    def test_replay_serves_the_cassette_with_the_origin_stopped(self) -> None:
+        sandbox = Sandbox(image=self._IMAGE, engine=self.engine)
+        self.addCleanup(sandbox.kill)
+        self.assertIn("external-ok", self._ok(sandbox, self._fetch("/read")))
+        self._wait_recorded(sandbox)
+
+        # Kill the origin: any live request now fails.
+        self.external.close()
+        failed = self._run(sandbox, self._fetch("/read"))
+        self.assertNotEqual(failed.returncode, 0, msg="origin still reachable")
+
+        with sandbox.replay_egress(policy="cassette_only") as window:
+            self.assertIn("external-ok", self._ok(sandbox, self._fetch("/read")))
+        self.assertIsNotNone(window.report)
+        self.assertEqual(window.report.served, 1)
+        self.assertEqual(window.report.missed, 0)
+        ledger = sandbox.egress()
+        self.assertGreaterEqual(ledger.replayed, 1)
+
+    def test_c4_replay_uses_the_forks_cassettes(self) -> None:
+        sandbox = Sandbox(image=self._IMAGE, engine=self.engine)
+        self.addCleanup(sandbox.kill)
+        self._ok(sandbox, "mkdir -p /probe && sh -c 'nohup sleep 300 >/dev/null 2>&1 & echo $! > /probe/bg.pid'")
+
+        [fork] = sandbox.fork()
+        self.addCleanup(fork.kill)
+        # The fork does the reading and writes what it read.
+        self._ok(
+            fork,
+            "python3 -c \"import urllib.request;"
+            f"open('/probe/fetched.txt','w').write(urllib.request.urlopen('http://{self.host_ip}:{self.port}/read', timeout=10).read().decode())\"",
+        )
+        self._wait_recorded(fork)
+
+        # Origin down: a live replay would fail, so zero deviations can
+        # only mean the fork's cassettes answered on the source.
+        self.external.close()
+        report = sandbox.merge_processes(fork, strategy="replay")
+
+        self.assertEqual(report.strategy, "replay")
+        self.assertEqual(report.deviations, 0, msg=str([e.argv for e in report.replayed]))
+        self.assertIsNotNone(report.egress_replay)
+        self.assertGreaterEqual(report.egress_replay.served, 1)
+        self.assertEqual(report.egress_replay.cassette_source, str(fork.sandbox_id))
+        self.assertEqual(self._ok(sandbox, "cat /probe/fetched.txt"), "external-ok")
+        # The source's background process survived the whole thing.
+        self.assertEqual(
+            self._ok(sandbox, "test -d /proc/$(cat /probe/bg.pid) && echo alive"), "alive"
+        )
+
+    def test_writes_are_never_swallowed_by_replay(self) -> None:
+        sandbox = Sandbox(image=self._IMAGE, engine=self.engine)
+        self.addCleanup(sandbox.kill)
+        with sandbox.replay_egress(policy="cassette_first") as window:
+            self._ok(
+                sandbox,
+                "python3 -c \"import urllib.request;"
+                f"urllib.request.urlopen(urllib.request.Request('http://{self.host_ip}:{self.port}/write', data=b'x', method='POST'), timeout=10).read()\"",
+            )
+        self.assertEqual(window.report.served, 0)
+        self.assertGreaterEqual(window.report.passed_through, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
