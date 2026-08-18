@@ -441,6 +441,15 @@ class EngineConfig:
     non-abortable on the first opaque flow. Without TLS interception a
     transaction using HTTPS cannot be guaranteed write-free."""
 
+    effects_max_queue_bytes: int = 16 * 1024 * 1024
+    """Whole-queue byte ceiling per transaction. Deferred bodies live in
+    the daemon's memory until commit, so the per-request cap alone cannot
+    bound a loop that posts many allow-listed writes; past this the write
+    is refused (``effect_reason="queue_full"``)."""
+
+    effects_max_queue_entries: int = 256
+    """Whole-queue entry ceiling per transaction (same reasoning)."""
+
     network_expected_sandboxes: int | None = None
     """Optional capacity hint for the bridge network allocator."""
 
@@ -670,6 +679,16 @@ class EngineConfig:
             effects_opaque_effects=str(
                 effects.get("opaque_effects", data.get("effects_opaque_effects")) or "allow"
             ),
+            effects_max_queue_bytes=_as_int(
+                effects.get("max_queue_bytes", data.get("effects_max_queue_bytes")),
+                default=16 * 1024 * 1024,
+            )
+            or 16 * 1024 * 1024,
+            effects_max_queue_entries=_as_int(
+                effects.get("max_queue_entries", data.get("effects_max_queue_entries")),
+                default=256,
+            )
+            or 256,
             network_expected_sandboxes=_as_int(
                 network.get("expected_sandboxes", data.get("network_expected_sandboxes")),
                 default=None,
@@ -1012,6 +1031,8 @@ class Engine:
                     "on_unlisted": cfg.effects_on_unlisted,
                     "opaque_effects": cfg.effects_opaque_effects,
                     "rules": cfg.effects_rules,
+                    "max_queue_bytes": cfg.effects_max_queue_bytes,
+                    "max_queue_entries": cfg.effects_max_queue_entries,
                 }
                 proxy = EgressProxyServer(
                     journal=getattr(self._system, "journal", None),

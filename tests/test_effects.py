@@ -13,6 +13,8 @@ from unittest import mock
 
 from crab.effects import (
     DECISION_DEFER,
+    DEFERRED_RESPONSE,
+    REJECTED_RESPONSE,
     DECISION_PASS,
     DECISION_REJECT,
     DECISION_SEAL,
@@ -222,10 +224,14 @@ class ConcurrencyTests(unittest.TestCase):
         for thread in threads:
             thread.join()
 
+        attempts = rounds * workers
         deferred, rejected, passed, sealed = gate.counters("sbx-1")
-        self.assertEqual(deferred, rounds * workers)
-        self.assertEqual((rejected, passed, sealed), (0, 0, False))
-        self.assertEqual(len(gate.drain("sbx-1")), rounds * workers)
+        # Nothing is lost and nothing is double-counted: every attempt is
+        # either queued or refused by the ceiling, never dropped silently.
+        self.assertEqual(deferred + rejected, attempts)
+        self.assertEqual(deferred, min(attempts, gate.session_for("sbx-1").max_queue_entries))
+        self.assertEqual((passed, sealed), (0, False))
+        self.assertEqual(len(gate.drain("sbx-1")), deferred)
 
 
 class BodyReadingTests(unittest.TestCase):
@@ -501,3 +507,151 @@ class ConfigTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SyntheticResponseShapeTests(unittest.TestCase):
+    """Byte-level shape of what the gate writes back. The first cut of the
+    503 declared Content-Length: 41 for a 44-byte body — lenient clients
+    hid it behind `Connection: close`, a strict one would mis-parse or
+    hang. Both responses are now asserted header-against-body."""
+
+    def _split(self, wire: bytes) -> tuple[dict, bytes]:
+        head, _, body = wire.partition(b"\r\n\r\n")
+        lines = head.split(b"\r\n")
+        headers = {}
+        for line in lines[1:]:
+            name, _, value = line.partition(b":")
+            headers[name.strip().lower()] = value.strip()
+        return headers, body
+
+    def test_declared_length_matches_the_body(self) -> None:
+        for label, wire in (("deferred", DEFERRED_RESPONSE), ("rejected", REJECTED_RESPONSE)):
+            with self.subTest(response=label):
+                headers, body = self._split(wire)
+                self.assertEqual(
+                    int(headers[b"content-length"]),
+                    len(body),
+                    msg=f"{label}: Content-Length disagrees with the body",
+                )
+                self.assertEqual(headers[b"x-crab-effect"], label.encode())
+                self.assertEqual(headers[b"connection"], b"close")
+
+    def test_status_lines(self) -> None:
+        self.assertTrue(DEFERRED_RESPONSE.startswith(b"HTTP/1.1 202 Accepted\r\n"))
+        self.assertTrue(
+            REJECTED_RESPONSE.startswith(b"HTTP/1.1 503 Service Unavailable\r\n")
+        )
+
+    def test_deferred_has_no_body(self) -> None:
+        _, body = self._split(DEFERRED_RESPONSE)
+        self.assertEqual(body, b"")
+
+    def test_parsable_by_a_real_http_client(self) -> None:
+        """A strict parser must accept both, and read exactly the declared
+        number of bytes without blocking."""
+        import http.client
+
+        for label, wire in (("deferred", DEFERRED_RESPONSE), ("rejected", REJECTED_RESPONSE)):
+            with self.subTest(response=label):
+                left, right = socket.socketpair()
+                self.addCleanup(left.close)
+                self.addCleanup(right.close)
+                right.sendall(wire)
+                right.shutdown(socket.SHUT_WR)
+                response = http.client.HTTPResponse(left)
+                response.begin()
+                body = response.read()
+                self.assertEqual(len(body), int(response.getheader("Content-Length")))
+                self.assertEqual(response.getheader("X-Crab-Effect"), label)
+
+
+class QueueCeilingTests(unittest.TestCase):
+    """A per-request body cap cannot bound a loop that posts many
+    allow-listed writes, so the session carries whole-queue ceilings."""
+
+    def _request(self, body: bytes) -> DeferredRequest:
+        return DeferredRequest(
+            method="POST", host="api.example.com", port=80, path="/w",
+            headers=(), body=body,
+        )
+
+    def test_entry_ceiling_refuses_further_writes(self) -> None:
+        gate = EffectGate()
+        gate.begin("sbx-1", policy="defer", rules=(EffectRule(),), max_queue_entries=2)
+        self.assertEqual(gate.enqueue("sbx-1", self._request(b"a")), 1)
+        self.assertEqual(gate.enqueue("sbx-1", self._request(b"b")), 2)
+        # Full: -1 tells the proxy to refuse rather than answer a fake 202.
+        self.assertEqual(gate.enqueue("sbx-1", self._request(b"c")), -1)
+        self.assertEqual(gate.queue_size("sbx-1"), (2, 2))
+        deferred, rejected, _, _ = gate.counters("sbx-1")
+        self.assertEqual((deferred, rejected), (2, 1))
+
+    def test_byte_ceiling_refuses_further_writes(self) -> None:
+        gate = EffectGate()
+        gate.begin("sbx-1", policy="defer", rules=(EffectRule(),), max_queue_bytes=10)
+        self.assertEqual(gate.enqueue("sbx-1", self._request(b"x" * 6)), 1)
+        self.assertEqual(gate.enqueue("sbx-1", self._request(b"x" * 6)), -1)  # 12 > 10
+        self.assertEqual(gate.enqueue("sbx-1", self._request(b"x" * 4)), 2)  # 10 fits
+        self.assertEqual(gate.queue_size("sbx-1"), (2, 10))
+
+    def test_draining_frees_the_budget(self) -> None:
+        gate = EffectGate()
+        gate.begin("sbx-1", policy="defer", rules=(EffectRule(),), max_queue_bytes=8)
+        gate.enqueue("sbx-1", self._request(b"x" * 8))
+        self.assertEqual(gate.enqueue("sbx-1", self._request(b"y")), -1)
+        self.assertEqual(len(gate.drain("sbx-1")), 1)
+        self.assertEqual(gate.queue_size("sbx-1"), (0, 0))
+        self.assertEqual(gate.enqueue("sbx-1", self._request(b"y")), 1)
+
+    def test_defaults_are_generous_but_finite(self) -> None:
+        from crab.effects import DEFAULT_MAX_QUEUE_BYTES, DEFAULT_MAX_QUEUE_ENTRIES
+
+        gate = EffectGate()
+        session = gate.begin("sbx-1", policy="defer")
+        self.assertEqual(session.max_queue_bytes, DEFAULT_MAX_QUEUE_BYTES)
+        self.assertEqual(session.max_queue_entries, DEFAULT_MAX_QUEUE_ENTRIES)
+
+
+class ProxyQueueCeilingTests(ProxyEffectGateTests):
+    def test_queue_full_is_refused_not_falsely_accepted(self) -> None:
+        self.gate.begin(
+            self.sandbox_id,
+            policy="defer",
+            rules=(EffectRule(),),
+            txn_id="txn-full",
+            max_queue_entries=1,
+        )
+        first = self._talk(self._POST)
+        self.assertIn(b"202", first)
+        second = self._talk(self._POST)
+        # The second write did not fit, so it must be refused - answering
+        # 202 for something that was never queued would be a lie.
+        self.assertIn(b"503", second)
+        self.assertEqual(self.upstream.received, [])
+        flows = self._flows(expected=2)
+        self.assertEqual(flows[-1]["effect"], "rejected")
+        self.assertEqual(flows[-1]["effect_reason"], "queue_full")
+        self.assertEqual(len(self.gate.drain(self.sandbox_id)), 1)
+
+    def test_session_closing_mid_flight_refuses_instead_of_faking(self) -> None:
+        session_gate = self.gate
+
+        class _RacingGate:
+            """Mimics commit/abort closing the session between the decision
+            and the enqueue."""
+
+            def __getattr__(self, name):
+                return getattr(session_gate, name)
+
+            def enqueue(self, sandbox_id, request):
+                return 0
+
+        self.gate.begin(
+            self.sandbox_id, policy="defer", rules=(EffectRule(),), txn_id="txn-race"
+        )
+        self.proxy.effect_gate = _RacingGate()
+        response = self._talk(self._POST)
+        self.assertIn(b"503", response)
+        self.assertEqual(self.upstream.received, [])
+        [flow] = self._flows()
+        self.assertEqual(flow["effect_reason"], "session_closed")
