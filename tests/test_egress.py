@@ -1094,7 +1094,8 @@ class LedgerRecordingFieldsTests(unittest.TestCase):
         replayed = EgressFlow(
             seq=2, host="a", dst_ip="10.0.0.1", dst_port=80, scheme="http",
             classification="idempotent_read", method="GET", path="/",
-            recorded=True, request_key="k", status=200, replayed_from_seq=1,
+            recorded=True, request_key="k", status=200, replayed=True,
+            replayed_from="sbx-fork",
         )
         plain = EgressFlow(
             seq=3, host="a", dst_ip="10.0.0.1", dst_port=80, scheme="http",
@@ -1121,7 +1122,9 @@ class LedgerRecordingFieldsTests(unittest.TestCase):
         self.assertIsNone(flow.request_key)
         self.assertIsNone(flow.status)
         self.assertFalse(flow.truncated)
+        self.assertFalse(flow.replayed)
         self.assertIsNone(flow.replayed_from_seq)
+        self.assertIsNone(flow.replayed_from)
 
 
 class RecordedCliTests(_CliHarness, unittest.TestCase):
@@ -1158,3 +1161,217 @@ class RecordedCliTests(_CliHarness, unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("/things", out)
         self.assertNotIn("POST", out)
+
+
+# ---------------------------------------------------------------------------
+# D2.2: replay
+# ---------------------------------------------------------------------------
+
+from crab.cassettes import CassetteEntry, sha256_hex
+from crab.egress import CassetteReplayer
+from crab.models import EgressReplayReport
+
+
+class _ReplayHarness(_ProxyHarness):
+    """Proxy with both a recorder and a replayer, plus a counter on the
+    upstream so "served from cassette" can be proven by absence."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store = CassetteStore(Path(self._tmp.name) / "cassettes")
+        self.proxy.cassette_recorder = CassetteRecorder(self.store)
+        self.replayer = CassetteReplayer(self.store)
+        self.proxy.cassette_replayer = self.replayer
+
+    def _upstream_hits(self) -> int:
+        return len(self.upstream.received)
+
+    def _seed(self, *, sandbox_id=None, path="/things", body=b"recorded body", status=200):
+        """Record one exchange the honest way (through the proxy)."""
+        self.upstream.response = (
+            f"HTTP/1.1 {status} OK\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body
+        )
+        if sandbox_id is not None:
+            original = self.sandbox_id
+            self.sandbox_id = sandbox_id
+            try:
+                self._talk(f"GET {path} HTTP/1.1\r\nHost: api.example.com\r\n\r\n".encode())
+            finally:
+                self.sandbox_id = original
+        else:
+            self._talk(f"GET {path} HTTP/1.1\r\nHost: api.example.com\r\n\r\n".encode())
+        self._flows()
+
+
+class ReplayServingTests(_ReplayHarness, unittest.TestCase):
+    def test_hit_serves_the_cassette_without_touching_upstream(self) -> None:
+        self._seed(body=b"recorded body")
+        hits_after_record = self._upstream_hits()
+
+        self.replayer.begin(self.sandbox_id, policy="cassette_first")
+        response = self._talk(b"GET /things HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+        session = self.replayer.end(self.sandbox_id)
+
+        self.assertIn(b"recorded body", response)
+        # The decisive assertion: the origin never saw a second request.
+        self.assertEqual(self._upstream_hits(), hits_after_record)
+        self.assertEqual((session.served, session.missed), (1, 0))
+        rows = self._flows(expected=2)
+        self.assertEqual(rows[-1]["replayed_from"], str(self.sandbox_id))
+        self.assertTrue(rows[-1]["recorded"])
+
+    def test_miss_falls_through_under_cassette_first(self) -> None:
+        self.upstream.response = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nlive"
+        self.replayer.begin(self.sandbox_id, policy="cassette_first")
+        response = self._talk(b"GET /never-recorded HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+        session = self.replayer.end(self.sandbox_id)
+        self.assertIn(b"live", response)
+        self.assertEqual((session.served, session.missed), (0, 1))
+
+    def test_miss_returns_504_under_cassette_only(self) -> None:
+        self.replayer.begin(self.sandbox_id, policy="cassette_only")
+        hits_before = self._upstream_hits()
+        response = self._talk(b"GET /never-recorded HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+        session = self.replayer.end(self.sandbox_id)
+        self.assertIn(b"504", response)
+        self.assertIn(b"X-Crab-Replay: miss", response)
+        self.assertEqual(self._upstream_hits(), hits_before)  # hermetic
+        self.assertEqual((session.served, session.missed), (0, 1))
+
+    def test_writes_always_reach_the_world_in_both_policies(self) -> None:
+        for policy in ("cassette_first", "cassette_only"):
+            with self.subTest(policy=policy):
+                self.upstream.response = b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\nok"
+                hits_before = self._upstream_hits()
+                self.replayer.begin(self.sandbox_id, policy=policy)
+                response = self._talk(
+                    b"POST /orders HTTP/1.1\r\nHost: api.example.com\r\n\r\n"
+                )
+                session = self.replayer.end(self.sandbox_id)
+                self.assertIn(b"201", response)
+                self.assertEqual(self._upstream_hits(), hits_before + 1)
+                self.assertEqual(session.passed_through, 1)
+                self.assertEqual(session.served, 0)
+
+    def test_reclassified_host_stops_being_served(self) -> None:
+        self._seed(body=b"recorded body")
+        hits_after_record = self._upstream_hits()
+        # The deployment now declares this host opaque: the stored row
+        # still says recorded=True, but the gate is recomputed on replay.
+        self.proxy.rules = (EgressRule(host_glob="api.example.com", classify="opaque"),)
+        self.upstream.response = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nlive"
+        self.replayer.begin(self.sandbox_id, policy="cassette_first")
+        response = self._talk(b"GET /things HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+        session = self.replayer.end(self.sandbox_id)
+        self.assertIn(b"live", response)
+        self.assertGreater(self._upstream_hits(), hits_after_record)
+        self.assertEqual(session.served, 0)
+        self.assertEqual(session.passed_through, 1)
+
+    def test_truncated_cassette_is_never_served(self) -> None:
+        entry = CassetteEntry(
+            request_key="k" * 64, method="GET", host="api.example.com", port=80,
+            path="/things", status=200, body=b"partial",
+            body_sha256=sha256_hex(b"partial"), truncated=True,
+        )
+        self.store.put(self.sandbox_id, entry)
+        session = self.replayer.begin(self.sandbox_id, policy="cassette_first")
+        found = self.replayer.lookup(
+            session,
+            request_head=b"GET /things HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
+            host="api.example.com", port=80, method="GET", path="/things",
+            varying_headers=("accept", "accept-encoding"),
+        )
+        self.assertIsNone(found)
+
+    def test_replay_off_by_default(self) -> None:
+        self._seed(body=b"recorded body")
+        hits_after_record = self._upstream_hits()
+        self._talk(b"GET /things HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+        # No session armed: the request goes out for real.
+        self.assertEqual(self._upstream_hits(), hits_after_record + 1)
+
+
+class ReplayCrossBucketTests(_ReplayHarness, unittest.TestCase):
+    """cassette_source is what makes C4 work: the fork recorded, the
+    source replays."""
+
+    def test_source_replays_the_forks_cassettes(self) -> None:
+        fork_id = SandboxId("sbx-egress-fork")
+        self._seed(sandbox_id=fork_id, body=b"fork body")
+        hits_after_record = self._upstream_hits()
+
+        # Without the redirect the source's own (empty) bucket is used.
+        self.replayer.begin(self.sandbox_id, policy="cassette_only")
+        response = self._talk(b"GET /things HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+        miss_session = self.replayer.end(self.sandbox_id)
+        self.assertIn(b"504", response)
+        self.assertEqual((miss_session.served, miss_session.missed), (0, 1))
+
+        # With it, the fork's recording answers the source's request.
+        self.replayer.begin(
+            self.sandbox_id, policy="cassette_only", cassette_source=fork_id
+        )
+        response = self._talk(b"GET /things HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+        hit_session = self.replayer.end(self.sandbox_id)
+        self.assertIn(b"fork body", response)
+        self.assertEqual((hit_session.served, hit_session.missed), (1, 0))
+        self.assertEqual(self._upstream_hits(), hits_after_record)
+        self.assertEqual(hit_session.cassette_source, str(fork_id))
+
+
+class ReplaySessionTests(unittest.TestCase):
+    def test_policy_validation_and_session_lifecycle(self) -> None:
+        replayer = CassetteReplayer(store=None)
+        with self.assertRaises(ValueError):
+            replayer.begin("sbx-1", policy="none")
+        with self.assertRaises(ValueError):
+            replayer.begin("sbx-1", policy="always")
+        session = replayer.begin("sbx-1", policy="cassette_first")
+        self.assertEqual(session.cassette_source, "sbx-1")  # defaults to itself
+        self.assertIs(replayer.session_for("sbx-1"), session)
+        self.assertIs(replayer.end("sbx-1"), session)
+        self.assertIsNone(replayer.session_for("sbx-1"))
+        self.assertIsNone(replayer.end("sbx-1"))  # idempotent
+
+    def test_report_round_trip(self) -> None:
+        report = EgressReplayReport(
+            sandbox_id=SandboxId("sbx-1"), policy="cassette_first",
+            cassette_source="sbx-fork", served=3, missed=1, passed_through=2,
+            hosts=("a.example", "b.example"),
+        )
+        self.assertEqual(EgressReplayReport.from_json(report.to_json()), report)
+
+
+class SystemReplayFacadeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="crab_replay_sys_")
+        self.addCleanup(self._tmp.cleanup)
+        self.journal = ActionJournal(Path(self._tmp.name) / "journal")
+        self.system = _minimal_system(self.journal)
+        self.store = CassetteStore(Path(self._tmp.name) / "cassettes")
+        self.system.cassette_replayer = CassetteReplayer(self.store)
+
+    def test_begin_end_round_trip(self) -> None:
+        self.system.begin_egress_replay(
+            SandboxId("sbx-1"), policy="cassette_only", cassette_source=SandboxId("sbx-fork")
+        )
+        session = self.system.cassette_replayer.session_for("sbx-1")
+        session.served = 2
+        session.missed = 1
+        session.hosts.add("api.example.com")
+        report = self.system.end_egress_replay(SandboxId("sbx-1"))
+        self.assertEqual(report.policy, "cassette_only")
+        self.assertEqual(report.cassette_source, "sbx-fork")
+        self.assertEqual((report.served, report.missed), (2, 1))
+        self.assertEqual(report.hosts, ("api.example.com",))
+        events = [name for name, _ in self.system.telemetry.events]
+        self.assertIn("egress_replay.completed", events)
+        # Ending twice is a no-op rather than an error.
+        self.assertIsNone(self.system.end_egress_replay(SandboxId("sbx-1")))
+
+    def test_requires_a_replayer(self) -> None:
+        self.system.cassette_replayer = None
+        with self.assertRaises(RuntimeError):
+            self.system.begin_egress_replay(SandboxId("sbx-1"))
+        self.assertIsNone(self.system.end_egress_replay(SandboxId("sbx-1")))

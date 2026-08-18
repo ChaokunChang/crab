@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Any, Mapping
 from .contracts import Runtime
 from .daemon import DaemonClient, DaemonRequestError
 from .ids import CheckpointId, SandboxId
-from .models import ChangesetResult, EgressLedger, JobStatus, MergeReport, ObservationReport, ProcessMergeReport, SandboxDescription, SandboxExecResult, SandboxRuntimeState
+from .models import ChangesetResult, EgressLedger, EgressReplayReport, JobStatus, MergeReport, ObservationReport, ProcessMergeReport, SandboxDescription, SandboxExecResult, SandboxRuntimeState
 from .journal import ActionRecord
 from .merging import MergeError, MergerHook
 from .process_merge import ProcessMergeConflict
@@ -375,6 +375,29 @@ class _SystemShim:
         )
         return EgressLedger.from_json(response["ledger"])
 
+    def begin_egress_replay(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        policy: str = "cassette_first",
+        cassette_source: object | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {"mode": "begin", "policy": policy}
+        if cassette_source is not None:
+            payload["cassette_source"] = str(cassette_source)
+        self._client.post_json(
+            f"/sandboxes/{sandbox_id}/egress/replay", payload, timeout_seconds=60.0
+        )
+
+    def end_egress_replay(self, sandbox_id: SandboxId) -> EgressReplayReport | None:
+        response = self._client.post_json(
+            f"/sandboxes/{sandbox_id}/egress/replay",
+            {"mode": "end"},
+            timeout_seconds=60.0,
+        )
+        raw = response.get("report")
+        return None if not isinstance(raw, dict) else EgressReplayReport.from_json(raw)
+
     def merge_processes(
         self,
         source_sandbox_id: SandboxId,
@@ -386,6 +409,7 @@ class _SystemShim:
         stop_on_deviation: bool = False,
         lazy_pages: bool = True,
         force: bool = False,
+        egress_replay: str = "cassette_first",
     ) -> ProcessMergeReport:
         payload: dict[str, Any] = {
             "fork_sandbox_id": str(fork_sandbox_id),
@@ -395,6 +419,7 @@ class _SystemShim:
             "stop_on_deviation": bool(stop_on_deviation),
             "lazy_pages": bool(lazy_pages),
             "force": bool(force),
+            "egress_replay": egress_replay,
         }
         try:
             response = self._client.post_json(

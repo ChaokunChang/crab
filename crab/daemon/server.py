@@ -560,6 +560,34 @@ class _Routes:
             raise _BadRequest(f"egress ledger unavailable: {exc}") from exc
         return {"ok": True, "ledger": ledger.to_json()}
 
+    def sandbox_egress_replay(
+        self, body: dict[str, Any], *, sandbox_id: str
+    ) -> dict[str, Any]:
+        """Arm or close a replay window (D2). ``mode="end"`` returns the
+        report; ``cassette_source`` reads another sandbox's bucket (the
+        fork whose reads are being re-run)."""
+        eng = self._daemon.require_engine()
+        mode = str(body.get("mode") or "begin")
+        sid = SandboxId(sandbox_id)
+        if mode == "end":
+            report = eng.system.end_egress_replay(sid)
+            return {
+                "ok": True,
+                "report": None if report is None else report.to_json(),
+            }
+        if mode != "begin":
+            raise _BadRequest(f"unknown replay mode: {mode!r} (expected begin or end)")
+        source = body.get("cassette_source")
+        try:
+            eng.system.begin_egress_replay(
+                sid,
+                policy=str(body.get("policy") or "cassette_first"),
+                cassette_source=None if not source else str(source),
+            )
+        except (ValueError, RuntimeError) as exc:
+            raise _BadRequest(f"egress replay failed: {exc}") from exc
+        return {"ok": True}
+
     def merge_processes_sandbox(
         self, body: dict[str, Any], *, sandbox_id: str
     ) -> dict[str, Any]:
@@ -581,6 +609,8 @@ class _Routes:
             kwargs["observations"] = str(body["observations"])
         if body.get("lazy_pages") is not None:
             kwargs["lazy_pages"] = bool(body["lazy_pages"])
+        if body.get("egress_replay") is not None:
+            kwargs["egress_replay"] = str(body["egress_replay"])
         try:
             report = eng.system.merge_processes(
                 SandboxId(sandbox_id), SandboxId(str(fork_raw)), **kwargs
@@ -775,6 +805,7 @@ def _build_handler(daemon: "DaemonServer"):
         ("POST", "/sandboxes/{sandbox_id}/actions", "", routes.sandbox_actions),
         # Effect ledger (D1)
         ("POST", "/sandboxes/{sandbox_id}/egress", "", routes.sandbox_egress),
+        ("POST", "/sandboxes/{sandbox_id}/egress/replay", "", routes.sandbox_egress_replay),
         # Process merge (C4)
         ("POST", "/sandboxes/{sandbox_id}/processes/merge", "", routes.merge_processes_sandbox),
     ]
