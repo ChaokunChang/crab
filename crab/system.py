@@ -2445,14 +2445,17 @@ class CrabSystem:
         session = replayer.end(sandbox_id)
         if session is None:
             return None
+        # Read the tallies under the replayer's lock: in-flight connections
+        # may still be finishing when the window closes.
+        served, missed, passed_through, hosts = replayer.snapshot(session)
         report = EgressReplayReport(
             sandbox_id=sandbox_id,
             policy=session.policy,
             cassette_source=session.cassette_source,
-            served=session.served,
-            missed=session.missed,
-            passed_through=session.passed_through,
-            hosts=tuple(sorted(session.hosts)),
+            served=served,
+            missed=missed,
+            passed_through=passed_through,
+            hosts=hosts,
         )
         self.telemetry.emit_event(
             "egress_replay.completed",
