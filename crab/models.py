@@ -779,6 +779,23 @@ class EgressLedger:
         return sum(1 for flow in self.flows if flow.classification == "mutating")
 
     @property
+    def mutating_sent(self) -> int:
+        """Mutating flows that actually reached the world.
+
+        A write the effect gate deferred, refused or dropped (D3) never
+        left the host, so counting it as "already fired" would misreport
+        exactly the guarantee ``effects="defer"`` exists to provide.
+        ``flush_failed`` counts: the attempt may have arrived before the
+        connection broke.
+        """
+        held = {"deferred", "rejected", "dropped", "lost"}
+        return sum(
+            1
+            for flow in self.flows
+            if flow.classification == "mutating" and flow.effect not in held
+        )
+
+    @property
     def opaque(self) -> int:
         return sum(1 for flow in self.flows if flow.classification == "opaque")
 

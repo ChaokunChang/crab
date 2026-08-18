@@ -1088,7 +1088,13 @@ class Sandbox:
             egress_replay=egress_replay,
         )
 
-    def begin(self, label: str | None = None, *, isolation: str = "snapshot") -> "Transaction":
+    def begin(
+        self,
+        label: str | None = None,
+        *,
+        isolation: str = "snapshot",
+        effects: str | None = None,
+    ) -> "Transaction":
         """Open a transaction. ``isolation="snapshot"`` (default, B2):
         adaptive base checkpoint + observation staging armed +
         auto-checkpoints suppressed; actions run in place (weak
@@ -1112,6 +1118,10 @@ class Sandbox:
                 "(daemon-mode txn RPC lands in a follow-up)"
             )
         kwargs = {} if isolation == "snapshot" else {"isolation": isolation}
+        # Only pass the policy when the caller chose one, so older system
+        # fakes (and pre-D3 daemons) keep working with their defaults.
+        if effects is not None:
+            kwargs["effects"] = effects
         description = begin_txn(self.sandbox_id, label=label, **kwargs)
         return Transaction(self, description)
 

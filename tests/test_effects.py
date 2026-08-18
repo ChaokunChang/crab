@@ -655,3 +655,285 @@ class ProxyQueueCeilingTests(ProxyEffectGateTests):
         self.assertEqual(self.upstream.received, [])
         [flow] = self._flows()
         self.assertEqual(flow["effect_reason"], "session_closed")
+
+
+# ---------------------------------------------------------------------------
+# D3.2: transaction wiring
+# ---------------------------------------------------------------------------
+
+from crab.effects import flush_deferred_request
+from crab.txn import EffectFlushReport, TxnNotAbortable
+
+
+class _RecordingHTTPServer:
+    """A real HTTP server: it frames the request properly, so a test can
+    assert the queued body arrived intact (a raw one-shot recv would miss
+    the body, which http.client writes as a separate segment)."""
+
+    def __init__(self, status: int = 204) -> None:
+        import http.server
+
+        seen: list[tuple[str, str, bytes]] = []
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def _handle(self) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length) if length else b""
+                seen.append((self.command, self.path, body))
+                self.send_response(status)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            do_POST = _handle
+            do_PUT = _handle
+
+            def log_message(self, *args) -> None:
+                pass
+
+        self.seen = seen
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self.port = self._server.server_address[1]
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5.0)
+
+
+class FlushTransportTests(unittest.TestCase):
+    """`flush_deferred_request` goes straight out from the host: not through
+    the proxy, so it cannot be caught by the gate that queued it."""
+
+    def setUp(self) -> None:
+        self.upstream = _RecordingHTTPServer(status=204)
+        self.addCleanup(self.upstream.close)
+
+    def _request(self, **overrides) -> DeferredRequest:
+        payload = {
+            "method": "POST", "host": "127.0.0.1", "port": self.upstream.port,
+            "path": "/orders", "headers": (("Content-Type", "application/json"),),
+            "body": b'{"a":1}',
+        }
+        payload.update(overrides)
+        return DeferredRequest(**payload)
+
+    def test_sends_the_queued_request_verbatim(self) -> None:
+        status, error = flush_deferred_request(self._request())
+        self.assertEqual(status, 204)
+        self.assertIsNone(error)
+        [(method, path, body)] = self.upstream.seen
+        self.assertEqual((method, path), ("POST", "/orders"))
+        self.assertEqual(body, b'{"a":1}')  # the queued body arrived intact
+
+    def test_unreachable_host_is_reported_not_raised(self) -> None:
+        # Port 1 on loopback: nothing serves it, so the failure is genuine
+        # (closing a listener still lets already-queued connections finish).
+        status, error = flush_deferred_request(
+            self._request(port=1), timeout=2.0
+        )
+        self.assertIsNone(status)
+        self.assertIsInstance(error, str)
+        self.assertTrue(error)
+
+
+class _EffectSystemHarness(unittest.TestCase):
+    """Real CrabSystem + real journal + a real EffectGate; the heavy txn
+    machinery is patched at the system boundary."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="crab_d32_")
+        self.addCleanup(self._tmp.cleanup)
+        self.journal = ActionJournal(Path(self._tmp.name) / "journal")
+        from tests.test_egress import _minimal_system
+
+        self.system = _minimal_system(self.journal)
+        self.gate = EffectGate()
+        self.system.effect_gate = self.gate
+        self.system.effect_policy_defaults = {
+            "default_policy": "allow",
+            "fork_policy": "reject",
+            "on_unlisted": "reject",
+            "opaque_effects": "allow",
+            "rules": ({"host_glob": "*", "method": "POST"},),
+        }
+        self.sandbox_id = SandboxId("sbx-d32")
+
+
+class PolicyResolutionTests(_EffectSystemHarness):
+    def test_snapshot_and_fork_defaults(self) -> None:
+        self.assertEqual(self.system._resolve_effect_policy("snapshot", None), "allow")
+        self.assertEqual(self.system._resolve_effect_policy("fork", None), "reject")
+        # An explicit request always wins.
+        self.assertEqual(self.system._resolve_effect_policy("fork", "seal"), "seal")
+
+    def test_arm_uses_configured_defaults_and_rules(self) -> None:
+        self.system._arm_effect_session(
+            self.sandbox_id, policy="defer", txn_id="txn-1", isolation="snapshot"
+        )
+        session = self.gate.session_for(self.sandbox_id)
+        self.assertEqual(session.policy, "defer")
+        self.assertEqual(session.on_unlisted, "reject")
+        self.assertEqual(session.txn_id, "txn-1")
+        self.assertEqual(len(session.rules), 1)
+        # The dict from config became a real rule.
+        self.assertTrue(
+            session.rules[0].matches(host="api.example.com", method="POST", path="/x")
+        )
+
+
+class FlushAndDropTests(_EffectSystemHarness):
+    def setUp(self) -> None:
+        super().setUp()
+        self.upstream = _RecordingHTTPServer(status=200)
+        self.addCleanup(self.upstream.close)
+        self.system._arm_effect_session(
+            self.sandbox_id, policy="defer", txn_id="txn-f", isolation="snapshot"
+        )
+
+    def _queue(self, path: str, *, port: int | None = None) -> None:
+        self.gate.enqueue(
+            self.sandbox_id,
+            DeferredRequest(
+                method="POST", host="127.0.0.1", port=port or self.upstream.port,
+                path=path, headers=(), body=b"x",
+            ),
+        )
+
+    def test_flush_sends_in_order_and_journals_each_outcome(self) -> None:
+        self._queue("/first")
+        self._queue("/second")
+        report = self.system._flush_deferred_effects(self.sandbox_id, "txn-f")
+        self.assertEqual((report.attempted, report.succeeded, report.failed), (2, 2, 0))
+        self.assertEqual([entry.path for entry in report.entries], ["/first", "/second"])
+        self.assertEqual(
+            [path for _, path, _ in self.upstream.seen], ["/first", "/second"]
+        )  # enqueue order preserved
+        rows = [
+            row.payload for row in self.journal.entries(self.sandbox_id, kind="egress")
+        ]
+        self.assertEqual([row["effect"] for row in rows], ["flushed", "flushed"])
+        self.assertEqual(rows[0]["effect_status"], 200)
+        self.assertEqual(rows[0]["txn_id"] if "txn_id" in rows[0] else "txn-f", "txn-f")
+
+    def test_flush_failure_is_reported_not_raised(self) -> None:
+        self._queue("/gone", port=1)  # nothing serves loopback port 1
+        report = self.system._flush_deferred_effects(self.sandbox_id, "txn-f")
+        self.assertEqual((report.attempted, report.succeeded, report.failed), (1, 0, 1))
+        self.assertIsNotNone(report.entries[0].error)
+        [row] = [r.payload for r in self.journal.entries(self.sandbox_id, kind="egress")]
+        self.assertEqual(row["effect"], "flush_failed")
+        self.assertIsNotNone(row["effect_error"])
+
+    def test_empty_queue_yields_no_report(self) -> None:
+        self.assertIsNone(self.system._flush_deferred_effects(self.sandbox_id, "txn-f"))
+
+    def test_drop_discards_without_sending(self) -> None:
+        self._queue("/never")
+        dropped = self.system._drop_deferred_effects(self.sandbox_id, "txn-f")
+        self.assertEqual(dropped, 1)
+        self.assertEqual(self.upstream.seen, [])  # nothing was sent
+        [row] = [r.payload for r in self.journal.entries(self.sandbox_id, kind="egress")]
+        self.assertEqual(row["effect"], "dropped")
+        # Nothing left to flush afterwards.
+        self.assertIsNone(self.system._flush_deferred_effects(self.sandbox_id, "txn-f"))
+
+    def test_report_round_trip(self) -> None:
+        self._queue("/rt")
+        report = self.system._flush_deferred_effects(self.sandbox_id, "txn-f")
+        self.assertEqual(EffectFlushReport.from_json(report.to_json()), report)
+
+
+class BeginPolicyGuardTests(unittest.TestCase):
+    """The one combination D3 refuses outright (decision 12)."""
+
+    def test_fork_with_defer_is_refused(self) -> None:
+        from types import SimpleNamespace
+
+        system = SimpleNamespace()
+        # Use the real method with a minimal object: the guard runs before
+        # anything else in begin_txn.
+        from crab.system import CrabSystem
+
+        with self.assertRaises(ValueError) as ctx:
+            CrabSystem.begin_txn(
+                _StubSystem(policy="defer"), SandboxId("sbx-1"), isolation="fork"
+            )
+        self.assertIn("not supported with isolation='fork'", str(ctx.exception))
+
+    def test_unknown_policy_is_refused(self) -> None:
+        from crab.system import CrabSystem
+
+        with self.assertRaises(ValueError):
+            CrabSystem.begin_txn(_StubSystem(policy="hold"), SandboxId("sbx-1"))
+
+
+class _StubSystem:
+    """Just enough surface for begin_txn's argument validation."""
+
+    def __init__(self, *, policy: str) -> None:
+        self._policy = policy
+        self.effect_policy_defaults = {}
+
+    def _resolve_effect_policy(self, isolation, requested):
+        return self._policy
+
+
+class BareHostTests(unittest.TestCase):
+    """The queued host comes from the Host header, which carries the port
+    for non-default ports; a flush connects with (host, port), so leaving
+    it in makes resolution fail every time (D2.1's request_key trap)."""
+
+    def test_strips_a_numeric_port(self) -> None:
+        from crab.effects import bare_host
+
+        self.assertEqual(bare_host("10.0.2.15:45411"), "10.0.2.15")
+        self.assertEqual(bare_host("api.example.com:8080"), "api.example.com")
+
+    def test_leaves_everything_else_alone(self) -> None:
+        from crab.effects import bare_host
+
+        self.assertEqual(bare_host("api.example.com"), "api.example.com")
+        self.assertEqual(bare_host("[::1]:8080"), "[::1]:8080")  # bracketed IPv6
+        self.assertEqual(bare_host("fe80::1"), "fe80::1")  # bare IPv6
+        self.assertEqual(bare_host("host:notaport"), "host:notaport")
+
+    def test_queue_entries_store_the_bare_host(self) -> None:
+        head = parse_head(b"POST /w HTTP/1.1\r\nHost: 10.0.2.15:45411\r\n\r\n")
+        request = build_deferred_request(
+            parsed_head=head, body=b"", host="10.0.2.15:45411", port=45411,
+            method="POST", path="/w", txn_id=None, enqueued_at=None,
+        )
+        self.assertEqual(request.host, "10.0.2.15")
+        self.assertEqual(request.port, 45411)
+
+
+class MutatingSentTests(unittest.TestCase):
+    """`mutating_egress` must not count writes the gate held: reporting a
+    deferred write as "already fired" would misstate the one guarantee
+    `effects="defer"` provides."""
+
+    def _flow(self, seq: int, effect: str | None) -> EgressFlow:
+        return EgressFlow(
+            seq=seq, host="api.example.com", dst_ip="10.0.0.1", dst_port=80,
+            scheme="http", classification="mutating", method="POST", path="/w",
+            effect=effect,
+        )
+
+    def test_held_writes_are_excluded(self) -> None:
+        ledger = EgressLedger(
+            sandbox_id=SandboxId("sbx-1"),
+            flows=(
+                self._flow(1, None),          # passed through
+                self._flow(2, "sealed"),      # sent under seal
+                self._flow(3, "flushed"),     # sent at commit
+                self._flow(4, "flush_failed"),  # attempted; may have landed
+                self._flow(5, "deferred"),    # queued, never sent
+                self._flow(6, "rejected"),    # refused
+                self._flow(7, "dropped"),     # discarded on abort
+                self._flow(8, "lost"),        # queue died with the daemon
+            ),
+        )
+        self.assertEqual(ledger.mutating, 8)  # all are mutating flows
+        self.assertEqual(ledger.mutating_sent, 4)  # only these left the host

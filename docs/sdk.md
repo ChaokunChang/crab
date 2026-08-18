@@ -362,6 +362,33 @@ service behavior should be validated for each task.
   drop on abort, `TxnNotAbortable` for `seal`) lands in PR-D3.2; until
   then no session is opened automatically and every flow behaves exactly
   as before.
+- `Sandbox.begin(label, isolation=..., effects=...)` selects the egress
+  effect policy for the transaction (D3): `allow` (default for snapshot
+  txns — writes pass through), `defer` (allow-listed writes are queued
+  and answered `202`, then sent **after** the commit succeeds), `reject`
+  (**default for fork-backed txns** — writes get `503`, nothing is sent)
+  or `seal` (writes pass but the txn can no longer be aborted).
+  `isolation="fork"` with `effects="defer"` is refused: the commit
+  destroys the fork that owns the queue. `Transaction.effects` reports
+  the policy in force.
+- `TxnCommitResult.effects` is an `EffectFlushReport`
+  (attempted/succeeded/failed + per-entry status or error). The queue is
+  flushed in enqueue order, one request at a time, **from the host**
+  (not through the proxy, so it cannot be caught by its own gate). **A
+  flush failure never unwinds the commit** — the filesystem is already
+  committed, so the failure is reported instead of pretended away.
+- `TxnAbortResult.deferred_dropped` counts writes the abort discarded;
+  they never reached the world, which is what `defer` is for.
+  `TxnAbortResult.mutating_egress` counts only writes that **actually
+  left the host** (deferred/rejected/dropped ones are excluded), so a
+  defer-only transaction reports 0.
+- Aborting a `seal`ed transaction raises `TxnNotAbortable` (daemon: 409
+  `txn_not_abortable`); `abort(force=True)` proceeds and accepts that the
+  external write stands.
+- `merge_processes(strategy="replay", replay_effects=...)` defaults to
+  `"reject"`: a replayed command's write would be the fork's write
+  fired **twice**, so it is refused and shows up as a deviation instead.
+  Pass `"allow"` to re-issue it.
 - `TxnAbortResult.mutating_egress` counts the mutating flows the
   transaction already fired: the filesystem rollback cannot undo them,
   so the abort reports rather than hides them (holding or rejecting

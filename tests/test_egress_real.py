@@ -20,6 +20,7 @@ import unittest
 from pathlib import Path
 
 from crab import Engine, EngineConfig, Sandbox
+from crab.txn import TxnNotAbortable
 
 
 def _real_stack_available() -> bool:
@@ -751,6 +752,148 @@ class EffectGateRealTests(unittest.TestCase):
         result = sandbox.commands.run(self._post("/write"))
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         self.assertEqual(self.external.requests, ["POST /write"])
+
+
+class EffectTxnRealTests(unittest.TestCase):
+    """D3.2 E2E: the external server's request log decides everything — a
+    deferred write appears there only after commit, never after abort."""
+
+    _IMAGE = "python:3.11-slim"
+
+    def setUp(self) -> None:
+        if not _real_stack_available():
+            self.skipTest("docker/runc/criu/zfs/iptables/root not available")
+        self.host_ip = _host_lan_ip()
+        if self.host_ip is None:
+            self.skipTest("no global-scope host address for the external service")
+        self._tmp = tempfile.TemporaryDirectory(prefix="crab_effects_txn_")
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.external = _CountingHTTPServer()
+        self.addCleanup(self.external.close)
+        self.port = self.external.port
+        self.engine = Engine.start(
+            EngineConfig(
+                runtime="runc",
+                enable_sandbox_network=True,
+                enable_interceptor=False,
+                enable_egress_proxy=True,
+                effects_rules=({"host_glob": "*", "method": "POST"},),
+                storage_root=root / "storage",
+                runtime_root=root / "runtime",
+            )
+        )
+        self.addCleanup(self.engine.stop)
+
+    def _post(self, path: str) -> str:
+        return (
+            "python3 -c \"import urllib.request;"
+            f"req=urllib.request.Request('http://{self.host_ip}:{self.port}{path}', data=b'payload', method='POST');"
+            "print(urllib.request.urlopen(req, timeout=10).status)\""
+        )
+
+    def _ok(self, sandbox: Sandbox, script: str) -> str:
+        result = sandbox.commands.run(script)
+        self.assertEqual(result.returncode, 0, msg=f"{script!r}: {result.stderr}")
+        return result.stdout.strip()
+
+    def test_deferred_write_fires_on_commit_only(self) -> None:
+        sandbox = Sandbox(image=self._IMAGE, engine=self.engine)
+        self.addCleanup(sandbox.kill)
+        txn = sandbox.begin("defer-commit", effects="defer")
+        self.assertEqual(sandbox.current_txn().effects, "defer")
+
+        self.assertIn("202", self._ok(sandbox, self._post("/write")))
+        self.assertEqual(self.external.requests, [], "a deferred write escaped early")
+
+        result = txn.commit()
+        self.assertIsNotNone(result.effects)
+        self.assertEqual(
+            (result.effects.attempted, result.effects.succeeded, result.effects.failed),
+            (1, 1, 0),
+        )
+        # Exactly once, and only after the commit.
+        self.assertEqual(self.external.requests, ["POST /write"])
+        ledger = sandbox.egress()
+        self.assertGreaterEqual(ledger.deferred, 1)
+        self.assertGreaterEqual(ledger.flushed, 1)
+
+    def test_abort_drops_the_write_entirely(self) -> None:
+        sandbox = Sandbox(image=self._IMAGE, engine=self.engine)
+        self.addCleanup(sandbox.kill)
+        txn = sandbox.begin("defer-abort", effects="defer")
+        self.assertIn("202", self._ok(sandbox, self._post("/write")))
+
+        result = txn.abort()
+        self.assertEqual(result.deferred_dropped, 1)
+        # The whole point of defer: an aborted txn leaves the world alone.
+        self.assertEqual(self.external.requests, [])
+        self.assertEqual(result.mutating_egress, 0)
+
+    def test_flush_failure_is_reported_and_commit_stands(self) -> None:
+        sandbox = Sandbox(image=self._IMAGE, engine=self.engine)
+        self.addCleanup(sandbox.kill)
+        self._ok(sandbox, "mkdir -p /probe && echo committed > /probe/state.txt")
+        txn = sandbox.begin("defer-flush-fail", effects="defer")
+        self.assertIn("202", self._ok(sandbox, self._post("/write")))
+
+        # Real disconnect: the origin is gone before the flush runs.
+        self.external.close()
+        result = txn.commit()
+
+        self.assertIsNotNone(result.effects)
+        self.assertEqual(result.effects.failed, 1)
+        self.assertIsNotNone(result.effects.entries[0].error)
+        # The filesystem commit stands: a flush failure never unwinds it.
+        self.assertEqual(self._ok(sandbox, "cat /probe/state.txt"), "committed")
+        self.assertIsNone(sandbox.current_txn())
+        rows = [row.effect for row in sandbox.egress().flows if row.effect]
+        self.assertIn("flush_failed", rows)
+
+    def test_seal_blocks_abort_until_forced(self) -> None:
+        sandbox = Sandbox(image=self._IMAGE, engine=self.engine)
+        self.addCleanup(sandbox.kill)
+        txn = sandbox.begin("seal", effects="seal")
+        self.assertIn("200", self._ok(sandbox, self._post("/write")))
+        self.assertEqual(self.external.requests, ["POST /write"])  # seal lets it out
+
+        with self.assertRaises(TxnNotAbortable):
+            txn.abort()
+        # Forcing accepts that the external write stands.
+        result = txn.abort(force=True)
+        self.assertEqual(result.txn_id, txn.txn_id)
+
+    def test_fork_txn_refuses_writes_by_default(self) -> None:
+        sandbox = Sandbox(image=self._IMAGE, engine=self.engine)
+        self.addCleanup(sandbox.kill)
+        txn = sandbox.begin("fork-default", isolation="fork")
+        self.assertEqual(sandbox.current_txn().effects, "reject")
+        result = txn.exec(self._post("/write"))
+        self.assertNotEqual(result.returncode, 0, msg="a fork write was allowed")
+        self.assertEqual(self.external.requests, [])
+        txn.abort()
+
+    def test_fork_with_defer_is_refused_at_begin(self) -> None:
+        sandbox = Sandbox(image=self._IMAGE, engine=self.engine)
+        self.addCleanup(sandbox.kill)
+        with self.assertRaises(ValueError):
+            sandbox.begin("nope", isolation="fork", effects="defer")
+
+    def test_c4_replay_does_not_refire_the_forks_write(self) -> None:
+        sandbox = Sandbox(image=self._IMAGE, engine=self.engine)
+        self.addCleanup(sandbox.kill)
+        self._ok(sandbox, "mkdir -p /probe && sh -c 'nohup sleep 300 >/dev/null 2>&1 & echo $! > /probe/bg.pid'")
+        [fork] = sandbox.fork()
+        self.addCleanup(fork.kill)
+        self._ok(fork, self._post("/write"))
+        self.assertEqual(self.external.requests, ["POST /write"])  # the fork's write
+
+        report = sandbox.merge_processes(fork, strategy="replay")
+
+        # Replay refuses the write instead of firing it a second time, and
+        # says so as a deviation rather than hiding it.
+        self.assertEqual(self.external.requests, ["POST /write"])
+        self.assertGreaterEqual(report.deviations, 1)
 
 
 if __name__ == "__main__":
