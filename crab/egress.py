@@ -36,6 +36,15 @@ from .cassettes import (
     request_key,
     sha256_hex,
 )
+from .effects import (
+    DECISION_DEFER,
+    DECISION_REJECT,
+    DECISION_SEAL,
+    DEFERRED_RESPONSE,
+    REJECTED_RESPONSE,
+    build_deferred_request,
+    read_remaining_body,
+)
 from .http_wire import ResponseAssembler, parse_head, serialize_response
 from .ids import SandboxId
 from .models import utc_now
@@ -541,6 +550,81 @@ class _EgressHandler(socketserver.BaseRequestHandler):
                         return
                 else:
                     replayer.record_pass_through(session)
+            # ---- effect gate (D3): a write may be queued for commit,
+            # refused, or sealed. Reads are never touched. Runs after
+            # replay so a cassette hit still short-circuits, and before
+            # the upstream connection so a held write truly never leaves.
+            gate = server.effect_gate
+            if gate is not None and sandbox_id is not None:
+                decision = None
+                gate_session = None
+                if scheme == "http":
+                    verdict = classify_flow(
+                        {"host": host or dst_ip, "method": method, "scheme": scheme},
+                        server.rules,
+                    )
+                    if verdict == CLASSIFICATION_MUTATING:
+                        outcome = gate.decide_write(
+                            sandbox_id,
+                            host=host or dst_ip,
+                            method=method or "",
+                            path=path or "/",
+                        )
+                        if outcome is not None:
+                            decision, gate_session = outcome
+                    elif verdict == CLASSIFICATION_OPAQUE:
+                        outcome = gate.decide_opaque(sandbox_id)
+                        if outcome is not None:
+                            decision, gate_session = outcome
+                else:
+                    # TLS / raw TCP: no method to classify (D3 decision 4).
+                    outcome = gate.decide_opaque(sandbox_id)
+                    if outcome is not None:
+                        decision, gate_session = outcome
+                if decision == DECISION_DEFER:
+                    parsed = parse_head(head)
+                    body, complete = (
+                        (b"", False)
+                        if parsed is None
+                        else read_remaining_body(
+                            client, parsed, parsed.rest, limit=server.max_deferred_body_bytes
+                        )
+                    )
+                    if parsed is None or not complete:
+                        # Unparsable head, unframed/chunked body, or a body
+                        # past the cap: refuse rather than queue a request
+                        # that would flush corrupted at commit.
+                        client.sendall(REJECTED_RESPONSE)
+                        bytes_in = len(REJECTED_RESPONSE)
+                        record_meta = {"effect": "rejected", "effect_reason": "unqueueable"}
+                        return
+                    queued = build_deferred_request(
+                        parsed_head=parsed,
+                        body=body,
+                        host=host or dst_ip,
+                        port=dst_port,
+                        method=method or "POST",
+                        path=path or "/",
+                        txn_id=gate_session.txn_id if gate_session else None,
+                        enqueued_at=utc_now().isoformat(),
+                    )
+                    position = gate.enqueue(sandbox_id, queued)
+                    client.sendall(DEFERRED_RESPONSE)
+                    bytes_in = len(DEFERRED_RESPONSE)
+                    record_meta = {
+                        "effect": "deferred",
+                        "effect_queue_position": position,
+                        "request_body_sha256": queued.body_sha256,
+                    }
+                    return  # finally still writes the journal row
+                if decision == DECISION_REJECT:
+                    client.sendall(REJECTED_RESPONSE)
+                    bytes_in = len(REJECTED_RESPONSE)
+                    record_meta = {"effect": "rejected"}
+                    return
+                if decision == DECISION_SEAL:
+                    # The write goes out; the txn just lost abortability.
+                    record_meta = {"effect": "sealed"}
             upstream = socket.create_connection(
                 (dst_ip, dst_port), timeout=server.connect_timeout_seconds
             )
@@ -674,6 +758,8 @@ class EgressProxyServer(socketserver.ThreadingTCPServer):
         cassette_recorder: "CassetteRecorder | None" = None,
         cassette_replayer: "CassetteReplayer | None" = None,
         replay_varying_headers: Sequence[str] = DEFAULT_VARYING_HEADERS,
+        effect_gate: object | None = None,
+        max_deferred_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
     ) -> None:
         """``host`` should be the bridge's own address: REDIRECT rewrites
         each flow's destination to it, so binding there receives all
@@ -682,6 +768,8 @@ class EgressProxyServer(socketserver.ThreadingTCPServer):
         self.recorder = EgressFlowRecorder(journal)
         self.cassette_recorder = cassette_recorder
         self.cassette_replayer = cassette_replayer
+        self.effect_gate = effect_gate
+        self.max_deferred_body_bytes = int(max_deferred_body_bytes)
         self.replay_varying_headers = tuple(replay_varying_headers)
         self.rules = tuple(rules)
         self._sandbox_id_resolver = sandbox_id_resolver

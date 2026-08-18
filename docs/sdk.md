@@ -340,6 +340,28 @@ service behavior should be validated for each task.
   `egress_replay="none"` for live traffic. The report nests the replay
   outcome under `egress_replay`. Replay the fork's cassettes **before**
   killing the fork — destroying it prunes them.
+- **Effect gate (D3, PR-D3.1)**: the proxy can hold back a *mutating*
+  flow instead of letting it fire. Policies are `allow` (today's
+  behavior), `defer` (queue allow-listed writes and answer
+  `202 Accepted` + `X-Crab-Effect: deferred`), `reject` (`503` +
+  `X-Crab-Effect: rejected`, nothing sent) and `seal` (the write goes
+  out but the transaction becomes non-abortable). **Reads are never
+  gated.** Deferral cannot wait for the commit — the sandbox process is
+  blocked on the response while commit arrives from outside it — so a
+  deferred write is answered immediately with `202`, which is why it
+  requires an explicit endpoint allow-list
+  (`EngineConfig(effects_rules=({"host_glob": "*.internal", "method":
+  "POST", "path_glob": "/events*"},))`, config `effects.rules`); an
+  unlisted write is refused rather than silently queued
+  (`effects.on_unlisted`). Encrypted and raw flows carry no method, so
+  `effects.opaque_effects` (`allow` default / `reject` / `seal`) decides
+  their fate — **without TLS interception a transaction using HTTPS
+  cannot be guaranteed write-free**. Ledger flows gain `effect` and
+  `effect_status`, and the ledger counts `deferred`/`rejected`/`flushed`.
+  Wiring the policies to transaction lifecycle (queue flush on commit,
+  drop on abort, `TxnNotAbortable` for `seal`) lands in PR-D3.2; until
+  then no session is opened automatically and every flow behaves exactly
+  as before.
 - `TxnAbortResult.mutating_egress` counts the mutating flows the
   transaction already fired: the filesystem rollback cannot undo them,
   so the abort reports rather than hides them (holding or rejecting
