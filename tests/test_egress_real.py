@@ -109,6 +109,43 @@ class _RawTCPServer:
         self._thread.join(timeout=2.0)
 
 
+class _CountingHTTPServer:
+    """Like _ExternalHTTPServer but records what it was asked for, so a
+    test can assert a write never arrived."""
+
+    def __init__(self) -> None:
+        requests: list[str] = []
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def _respond(self) -> None:
+                requests.append(f"{self.command} {self.path}")
+                length = int(self.headers.get("Content-Length") or 0)
+                if length:
+                    self.rfile.read(length)
+                body = b"external-ok"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            do_GET = _respond
+            do_POST = _respond
+
+            def log_message(self, *args) -> None:
+                pass
+
+        self.requests = requests
+        self._server = http.server.ThreadingHTTPServer(("0.0.0.0", 0), _Handler)
+        self.port = self._server.server_address[1]
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5.0)
+
+
 class EgressRealTests(unittest.TestCase):
     _IMAGE = "python:3.11-slim"
 
@@ -606,6 +643,114 @@ class EgressReplayRealTests(unittest.TestCase):
             )
         self.assertEqual(window.report.served, 0)
         self.assertGreaterEqual(window.report.passed_through, 1)
+
+
+class EffectGateRealTests(unittest.TestCase):
+    """D3.1 E2E: the decisive property is the external server's request
+    log — a refused or deferred write must not appear in it."""
+
+    _IMAGE = "python:3.11-slim"
+
+    def setUp(self) -> None:
+        if not _real_stack_available():
+            self.skipTest("docker/runc/criu/zfs/iptables/root not available")
+        self.host_ip = _host_lan_ip()
+        if self.host_ip is None:
+            self.skipTest("no global-scope host address for the external service")
+        self._tmp = tempfile.TemporaryDirectory(prefix="crab_effects_e2e_")
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.external = _CountingHTTPServer()
+        self.addCleanup(self.external.close)
+        self.port = self.external.port
+        self.engine = Engine.start(
+            EngineConfig(
+                runtime="runc",
+                enable_sandbox_network=True,
+                enable_interceptor=False,
+                enable_egress_proxy=True,
+                storage_root=root / "storage",
+                runtime_root=root / "runtime",
+            )
+        )
+        self.addCleanup(self.engine.stop)
+        self.gate = self.engine._system.effect_gate
+        self.assertIsNotNone(self.gate, "engine did not wire the effect gate")
+
+    def _post(self, path: str) -> str:
+        return (
+            "python3 -c \"import urllib.request;"
+            f"req=urllib.request.Request('http://{self.host_ip}:{self.port}{path}', data=b'payload', method='POST');"
+            "print(urllib.request.urlopen(req, timeout=10).status)\""
+        )
+
+    def _get(self, path: str) -> str:
+        return (
+            "python3 -c \"import urllib.request;"
+            f"print(urllib.request.urlopen('http://{self.host_ip}:{self.port}{path}', timeout=10).read().decode())\""
+        )
+
+    def _wait_flows(self, sandbox: Sandbox, *, expected: int, timeout: float = 20.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            flows = sandbox.egress().flows
+            if len(flows) >= expected:
+                return flows
+            time.sleep(0.25)
+        self.fail(f"expected {expected} flows, saw {[f.to_json() for f in sandbox.egress().flows]}")
+
+    def test_reject_refuses_the_write_and_the_server_never_sees_it(self) -> None:
+        sandbox = Sandbox(image=self._IMAGE, engine=self.engine)
+        self.addCleanup(sandbox.kill)
+        self.gate.begin(sandbox.sandbox_id, policy="reject", txn_id="txn-e2e")
+
+        result = sandbox.commands.run(self._post("/write"))
+        self.assertNotEqual(result.returncode, 0, msg="the write was not refused")
+        self.assertIn("503", result.stderr + result.stdout)
+        self.assertEqual(self.external.requests, [], "a refused write reached the server")
+
+        # Reads in the same window still work.
+        read = sandbox.commands.run(self._get("/read"))
+        self.assertEqual(read.returncode, 0, msg=read.stderr)
+        self.assertIn("external-ok", read.stdout)
+        self.assertEqual(self.external.requests, ["GET /read"])
+
+        flows = self._wait_flows(sandbox, expected=2)
+        effects = [flow.effect for flow in flows]
+        self.assertIn("rejected", effects)
+        self.assertEqual(sandbox.egress().rejected, 1)
+
+    def test_defer_answers_202_and_holds_the_write(self) -> None:
+        sandbox = Sandbox(image=self._IMAGE, engine=self.engine)
+        self.addCleanup(sandbox.kill)
+        from crab.effects import EffectRule
+
+        self.gate.begin(
+            sandbox.sandbox_id,
+            policy="defer",
+            rules=(EffectRule(host_glob="*", method="POST"),),
+            txn_id="txn-defer",
+        )
+        result = sandbox.commands.run(self._post("/write"))
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("202", result.stdout)  # the sandbox saw Accepted
+        self.assertEqual(self.external.requests, [], "a deferred write was sent anyway")
+
+        [flow] = [f for f in self._wait_flows(sandbox, expected=1) if f.effect]
+        self.assertEqual(flow.effect, "deferred")
+        self.assertEqual(sandbox.egress().deferred, 1)
+        # The queue holds the real request, body and all (D3.2 flushes it).
+        [queued] = self.gate.drain(sandbox.sandbox_id)
+        self.assertEqual((queued.method, queued.path), ("POST", "/write"))
+        self.assertEqual(queued.body, b"payload")
+        self.assertEqual(queued.txn_id, "txn-defer")
+
+    def test_without_a_session_writes_flow_as_before(self) -> None:
+        sandbox = Sandbox(image=self._IMAGE, engine=self.engine)
+        self.addCleanup(sandbox.kill)
+        result = sandbox.commands.run(self._post("/write"))
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(self.external.requests, ["POST /write"])
 
 
 if __name__ == "__main__":

@@ -175,6 +175,14 @@ class CrabSystem:
     cassette_replayer: object | None = None
     """Serves recorded reads during a replay window (D2), assigned by the
     engine alongside the proxy."""
+    effect_gate: object | None = None
+    """Effect policy for in-transaction egress (D3), assigned by the
+    engine alongside the proxy. Sessions are opened/closed by the txn
+    lifecycle (PR-D3.2); without a session the gate is inert and every
+    flow behaves as it did before D3."""
+    effect_policy_defaults: dict = field(default_factory=dict)
+    """Configured defaults for effect sessions (default/fork policy,
+    on_unlisted, opaque_effects, rules)."""
     relaunch_handler: Callable[[SandboxId, str, bool], None] | None = None
     extra_checkpoint_metadata_provider: Callable[[SandboxId], dict[str, object]] | None = None
     restore_metadata_handler: Callable[[SandboxId, CheckpointManifest], None] | None = None

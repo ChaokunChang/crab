@@ -412,6 +412,35 @@ class EngineConfig:
     """Record 206 responses. Only meaningful with ``range`` among the
     varying headers, or different ranges would collide on one cassette."""
 
+    effects_default_policy: str = "allow"
+    """Effect policy for snapshot transactions (roadmap D3):
+    ``allow`` (writes pass through, aborts report what already left),
+    ``defer`` (allow-listed writes queue until commit, answered 202),
+    ``reject`` (writes refused with 503), ``seal`` (writes pass but the
+    txn becomes non-abortable). Default keeps today's behavior."""
+
+    effects_fork_policy: str = "reject"
+    """Policy for fork-backed transactions: a speculative fork should not
+    write to the world (roadmap: "multiple forks must not double-fire
+    external writes")."""
+
+    effects_rules: tuple = ()
+    """Endpoints that tolerate deferral, e.g.
+    ``({"host_glob": "*.internal", "method": "POST", "path_glob": "/events*"},)``.
+    Empty by default: under ``defer`` an unlisted write is refused rather
+    than silently queued, since only the deployment knows whether a caller
+    can accept ``202`` instead of the real response."""
+
+    effects_on_unlisted: str = "reject"
+    """What ``defer`` does with writes that match no rule."""
+
+    effects_opaque_effects: str = "allow"
+    """Encrypted/raw flows carry no method, so they cannot be classified:
+    ``allow`` (default) lets them through — refusing would break HTTPS
+    reads too; ``reject`` gives a hard seal; ``seal`` marks the txn
+    non-abortable on the first opaque flow. Without TLS interception a
+    transaction using HTTPS cannot be guaranteed write-free."""
+
     network_expected_sandboxes: int | None = None
     """Optional capacity hint for the bridge network allocator."""
 
@@ -509,6 +538,7 @@ class EngineConfig:
         journal_data = _optional_mapping(data.get("journal"), label="journal")
         egress = _optional_mapping(data.get("egress"), label="egress")
         recording = _optional_mapping(egress.get("recording"), label="egress.recording")
+        effects = _optional_mapping(data.get("effects"), label="effects")
 
         default_workers = _as_int(data.get("max_workers"), default=None)
         executor_data = _optional_mapping(data.get("executor"), label="executor")
@@ -626,6 +656,19 @@ class EngineConfig:
             egress_recording_record_partial=_as_bool(
                 recording.get("record_partial", data.get("egress_recording_record_partial")),
                 default=False,
+            ),
+            effects_default_policy=str(
+                effects.get("default_policy", data.get("effects_default_policy")) or "allow"
+            ),
+            effects_fork_policy=str(
+                effects.get("fork_policy", data.get("effects_fork_policy")) or "reject"
+            ),
+            effects_rules=tuple(effects.get("rules", data.get("effects_rules")) or ()),
+            effects_on_unlisted=str(
+                effects.get("on_unlisted", data.get("effects_on_unlisted")) or "reject"
+            ),
+            effects_opaque_effects=str(
+                effects.get("opaque_effects", data.get("effects_opaque_effects")) or "allow"
             ),
             network_expected_sandboxes=_as_int(
                 network.get("expected_sandboxes", data.get("network_expected_sandboxes")),
@@ -959,6 +1002,17 @@ class Engine:
                     # pruning a sandbox's cassettes when it is destroyed.
                     self._system.cassette_store = store
                     self._system.cassette_replayer = cassette_replayer
+                from .effects import EffectGate
+
+                effect_gate = EffectGate()
+                self._system.effect_gate = effect_gate
+                self._system.effect_policy_defaults = {
+                    "default_policy": cfg.effects_default_policy,
+                    "fork_policy": cfg.effects_fork_policy,
+                    "on_unlisted": cfg.effects_on_unlisted,
+                    "opaque_effects": cfg.effects_opaque_effects,
+                    "rules": cfg.effects_rules,
+                }
                 proxy = EgressProxyServer(
                     journal=getattr(self._system, "journal", None),
                     sandbox_id_resolver=manager.resolve_sandbox_id,
@@ -971,6 +1025,7 @@ class Engine:
                     cassette_recorder=cassette_recorder,
                     cassette_replayer=cassette_replayer,
                     replay_varying_headers=cfg.egress_recording_varying_headers,
+                    effect_gate=effect_gate,
                 )
                 proxy.start()
                 manager.enable_egress_redirect(proxy.port)

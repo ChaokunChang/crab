@@ -679,6 +679,13 @@ class EgressFlow:
     by the proxy; ``replayed`` is the authoritative flag."""
     replayed_from: str | None = None
     """Which sandbox's cassette bucket answered (a fork, for C4)."""
+    effect: str | None = None
+    """Effect-gate outcome for a write (D3): ``deferred`` (queued for
+    commit), ``rejected``, ``sealed`` (sent, txn no longer abortable),
+    ``flushed``/``flush_failed`` (recorded by the commit flush), or
+    ``lost`` (queued but never flushed — the daemon restarted)."""
+    effect_status: int | None = None
+    """Upstream status of a flushed deferred write."""
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -702,6 +709,8 @@ class EgressFlow:
             "replayed": self.replayed,
             "replayed_from_seq": self.replayed_from_seq,
             "replayed_from": self.replayed_from,
+            "effect": self.effect,
+            "effect_status": self.effect_status,
         }
 
     @classmethod
@@ -738,6 +747,12 @@ class EgressFlow:
                 None
                 if payload.get("replayed_from") is None
                 else str(payload["replayed_from"])
+            ),
+            effect=None if payload.get("effect") is None else str(payload["effect"]),
+            effect_status=(
+                None
+                if payload.get("effect_status") is None
+                else int(payload["effect_status"])
             ),
         )
 
@@ -782,6 +797,21 @@ class EgressLedger:
     def replayed(self) -> int:
         return sum(1 for flow in self.flows if flow.replayed)
 
+    @property
+    def deferred(self) -> int:
+        """Writes queued for commit. Still-pending ones are those whose
+        `effect` is exactly ``deferred`` (a later row records the
+        flush/drop outcome)."""
+        return sum(1 for flow in self.flows if flow.effect == "deferred")
+
+    @property
+    def rejected(self) -> int:
+        return sum(1 for flow in self.flows if flow.effect == "rejected")
+
+    @property
+    def flushed(self) -> int:
+        return sum(1 for flow in self.flows if flow.effect == "flushed")
+
     def to_json(self) -> dict[str, object]:
         return {
             "sandbox_id": str(self.sandbox_id),
@@ -793,6 +823,9 @@ class EgressLedger:
             "opaque": self.opaque,
             "recorded": self.recorded,
             "replayed": self.replayed,
+            "deferred": self.deferred,
+            "rejected": self.rejected,
+            "flushed": self.flushed,
         }
 
     @classmethod
