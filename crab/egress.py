@@ -398,6 +398,32 @@ class CassetteReplayer:
         with self._lock:
             return self._sessions.get(str(sandbox_id))
 
+    # The proxy is one thread per connection, so the session's tallies are
+    # mutated concurrently; ``+=`` is a lost-update race. Fold every
+    # counter bump through the lock so the report (C4's determinism input)
+    # stays accurate under real traffic.
+    def record_hit(self, session: ReplaySession, host: str) -> None:
+        with self._lock:
+            session.served += 1
+            session.hosts.add(host)
+
+    def record_miss(self, session: ReplaySession) -> None:
+        with self._lock:
+            session.missed += 1
+
+    def record_pass_through(self, session: ReplaySession) -> None:
+        with self._lock:
+            session.passed_through += 1
+
+    def snapshot(self, session: ReplaySession) -> tuple[int, int, int, tuple[str, ...]]:
+        with self._lock:
+            return (
+                session.served,
+                session.missed,
+                session.passed_through,
+                tuple(sorted(session.hosts)),
+            )
+
     def lookup(
         self,
         session: ReplaySession,
@@ -497,8 +523,7 @@ class _EgressHandler(socketserver.BaseRequestHandler):
                         )
                         client.sendall(wire)
                         bytes_in = len(wire)
-                        session.served += 1
-                        session.hosts.add(entry.host)
+                        replayer.record_hit(session, entry.host)
                         record_meta = {
                             "recorded": True,
                             "request_key": entry.request_key,
@@ -509,13 +534,13 @@ class _EgressHandler(socketserver.BaseRequestHandler):
                             "replayed_from": session.cassette_source,
                         }
                         return  # finally still writes the journal row
-                    session.missed += 1
+                    replayer.record_miss(session)
                     if session.policy == "cassette_only":
                         client.sendall(_REPLAY_MISS_RESPONSE)
                         record_meta = {"replay_miss": True}
                         return
                 else:
-                    session.passed_through += 1
+                    replayer.record_pass_through(session)
             upstream = socket.create_connection(
                 (dst_ip, dst_port), timeout=server.connect_timeout_seconds
             )

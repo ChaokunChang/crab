@@ -1375,3 +1375,172 @@ class SystemReplayFacadeTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.system.begin_egress_replay(SandboxId("sbx-1"))
         self.assertIsNone(self.system.end_egress_replay(SandboxId("sbx-1")))
+
+
+class _KeepAliveUpstream:
+    """Serves two requests on one connection, so the recorder's
+    one-exchange-per-connection assumption can be tested rather than
+    assumed (a D2.1 review follow-up)."""
+
+    def __init__(self, responses: list[bytes]) -> None:
+        self.responses = responses
+        self.requests: list[bytes] = []
+        self._sock = socket.socket()
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(8)
+        self.port = self._sock.getsockname()[1]
+        self.connections = 0
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self) -> None:
+        while True:
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                return
+            self.connections += 1
+            with conn:
+                try:
+                    for response in self.responses:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            break
+                        self.requests.append(chunk)
+                        conn.sendall(response)
+                except OSError:
+                    pass
+
+    def close(self) -> None:
+        self._sock.close()
+        self._thread.join(timeout=2.0)
+
+
+class KeepAliveTests(unittest.TestCase):
+    """Pins what a keep-alive connection does to recording and replay.
+    v1 records one exchange per connection; the point of these tests is
+    that the second exchange must not corrupt the first one's cassette."""
+
+    _FIRST = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst"
+    _SECOND = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond"
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="crab_keepalive_")
+        self.addCleanup(self._tmp.cleanup)
+        self.journal = ActionJournal(Path(self._tmp.name) / "journal")
+        self.store = CassetteStore(Path(self._tmp.name) / "cassettes")
+        self.sandbox_id = SandboxId("sbx-keepalive")
+        self.upstream = _KeepAliveUpstream([self._FIRST, self._SECOND])
+        self.addCleanup(self.upstream.close)
+        self.proxy = EgressProxyServer(
+            journal=self.journal,
+            sandbox_id_resolver=lambda peer: self.sandbox_id,
+            host="127.0.0.1",
+            port=0,
+            head_timeout_seconds=1.0,
+            cassette_recorder=CassetteRecorder(self.store),
+        )
+        self.replayer = CassetteReplayer(self.store)
+        self.proxy.cassette_replayer = self.replayer
+        self.proxy.start()
+        self.addCleanup(self.proxy.stop)
+        patcher = mock.patch(
+            "crab.egress.original_destination",
+            return_value=("127.0.0.1", self.upstream.port),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _pipeline_two_requests(self) -> bytes:
+        """One connection, two sequential requests (classic keep-alive)."""
+        received = b""
+        with socket.create_connection(("127.0.0.1", self.proxy.port), timeout=5.0) as sock:
+            sock.sendall(b"GET /one HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+            received += sock.recv(4096)
+            sock.sendall(b"GET /two HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                received += chunk
+        return received
+
+    def _flows(self, *, expected: int = 1, timeout: float = 5.0) -> list[dict]:
+        deadline = time.monotonic() + timeout
+        records: list = []
+        while time.monotonic() < deadline:
+            records = self.journal.entries(self.sandbox_id, kind="egress")
+            if len(records) >= expected:
+                break
+            time.sleep(0.05)
+        return [record.payload for record in records]
+
+    def test_second_exchange_does_not_corrupt_the_first_cassette(self) -> None:
+        body = self._pipeline_two_requests()
+        self.assertIn(b"first", body)
+        self.assertIn(b"second", body)  # both answers reached the client
+        self.assertEqual(self.upstream.connections, 1)  # genuinely keep-alive
+
+        [flow] = self._flows()
+        self.assertTrue(flow["recorded"])
+        entry = self.store.get(self.sandbox_id, flow["request_key"])
+        # One exchange per connection: the cassette holds the FIRST
+        # request's response and nothing of the second one.
+        self.assertEqual(entry.path, "/one")
+        self.assertEqual(entry.body, b"first")
+        self.assertNotIn(b"second", entry.body)
+        self.assertEqual(self.store.count(self.sandbox_id), 1)
+
+    def test_replay_hit_serves_one_exchange_and_closes(self) -> None:
+        self._pipeline_two_requests()
+        self._flows()
+        connections_after_record = self.upstream.connections
+
+        self.replayer.begin(self.sandbox_id, policy="cassette_first")
+        with socket.create_connection(("127.0.0.1", self.proxy.port), timeout=5.0) as sock:
+            sock.sendall(b"GET /one HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+            served = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                served += chunk
+        session = self.replayer.end(self.sandbox_id)
+
+        self.assertIn(b"first", served)
+        # Replay answers with Connection: close, so a keep-alive client
+        # knows not to reuse the socket for a second request.
+        self.assertIn(b"Connection: close", served)
+        self.assertEqual(session.served, 1)
+        self.assertEqual(self.upstream.connections, connections_after_record)
+
+
+class ReplayCounterConcurrencyTests(unittest.TestCase):
+    """The proxy is one thread per connection, so the session tallies are
+    written concurrently: a plain ``+=`` loses updates and the report
+    (C4's determinism input) under-counts."""
+
+    def test_concurrent_bumps_are_not_lost(self) -> None:
+        replayer = CassetteReplayer(store=None)
+        session = replayer.begin("sbx-1", policy="cassette_first")
+        bumps = 200
+        workers = 8
+
+        def hammer() -> None:
+            for _ in range(bumps):
+                replayer.record_hit(session, "api.example.com")
+                replayer.record_miss(session)
+                replayer.record_pass_through(session)
+
+        threads = [threading.Thread(target=hammer) for _ in range(workers)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        served, missed, passed, hosts = replayer.snapshot(session)
+        self.assertEqual(served, bumps * workers)
+        self.assertEqual(missed, bumps * workers)
+        self.assertEqual(passed, bumps * workers)
+        self.assertEqual(hosts, ("api.example.com",))
