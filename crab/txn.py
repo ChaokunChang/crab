@@ -62,6 +62,13 @@ class TxnCommitConflict(TxnError):
     Commit with ``force=True`` to discard them, or abort the txn."""
 
 
+class TxnNotAbortable(TxnError):
+    """Abort refused: under ``effects="seal"`` this txn already sent a
+    mutating request, so rolling the filesystem back would leave the world
+    ahead of the sandbox. Commit it, or abort with ``force=True`` to
+    accept that the external write stands."""
+
+
 def new_txn_id() -> str:
     return f"txn-{uuid.uuid4().hex[:12]}"
 
@@ -78,6 +85,72 @@ class TxnDescription:
     label: str | None = None
     isolation: str = "snapshot"
     fork_sandbox_id: str | None = None
+    effects: str = "allow"
+    """Egress effect policy for this txn (D3): allow / defer / reject /
+    seal. See crab.effects for what each one does to a mutating flow."""
+
+
+@dataclass(frozen=True)
+class FlushedEffect:
+    """One deferred write's flush outcome (D3)."""
+
+    method: str
+    host: str
+    path: str
+    status: int | None = None
+    error: str | None = None
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "method": self.method,
+            "host": self.host,
+            "path": self.path,
+            "status": self.status,
+            "error": self.error,
+        }
+
+    @classmethod
+    def from_json(cls, payload: dict) -> "FlushedEffect":
+        status = payload.get("status")
+        error = payload.get("error")
+        return cls(
+            method=str(payload.get("method", "")),
+            host=str(payload.get("host", "")),
+            path=str(payload.get("path", "")),
+            status=None if status is None else int(status),
+            error=None if error is None else str(error),
+        )
+
+
+@dataclass(frozen=True)
+class EffectFlushReport:
+    """What the commit did with the deferred queue (D3). A failure here
+    never unwinds the commit — the filesystem is already committed, so the
+    honest move is to report it."""
+
+    attempted: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    entries: tuple[FlushedEffect, ...] = ()
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "attempted": self.attempted,
+            "succeeded": self.succeeded,
+            "failed": self.failed,
+            "entries": [entry.to_json() for entry in self.entries],
+        }
+
+    @classmethod
+    def from_json(cls, payload: dict) -> "EffectFlushReport":
+        return cls(
+            attempted=int(payload.get("attempted", 0)),
+            succeeded=int(payload.get("succeeded", 0)),
+            failed=int(payload.get("failed", 0)),
+            entries=tuple(
+                FlushedEffect.from_json(entry) for entry in (payload.get("entries") or [])
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -87,6 +160,7 @@ class TxnCommitResult:
     base_dropped: bool
     promoted_checkpoint_id: str | None = None
     observations_consolidated: int | None = None
+    effects: "EffectFlushReport | None" = None
 
 
 @dataclass(frozen=True)
@@ -99,6 +173,9 @@ class TxnAbortResult:
     filesystem rollback cannot undo them; the count surfaces to scripts
     and callers so they know the abort was not total. Blocking/deferring
     is D3's charter."""
+    deferred_dropped: int = 0
+    """Deferred writes discarded by this abort (D3). These never reached
+    the world at all — that is the point of ``effects="defer"``."""
 
 
 class Transaction:
@@ -138,6 +215,14 @@ class Transaction:
         return self._description.fork_sandbox_id
 
     @property
+    def effects(self) -> str:
+        """Egress effect policy in force for this txn (D3): allow / defer /
+        reject / seal. Worth knowing before issuing a write — under
+        ``reject`` it will fail, under ``defer`` it returns ``202`` and
+        fires at commit."""
+        return getattr(self._description, "effects", "allow")
+
+    @property
     def resolved(self) -> str | None:
         """None while open; "committed" or "aborted" afterwards."""
         return self._resolved
@@ -171,10 +256,15 @@ class Transaction:
         self._resolved = "committed"
         return result
 
-    def abort(self) -> TxnAbortResult:
+    def abort(self, *, force: bool = False) -> TxnAbortResult:
+        """Roll back. Under ``effects="seal"`` a txn that already sent a
+        mutating request raises :class:`TxnNotAbortable`; ``force=True``
+        aborts anyway, accepting that the external write stands."""
         self._ensure_open()
+        # Only pass the kwarg when set, so older system fakes keep working.
+        kwargs = {"force": True} if force else {}
         result = self._sandbox._engine.system.abort_txn(
-            self._sandbox.sandbox_id, self.txn_id
+            self._sandbox.sandbox_id, self.txn_id, **kwargs
         )
         self._resolved = "aborted"
         return result

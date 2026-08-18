@@ -308,6 +308,21 @@ class EffectGate:
             return (len(session.queue), session.queued_bytes)
 
 
+def bare_host(host: str) -> str:
+    """Strip a trailing ``:port`` from a Host header value.
+
+    The queued host comes from the request's Host header, which usually
+    carries the port for non-default ports. A flush connects with
+    ``(host, port)``, so leaving the port in the hostname makes DNS
+    resolution fail every time — the same trap D2.1's request_key hit.
+    IPv6 literals (bracketed, or with several colons) are left alone.
+    """
+    if host.count(":") != 1:
+        return host
+    name, _, port = host.rpartition(":")
+    return name if port.isdigit() else host
+
+
 def build_deferred_request(
     *,
     parsed_head,
@@ -323,7 +338,7 @@ def build_deferred_request(
     entry, dropping credential headers."""
     return DeferredRequest(
         method=method.upper(),
-        host=host,
+        host=bare_host(host),
         port=int(port),
         path=path,
         headers=tuple(
@@ -363,6 +378,44 @@ def read_remaining_body(sock, parsed_head, already: bytes, *, limit: int) -> tup
     return bytes(body), len(body) == length
 
 
+def flush_deferred_request(request: DeferredRequest, *, timeout: float = 30.0) -> tuple:
+    """Send one queued write from the host and report what happened.
+
+    Deliberately **not** routed through the egress proxy: no REDIRECT
+    applies to host-originated traffic, the flush is not re-classified or
+    re-recorded, and it cannot be caught by the very gate that queued it.
+    One attempt only — no retries, no idempotency keys (a non-goal); the
+    caller journals the outcome either way.
+
+    Returns ``(status, error)`` with exactly one of them set.
+    """
+    import http.client
+
+    connection = None
+    try:
+        connection = http.client.HTTPConnection(
+            bare_host(request.host), request.port, timeout=timeout
+        )
+        headers = {name: value for name, value in request.headers}
+        # Framing is ours to state: the queued body is complete by
+        # construction (unframed bodies are refused at enqueue time).
+        headers.pop("Transfer-Encoding", None)
+        headers["Content-Length"] = str(len(request.body))
+        connection.request(request.method, request.path, body=request.body, headers=headers)
+        response = connection.getresponse()
+        status = int(response.status)
+        response.read()
+        return status, None
+    except Exception as exc:  # network, DNS, protocol - all reported alike
+        return None, f"{type(exc).__name__}: {exc}"
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+
 __all__ = [
     "DECISION_DEFER",
     "DECISION_PASS",
@@ -380,5 +433,7 @@ __all__ = [
     "EffectRule",
     "EffectSession",
     "build_deferred_request",
+    "bare_host",
+    "flush_deferred_request",
     "read_remaining_body",
 ]

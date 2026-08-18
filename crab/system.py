@@ -41,6 +41,13 @@ from .models import (
     utc_now,
 )
 from . import forking
+from .effects import (
+    DEFAULT_MAX_QUEUE_BYTES,
+    DEFAULT_MAX_QUEUE_ENTRIES,
+    EFFECT_POLICIES,
+    EffectRule,
+    flush_deferred_request,
+)
 from .egress import classify_flow
 from .journal import ActionJournal
 from .process_merge import (
@@ -61,6 +68,8 @@ from .merging import (
     plan_merge,
 )
 from .txn import (
+    EffectFlushReport,
+    FlushedEffect,
     TxnAbortError,
     TxnAbortResult,
     TxnActiveError,
@@ -69,6 +78,7 @@ from .txn import (
     TxnDescription,
     TxnError,
     TxnMismatchError,
+    TxnNotAbortable,
     new_txn_id,
 )
 from .runtime import InMemoryRuntime, RuncRuntime, RuncRuntimeOptions
@@ -1023,9 +1033,25 @@ class CrabSystem:
         *,
         label: str | None = None,
         isolation: str = "snapshot",
+        effects: str | None = None,
     ) -> TxnDescription:
         if isolation not in ("snapshot", "fork"):
             raise ValueError(f"unknown txn isolation: {isolation!r} (expected snapshot or fork)")
+        effect_policy = self._resolve_effect_policy(isolation, effects)
+        if effect_policy not in EFFECT_POLICIES:
+            raise ValueError(
+                f"unknown effect policy: {effect_policy!r} "
+                f"(expected one of {EFFECT_POLICIES})"
+            )
+        if isolation == "fork" and effect_policy == "defer":
+            # The queue would live on a session whose sandbox the commit
+            # destroys; no use case justifies that hand-off yet (D3
+            # decision 12).
+            raise ValueError(
+                "effects='defer' is not supported with isolation='fork': the "
+                "fork owning the queue is destroyed by commit. Use 'reject' "
+                "(the fork default), 'seal', or 'allow'."
+            )
         txn_id = new_txn_id()
         with self._txn_lock:
             existing = self._active_txns.get(sandbox_id)
@@ -1044,7 +1070,9 @@ class CrabSystem:
                     f"merge in progress for {sandbox_id}; begin the transaction after it completes"
                 )
             if isolation == "fork":
-                return self._begin_fork_txn(sandbox_id, txn_id, label)
+                return self._begin_fork_txn(
+                    sandbox_id, txn_id, label, effect_policy=effect_policy
+                )
             base_checkpoint_id: CheckpointId | None = None
             base_was_fresh = False
             changed = True
@@ -1078,9 +1106,13 @@ class CrabSystem:
                 base_was_fresh=base_was_fresh,
                 started_at=utc_now().isoformat(),
                 label=label,
+                effects=effect_policy,
             )
             with self._txn_lock:
                 self._active_txns[sandbox_id] = description
+            self._arm_effect_session(
+                sandbox_id, policy=effect_policy, txn_id=txn_id, isolation="snapshot"
+            )
             self._journal_lifecycle(
                 sandbox_id,
                 "txn_begin",
@@ -1162,6 +1194,10 @@ class CrabSystem:
                 "base_dropped": base_dropped,
             },
         )
+        # Deferred writes fire only now, after the filesystem commit, and
+        # a failure here never unwinds it (D3 decision 5).
+        flush_report = self._flush_deferred_effects(sandbox_id, active.txn_id)
+        self._release_effect_session(sandbox_id)
         self._clear_txn(sandbox_id)
         self.telemetry.emit_event(
             "txn.commit",
@@ -1182,10 +1218,28 @@ class CrabSystem:
             txn_id=active.txn_id,
             released_observations=released,
             base_dropped=base_dropped,
+            effects=flush_report,
         )
 
-    def abort_txn(self, sandbox_id: SandboxId, txn_id: str) -> TxnAbortResult:
+    def abort_txn(
+        self, sandbox_id: SandboxId, txn_id: str, *, force: bool = False
+    ) -> TxnAbortResult:
         active = self._require_txn(sandbox_id, txn_id)
+        gate = self.effect_gate
+        if not force and gate is not None:
+            # `seal` traded abortability for letting the write out; refusing
+            # here is the whole point of the policy.
+            sealed_side = None
+            for candidate in (sandbox_id, active.fork_sandbox_id):
+                if candidate is not None and gate.sealed(candidate):
+                    sealed_side = candidate
+                    break
+            if sealed_side is not None:
+                raise TxnNotAbortable(
+                    f"txn {active.txn_id} already sent a mutating request under "
+                    "effects='seal'; commit it, or abort with force=True to "
+                    "accept that the external write stands"
+                )
         if active.isolation == "fork":
             if active.sandbox_id != str(sandbox_id):
                 raise TxnMismatchError(
@@ -1219,6 +1273,8 @@ class CrabSystem:
         )
         self._clear_txn(sandbox_id)
         mutating_egress = self._mutating_egress_in_txn(sandbox_id, active.txn_id)
+        dropped = self._drop_deferred_effects(sandbox_id, active.txn_id)
+        self._release_effect_session(sandbox_id)
         self.telemetry.emit_event(
             "txn.abort",
             self._telemetry_attrs(
@@ -1244,6 +1300,7 @@ class CrabSystem:
             discarded_observations=discarded,
             restored_checkpoint_id=active.base_checkpoint_id,
             mutating_egress=mutating_egress,
+            deferred_dropped=dropped,
         )
 
     def current_txn(self, sandbox_id: SandboxId) -> TxnDescription | None:
@@ -1321,7 +1378,12 @@ class CrabSystem:
         self._fork_txn_lease_repair = lease_repair
 
     def _begin_fork_txn(
-        self, sandbox_id: SandboxId, txn_id: str, label: str | None
+        self,
+        sandbox_id: SandboxId,
+        txn_id: str,
+        label: str | None,
+        *,
+        effect_policy: str = "reject",
     ) -> TxnDescription:
         if self._fork_txn_fork is None or self._fork_txn_destroy is None:
             raise TxnError(
@@ -1351,12 +1413,18 @@ class CrabSystem:
                 label=label,
                 isolation="fork",
                 fork_sandbox_id=str(fork_sandbox_id),
+                effects=effect_policy,
             )
             with self._txn_lock:
                 # Both ids map to the description: auto-checkpoints stay
                 # suppressed and merges locked out on either side.
                 self._active_txns[sandbox_id] = description
                 self._active_txns[fork_sandbox_id] = description
+            # The fork is what executes inside a fork-backed txn, so its
+            # egress is what the policy must gate.
+            self._arm_effect_session(
+                fork_sandbox_id, policy=effect_policy, txn_id=txn_id, isolation="fork"
+            )
             self._journal_lifecycle(
                 sandbox_id,
                 "txn_begin",
@@ -1502,6 +1570,10 @@ class CrabSystem:
                 "txn_fork_committed",
                 metadata={"txn_id": active.txn_id, "source_sandbox_id": str(source_id)},
             )
+            # The fork carried this txn's effect window and is about to be
+            # destroyed; `defer` is refused for fork txns so there is never
+            # a queue to hand over (D3 decision 12).
+            self._release_effect_session(fork_id)
             self._clear_fork_txn(source_id, fork_id)
             if not fork_retained:
                 try:
@@ -1697,6 +1769,9 @@ class CrabSystem:
         # The fork's own flows died with it, but flows the fork fired at
         # the world did not — report them like the snapshot path does.
         mutating_egress = self._mutating_egress_in_txn(fork_id, active.txn_id)
+        # A fork-backed txn's effect window lives on the fork.
+        fork_dropped = self._drop_deferred_effects(fork_id, active.txn_id)
+        self._release_effect_session(fork_id)
         self.telemetry.emit_event(
             "txn.abort",
             self._telemetry_attrs(
@@ -1723,6 +1798,7 @@ class CrabSystem:
             discarded_observations=discarded,
             restored_checkpoint_id=None,
             mutating_egress=mutating_egress,
+            deferred_dropped=fork_dropped,
         )
 
     def _release_fork_txn(self, sandbox_id: SandboxId, active: TxnDescription) -> None:
@@ -2495,10 +2571,179 @@ class CrabSystem:
         if self.journal is None:
             return 0
         try:
-            return self.egress_ledger(sandbox_id, txn_id=txn_id).mutating
+            # Only flows that actually left the host count: a write the
+            # effect gate held or refused (D3) never reached the world.
+            return self.egress_ledger(sandbox_id, txn_id=txn_id).mutating_sent
         except Exception:
             logger.debug("Failed to read the effect ledger for %s", sandbox_id, exc_info=True)
             return 0
+
+    # ----- effect gate wiring (D3) --------------------------------------
+
+    def _effect_defaults(self) -> dict:
+        return dict(self.effect_policy_defaults or {})
+
+    def _resolve_effect_policy(self, isolation: str, requested: str | None) -> str:
+        defaults = self._effect_defaults()
+        if requested is not None:
+            return requested
+        key = "fork_policy" if isolation == "fork" else "default_policy"
+        return str(defaults.get(key) or ("reject" if isolation == "fork" else "allow"))
+
+    def _arm_effect_session(
+        self, sandbox_id: SandboxId, *, policy: str, txn_id: str, isolation: str
+    ) -> None:
+        """Open the effect window for a txn. ``allow`` still opens a session
+        so counters and `seal`-style bookkeeping stay uniform; the gate
+        simply passes writes through."""
+        gate = self.effect_gate
+        if gate is None:
+            return
+        defaults = self._effect_defaults()
+        rules = tuple(
+            rule if isinstance(rule, EffectRule) else EffectRule.from_json(dict(rule))
+            for rule in (defaults.get("rules") or ())
+        )
+        gate.begin(
+            sandbox_id,
+            policy=policy,
+            on_unlisted=str(defaults.get("on_unlisted") or "reject"),
+            opaque_effects=str(defaults.get("opaque_effects") or "allow"),
+            rules=rules,
+            txn_id=txn_id,
+            max_queue_bytes=int(
+                defaults.get("max_queue_bytes") or DEFAULT_MAX_QUEUE_BYTES
+            ),
+            max_queue_entries=int(
+                defaults.get("max_queue_entries") or DEFAULT_MAX_QUEUE_ENTRIES
+            ),
+        )
+        logger.info(
+            "Effect gate armed sandbox=%s txn=%s policy=%s isolation=%s",
+            sandbox_id,
+            txn_id,
+            policy,
+            isolation,
+        )
+
+    def _flush_deferred_effects(
+        self, sandbox_id: SandboxId, txn_id: str
+    ) -> EffectFlushReport | None:
+        """Send the queued writes, in enqueue order, one at a time.
+
+        Runs **after** the filesystem commit and goes straight out from the
+        host (not through the proxy: no REDIRECT applies, the flush is not
+        re-classified, and it cannot be caught by its own gate). A failure
+        never unwinds the commit — the filesystem is already committed, so
+        the honest move is to report it.
+        """
+        gate = self.effect_gate
+        if gate is None:
+            return None
+        queued = gate.drain(sandbox_id)
+        if not queued:
+            return None
+        entries: list[FlushedEffect] = []
+        succeeded = failed = 0
+        for request in queued:
+            status, error = flush_deferred_request(request)
+            entries.append(
+                FlushedEffect(
+                    method=request.method,
+                    host=request.host,
+                    path=request.path,
+                    status=status,
+                    error=error,
+                )
+            )
+            payload = {
+                "host": request.host,
+                "dst_ip": request.host,
+                "dst_port": request.port,
+                "scheme": "http",
+                "method": request.method,
+                "path": request.path,
+                "bytes_out": len(request.body),
+                "bytes_in": 0,
+                "duration_ms": 0.0,
+                "classification": "mutating",
+                "effect": "flushed" if error is None else "flush_failed",
+                "effect_status": status,
+                "effect_error": error,
+            }
+            if self.journal is not None:
+                try:
+                    self.journal.record_egress(sandbox_id, payload=payload, txn_id=txn_id)
+                except Exception:
+                    logger.debug("Failed to journal a flushed effect", exc_info=True)
+            if error is None:
+                succeeded += 1
+            else:
+                failed += 1
+                logger.warning(
+                    "Deferred %s %s%s failed to flush after commit: %s",
+                    request.method,
+                    request.host,
+                    request.path,
+                    error,
+                )
+        report = EffectFlushReport(
+            attempted=len(queued),
+            succeeded=succeeded,
+            failed=failed,
+            entries=tuple(entries),
+        )
+        self.telemetry.emit_event(
+            "effects.flushed",
+            self._telemetry_attrs(
+                sandbox_id,
+                component="system",
+                extra={
+                    "txn_id": txn_id,
+                    "attempted": report.attempted,
+                    "succeeded": report.succeeded,
+                    "failed": report.failed,
+                },
+            ),
+        )
+        return report
+
+    def _drop_deferred_effects(self, sandbox_id: SandboxId, txn_id: str) -> int:
+        """Abort path: the queue is discarded, so those writes never
+        happened at all — the property ``effects="defer"`` exists for."""
+        gate = self.effect_gate
+        if gate is None:
+            return 0
+        dropped = gate.drain(sandbox_id)
+        for request in dropped:
+            if self.journal is None:
+                break
+            try:
+                self.journal.record_egress(
+                    sandbox_id,
+                    payload={
+                        "host": request.host,
+                        "dst_ip": request.host,
+                        "dst_port": request.port,
+                        "scheme": "http",
+                        "method": request.method,
+                        "path": request.path,
+                        "bytes_out": 0,
+                        "bytes_in": 0,
+                        "duration_ms": 0.0,
+                        "classification": "mutating",
+                        "effect": "dropped",
+                    },
+                    txn_id=txn_id,
+                )
+            except Exception:
+                logger.debug("Failed to journal a dropped effect", exc_info=True)
+        return len(dropped)
+
+    def _release_effect_session(self, sandbox_id: SandboxId) -> None:
+        gate = self.effect_gate
+        if gate is not None:
+            gate.end(sandbox_id)
 
     # ----- process merge (C4) ------------------------------------------
     # The process half of consolidation. "replay" re-runs the fork's
@@ -2542,6 +2787,7 @@ class CrabSystem:
         lazy_pages: bool = True,
         force: bool = False,
         egress_replay: str = "cassette_first",
+        replay_effects: str = "reject",
     ) -> ProcessMergeReport:
         """Process-half of consolidation (C4). ``auto`` picks ``replay``
         when the source runs background processes (a promotion would
@@ -2645,6 +2891,26 @@ class CrabSystem:
                         "Failed to arm egress replay for %s; replaying live",
                         source_sandbox_id,
                     )
+            # Replayed commands must not re-fire the fork's writes: the
+            # fork already sent them, so a second POST is the least
+            # deterministic thing replay could do (D3 decision 11). The
+            # session goes on the SOURCE — it is what re-executes.
+            effects_armed = False
+            if replay_effects != "none" and self.effect_gate is not None:
+                try:
+                    self._arm_effect_session(
+                        source_sandbox_id,
+                        policy=replay_effects,
+                        txn_id=f"replay-{fork_sandbox_id}",
+                        isolation="replay",
+                    )
+                    effects_armed = True
+                except Exception:
+                    logger.exception(
+                        "Failed to arm the effect gate for replay on %s; writes will "
+                        "re-fire",
+                        source_sandbox_id,
+                    )
             try:
                 entries, stopped_early = replay_fork_execs(
                     _source_exec, records, stop_on_deviation=stop_on_deviation
@@ -2653,6 +2919,8 @@ class CrabSystem:
                 replay_report = (
                     self.end_egress_replay(source_sandbox_id) if replay_armed else None
                 )
+                if effects_armed:
+                    self._release_effect_session(source_sandbox_id)
             deviations = sum(1 for entry in entries if entry.deviated)
             report = ProcessMergeReport(
                 source_sandbox_id=source_sandbox_id,

@@ -40,7 +40,7 @@ from ..ids import SandboxId
 from ..merging import MergeError
 from ..process_merge import ProcessMergeConflict
 from ..models import SandboxSnapshot, utc_now
-from ..txn import TxnAbortError, TxnActiveError, TxnCommitConflict, TxnError, TxnMismatchError
+from ..txn import TxnAbortError, TxnActiveError, TxnCommitConflict, TxnError, TxnMismatchError, TxnNotAbortable
 from .transport import (
     DEFAULT_SOCKET_PERMS,
     default_socket_path,
@@ -382,7 +382,10 @@ class _Routes:
         label = None if label_raw is None else str(label_raw)
         isolation = str(body.get("isolation") or "snapshot")
         try:
-            description = eng.system.begin_txn(sid, label=label, isolation=isolation)
+            begin_kwargs: dict[str, Any] = {"label": label, "isolation": isolation}
+            if body.get("effects") is not None:
+                begin_kwargs["effects"] = str(body["effects"])
+            description = eng.system.begin_txn(sid, **begin_kwargs)
         except TxnActiveError as exc:
             raise _TxnConflict("txn_active", str(exc)) from exc
         except (TxnError, ValueError) as exc:
@@ -415,6 +418,12 @@ class _Routes:
                 "base_dropped": result.base_dropped,
                 "promoted_checkpoint_id": result.promoted_checkpoint_id,
                 "observations_consolidated": result.observations_consolidated,
+                # Deferred-write flush outcome (D3); absent on pre-D3 results.
+                "effects": (
+                    None
+                    if getattr(result, "effects", None) is None
+                    else result.effects.to_json()
+                ),
             },
         }
 
@@ -424,7 +433,13 @@ class _Routes:
         eng = self._daemon.require_engine()
         sid = SandboxId(sandbox_id)
         try:
-            result = eng.system.abort_txn(sid, txn_id)
+            abort_kwargs: dict[str, Any] = {}
+            if body.get("force"):
+                abort_kwargs["force"] = True
+            result = eng.system.abort_txn(sid, txn_id, **abort_kwargs)
+        except TxnNotAbortable as exc:
+            # `seal` traded abortability for letting the write out.
+            raise _TxnConflict("txn_not_abortable", str(exc)) from exc
         except TxnMismatchError as exc:
             raise _TxnConflict("txn_mismatch", str(exc)) from exc
         except TxnAbortError as exc:
@@ -441,6 +456,8 @@ class _Routes:
                 # Mutating egress the abort could not undo (D1); omitting it
                 # would make remote aborts silently report zero.
                 "mutating_egress": getattr(result, "mutating_egress", 0),
+                # Deferred writes this abort discarded (D3).
+                "deferred_dropped": getattr(result, "deferred_dropped", 0),
             },
         }
 
@@ -670,6 +687,7 @@ def _serialize_txn(description) -> dict[str, Any]:
         "started_at": description.started_at,
         "label": description.label,
         "isolation": getattr(description, "isolation", "snapshot"),
+        "effects": getattr(description, "effects", "allow"),
         "fork_sandbox_id": getattr(description, "fork_sandbox_id", None),
     }
 

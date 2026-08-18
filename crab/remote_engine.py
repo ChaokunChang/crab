@@ -40,6 +40,7 @@ from .merging import MergeError, MergerHook
 from .process_merge import ProcessMergeConflict
 from .telemetry import NoopTelemetrySink
 from .txn import (
+    EffectFlushReport,
     TxnAbortError,
     TxnAbortResult,
     TxnActiveError,
@@ -47,6 +48,7 @@ from .txn import (
     TxnCommitResult,
     TxnDescription,
     TxnMismatchError,
+    TxnNotAbortable,
 )
 
 if TYPE_CHECKING:
@@ -206,10 +208,13 @@ class _SystemShim:
         *,
         label: str | None = None,
         isolation: str = "snapshot",
+        effects: str | None = None,
     ) -> TxnDescription:
         payload: dict[str, Any] = {} if label is None else {"label": label}
         if isolation != "snapshot":
             payload["isolation"] = isolation
+        if effects is not None:
+            payload["effects"] = effects
         try:
             response = self._client.post_json(
                 f"/sandboxes/{sandbox_id}/txn",
@@ -234,19 +239,28 @@ class _SystemShim:
         raw = response["result"]
         promoted = raw.get("promoted_checkpoint_id")
         consolidated = raw.get("observations_consolidated")
+        raw_effects = raw.get("effects")
         return TxnCommitResult(
             txn_id=str(raw["txn_id"]),
             released_observations=int(raw["released_observations"]),
             base_dropped=bool(raw["base_dropped"]),
             promoted_checkpoint_id=None if promoted is None else str(promoted),
             observations_consolidated=None if consolidated is None else int(consolidated),
+            # Absent from pre-D3 daemons.
+            effects=(
+                None
+                if not isinstance(raw_effects, dict)
+                else EffectFlushReport.from_json(raw_effects)
+            ),
         )
 
-    def abort_txn(self, sandbox_id: SandboxId, txn_id: str) -> TxnAbortResult:
+    def abort_txn(
+        self, sandbox_id: SandboxId, txn_id: str, *, force: bool = False
+    ) -> TxnAbortResult:
         try:
             response = self._client.post_json(
                 f"/sandboxes/{sandbox_id}/txn/{txn_id}/abort",
-                {},
+                {"force": True} if force else {},
                 timeout_seconds=300.0,  # abort restores the base checkpoint
             )
         except DaemonRequestError as exc:
@@ -259,6 +273,8 @@ class _SystemShim:
             restored_checkpoint_id=None if restored is None else str(restored),
             # Absent from pre-D1 daemons; 0 is the honest default there.
             mutating_egress=int(raw.get("mutating_egress") or 0),
+            # Absent from pre-D3 daemons.
+            deferred_dropped=int(raw.get("deferred_dropped") or 0),
         )
 
     def current_txn(self, sandbox_id: SandboxId) -> TxnDescription | None:
@@ -851,6 +867,7 @@ def _deserialize_txn(payload: Mapping[str, Any]) -> TxnDescription:
         label=None if label is None else str(label),
         isolation=str(payload.get("isolation") or "snapshot"),
         fork_sandbox_id=None if fork_sandbox_id is None else str(fork_sandbox_id),
+        effects=str(payload.get("effects") or "allow"),
     )
 
 
@@ -865,6 +882,8 @@ def _map_txn_error(exc: DaemonRequestError) -> Exception:
     message = str(payload.get("error")) if isinstance(payload, dict) and payload.get("error") else str(exc)
     if error_type == "txn_active":
         return TxnActiveError(message)
+    if error_type == "txn_not_abortable":
+        return TxnNotAbortable(message)
     if error_type == "txn_mismatch":
         return TxnMismatchError(message)
     if error_type == "txn_commit_conflict":
