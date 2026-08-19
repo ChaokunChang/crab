@@ -214,6 +214,16 @@ def _btrfs_root_available() -> bool:
     return result.returncode == 0 and result.stdout.strip() == "btrfs"
 
 
+def _overlay_available() -> bool:
+    if not _btrfs_root_available():
+        return False
+    try:
+        filesystems = Path("/proc/filesystems").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return any(line.split() and line.split()[-1] == "overlay" for line in filesystems.splitlines())
+
+
 class _PromotionRealMixin:
     """Shared promotion scenario; concrete classes bind the backend."""
 
@@ -340,3 +350,17 @@ class BtrfsPromotionRealTests(_PromotionRealMixin, unittest.TestCase):
         super().setUp()
         if not _btrfs_root_available():
             self.skipTest(f"btrfs root {_BTRFS_ROOT} not available")
+
+
+class OverlayPromotionRealTests(_PromotionRealMixin, unittest.TestCase):
+    """A2 engine-level leg — the highest-risk integration: C4's
+    promotion-based migration dumps the fork, destroys the source's
+    overlay, re-clones the fork vol onto the source identity, remounts,
+    and CRIU-restores a live process tree onto that fresh mount."""
+
+    _BACKEND = "overlay"
+
+    def setUp(self) -> None:
+        super().setUp()
+        if not _overlay_available():
+            self.skipTest(f"overlay backend prerequisites missing at {_BTRFS_ROOT}")

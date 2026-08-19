@@ -58,7 +58,13 @@ flowchart TD
   checkpoints to ZFS snapshots/rollbacks/clones; the `BtrfsProvider`
   maps them to btrfs subvolume snapshots with an emulated rollback
   (trash-swap) and needs no `promote` because btrfs snapshots carry no
-  clone-origin dependency. Select the backend with `filesystem_backend`.
+  clone-origin dependency. The `OverlayProvider` mounts the rootfs as
+  overlayfs — lowerdir is the shared image content (one copy per image,
+  page-cache shared across fork fleets), upperdir+workdir live in one
+  per-sandbox btrfs subvolume that inherits the btrfs snapshot/fork
+  mechanics, and the upperdir doubles as a native changeset source
+  (whiteouts and opaque markers are decoded into container semantics).
+  Select the backend with `filesystem_backend`.
 
 ## Request Interception And Checkpoint Coordination
 

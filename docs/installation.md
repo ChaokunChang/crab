@@ -53,6 +53,15 @@ btrfs filesystem at `/var/lib/crab/btrfs` and writes
 sudo ./scripts/install-ubuntu.sh --fs-backend btrfs
 ```
 
+Use the overlayfs backend (same loop-backed btrfs mount; sandbox root
+filesystems become overlay mounts whose upper/work subvolumes live under
+`/var/lib/crab/btrfs/overlay`). Not for workloads that run a nested
+container engine inside the sandbox — keep those on zfs/btrfs:
+
+```bash
+sudo ./scripts/install-ubuntu.sh --fs-backend overlay
+```
+
 The installer never picks the first pool on the machine. If the requested
 pool does not exist and `--no-create-pool` is set, installation stops.
 

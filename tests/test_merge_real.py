@@ -42,6 +42,16 @@ def _btrfs_root_available() -> bool:
     return result.returncode == 0 and result.stdout.strip() == "btrfs"
 
 
+def _overlay_available() -> bool:
+    if not _btrfs_root_available():
+        return False
+    try:
+        filesystems = Path("/proc/filesystems").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return any(line.split() and line.split()[-1] == "overlay" for line in filesystems.splitlines())
+
+
 _SETUP = (
     "mkdir -p /probe && printf 'one\\ntwo\\nthree\\nfour\\nfive\\n' > /probe/doc.txt "
     "&& echo keep-v1 > /probe/keep.txt && echo shared-v1 > /probe/shared.txt"
@@ -232,6 +242,19 @@ class BtrfsMergeRealTests(_MergeRealMixin, unittest.TestCase):
         super().setUp()
         if not _btrfs_root_available():
             self.skipTest(f"btrfs root {_BTRFS_ROOT} not available")
+
+
+class OverlayMergeRealTests(_MergeRealMixin, unittest.TestCase):
+    """A2 engine-level leg: C2's three-way merge consumes the overlay
+    provider's changeset (whiteout decoding) and snapshot content roots
+    (kernel-merged ro views) through the unchanged interface."""
+
+    _BACKEND = "overlay"
+
+    def setUp(self) -> None:
+        super().setUp()
+        if not _overlay_available():
+            self.skipTest(f"overlay backend prerequisites missing at {_BTRFS_ROOT}")
 
 
 if __name__ == "__main__":
