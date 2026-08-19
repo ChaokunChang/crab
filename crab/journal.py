@@ -253,6 +253,19 @@ class ActionJournal:
     # Reads
     # ------------------------------------------------------------------
 
+    def known_sandbox_ids(self) -> list[str]:
+        """Every sandbox with a journal on disk, newest file last.
+
+        Startup reconciliation needs this: after a restart the in-memory
+        state is gone, but the journal still holds rows describing work
+        that was in flight.
+        """
+        try:
+            files = [path for path in self._root.iterdir() if path.suffix == ".jsonl"]
+        except OSError:
+            return []
+        return [path.stem for path in sorted(files, key=lambda p: p.name)]
+
     def entries(
         self,
         sandbox_id: SandboxId | str,

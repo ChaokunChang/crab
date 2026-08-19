@@ -628,6 +628,8 @@ class _Routes:
             kwargs["lazy_pages"] = bool(body["lazy_pages"])
         if body.get("egress_replay") is not None:
             kwargs["egress_replay"] = str(body["egress_replay"])
+        if body.get("replay_effects") is not None:
+            kwargs["replay_effects"] = str(body["replay_effects"])
         try:
             report = eng.system.merge_processes(
                 SandboxId(sandbox_id), SandboxId(str(fork_raw)), **kwargs

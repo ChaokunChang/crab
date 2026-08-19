@@ -891,13 +891,22 @@ class BareHostTests(unittest.TestCase):
         self.assertEqual(bare_host("10.0.2.15:45411"), "10.0.2.15")
         self.assertEqual(bare_host("api.example.com:8080"), "api.example.com")
 
+    def test_strips_the_port_from_a_bracketed_ipv6_literal(self) -> None:
+        # This assertion previously pinned the wrong behavior: leaving the
+        # port on made every flush to an IPv6 host fail.
+        from crab.effects import bare_host
+
+        self.assertEqual(bare_host("[::1]:8080"), "[::1]")
+        self.assertEqual(bare_host("[2001:db8::1]:443"), "[2001:db8::1]")
+
     def test_leaves_everything_else_alone(self) -> None:
         from crab.effects import bare_host
 
         self.assertEqual(bare_host("api.example.com"), "api.example.com")
-        self.assertEqual(bare_host("[::1]:8080"), "[::1]:8080")  # bracketed IPv6
-        self.assertEqual(bare_host("fe80::1"), "fe80::1")  # bare IPv6
+        self.assertEqual(bare_host("[::1]"), "[::1]")  # bracketed, no port
+        self.assertEqual(bare_host("fe80::1"), "fe80::1")  # bare IPv6, no port
         self.assertEqual(bare_host("host:notaport"), "host:notaport")
+        self.assertEqual(bare_host("[::1"), "[::1")  # unterminated bracket
 
     def test_queue_entries_store_the_bare_host(self) -> None:
         head = parse_head(b"POST /w HTTP/1.1\r\nHost: 10.0.2.15:45411\r\n\r\n")
@@ -937,3 +946,113 @@ class MutatingSentTests(unittest.TestCase):
         )
         self.assertEqual(ledger.mutating, 8)  # all are mutating flows
         self.assertEqual(ledger.mutating_sent, 4)  # only these left the host
+
+
+class LostEffectBackfillTests(_EffectSystemHarness):
+    """The queue is in-memory only, so a restart loses it while the journal
+    keeps the `deferred` rows. Left alone they look like writes that might
+    still fire (`crab egress --pending`), so startup closes them out."""
+
+    def _row(self, effect: str, *, txn_id: str = "txn-a", path: str = "/w") -> None:
+        self.journal.record_egress(
+            self.sandbox_id,
+            payload={
+                "host": "api.example.com", "dst_ip": "10.0.0.1", "dst_port": 80,
+                "scheme": "http", "method": "POST", "path": path,
+                "bytes_out": 3, "bytes_in": 0, "duration_ms": 1.0,
+                "classification": "mutating", "effect": effect,
+            },
+            txn_id=txn_id,
+        )
+
+    def _effects(self) -> list[str]:
+        return [
+            row.payload["effect"]
+            for row in self.journal.entries(self.sandbox_id, kind="egress")
+            if row.payload.get("effect")
+        ]
+
+    def test_orphaned_deferred_row_gets_a_terminal_lost_row(self) -> None:
+        self._row("deferred")
+        self.assertEqual(self.system.backfill_lost_effects(), 1)
+        self.assertEqual(self._effects(), ["deferred", "lost"])
+        ledger = self.system.egress_ledger(self.sandbox_id)
+        # The pending row is closed out, and a lost write is not "sent".
+        self.assertEqual(ledger.deferred, 1)
+        self.assertEqual(ledger.mutating_sent, 0)
+
+    def test_is_idempotent(self) -> None:
+        self._row("deferred")
+        self.assertEqual(self.system.backfill_lost_effects(), 1)
+        # A second startup must not pile on more rows.
+        self.assertEqual(self.system.backfill_lost_effects(), 0)
+        self.assertEqual(self._effects().count("lost"), 1)
+
+    def test_resolved_queues_are_left_alone(self) -> None:
+        self._row("deferred")
+        self._row("flushed")
+        self._row("deferred", txn_id="txn-b")
+        self._row("dropped", txn_id="txn-b")
+        self.assertEqual(self.system.backfill_lost_effects(), 0)
+        self.assertNotIn("lost", self._effects())
+
+    def test_partially_flushed_queue_only_closes_the_remainder(self) -> None:
+        self._row("deferred", path="/one")
+        self._row("deferred", path="/two")
+        self._row("flushed", path="/one")  # the restart hit mid-flush
+        self.assertEqual(self.system.backfill_lost_effects(), 1)
+        self.assertEqual(self._effects().count("lost"), 1)
+
+    def test_non_effect_rows_are_ignored(self) -> None:
+        self.journal.record_egress(
+            self.sandbox_id,
+            payload={
+                "host": "api.example.com", "dst_ip": "10.0.0.1", "dst_port": 80,
+                "scheme": "http", "method": "GET", "path": "/r",
+                "bytes_out": 0, "bytes_in": 2, "duration_ms": 1.0,
+                "classification": "idempotent_read",
+            },
+        )
+        self.assertEqual(self.system.backfill_lost_effects(), 0)
+
+    def test_no_journal_is_a_noop(self) -> None:
+        self.system.journal = None
+        self.assertEqual(self.system.backfill_lost_effects(), 0)
+
+
+class ReleaseTxnEffectCleanupTests(_EffectSystemHarness):
+    """A sandbox dying with an open txn must discard its queue exactly as an
+    abort would; otherwise the bodies stay in memory and the ledger keeps a
+    pending row that can never fire."""
+
+    def test_release_drops_the_queue_and_disarms(self) -> None:
+        from crab.txn import TxnDescription
+
+        description = TxnDescription(
+            txn_id="txn-r", sandbox_id=str(self.sandbox_id), base_checkpoint_id="ckpt-1",
+            base_was_fresh=True, started_at="now", effects="defer",
+        )
+        self.system._active_txns[self.sandbox_id] = description
+        self.system._arm_effect_session(
+            self.sandbox_id, policy="defer", txn_id="txn-r", isolation="snapshot"
+        )
+        self.gate.enqueue(
+            self.sandbox_id,
+            DeferredRequest(
+                method="POST", host="api.example.com", port=80, path="/w",
+                headers=(), body=b"x",
+            ),
+        )
+
+        self.system.release_txn(self.sandbox_id)
+
+        self.assertIsNone(self.gate.session_for(self.sandbox_id))
+        self.assertEqual(self.gate.queue_size(self.sandbox_id), (0, 0))
+        rows = [
+            row.payload["effect"]
+            for row in self.journal.entries(self.sandbox_id, kind="egress")
+            if row.payload.get("effect")
+        ]
+        self.assertEqual(rows, ["dropped"])
+        # Nothing is left pending, so no backfill is needed either.
+        self.assertEqual(self.system.backfill_lost_effects(), 0)

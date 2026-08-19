@@ -1317,6 +1317,11 @@ class CrabSystem:
         if active.isolation == "fork":
             self._release_fork_txn(sandbox_id, active)
             return
+        # The sandbox is dying with an open txn: its queued writes are
+        # discarded exactly as an abort would (design §3.3), so the ledger
+        # never keeps a pending row that can no longer fire.
+        self._drop_deferred_effects(sandbox_id, active.txn_id)
+        self._release_effect_session(sandbox_id)
         try:
             registry = self.response_gate_registry
             if registry is not None:
@@ -1807,6 +1812,11 @@ class CrabSystem:
         destroyed too (a dying fork's own kill path finishes itself)."""
         source_id = SandboxId(active.sandbox_id)
         fork_id = None if active.fork_sandbox_id is None else SandboxId(active.fork_sandbox_id)
+        if fork_id is not None:
+            # The fork owned this txn's effect window; dying discards its
+            # queue like an abort would (design §3.3).
+            self._drop_deferred_effects(fork_id, active.txn_id)
+            self._release_effect_session(fork_id)
         with self._txn_lock:
             self._active_txns.pop(source_id, None)
             if fork_id is not None:
@@ -2739,6 +2749,83 @@ class CrabSystem:
             except Exception:
                 logger.debug("Failed to journal a dropped effect", exc_info=True)
         return len(dropped)
+
+    def backfill_lost_effects(self) -> int:
+        """Close out deferred writes whose queue died with the process.
+
+        The queue is in-memory only, so a daemon restart loses it while the
+        journal keeps the ``deferred`` rows. Left alone they look like
+        writes that might still fire, which would mislead anything reading
+        the ledger (``crab egress --pending``) forever. Startup therefore
+        appends a terminal ``lost`` row for every deferred write that has
+        no outcome yet — the journal stays append-only, no row is rewritten.
+
+        Idempotent: a second run finds the outcomes already recorded and
+        writes nothing. Returns the number of rows appended.
+        """
+        journal = self.journal
+        if journal is None:
+            return 0
+        terminal = {"flushed", "flush_failed", "dropped", "lost"}
+        appended = 0
+        for raw_id in journal.known_sandbox_ids():
+            sandbox_id = SandboxId(raw_id)
+            try:
+                rows = journal.entries(sandbox_id, kind="egress")
+            except Exception:
+                logger.debug("Could not read journal for %s", raw_id, exc_info=True)
+                continue
+            # Deferred writes belong to a txn, and the whole queue dies
+            # together, so reconcile per txn: any deferred row beyond the
+            # recorded outcomes never fired.
+            pending: dict[str, list] = {}
+            resolved: dict[str, int] = {}
+            for record in rows:
+                payload = record.payload or {}
+                effect = payload.get("effect")
+                if effect is None:
+                    continue
+                key = str(payload.get("txn_id") or record.txn_id or "")
+                if effect == "deferred":
+                    pending.setdefault(key, []).append(payload)
+                elif effect in terminal:
+                    resolved[key] = resolved.get(key, 0) + 1
+            for key, queued in pending.items():
+                orphans = queued[resolved.get(key, 0) :]
+                for payload in orphans:
+                    try:
+                        journal.record_egress(
+                            sandbox_id,
+                            payload={
+                                "host": payload.get("host"),
+                                "dst_ip": payload.get("dst_ip"),
+                                "dst_port": payload.get("dst_port"),
+                                "scheme": payload.get("scheme", "http"),
+                                "method": payload.get("method"),
+                                "path": payload.get("path"),
+                                "bytes_out": 0,
+                                "bytes_in": 0,
+                                "duration_ms": 0.0,
+                                "classification": "mutating",
+                                "effect": "lost",
+                                "effect_reason": "queue_lost_on_restart",
+                            },
+                            txn_id=key or None,
+                        )
+                        appended += 1
+                    except Exception:
+                        logger.debug(
+                            "Failed to mark a lost deferred write for %s",
+                            raw_id,
+                            exc_info=True,
+                        )
+        if appended:
+            logger.warning(
+                "Marked %d deferred write(s) as lost: their queue did not survive "
+                "the last shutdown",
+                appended,
+            )
+        return appended
 
     def _release_effect_session(self, sandbox_id: SandboxId) -> None:
         gate = self.effect_gate
