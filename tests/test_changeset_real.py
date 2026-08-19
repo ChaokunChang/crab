@@ -39,6 +39,16 @@ def _btrfs_root_available() -> bool:
     return result.returncode == 0 and result.stdout.strip() == "btrfs"
 
 
+def _overlay_available() -> bool:
+    if not _btrfs_root_available():
+        return False
+    try:
+        filesystems = Path("/proc/filesystems").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return any(line.split() and line.split()[-1] == "overlay" for line in filesystems.splitlines())
+
+
 # The scripted mutation list from the roadmap exit criteria: modify,
 # delete, rename, create, mkdir tree, nested create — all under /probe.
 _SETUP = (
@@ -209,6 +219,46 @@ class BtrfsChangesetRealTests(_ChangesetRealBase):
 
     def test_fork_changeset_matches_mutations(self) -> None:
         engine = self._engine(filesystem_backend="btrfs")
+        parent = Sandbox(image=self._IMAGE, engine=engine)
+        self.addCleanup(parent.kill)
+        self._run(parent, _SETUP)
+
+        [fork] = parent.fork()
+        self.addCleanup(fork.kill)
+        for mutation in _MUTATIONS:
+            self._run(fork, mutation)
+        self._wait_filesystem_changed(engine, fork)
+
+        self.assertEqual(fork.changeset(), _EXPECTED)
+
+
+class OverlayChangesetRealTests(_ChangesetRealBase):
+    """A2 engine-level leg: the scripted mutation list produces the SAME
+    raw-truth changeset on overlay — _SETUP runs after launch so its
+    files live in the upper (the mv is a physical in-upper rename with
+    attribution), and the dump's /tmp scratch arrives as a copy-up that
+    the translation pass reports `modified` like zfs/btrfs mtime churn."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        if not _overlay_available():
+            self.skipTest(f"overlay backend prerequisites missing at {_BTRFS_ROOT}")
+
+    def test_checkpoint_base_changeset_matches_mutations(self) -> None:
+        engine = self._engine(filesystem_backend="overlay")
+        sandbox = Sandbox(image=self._IMAGE, engine=engine)
+        self.addCleanup(sandbox.kill)
+        self._run(sandbox, _SETUP)
+        ckpt = sandbox.checkpoint()
+
+        for mutation in _MUTATIONS:
+            self._run(sandbox, mutation)
+        self._wait_filesystem_changed(engine, sandbox)
+
+        self.assertEqual(sandbox.changeset(since=ckpt), _EXPECTED_AFTER_DUMP)
+
+    def test_fork_changeset_matches_mutations(self) -> None:
+        engine = self._engine(filesystem_backend="overlay")
         parent = Sandbox(image=self._IMAGE, engine=engine)
         self.addCleanup(parent.kill)
         self._run(parent, _SETUP)

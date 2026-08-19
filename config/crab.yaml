@@ -22,6 +22,15 @@ zfs_dataset_prefix: crab/sandboxes
 # filesystem_backend: btrfs
 # btrfs_root: /var/lib/crab/btrfs
 
+# Third backend: overlayfs rootfs (lowerdir = shared image content,
+# upperdir/workdir = per-sandbox btrfs subvolumes). Needs the same btrfs
+# mount (`install-ubuntu.sh --fs-backend overlay` prepares it); the overlay
+# area defaults to `<btrfs_root>/overlay` (override with overlay_root).
+# Not for docker-in-sandbox workloads: the kernel rejects nested overlay
+# uppers — keep those on zfs/btrfs. qgroups stats cover the upper only.
+# filesystem_backend: overlay
+# btrfs_root: /var/lib/crab/btrfs
+
 storage_planes:
   runtime_root: /var/lib/crab/runtime
   storage_root: /var/lib/crab/checkpoints

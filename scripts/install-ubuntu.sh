@@ -9,7 +9,7 @@ Usage:
   sudo ./scripts/install-ubuntu.sh [options]
 
 Options:
-  --fs-backend NAME  Filesystem backend: zfs (default) or btrfs
+  --fs-backend NAME  Filesystem backend: zfs (default), btrfs, or overlay
   --zpool NAME       Dedicated ZFS pool name (default: crab)
   --zpool-file PATH  Sparse backing file for a new pool
                      (default: /var/lib/crab/crab.zpool)
@@ -144,7 +144,7 @@ require_root
 
 [[ ${ZPOOL_NAME} =~ ^[A-Za-z][A-Za-z0-9_.:-]*$ ]] || die "invalid zpool name: ${ZPOOL_NAME}"
 [[ ${ZPOOL_FILE} = /* ]] || die "--zpool-file must be an absolute path"
-[[ ${FS_BACKEND} = zfs || ${FS_BACKEND} = btrfs ]] || die "--fs-backend must be zfs or btrfs"
+[[ ${FS_BACKEND} = zfs || ${FS_BACKEND} = btrfs || ${FS_BACKEND} = overlay ]] || die "--fs-backend must be zfs, btrfs or overlay"
 [[ ${BTRFS_FILE} = /* ]] || die "--btrfs-file must be an absolute path"
 [[ ${BTRFS_ROOT} = /* ]] || die "--btrfs-root must be an absolute path"
 [[ ${CONFIG_PATH} = /* ]] || die "--config must be an absolute path"
@@ -183,7 +183,7 @@ if ((SKIP_PACKAGES == 0)); then
 fi
 
 fs_binaries=(zfs zpool)
-[[ ${FS_BACKEND} = btrfs ]] && fs_binaries=(btrfs)
+[[ ${FS_BACKEND} != zfs ]] && fs_binaries=(btrfs)
 for binary in docker runc criu "${fs_binaries[@]}" clang gcc make python3; do
   command_exists "${binary}" || die "missing dependency after installation: ${binary}"
 done
@@ -251,7 +251,9 @@ if [[ ${FS_BACKEND} = zfs ]]; then
   sed "s|^zfs_dataset_prefix: crab/sandboxes$|zfs_dataset_prefix: ${ZPOOL_NAME}/sandboxes|" \
     "${REPO_ROOT}/config/crab.yaml" >"${config_tmp}"
 else
-  sed "s|^zfs_dataset_prefix: crab/sandboxes$|filesystem_backend: btrfs\nbtrfs_root: ${BTRFS_ROOT}|" \
+  # btrfs and overlay share the btrfs mount; overlay derives its area
+  # from btrfs_root (<btrfs_root>/overlay) so no extra key is needed.
+  sed "s|^zfs_dataset_prefix: crab/sandboxes$|filesystem_backend: ${FS_BACKEND}\nbtrfs_root: ${BTRFS_ROOT}|" \
     "${REPO_ROOT}/config/crab.yaml" >"${config_tmp}"
 fi
 install -D -m 0644 "${config_tmp}" "${CONFIG_PATH}"
@@ -262,6 +264,11 @@ if [[ ${FS_BACKEND} = zfs ]]; then
   zpool status "${ZPOOL_NAME}"
 else
   btrfs filesystem show "${BTRFS_ROOT}"
+fi
+if [[ ${FS_BACKEND} = overlay ]]; then
+  # The engine's ensure_root re-checks this at startup; fail early here.
+  modprobe overlay 2>/dev/null || true
+  grep -qw overlay /proc/filesystems || die "kernel lacks overlayfs support"
 fi
 
 echo

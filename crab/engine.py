@@ -60,6 +60,7 @@ from .remote_inspector import HostInspectorServiceClient, RemoteSandboxInspector
 from . import forking
 from .runtime import (
     BtrfsProvider,
+    OverlayProvider,
     RuncCheckpointOptions,
     RuncRestoreOptions,
     RuncRuntime,
@@ -466,9 +467,10 @@ class EngineConfig:
     an installed zpool whose name starts with `crab`."""
 
     filesystem_backend: str = "zfs"
-    """CoW backend for sandbox rootfs checkpoints: `zfs` (default) or
-    `btrfs`. With btrfs, the engine verifies `btrfs_root` is a btrfs
-    mount instead of resolving/creating a zpool dataset prefix."""
+    """CoW backend for sandbox rootfs checkpoints: `zfs` (default),
+    `btrfs`, or `overlay` (overlayfs rootfs with upper/work subvolumes
+    on btrfs). With btrfs/overlay, the engine verifies the btrfs area
+    instead of resolving/creating a zpool dataset prefix."""
 
     btrfs_root: Path | None = None
     """Root of the btrfs filesystem holding sandbox subvolumes. Only
@@ -476,6 +478,14 @@ class EngineConfig:
     `/var/lib/crab/btrfs` (the installer's `--fs-backend btrfs` mount).
     Mount it `noatime` (the installer does): with atime enabled, mere
     reads leak into `btrfs send`-based changesets as utimes-only noise."""
+
+    overlay_root: Path | None = None
+    """Root of the overlay backend's btrfs area (per-sandbox upper/work
+    subvolumes, shared lowers, snapshot mounts). Only used when
+    `filesystem_backend == "overlay"`; defaults to `<btrfs_root>/overlay`
+    so a host prepared with `--fs-backend btrfs`/`overlay` runs overlay
+    with zero extra setup and the two backends' namespaces never
+    collide. Must sit on a btrfs mount (same noatime advice applies)."""
 
     btrfs_qgroups_enabled: bool = False
     """Enable btrfs qgroups-backed per-snapshot byte stats (real
@@ -558,6 +568,7 @@ class EngineConfig:
         filesystem_data = _optional_mapping(data.get("filesystem"), label="filesystem")
         btrfs_data = _optional_mapping(filesystem_data.get("btrfs"), label="filesystem.btrfs")
         zfs_data = _optional_mapping(filesystem_data.get("zfs"), label="filesystem.zfs")
+        overlay_data = _optional_mapping(filesystem_data.get("overlay"), label="filesystem.overlay")
 
         storage_root = _resolve_config_path(
             data.get("storage_root", storage_planes.get("storage_root")),
@@ -705,6 +716,10 @@ class EngineConfig:
             ).strip().lower(),
             btrfs_root=_resolve_config_path(
                 btrfs_data.get("root", data.get("btrfs_root")),
+                base_dir=config_base_dir,
+            ),
+            overlay_root=_resolve_config_path(
+                overlay_data.get("root", data.get("overlay_root")),
                 base_dir=config_base_dir,
             ),
             btrfs_qgroups_enabled=_as_bool(
@@ -1102,9 +1117,13 @@ class Engine:
         assert self._request_state_store is not None
         assert self._runtime_root is not None
         backend = cfg.filesystem_backend.strip().lower()
-        if backend not in {"zfs", "btrfs"}:
-            raise ValueError(f"unsupported filesystem_backend: {cfg.filesystem_backend!r} (expected 'zfs' or 'btrfs')")
+        if backend not in {"zfs", "btrfs", "overlay"}:
+            raise ValueError(
+                f"unsupported filesystem_backend: {cfg.filesystem_backend!r} "
+                "(expected 'zfs', 'btrfs' or 'overlay')"
+            )
         btrfs_root = cfg.btrfs_root or RuncRuntimePaths().btrfs_root
+        overlay_root = cfg.overlay_root or btrfs_root / "overlay"
         paths = cfg.runc_paths or RuncRuntimePaths(
             state_root=self._runtime_root / "runtime-state",
             bundle_root=self._runtime_root / "bundles",
@@ -1116,11 +1135,14 @@ class Engine:
                 else RuncRuntimePaths().zfs_dataset_prefix
             ),
             btrfs_root=btrfs_root,
+            overlay_root=overlay_root,
         )
         if backend == "zfs":
             ZfsProvider.ensure_parent_dataset(paths.zfs_dataset_prefix)
-        else:
+        elif backend == "btrfs":
             BtrfsProvider.ensure_root(paths.btrfs_root)
+        else:
+            OverlayProvider.ensure_root(paths.overlay_root or paths.btrfs_root / "overlay")
         runc_options = cfg.runc_options or RuncRuntimeOptions()
         if runc_options.filesystem_backend != backend or runc_options.btrfs_qgroups_enabled != cfg.btrfs_qgroups_enabled:
             runc_options = replace(

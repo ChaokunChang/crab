@@ -412,6 +412,33 @@ class OverlayBackendSelectionTests(unittest.TestCase):
                     options=RuncRuntimeOptions(filesystem_backend="ext4"),
                 )
 
+    def test_engine_config_parses_overlay_block_and_flat_keys(self) -> None:
+        from crab.engine import EngineConfig
+
+        nested = EngineConfig.from_mapping(
+            {
+                "filesystem": {
+                    "backend": "overlay",
+                    "btrfs": {"root": "/mnt/pool"},
+                    "overlay": {"root": "/mnt/pool/ovl"},
+                }
+            }
+        )
+        self.assertEqual(nested.filesystem_backend, "overlay")
+        self.assertEqual(nested.btrfs_root, Path("/mnt/pool"))
+        self.assertEqual(nested.overlay_root, Path("/mnt/pool/ovl"))
+
+        flat = EngineConfig.from_mapping(
+            {"filesystem_backend": "overlay", "overlay_root": "/mnt/flat-ovl"}
+        )
+        self.assertEqual(flat.filesystem_backend, "overlay")
+        self.assertEqual(flat.overlay_root, Path("/mnt/flat-ovl"))
+
+        # No explicit root: stays None in the config; the engine derives
+        # `<btrfs_root>/overlay` at system build time.
+        default = EngineConfig.from_mapping({"filesystem_backend": "overlay"})
+        self.assertIsNone(default.overlay_root)
+
 
 def _overlay_playground_available() -> bool:
     if shutil.which("btrfs") is None or os.geteuid() != 0:
