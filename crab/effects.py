@@ -311,13 +311,24 @@ class EffectGate:
 def bare_host(host: str) -> str:
     """Strip a trailing ``:port`` from a Host header value.
 
-    The queued host comes from the request's Host header, which usually
-    carries the port for non-default ports. A flush connects with
-    ``(host, port)``, so leaving the port in the hostname makes DNS
-    resolution fail every time — the same trap D2.1's request_key hit.
-    IPv6 literals (bracketed, or with several colons) are left alone.
+    The queued host comes from the request's Host header, which carries
+    the port for non-default ports. A flush connects with ``(host, port)``,
+    so leaving the port in the hostname makes resolution fail every time —
+    the third appearance of this trap after D2.1's request_key and the
+    first cut of the flush, which is why IPv6 is handled here too:
+    ``[::1]:8080`` → ``[::1]``, while a bare ``fe80::1`` (no brackets, so
+    no port can be attached) is returned unchanged.
     """
+    if host.startswith("["):
+        closing = host.find("]")
+        if closing == -1:
+            return host
+        rest = host[closing + 1 :]
+        if rest.startswith(":") and rest[1:].isdigit():
+            return host[: closing + 1]
+        return host
     if host.count(":") != 1:
+        # No colon, or several: a bare IPv6 literal cannot carry a port.
         return host
     name, _, port = host.rpartition(":")
     return name if port.isdigit() else host

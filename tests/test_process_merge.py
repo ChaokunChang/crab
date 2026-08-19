@@ -651,6 +651,7 @@ class SandboxPlumbingTests(unittest.TestCase):
                         "lazy_pages": False,
                         "force": True,
                         "egress_replay": "cassette_first",
+                    "replay_effects": "reject",
                     },
                 )
             ],
@@ -833,6 +834,7 @@ class ShimTests(unittest.TestCase):
                 "lazy_pages": True,
                 "force": False,
                 "egress_replay": "cassette_first",
+                    "replay_effects": "reject",
             },
         )
 

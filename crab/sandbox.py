@@ -1056,7 +1056,8 @@ class Sandbox:
         lazy_pages: bool = True,
         force: bool = False,
         egress_replay: str = "cassette_first",
-    ) -> ProcessMergeReport:
+        replay_effects: str = "reject",
+    ) -> "ProcessMergeReport":
         """Process-half of consolidation (C4). ``strategy="auto"``
         resolves from a process census on this sandbox: with live
         background processes the fork's journaled execs are **replayed**
@@ -1086,6 +1087,7 @@ class Sandbox:
             lazy_pages=lazy_pages,
             force=force,
             egress_replay=egress_replay,
+            replay_effects=replay_effects,
         )
 
     def begin(

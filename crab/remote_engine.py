@@ -426,6 +426,7 @@ class _SystemShim:
         lazy_pages: bool = True,
         force: bool = False,
         egress_replay: str = "cassette_first",
+        replay_effects: str = "reject",
     ) -> ProcessMergeReport:
         payload: dict[str, Any] = {
             "fork_sandbox_id": str(fork_sandbox_id),
@@ -436,6 +437,7 @@ class _SystemShim:
             "lazy_pages": bool(lazy_pages),
             "force": bool(force),
             "egress_replay": egress_replay,
+            "replay_effects": replay_effects,
         }
         try:
             response = self._client.post_json(

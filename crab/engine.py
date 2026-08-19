@@ -1050,6 +1050,12 @@ class Engine:
                 )
                 proxy.start()
                 manager.enable_egress_redirect(proxy.port)
+                # A previous run's deferred queue did not survive; close out
+                # its journal rows so nothing looks pending forever.
+                try:
+                    self._system.backfill_lost_effects()
+                except Exception:
+                    logger.debug("Lost-effect backfill failed", exc_info=True)
                 # The ledger re-derives classification when read, so the
                 # query side needs the same rules as the recording side.
                 self._system.egress_rules = rules
