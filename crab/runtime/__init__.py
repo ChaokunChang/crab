@@ -3,6 +3,7 @@ from .base import CommandRunner, SubprocessCommandRunner
 from .btrfs_provider import BtrfsProvider
 from .fs_provider import FilesystemProvider
 from .in_memory import InMemoryRuntime
+from .overlay_provider import OverlayProvider
 from .runc import (
     RuncCheckpointOptions,
     RuncRestoreOptions,
@@ -17,6 +18,7 @@ __all__ = [
     "CommandRunner",
     "FilesystemProvider",
     "InMemoryRuntime",
+    "OverlayProvider",
     "RuncCheckpointOptions",
     "RuncRestoreOptions",
     "RuncRuntime",

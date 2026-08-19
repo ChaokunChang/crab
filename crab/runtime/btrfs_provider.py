@@ -22,7 +22,6 @@ from .fs_provider import (
 
 logger = logging.getLogger(__name__)
 
-_FS_REF_PREFIX = "btrfs:"
 _TRASH_INFIX = ".trash-"
 _CHANGESET_INFIX = "@changeset-"
 _BTRFS_DUMP_CREATE_COMMANDS = {"mkfile", "mkdir", "mknod", "mkfifo", "mksock", "symlink"}
@@ -212,6 +211,12 @@ class BtrfsProvider(FilesystemProvider):
       they are off by default and stats degrade to unknown (telemetry
       tolerates missing byte counts).
     """
+
+    # Opaque fs_ref prefix stamped into checkpoint metadata and stripped
+    # by destroy_snapshot_ref. Class attribute so subclasses that reuse
+    # the btrfs mechanics under another backend name (OverlayProvider)
+    # mint and consume their own refs.
+    _fs_ref_prefix = "btrfs:"
 
     def __init__(
         self,
@@ -562,7 +567,7 @@ class BtrfsProvider(FilesystemProvider):
             "dataset": dataset,
             "snapshot": snapshot,
             "mountpoint": str(self._rootfs_resolver(sandbox_id)),
-            "fs_ref": f"{_FS_REF_PREFIX}{snapshot}",
+            "fs_ref": f"{self._fs_ref_prefix}{snapshot}",
         }
 
     def destroy_filesystem_dataset(self, sandbox_id: SandboxId, dataset: str) -> None:
@@ -716,7 +721,7 @@ class BtrfsProvider(FilesystemProvider):
                 )
 
     def destroy_snapshot_ref(self, fs_ref: str) -> None:
-        snapshot = fs_ref[len(_FS_REF_PREFIX):] if fs_ref.startswith(_FS_REF_PREFIX) else fs_ref
+        snapshot = fs_ref[len(self._fs_ref_prefix):] if fs_ref.startswith(self._fs_ref_prefix) else fs_ref
         if not snapshot:
             return
         result = self._run_command(

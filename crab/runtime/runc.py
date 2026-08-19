@@ -20,6 +20,7 @@ from ..telemetry import NoopTelemetrySink, start_operation, telemetry_capture_co
 from .base import CommandResult, CommandRunner, SubprocessCommandRunner
 from .btrfs_provider import BtrfsProvider
 from .fs_provider import FilesystemProvider
+from .overlay_provider import OverlayProvider
 from .zfs_provider import ZfsProvider
 
 logger = logging.getLogger(__name__)
@@ -160,6 +161,12 @@ class RuncRuntimePaths:
     # Root of the btrfs filesystem holding sandbox subvolumes. Only
     # consulted when RuncRuntimeOptions.filesystem_backend == "btrfs".
     btrfs_root: Path = Path("/var/lib/crab/btrfs")
+    # Root of the overlay backend's btrfs area (per-sandbox upper/work
+    # subvolumes, shared lowers, snapshot mounts). Only consulted when
+    # filesystem_backend == "overlay"; defaults to `<btrfs_root>/overlay`
+    # so a host prepared for the btrfs backend runs overlay with zero
+    # extra setup and the two backends' namespaces never collide.
+    overlay_root: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -205,11 +212,13 @@ class RuncRuntimeOptions:
     restore: RuncRestoreOptions = field(default_factory=RuncRestoreOptions)
     command_timeout_seconds: float = _DEFAULT_RUNTIME_COMMAND_TIMEOUT_SECONDS
     zfs_prepare_timeout_seconds: float = _DEFAULT_ZFS_PREPARE_TIMEOUT_SECONDS
-    # CoW backend for sandbox rootfs checkpoints: "zfs" (default) or
-    # "btrfs". Ignored when an explicit fs_provider is injected.
+    # CoW backend for sandbox rootfs checkpoints: "zfs" (default),
+    # "btrfs", or "overlay" (overlayfs rootfs with upper/work on btrfs).
+    # Ignored when an explicit fs_provider is injected.
     filesystem_backend: str = "zfs"
-    # Per-snapshot byte stats on btrfs require qgroups, which carry real
-    # overhead; default off (stats degrade to unknown).
+    # Per-snapshot byte stats on btrfs/overlay require qgroups, which
+    # carry real overhead; default off (stats degrade to unknown). On
+    # overlay the stats cover the upper subvolume only.
     btrfs_qgroups_enabled: bool = False
 
 
@@ -259,6 +268,16 @@ class RuncRuntime(Runtime):
                 rootfs_resolver=self.rootfs_path_for,
                 qgroups_enabled=resolved_options.btrfs_qgroups_enabled,
             )
+        elif resolved_options.filesystem_backend == "overlay":
+            self._fs = OverlayProvider(
+                overlay_root=self._paths.overlay_root or self._paths.btrfs_root / "overlay",
+                runtime_name=self.name,
+                run_command=self._run_command,
+                run_status=self._run_status,
+                dataset_resolver=self.dataset_name_for,
+                rootfs_resolver=self.rootfs_path_for,
+                qgroups_enabled=resolved_options.btrfs_qgroups_enabled,
+            )
         elif resolved_options.filesystem_backend == "zfs":
             self._fs = ZfsProvider(
                 dataset_prefix=self._paths.zfs_dataset_prefix,
@@ -272,7 +291,7 @@ class RuncRuntime(Runtime):
         else:
             raise ValueError(
                 f"unsupported filesystem_backend: {resolved_options.filesystem_backend!r} "
-                "(expected 'zfs' or 'btrfs')"
+                "(expected 'zfs', 'btrfs' or 'overlay')"
             )
         self._lock = Lock()
         self._items: dict[SandboxId, SandboxDescription] = {}

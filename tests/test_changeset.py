@@ -38,6 +38,7 @@ from crab.models import ChangesetEntry, ChangesetResult, utc_now
 from crab.runtime import BtrfsProvider, CommandRunner, ZfsProvider
 from crab.runtime.base import CommandResult
 from crab.runtime.btrfs_provider import parse_btrfs_receive_dump
+from crab.runtime.overlay_provider import translate_overlay_changeset
 from crab.runtime.zfs_provider import parse_zfs_diff
 from crab.sandbox import Sandbox
 from crab.scheduler import FaultToleranceCheckpointingPolicy
@@ -739,6 +740,179 @@ class SandboxChangesetTests(unittest.TestCase):
             sandbox.changeset()
         with self.assertRaises(NotImplementedError):
             sandbox.changeset(since="ckpt-1")
+
+
+class OverlayChangesetTranslationTests(unittest.TestCase):
+    """A2 §5 translation pass: vol-level send-diff entries (raw upperdir
+    deltas) decoded into container semantics via injectable probes.
+    Host-runnable — probes are fakes; the real-probe wiring is covered
+    by OverlayRealChangesetTests in the VM."""
+
+    @staticmethod
+    def _translate(entries, **overrides):
+        probes = {
+            "live_whiteout": lambda path: False,
+            "base_whiteout": lambda path: False,
+            "base_exists": lambda path: False,
+            "live_exists": lambda path: False,
+            "newly_opaque": lambda path: False,
+            "base_children": lambda path: [],
+            "live_children": lambda path: [],
+        }
+        probes.update(overrides)
+        return translate_overlay_changeset(entries, **probes)
+
+    @staticmethod
+    def _shapes(entries):
+        return [(entry.path, entry.change, entry.renamed_from) for entry in entries]
+
+    def test_upper_prefix_strip_and_internal_paths_dropped(self) -> None:
+        entries = [
+            ChangesetEntry(path="/upper/a.txt", change="added"),
+            ChangesetEntry(path="/work/#123", change="modified"),
+            ChangesetEntry(path="/.crab-overlay.json", change="modified"),
+            ChangesetEntry(path="/upper", change="modified"),
+        ]
+        self.assertEqual(
+            self._shapes(self._translate(entries)),
+            [("/a.txt", "added", None)],
+        )
+
+    def test_copy_up_of_lower_file_becomes_modified(self) -> None:
+        # The diff reports a copy-up as `added` (the file is new in the
+        # upper); container semantics say `modified` because the base
+        # merged view already had it.
+        entries = [ChangesetEntry(path="/upper/etc/issue", change="added")]
+        self.assertEqual(
+            self._shapes(self._translate(entries, base_exists=lambda p: p == "/etc/issue")),
+            [("/etc/issue", "modified", None)],
+        )
+
+    def test_sed_i_composite_folds_to_single_modified(self) -> None:
+        # sed -i on a lower file = copy-up + in-upper rename of the temp
+        # file onto the target: the parser's placeholder folding already
+        # yields one `added` entry for the destination; base existence
+        # turns it into exactly one `modified` (the C1 pitfall, pinned).
+        entries = [ChangesetEntry(path="/upper/etc/target.conf", change="added")]
+        self.assertEqual(
+            self._shapes(self._translate(entries, base_exists=lambda p: p == "/etc/target.conf")),
+            [("/etc/target.conf", "modified", None)],
+        )
+
+    def test_new_upper_file_stays_added(self) -> None:
+        entries = [ChangesetEntry(path="/upper/fresh.txt", change="added")]
+        self.assertEqual(
+            self._shapes(self._translate(entries)),
+            [("/fresh.txt", "added", None)],
+        )
+
+    def test_whiteout_means_removed(self) -> None:
+        # Deleting a lower-visible file plants a char 0:0 device in the
+        # upper; the diff calls that `added`.
+        entries = [ChangesetEntry(path="/upper/gone.txt", change="added")]
+        self.assertEqual(
+            self._shapes(self._translate(entries, live_whiteout=lambda p: p == "/gone.txt")),
+            [("/gone.txt", "removed", None)],
+        )
+
+    def test_whiteout_replace_recreation_classified_by_base_view(self) -> None:
+        # A file deleted before the base checkpoint (whiteout in the
+        # base upper) and recreated since: the raw kind is added or
+        # modified depending on stream folding, but the base *merged*
+        # view (where the whiteout hides the file) decides `added`.
+        entries = [ChangesetEntry(path="/upper/reborn.txt", change="modified")]
+        self.assertEqual(
+            self._shapes(self._translate(entries)),
+            [("/reborn.txt", "added", None)],
+        )
+
+    def test_vanished_whiteout_reappearance(self) -> None:
+        # The deletion marker disappeared without replacement: the lower
+        # shows through again — `added` when the live merged view has
+        # the path, dropped otherwise.
+        entries = [ChangesetEntry(path="/upper/back.txt", change="removed")]
+        self.assertEqual(
+            self._shapes(
+                self._translate(
+                    entries,
+                    base_whiteout=lambda p: p == "/back.txt",
+                    live_exists=lambda p: p == "/back.txt",
+                )
+            ),
+            [("/back.txt", "added", None)],
+        )
+        self.assertEqual(
+            self._shapes(self._translate(entries, base_whiteout=lambda p: p == "/back.txt")),
+            [],
+        )
+
+    def test_upper_only_delete_stays_removed(self) -> None:
+        entries = [ChangesetEntry(path="/upper/scratch.txt", change="removed")]
+        self.assertEqual(
+            self._shapes(self._translate(entries)),
+            [("/scratch.txt", "removed", None)],
+        )
+
+    def test_in_upper_rename_keeps_attribution(self) -> None:
+        entries = [
+            ChangesetEntry(path="/upper/new.txt", change="renamed", renamed_from="/upper/old.txt"),
+        ]
+        self.assertEqual(
+            self._shapes(self._translate(entries)),
+            [("/new.txt", "renamed", "/old.txt")],
+        )
+
+    def test_rename_from_outside_upper_degrades(self) -> None:
+        entries = [
+            ChangesetEntry(path="/upper/new.txt", change="renamed", renamed_from="/work/#42"),
+        ]
+        self.assertEqual(
+            self._shapes(self._translate(entries)),
+            [("/new.txt", "added", None)],
+        )
+
+    def test_opaque_dir_emits_masked_children_removed_recursively(self) -> None:
+        # rm -rf /data && mkdir /data && touch /data/z.txt: the upper
+        # diff only shows the (opaque) dir and the recreated child; the
+        # masked lower children come from the base merged view, minus
+        # what the live merged view re-created, descending subtrees.
+        entries = [
+            ChangesetEntry(path="/upper/data", change="added"),
+            ChangesetEntry(path="/upper/data/z.txt", change="added"),
+        ]
+        base_tree = {
+            "/data": ["a.txt", "sub"],
+            "/data/sub": ["x.txt"],
+        }
+        result = self._translate(
+            entries,
+            base_exists=lambda p: p in {"/data", "/data/a.txt", "/data/sub", "/data/sub/x.txt"},
+            newly_opaque=lambda p: p == "/data",
+            base_children=lambda p: base_tree.get(p, []),
+            live_children=lambda p: ["z.txt"] if p == "/data" else [],
+        )
+        self.assertEqual(
+            self._shapes(result),
+            [
+                ("/data", "modified", None),
+                ("/data/a.txt", "removed", None),
+                ("/data/sub", "removed", None),
+                ("/data/sub/x.txt", "removed", None),
+                ("/data/z.txt", "added", None),
+            ],
+        )
+
+    def test_precedence_folds_duplicate_paths(self) -> None:
+        # A whiteouted path reported through two raw kinds folds to one
+        # `removed` entry.
+        entries = [
+            ChangesetEntry(path="/upper/x", change="modified"),
+            ChangesetEntry(path="/upper/x", change="added"),
+        ]
+        self.assertEqual(
+            self._shapes(self._translate(entries, live_whiteout=lambda p: p == "/x")),
+            [("/x", "removed", None)],
+        )
 
 
 if __name__ == "__main__":
