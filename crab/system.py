@@ -8,7 +8,7 @@ from queue import Empty, Queue
 from threading import Event, Lock, Thread
 import time
 import uuid
-from typing import Callable
+from typing import Callable, Protocol
 
 from .config import ExecutorConfig, SchedulerConfig, StorageConfig, TelemetryConfig
 from .contracts import CheckpointManager, Runtime, SandboxInspector, TelemetrySink
@@ -122,9 +122,22 @@ PROMOTION_POLICIES: dict[str, str] = {
 
 
 class ForkPromotionError(RuntimeError):
-    """The fork->source identity swap failed mid-flight. The fork is
-    intact and still holds the promoted state — the operation is
-    retryable against it."""
+    """The fork->source identity swap failed mid-flight. On the no-transfer
+    path the fork is still running and the operation is retryable against
+    it; on the netns-transfer path the fork is dumped-and-stopped but its
+    filesystem is intact, so recovery is a restore of the promoted
+    checkpoint. Either way the fork's dataset is retained."""
+
+
+class _LeaseTransfer(Protocol):
+    """Engine-provided hook moving a fork's network identity onto the
+    source during promotion. ``probe=True`` answers "would a transfer
+    happen?" without mutating (used before the fork is dumped); the real
+    call performs the move and returns whether it happened."""
+
+    def __call__(
+        self, from_sandbox_id: SandboxId, to_sandbox_id: SandboxId, *, probe: bool = ...
+    ) -> bool: ...
 
 _CAPTURES_INFLIGHT_LLM = "captures_inflight_llm"
 _CAPTURED_REQUEST_ID = "captured_request_id"
@@ -257,6 +270,9 @@ class CrabSystem:
         self._fork_txn_fork: Callable[[SandboxId], SandboxId] | None = None
         self._fork_txn_destroy: Callable[[SandboxId], None] | None = None
         self._fork_txn_lease_repair: Callable[[SandboxId], None] | None = None
+        # Promotion moves the fork's network identity onto the source so
+        # CRIU can bind its sockets back (see _promote_fork_onto_source).
+        self._fork_txn_lease_transfer: "_LeaseTransfer | None" = None
 
     def start(self) -> None:
         with self._coordination_lock:
@@ -1374,13 +1390,22 @@ class CrabSystem:
         fork: Callable[[SandboxId], SandboxId],
         destroy: Callable[[SandboxId], None],
         lease_repair: Callable[[SandboxId], None] | None = None,
+        lease_transfer: "_LeaseTransfer | None" = None,
     ) -> None:
         """Engine-owned hooks: forking needs lease allocation + bundle
         replication + restore (Engine.fork_sandbox) and fork teardown
-        mirrors the SDK kill path — both live above the system."""
+        mirrors the SDK kill path — both live above the system.
+
+        ``lease_transfer(fork_id, source_id)`` moves the fork's network
+        identity onto the source before a promotion restore and returns
+        whether it happened; the system cannot reach the network manager
+        itself. An unwired hook (or a ``False`` return) means the promotion
+        takes the pre-existing `lease_repair` path.
+        """
         self._fork_txn_fork = fork
         self._fork_txn_destroy = destroy
         self._fork_txn_lease_repair = lease_repair
+        self._fork_txn_lease_transfer = lease_transfer
 
     def _begin_fork_txn(
         self,
@@ -1631,13 +1656,45 @@ class CrabSystem:
     ) -> tuple[CheckpointId, bool]:
         """Shared B3/C4 swap: promote the fork's whole state (filesystem
         + processes) onto the source's unchanged identity. Returns
-        ``(promoted_checkpoint_id, fork_retained)``. The fork stays
-        alive until the swap is proven — failures raise
-        ``ForkPromotionError`` and are retryable against the live fork;
-        ``fork_retained=True`` means the final detach promote failed and
-        the fork must NOT be destroyed."""
-        # Dump the fork; it keeps running.
-        checkpoint_result = self.checkpoint_once(fork_id, leave_running=True)
+        ``(promoted_checkpoint_id, fork_retained)``.
+
+        Fork lifecycle differs by path (see the dump below):
+        - **no-transfer path** (unnetworked, or a fork without its own
+          lease): the fork is dumped ``leave_running=True`` and stays
+          alive, so a failed swap is retryable against the live fork;
+        - **transfer path** (the fork owns a netns the source must adopt):
+          the fork is dumped-and-stopped, so its *processes* are gone once
+          the dump succeeds. Its filesystem and checkpoint chain survive,
+          so a failed restore is recoverable by restoring the replicated
+          ``commit_checkpoint_id`` — not by re-running the dead fork.
+
+        Failures raise ``ForkPromotionError``; ``fork_retained=True`` means
+        the final detach promote failed and the fork's dataset must NOT be
+        destroyed (it still backs the source)."""
+        # Pre-flight, before anything irreversible: does this promotion move
+        # the fork's network identity onto the source? The probe mutates
+        # nothing, and the answer decides how the fork is dumped below.
+        transfer_netns = False
+        if self._fork_txn_lease_transfer is not None:
+            transfer_netns = bool(
+                self._fork_txn_lease_transfer(fork_id, source_id, probe=True)
+            )
+        if transfer_netns:
+            bundle_path = getattr(self.runtime, "bundle_path_for", None)
+            if bundle_path is not None and not (Path(bundle_path(source_id)) / "config.json").is_file():
+                raise ForkPromotionError(
+                    f"promotion cannot retarget the netns of {source_id}: its bundle "
+                    "config.json is missing; nothing was changed"
+                )
+        # Dump the fork. On the transfer path the fork's processes must LEAVE
+        # the netns the source is about to run in — two live copies of a
+        # listener in one namespace collide (CRIU: "Can't bind inet socket:
+        # Address already in use") and killing them after an unlocked dump
+        # would also RST the very connections promotion exists to carry.
+        # Dump-and-stop is the standard CRIU migration shape. Elsewhere the
+        # fork keeps running, as before, so a failed swap is retryable
+        # against it.
+        checkpoint_result = self.checkpoint_once(fork_id, leave_running=not transfer_netns)
         if checkpoint_result.status.value != "succeeded" or checkpoint_result.checkpoint_id is None:
             raise ForkPromotionError(
                 f"promotion checkpoint failed for {fork_id}: "
@@ -1673,17 +1730,44 @@ class CrabSystem:
             source_id,
             target_rootfs_path=source_rootfs,
         )
+        # The fork was dumped inside its own netns, so its sockets are bound
+        # to the fork's guest IP. Restoring that image against the source's
+        # netns fails in CRIU's soccr with EADDRNOTAVAIL ("Can't bind inet
+        # socket back"), so the address moves with the processes: the source
+        # identity adopts the fork's lease, bundle netns and metadata.
+        netns_transferred = False
+        if transfer_netns and self._fork_txn_lease_transfer is not None:
+            try:
+                netns_transferred = bool(self._fork_txn_lease_transfer(fork_id, source_id))
+            except Exception as exc:
+                # The fork is already dumped-and-stopped on this path; its
+                # filesystem and image survive, so recovery is a restore of
+                # commit_checkpoint_id, not a retry against a live fork.
+                raise ForkPromotionError(
+                    f"promotion could not transfer the network identity of {fork_id} "
+                    f"onto {source_id}: {exc}; the fork's processes are stopped but its "
+                    "filesystem is intact"
+                ) from exc
         restore = self.restore_once(
             source_id,
             commit_checkpoint_id,
             restore_metadata={"lazy_pages": True} if lazy_pages else None,
         )
         if restore.status.value != "succeeded":
+            # On the transfer path the fork is stopped; "intact" means its
+            # filesystem, not a live process tree.
+            fork_state = (
+                "the fork's processes are stopped but its filesystem is intact"
+                if netns_transferred
+                else "the fork is intact"
+            )
             raise ForkPromotionError(
                 f"promotion restore failed for {source_id}: "
-                f"status={restore.status.value} message={restore.message}; the fork is intact"
+                f"status={restore.status.value} message={restore.message}; {fork_state}"
             )
-        if self._fork_txn_lease_repair is not None:
+        # A transferred netns is already plumbed and was never torn down;
+        # repair only applies when the source kept its own lease.
+        if not netns_transferred and self._fork_txn_lease_repair is not None:
             try:
                 self._fork_txn_lease_repair(source_id)
             except Exception:

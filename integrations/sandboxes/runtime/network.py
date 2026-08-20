@@ -4,7 +4,7 @@ import ipaddress
 import heapq
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import subprocess
 import threading
@@ -421,28 +421,81 @@ class BenchmarkNetworkManager:
         )
         return True
 
+    def transfer_lease(
+        self, from_sandbox_id: SandboxId, to_sandbox_id: SandboxId
+    ) -> BenchmarkNetworkLease | None:
+        """Move ``from``'s lease onto ``to``'s identity, destroying whatever
+        lease ``to`` held before. Returns the re-keyed lease, or ``None``
+        when ``from`` holds none (which makes a repeated call a no-op).
+
+        Promotion (B3 commit, C4 promote) restores a fork's CRIU image onto
+        the source's identity. The image's sockets are bound to the *fork's*
+        guest IP, so unless that address moves with them CRIU's ``soccr``
+        fails to bind them back (``EADDRNOTAVAIL``) and the restore dies.
+
+        Ordering is load-bearing: `release_lease` pops by sandbox id and
+        then tears down whatever it popped, so the outgoing record must
+        leave the table *before* the incoming one takes its key. Re-keying
+        first and releasing afterwards would destroy the netns just
+        transferred in.
+        """
+        with self._lock:
+            incoming = self._leases.get(from_sandbox_id)
+            if incoming is None:
+                return None
+            # 1. the outgoing record leaves the table first.
+            outgoing = self._leases.pop(to_sandbox_id, None)
+            if outgoing is not None:
+                self._ip_to_sandbox.pop(outgoing.guest_ip, None)
+                self._recycle_guest_ip_locked(outgoing.guest_ip)
+            # 2. re-key the incoming record onto the target identity.
+            del self._leases[from_sandbox_id]
+            transferred = replace(incoming, sandbox_id=to_sandbox_id)
+            self._leases[to_sandbox_id] = transferred
+            # 3. attribution follows the address.
+            self._ip_to_sandbox[transferred.guest_ip] = to_sandbox_id
+        # 4. only the popped record's plumbing is destroyed, outside the lock.
+        if outgoing is not None:
+            self._destroy_lease_plumbing(outgoing)
+        logger.info(
+            "Transferred benchmark network lease from=%s to=%s guest_ip=%s namespace=%s",
+            from_sandbox_id,
+            to_sandbox_id,
+            transferred.guest_ip,
+            transferred.namespace_name,
+        )
+        return transferred
+
     def release_lease(self, sandbox_id: SandboxId) -> None:
         with self._lock:
             lease = self._leases.pop(sandbox_id, None)
             if lease is not None:
                 self._ip_to_sandbox.pop(lease.guest_ip, None)
-                network = ipaddress.ip_network(self._network_cidr, strict=False)
-                try:
-                    guest_index = int(ipaddress.ip_address(lease.guest_ip)) - int(network.network_address)
-                except ValueError:
-                    guest_index = -1
-                if 2 <= guest_index < network.num_addresses - 1:
-                    heapq.heappush(self._free_ip_indices, guest_index)
+                self._recycle_guest_ip_locked(lease.guest_ip)
         if lease is None:
             return
-        subprocess.run(["ip", "netns", "del", lease.namespace_name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["ip", "link", "delete", lease.host_veth_name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self._destroy_lease_plumbing(lease)
         logger.info(
             "Released benchmark network lease sandbox=%s guest_ip=%s namespace=%s",
             sandbox_id,
             lease.guest_ip,
             lease.namespace_name,
         )
+
+    def _recycle_guest_ip_locked(self, guest_ip: str) -> None:
+        """Return a freed address to the allocation pool. Caller holds the lock."""
+        network = ipaddress.ip_network(self._network_cidr, strict=False)
+        try:
+            guest_index = int(ipaddress.ip_address(guest_ip)) - int(network.network_address)
+        except ValueError:
+            guest_index = -1
+        if 2 <= guest_index < network.num_addresses - 1:
+            heapq.heappush(self._free_ip_indices, guest_index)
+
+    @staticmethod
+    def _destroy_lease_plumbing(lease: BenchmarkNetworkLease) -> None:
+        subprocess.run(["ip", "netns", "del", lease.namespace_name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["ip", "link", "delete", lease.host_veth_name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def cleanup(self) -> None:
         self.disable_egress_redirect()

@@ -322,6 +322,241 @@ class RedirectRuleTests(unittest.TestCase):
         )
 
 
+class LeaseTransferTests(unittest.TestCase):
+    """PR-N1: promotion moves a fork's network identity onto the source.
+    The release ordering inside the manager is the whole risk —
+    `release_lease` pops by sandbox id and then destroys whatever it
+    popped, so re-keying before releasing would tear down the netns just
+    transferred in."""
+
+    def _manager(self):
+        from integrations.sandboxes.runtime.network import BenchmarkNetworkManager
+
+        manager = BenchmarkNetworkManager()
+        manager._bridge_name = "acbdeadbeef"
+        return manager
+
+    def _seed(self, manager, sandbox_id: str, guest_ip: str):
+        from integrations.sandboxes.runtime.network import BenchmarkNetworkLease
+        from crab.ids import SandboxId
+
+        sid = SandboxId(sandbox_id)
+        suffix = guest_ip.replace(".", "")
+        lease = BenchmarkNetworkLease(
+            sandbox_id=sid,
+            namespace_name=f"ts-{suffix}",
+            namespace_path=Path(f"/var/run/netns/ts-{suffix}"),
+            host_veth_name=f"vh{suffix}",
+            guest_veth_name=f"vg{suffix}",
+            guest_ip=guest_ip,
+        )
+        manager._leases[sid] = lease
+        manager._ip_to_sandbox[guest_ip] = sid
+        return sid, lease
+
+    def test_transfer_rekeys_and_destroys_only_the_outgoing_netns(self) -> None:
+        from crab.ids import SandboxId
+
+        manager = self._manager()
+        source, old = self._seed(manager, "sbx-src", "10.250.0.2")
+        fork, incoming = self._seed(manager, "sbx-src-fork-1", "10.250.0.3")
+
+        with mock.patch(
+            "integrations.sandboxes.runtime.network.subprocess.run"
+        ) as run:
+            transferred = manager.transfer_lease(fork, source)
+
+        # The fork's plumbing survives untouched; only the source's old
+        # netns/veth are destroyed.
+        destroyed = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(
+            destroyed,
+            [
+                ["ip", "netns", "del", old.namespace_name],
+                ["ip", "link", "delete", old.host_veth_name],
+            ],
+        )
+        # The lease now belongs to the source, address and namespace intact.
+        self.assertEqual(transferred.guest_ip, incoming.guest_ip)
+        self.assertEqual(transferred.namespace_name, incoming.namespace_name)
+        self.assertEqual(transferred.sandbox_id, source)
+        self.assertEqual(manager.lease_for(source), transferred)
+        self.assertIsNone(manager.lease_for(fork))
+        # Attribution follows the address.
+        self.assertEqual(manager.resolve_sandbox_id(incoming.guest_ip), source)
+        self.assertIsNone(manager.resolve_sandbox_id(old.guest_ip))
+        # The freed address returns to the pool.
+        self.assertEqual(manager._free_ip_indices, [2])
+
+    def test_releasing_the_old_id_after_a_transfer_is_a_no_op(self) -> None:
+        """Fork teardown runs `release_network_lease(fork_id)` after a
+        promotion. Post-transfer the fork id owns nothing, so the netns the
+        source now runs in must survive."""
+        manager = self._manager()
+        source, _ = self._seed(manager, "sbx-src", "10.250.0.2")
+        fork, incoming = self._seed(manager, "sbx-src-fork-1", "10.250.0.3")
+        with mock.patch("integrations.sandboxes.runtime.network.subprocess.run"):
+            manager.transfer_lease(fork, source)
+
+        with mock.patch(
+            "integrations.sandboxes.runtime.network.subprocess.run"
+        ) as run:
+            manager.release_lease(fork)
+
+        run.assert_not_called()
+        self.assertEqual(manager.lease_for(source).namespace_name, incoming.namespace_name)
+        self.assertEqual(manager.resolve_sandbox_id(incoming.guest_ip), source)
+
+    def test_transfer_without_a_source_lease_only_rekeys(self) -> None:
+        manager = self._manager()
+        from crab.ids import SandboxId
+
+        source = SandboxId("sbx-src")
+        fork, incoming = self._seed(manager, "sbx-src-fork-1", "10.250.0.3")
+
+        with mock.patch(
+            "integrations.sandboxes.runtime.network.subprocess.run"
+        ) as run:
+            transferred = manager.transfer_lease(fork, source)
+
+        run.assert_not_called()
+        self.assertEqual(transferred.guest_ip, incoming.guest_ip)
+        self.assertEqual(manager.resolve_sandbox_id(incoming.guest_ip), source)
+
+    def test_repeated_transfer_is_a_no_op(self) -> None:
+        manager = self._manager()
+        source, _ = self._seed(manager, "sbx-src", "10.250.0.2")
+        fork, incoming = self._seed(manager, "sbx-src-fork-1", "10.250.0.3")
+        with mock.patch("integrations.sandboxes.runtime.network.subprocess.run"):
+            self.assertIsNotNone(manager.transfer_lease(fork, source))
+            # Nothing left under the fork id: a retry must not disturb the
+            # lease the source now holds.
+            self.assertIsNone(manager.transfer_lease(fork, source))
+        self.assertEqual(manager.lease_for(source).namespace_name, incoming.namespace_name)
+
+
+class _RecordingRuntime:
+    """Minimal runtime for Engine.transfer_network_lease: records the
+    metadata refresh and hands out a bundle dir the retarget can rewrite."""
+
+    def __init__(self, bundle_root: Path) -> None:
+        self._bundle_root = bundle_root
+        self.metadata_updates: list[tuple] = []
+
+    def bundle_path_for(self, sandbox_id):
+        return self._bundle_root / str(sandbox_id)
+
+    def update_network_metadata(self, sandbox_id, *, guest_ip, network_namespace_path):
+        self.metadata_updates.append((str(sandbox_id), guest_ip, network_namespace_path))
+
+
+class EngineTransferNetworkLeaseTests(unittest.TestCase):
+    """PR-N1 decision 9: the Engine call is the three-in-one — lease re-key,
+    bundle netns retarget, and runtime metadata refresh. A transfer that
+    only moves the lease passes the E2E socket assertions while silently
+    breaking attribution, so the composition is pinned directly here."""
+
+    def _engine(self, manager, runtime):
+        from crab.engine import Engine
+
+        engine = Engine.__new__(Engine)  # bypass full construction
+        engine._network_manager = manager
+        engine._runtime = runtime
+        return engine
+
+    def _write_bundle(self, bundle_root: Path, sandbox_id: str, netns_path: str) -> Path:
+        import json
+
+        bundle = bundle_root / sandbox_id
+        bundle.mkdir(parents=True)
+        spec = {"linux": {"namespaces": [{"type": "network", "path": netns_path}]}}
+        (bundle / "config.json").write_text(json.dumps(spec), encoding="utf-8")
+        return bundle
+
+    def _manager(self):
+        from integrations.sandboxes.runtime.network import BenchmarkNetworkManager
+
+        manager = BenchmarkNetworkManager()
+        manager._bridge_name = "acbdeadbeef"
+        return manager
+
+    def _seed(self, manager, sandbox_id: str, guest_ip: str):
+        from integrations.sandboxes.runtime.network import BenchmarkNetworkLease
+        from crab.ids import SandboxId
+
+        sid = SandboxId(sandbox_id)
+        suffix = guest_ip.replace(".", "")
+        lease = BenchmarkNetworkLease(
+            sandbox_id=sid,
+            namespace_name=f"ts-{suffix}",
+            namespace_path=Path(f"/var/run/netns/ts-{suffix}"),
+            host_veth_name=f"vh{suffix}",
+            guest_veth_name=f"vg{suffix}",
+            guest_ip=guest_ip,
+        )
+        manager._leases[sid] = lease
+        manager._ip_to_sandbox[guest_ip] = sid
+        return sid
+
+    def test_transfer_moves_lease_bundle_netns_and_metadata_together(self) -> None:
+        from crab.ids import SandboxId
+
+        with tempfile.TemporaryDirectory(prefix="crab_engine_xfer_") as tmp:
+            bundle_root = Path(tmp) / "bundles"
+            manager = self._manager()
+            source = self._seed(manager, "sbx-src", "10.250.0.2")
+            fork = self._seed(manager, "sbx-src-fork-1", "10.250.0.3")
+            fork_lease = manager.lease_for(fork)
+            self._write_bundle(bundle_root, "sbx-src", "/var/run/netns/ts-old")
+            runtime = _RecordingRuntime(bundle_root)
+            engine = self._engine(manager, runtime)
+
+            with mock.patch("integrations.sandboxes.runtime.network.subprocess.run"):
+                result = engine.transfer_network_lease(fork, source)
+
+            self.assertTrue(result)
+            # 1. lease re-keyed onto the source.
+            self.assertEqual(manager.resolve_sandbox_id("10.250.0.3"), source)
+            # 2. the source bundle now names the fork's netns.
+            import json
+
+            spec = json.loads((bundle_root / "sbx-src" / "config.json").read_text())
+            netns = [ns for ns in spec["linux"]["namespaces"] if ns["type"] == "network"][0]
+            self.assertEqual(netns["path"], str(fork_lease.namespace_path))
+            # 3. runtime metadata refreshed to the new address + netns.
+            self.assertEqual(
+                runtime.metadata_updates,
+                [("sbx-src", "10.250.0.3", str(fork_lease.namespace_path))],
+            )
+
+    def test_probe_reports_without_mutating(self) -> None:
+        manager = self._manager()
+        source = self._seed(manager, "sbx-src", "10.250.0.2")
+        fork = self._seed(manager, "sbx-src-fork-1", "10.250.0.3")
+        runtime = _RecordingRuntime(Path("/nonexistent"))
+        engine = self._engine(manager, runtime)
+
+        self.assertTrue(engine.transfer_network_lease(fork, source, probe=True))
+        # No lease moved, no metadata touched.
+        self.assertEqual(manager.resolve_sandbox_id("10.250.0.3"), fork)
+        self.assertEqual(runtime.metadata_updates, [])
+
+    def test_vanished_lease_after_probe_raises_rather_than_downgrading(self) -> None:
+        # The fork was already dumped-and-stopped by the time the real
+        # transfer runs; a silent False would send the caller down the
+        # repair path with an image bound to the fork's address (decision
+        # 13). No fork lease seeded → transfer_lease returns None.
+        from crab.ids import SandboxId
+
+        manager = self._manager()
+        self._seed(manager, "sbx-src", "10.250.0.2")
+        runtime = _RecordingRuntime(Path("/nonexistent"))
+        engine = self._engine(manager, runtime)
+
+        with self.assertRaises(RuntimeError):
+            engine.transfer_network_lease(SandboxId("sbx-src-fork-1"), SandboxId("sbx-src"))
+
+
 class ConfigGateTests(unittest.TestCase):
     def test_defaults_off(self) -> None:
         from crab.engine import EngineConfig

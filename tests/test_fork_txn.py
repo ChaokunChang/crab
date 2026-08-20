@@ -159,6 +159,13 @@ class ForkTxnSystemBase(unittest.TestCase):
         def lease_hook(sandbox_id):
             self.hook_calls.append(("lease_repair", str(sandbox_id)))
 
+        # Saved so subclasses can re-wire with an extra hook. `lease_transfer`
+        # is deliberately left unwired here: the commit tests below then pin
+        # the no-transfer path, which is what an unnetworked promotion does.
+        self._fork_hook = fork_hook
+        self._destroy_hook = destroy_hook
+        self._lease_hook = lease_hook
+
         self.system.configure_fork_txn_hooks(
             fork=fork_hook, destroy=destroy_hook, lease_repair=lease_hook
         )
@@ -377,6 +384,102 @@ class CommitForkTxnTests(ForkTxnSystemBase):
         description = self._begin()
         with self.assertRaises(TxnMismatchError):
             self.system.commit_txn(self.fork, description.txn_id)
+
+
+class PromotionNetnsTransferTests(ForkTxnSystemBase):
+    """PR-N1: the fork is dumped inside its own netns, so its sockets are
+    bound to the fork's guest IP. Promotion therefore moves that network
+    identity onto the source instead of restoring the image against the
+    source's netns, where CRIU's soccr cannot bind the addresses back
+    (`EADDRNOTAVAIL`)."""
+
+    def _wire_transfer(self, *, result: bool = True, boom: bool = False) -> list:
+        """Wire the hook and return the runtime call names observed at
+        transfer time, so ordering can be asserted rather than assumed."""
+        seen_calls: list[list[str]] = []
+
+        def transfer(fork_id, source_id, *, probe: bool = False):
+            if probe:
+                # The pre-flight asks whether a transfer would happen; it
+                # must not record a call or mutate anything.
+                return result
+            self.hook_calls.append(("lease_transfer", str(fork_id), str(source_id)))
+            seen_calls.append([call[0] for call in self.fake.calls])
+            if boom:
+                raise RuntimeError("netns busy")
+            return result
+
+        self.system.configure_fork_txn_hooks(
+            fork=self._fork_hook,
+            destroy=self._destroy_hook,
+            lease_repair=self._lease_hook,
+            lease_transfer=transfer,
+        )
+        return seen_calls
+
+    def test_transfer_replaces_repair_and_precedes_the_restore(self) -> None:
+        description = self._begin()
+        mocks = self._patch_commit_flows()
+        seen = self._wire_transfer()
+
+        result = self.system.commit_txn(self.source, description.txn_id)
+
+        self.assertEqual(result.promoted_checkpoint_id, "ckpt-commit")
+        self.assertIn(
+            ("lease_transfer", str(self.fork), str(self.source)), self.hook_calls
+        )
+        # The transferred netns is already plumbed and was never torn down;
+        # repairing the source's released lease would be wrong.
+        self.assertNotIn(("lease_repair", str(self.source)), self.hook_calls)
+        # The dataset swap is complete and the restore has not started.
+        self.assertEqual(
+            seen, [["stop", "delete_runtime", "promote", "destroy_fs", "clone"]]
+        )
+        mocks.restore.assert_called_once()
+
+    def test_a_fork_without_its_own_lease_keeps_the_repair_path(self) -> None:
+        # Engine.fork_sandbox only logs lease-allocation failures, so a
+        # networked engine can hold a lease-less fork; it shares the source's
+        # netns, which is exactly what lease_repair already handles. The
+        # probe says "no transfer", so the fork is also dumped
+        # leave_running=True and stays retryable.
+        description = self._begin()
+        mocks = self._patch_commit_flows()
+        self._wire_transfer(result=False)
+
+        result = self.system.commit_txn(self.source, description.txn_id)
+
+        self.assertEqual(result.promoted_checkpoint_id, "ckpt-commit")
+        self.assertNotIn(
+            ("lease_transfer", str(self.fork), str(self.source)), self.hook_calls
+        )
+        self.assertIn(("lease_repair", str(self.source)), self.hook_calls)
+        self.assertTrue(mocks.checkpoint.call_args.kwargs["leave_running"])
+
+    def test_the_transfer_path_dumps_the_fork_stopped(self) -> None:
+        """Two live copies of a listener cannot share one netns (CRIU:
+        "Can't bind inet socket: Address already in use"), so the fork's
+        processes leave the namespace at dump time — the standard CRIU
+        migration shape."""
+        description = self._begin()
+        mocks = self._patch_commit_flows()
+        self._wire_transfer()
+
+        self.system.commit_txn(self.source, description.txn_id)
+
+        self.assertFalse(mocks.checkpoint.call_args.kwargs["leave_running"])
+
+    def test_transfer_failure_keeps_the_fork_and_the_txn(self) -> None:
+        description = self._begin()
+        mocks = self._patch_commit_flows()
+        self._wire_transfer(boom=True)
+
+        with self.assertRaises(TxnError):
+            self.system.commit_txn(self.source, description.txn_id)
+
+        mocks.restore.assert_not_called()
+        self.assertNotIn(("destroy", str(self.fork)), self.hook_calls)
+        self.assertTrue(self.system._txn_active(self.source))
 
 
 class AbortForkTxnTests(ForkTxnSystemBase):

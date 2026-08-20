@@ -851,6 +851,34 @@ class RuncRuntime(Runtime):
             except Exception:
                 logger.exception("Failed to unregister sandbox %s from host inspector", sandbox_id)
 
+    def update_network_metadata(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        guest_ip: str,
+        network_namespace_path: str,
+    ) -> None:
+        """Re-point an already-launched sandbox's network metadata.
+
+        Launch metadata is written once by the SDK from the sandbox's network
+        lease and is otherwise immutable. Promotion breaks that assumption:
+        the source identity adopts the fork's lease, so the address recorded
+        at launch becomes dead. Two readers depend on it — the engine's
+        interceptor attribution fallback and `Sandbox.get_host` — so the
+        metadata is part of the identity swap, not cosmetic.
+
+        Missing sandboxes are ignored: the caller is mid-swap and a sandbox
+        without a description has no metadata to correct.
+        """
+        with self._lock:
+            description = self._items.get(sandbox_id)
+        if description is None:
+            return
+        new_metadata = dict(description.metadata)
+        new_metadata["guest_ip"] = guest_ip
+        new_metadata["network_namespace_path"] = network_namespace_path
+        self._update_description(replace(description, metadata=new_metadata))
+
     def update_host_inspector_filters(
         self,
         sandbox_id: SandboxId,
