@@ -429,6 +429,13 @@ flush a queue into and no abort for a seal to block, so accepting either
 name would promise something this cannot deliver. Reads are never gated.
 The session is per sandbox and released when the fork is destroyed.
 
+**Requires the egress proxy.** Gating happens in the host-side proxy, so
+`effects="reject"` only bites on an engine started with
+`enable_egress_proxy=True` (which itself needs
+`enable_sandbox_network=True`). Without it there is nothing to gate with:
+the call still succeeds and the fork writes freely, and Crab logs a warning
+naming the missing prerequisite rather than failing the fork.
+
 Three config keys govern three different things — the middle two are one
 word apart, so they are always shown together:
 
