@@ -194,6 +194,45 @@ class BtrfsReceiveDumpParserTests(unittest.TestCase):
         )
         self.assertEqual(parse_btrfs_receive_dump(stdout, snapshot_name="s@changeset-x"), [])
 
+    def test_atime_only_utimes_is_not_a_modification(self) -> None:
+        """`btrfs send` emits utimes for inodes the sandbox merely read or
+        executed. Those are not changes, and left in they collide with the
+        same image paths on the other side of a merge. Timestamps pinned
+        from real VM dump output."""
+        stdout = (
+            "utimes ./s@changeset-x/usr/bin/mv atime=2026-08-20T10:41:33+0000 "
+            "mtime=2026-08-20T10:41:32+0000 ctime=2026-08-20T10:41:32+0000\n"
+        )
+        self.assertEqual(parse_btrfs_receive_dump(stdout, snapshot_name="s@changeset-x"), [])
+
+    def test_touch_is_still_a_modification(self) -> None:
+        # `touch` sets atime and mtime to now, so ctime is not older than
+        # atime — the read-noise rule must not swallow it.
+        stdout = (
+            "utimes ./s@changeset-x/probe/g.txt atime=2026-08-20T10:41:33+0000 "
+            "mtime=2026-08-20T10:41:33+0000 ctime=2026-08-20T10:41:33+0000\n"
+        )
+        entries = parse_btrfs_receive_dump(stdout, snapshot_name="s@changeset-x")
+        self.assertEqual([(e.change, e.path) for e in entries], [("modified", "/probe/g.txt")])
+
+    def test_written_then_read_file_survives_via_its_extent_line(self) -> None:
+        # Content change plus a later read: the utimes line looks like
+        # read-noise on its own, but update_extent already reported it.
+        stdout = (
+            "update_extent ./s@changeset-x/probe/h.txt offset=0 len=4\n"
+            "utimes ./s@changeset-x/probe/h.txt atime=2026-08-20T10:41:40+0000 "
+            "mtime=2026-08-20T10:41:33+0000 ctime=2026-08-20T10:41:33+0000\n"
+        )
+        entries = parse_btrfs_receive_dump(stdout, snapshot_name="s@changeset-x")
+        self.assertEqual([(e.change, e.path) for e in entries], [("modified", "/probe/h.txt")])
+
+    def test_unparseable_utimes_stays_a_modification(self) -> None:
+        # Conservative fallback: an unexpected timestamp format must not
+        # silently drop a path from the changeset.
+        stdout = "utimes ./s@changeset-x/probe/x.txt atime=2026 mtime=2026 ctime=2026\n"
+        entries = parse_btrfs_receive_dump(stdout, snapshot_name="s@changeset-x")
+        self.assertEqual([(e.change, e.path) for e in entries], [("modified", "/probe/x.txt")])
+
     def test_rmdir_of_preexisting_directory_is_removed(self) -> None:
         stdout = "rmdir ./s@changeset-x/olddir\n"
         entries = parse_btrfs_receive_dump(stdout, snapshot_name="s@changeset-x")

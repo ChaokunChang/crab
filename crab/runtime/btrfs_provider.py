@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import uuid
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 from ..ids import CheckpointId, SandboxId
@@ -34,10 +35,11 @@ _BTRFS_DUMP_MODIFY_COMMANDS = {
     "fileattr",
     "chmod",
     "chown",
-    "utimes",
     "set_xattr",
     "remove_xattr",
 }
+# `utimes` is handled separately (_utimes_is_read_noise): it also fires for
+# inodes whose only change is an atime bump from being read or executed.
 
 
 def _tokenize_dump_line(line: str) -> list[str]:
@@ -76,6 +78,43 @@ def _dump_container_path(raw: str, snapshot_name: str) -> str | None:
         return None
     trimmed = remainder.rstrip("/")
     return trimmed if trimmed else "/"
+
+
+def _parse_dump_time(raw: str | None) -> datetime | None:
+    """Parse a `btrfs receive --dump` timestamp (``2026-08-20T10:41:33+0000``).
+    Returns None for anything unparseable, so callers stay conservative."""
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y-%m-%dT%H:%M:%S%z")
+    except ValueError:
+        return None
+
+
+def _utimes_is_read_noise(args: dict[str, str]) -> bool:
+    r"""True when the newest event on this inode was a *read*.
+
+    ``btrfs send`` emits ``utimes`` for every inode it touches, including
+    ones whose only change since the base is an atime bump from being read
+    or executed. Left unfiltered that floods the changeset with image
+    binaries the sandbox merely ran (``/usr/bin/mv``, ``libacl.so`` …),
+    which then look like fork-side modifications to the C2 merge and
+    collide with the same paths on the source side.
+
+    Any real change pushes ctime to at least atime — a write or chmod sets
+    ctime to now while atime stays older, and ``touch`` sets all three to
+    now. Only a read leaves ``atime > ctime``. Verified against real dump
+    output: read → ``atime=33 mtime=32 ctime=32``; touch → ``33/33/33``;
+    write → ``32/33/33`` (plus its own ``update_extent`` line, so content
+    changes are never dropped by this rule).
+
+    Missing or malformed timestamps keep the entry.
+    """
+    atime = _parse_dump_time(args.get("atime"))
+    ctime = _parse_dump_time(args.get("ctime"))
+    if atime is None or ctime is None:
+        return False
+    return atime > ctime
 
 
 def parse_btrfs_receive_dump(stdout: str, *, snapshot_name: str) -> list[ChangesetEntry]:
@@ -155,6 +194,13 @@ def parse_btrfs_receive_dump(stdout: str, *, snapshot_name: str) -> list[Changes
                 created.discard(path)
             else:
                 removed.add(path)
+        elif command == "utimes":
+            # A bare atime bump is not a modification (see
+            # _utimes_is_read_noise); a genuine `touch` still is.
+            if _utimes_is_read_noise(args):
+                continue
+            if path not in created and path not in renamed:
+                modified.add(path)
         elif command in _BTRFS_DUMP_MODIFY_COMMANDS:
             if path not in created and path not in renamed:
                 modified.add(path)
