@@ -253,6 +253,21 @@ service behavior should be validated for each task.
   live source processes (they die). Returns a ProcessMergeReport.
   Works both locally and against the daemon
   (`crab sandbox merge-processes`).
+
+### Promotion and the sandbox's network identity
+
+Both promotion paths above — a fork-backed `commit()` and a
+`merge_processes` that promotes — restore the fork's process image onto
+the source's identity. When sandbox networking is on, the fork's dumped
+sockets are bound to the *fork's* guest IP, so the source **adopts the
+fork's network lease** during the swap: its `sandbox_id` is unchanged (SDK
+handles keep working), but its **guest IP changes** to the fork's. This is
+what lets an in-sandbox server or client survive the cutover — the address
+moved with it. Egress attribution and `Sandbox.get_host` follow the new
+address automatically. On this path the fork is dumped stopped, so a
+failed promotion is recovered by re-restoring the promoted checkpoint, not
+by resuming the fork; the fork's filesystem is retained until the swap is
+proven. Networking-off deployments are unaffected (no lease to move).
 - `Sandbox.consolidate_observations(fork, policy="append",
   summarizer=None)` adopts a fork's journal history into this sandbox's
   journal as `kind="observation"` records with provenance (fork id,

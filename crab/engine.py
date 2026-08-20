@@ -1231,6 +1231,7 @@ class Engine:
             fork=self._fork_for_txn,
             destroy=self._destroy_txn_fork,
             lease_repair=self.repair_network_lease,
+            lease_transfer=self.transfer_network_lease,
         )
         return system
 
@@ -1652,6 +1653,71 @@ class Engine:
         except Exception:
             logger.exception("Failed to repair sandbox network lease: %s", sandbox_id)
             return False
+
+    def transfer_network_lease(
+        self,
+        from_sandbox_id: SandboxId,
+        to_sandbox_id: SandboxId,
+        *,
+        probe: bool = False,
+    ) -> bool:
+        """Move a fork's network identity onto the source it is promoted into.
+
+        Three things have to move together, which is why this is one call:
+        the lease itself (so the address still exists), the target's bundle
+        `netns` path (so runc restores into the namespace the image was
+        dumped in), and the target's runtime metadata (so the interceptor's
+        attribution fallback and `Sandbox.get_host` stop serving the dead
+        address). Returns False when there is nothing to transfer, which
+        tells the caller to keep the `repair_network_lease` path.
+
+        With ``probe=True`` nothing is mutated and the return value only
+        answers "would a transfer happen?" — the promotion needs that before
+        it dumps the fork, because a transferred netns requires the fork's
+        processes to leave it. The probe swallows its own errors (a
+        pre-flight must not abort the promotion); the real call does not,
+        because by then the fork is dumped-and-stopped and a silent False
+        would send the caller down the repair path with a stopped fork and
+        an image bound to the fork's address.
+        """
+        manager = self._network_manager
+        if manager is None:
+            return False
+        if probe:
+            try:
+                return manager.lease_for(from_sandbox_id) is not None
+            except Exception:
+                logger.exception("Failed to probe sandbox network lease: %s", from_sandbox_id)
+                return False
+        lease = manager.transfer_lease(from_sandbox_id, to_sandbox_id)
+        if lease is None:
+            # The probe already confirmed a lease before the fork was
+            # dumped, so None here means it vanished mid-promotion. The
+            # fork is stopped and its image carries the fork's address;
+            # falling back to repair would restore it into the wrong netns.
+            # Surface it so _promote_fork_onto_source raises with the cause.
+            raise RuntimeError(
+                f"network lease for {from_sandbox_id} vanished between the "
+                "promotion pre-flight and the transfer"
+            )
+        netns_path = str(lease.namespace_path)
+        forking.retarget_bundle_network_namespace(
+            self.runtime.bundle_path_for(to_sandbox_id), netns_path
+        )
+        update_metadata = getattr(self.runtime, "update_network_metadata", None)
+        if update_metadata is not None:
+            try:
+                update_metadata(
+                    to_sandbox_id,
+                    guest_ip=str(lease.guest_ip),
+                    network_namespace_path=netns_path,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to refresh network metadata after lease transfer sandbox=%s",
+                    to_sandbox_id,
+                )
+        return True
 
     def fork_sandbox(
         self,
