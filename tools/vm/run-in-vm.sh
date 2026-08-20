@@ -35,6 +35,7 @@ if [ "${1:-}" = --revert-pristine ]; then
     qemu-img snapshot -a pristine "$DISK"
     vm_boot
     vm_wait_ssh 60 || die "VM did not come back after revert"
+    vm_ensure_btrfs_noatime
     echo "run-in-vm: revert complete" >&2
     exit 0
 fi
@@ -45,6 +46,9 @@ if ! vm_running; then
     vm_boot
 fi
 vm_wait_ssh 60 || die "VM did not become reachable over SSH"
+# The pristine snapshot predates the noatime requirement, so this self-heals
+# on every boot rather than trusting provision-time setup (see vm-lib.sh).
+vm_ensure_btrfs_noatime
 
 # --- sync the repository ------------------------------------------------------
 vm_rsync_repo "$REPO_ROOT"
