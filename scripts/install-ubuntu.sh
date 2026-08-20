@@ -217,6 +217,31 @@ else
     if ! findmnt -no OPTIONS --target "${BTRFS_ROOT}" | grep -qw noatime; then
       log "Remounting ${BTRFS_ROOT} with noatime (required for clean changesets)"
       mount -o remount,noatime "${BTRFS_ROOT}" || die "failed to remount ${BTRFS_ROOT} with noatime"
+      # A remount alone does not survive a reboot, and the noise it lets
+      # back in is silent: changesets simply start listing binaries the
+      # sandbox executed. Persist it, or say plainly that we could not.
+      BTRFS_MOUNT_TARGET=$(findmnt -no TARGET --target "${BTRFS_ROOT}")
+      # --target resolves to the enclosing mount, which may be a parent
+      # (e.g. /) rather than BTRFS_ROOT itself. Persisting noatime there
+      # widens the change beyond Crab's directory, so flag it.
+      if [[ "${BTRFS_MOUNT_TARGET}" != "${BTRFS_ROOT}" ]]; then
+        log "WARNING: ${BTRFS_ROOT} is not its own mount; noatime applies to the"
+        log "WARNING: enclosing filesystem ${BTRFS_MOUNT_TARGET}. Mount Crab's btrfs"
+        log "WARNING: on a dedicated subvolume/loop file to scope this to Crab."
+      fi
+      if awk -v t="${BTRFS_MOUNT_TARGET}" '$1 !~ /^#/ && $2 == t { found = 1 } END { exit !found }' /etc/fstab; then
+        FSTAB_TMP=$(mktemp)
+        awk -v t="${BTRFS_MOUNT_TARGET}" 'BEGIN { OFS = " " }
+          $1 !~ /^#/ && $2 == t && $4 !~ /(^|,)noatime(,|$)/ { $4 = $4 ",noatime" }
+          { print }' /etc/fstab >"${FSTAB_TMP}" &&
+          cat "${FSTAB_TMP}" >/etc/fstab
+        rm -f -- "${FSTAB_TMP}"
+        log "Persisted noatime on the ${BTRFS_MOUNT_TARGET} entry in /etc/fstab"
+      else
+        log "WARNING: ${BTRFS_MOUNT_TARGET} has no /etc/fstab entry, so noatime is not persistent."
+        log "WARNING: add noatime to how that filesystem is mounted, or changesets will silently"
+        log "WARNING: regain read-induced noise after the next reboot."
+      fi
     fi
   else
     ((CREATE_POOL == 1)) || die "no btrfs filesystem mounted at ${BTRFS_ROOT}"

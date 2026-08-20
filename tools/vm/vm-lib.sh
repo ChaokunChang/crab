@@ -91,3 +91,24 @@ vm_rsync_repo() {
         --exclude '.ruff_cache' \
         "$1/" "$SSH_DEST:/root/crab/"
 }
+
+# vm_ensure_btrfs_noatime — enforce noatime on the guest's btrfs root.
+#
+# Read-induced atime bumps surface in `btrfs send` diffs as utimes-only
+# entries, so a relatime mount fills every changeset with image binaries the
+# sandbox merely executed (`/usr/bin/mv`, `libacl.so` …). vm-setup.sh sets
+# this at provision time, but a pristine snapshot taken before that rule
+# existed carries a stale `btrfs loop 0 0` fstab line, and every
+# --revert-pristine restores it. So the repair runs on each boot instead of
+# once at provision time. Quiet when the mount is already correct.
+vm_ensure_btrfs_noatime() {
+    ssh "${SSH_OPTS[@]}" "$SSH_DEST" '
+        B=/var/lib/crab/crab.btrfs
+        M=/var/lib/crab/btrfs
+        mountpoint -q "$M" || exit 0
+        findmnt -no OPTIONS "$M" | grep -qw noatime && exit 0
+        echo "vm: remounting $M with noatime (required for clean changesets)" >&2
+        mount -o remount,noatime "$M" || exit 1
+        sed -i "s|^$B $M btrfs loop 0 0\$|$B $M btrfs loop,noatime 0 0|" /etc/fstab
+    ' || echo "vm-lib: WARNING could not enforce noatime on the btrfs root" >&2
+}
