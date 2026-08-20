@@ -885,6 +885,10 @@ class CrabSystem:
 
     def release_fork(self, target_sandbox_id: SandboxId) -> None:
         """Reverse fork_once's bookkeeping when a fork is destroyed."""
+        # First, and unconditionally: a bare fork's effect session (F1). This
+        # cannot ride the chain-pin path below, which returns early when the
+        # fork has no pin — the session would then leak onto a dead id.
+        self._release_effect_session(target_sandbox_id)
         with self._fork_lock:
             pin = self._fork_chain_pins.pop(target_sandbox_id, None)
             for children in self._fork_children.values():
@@ -2678,18 +2682,82 @@ class CrabSystem:
         return dict(self.effect_policy_defaults or {})
 
     def _resolve_effect_policy(self, isolation: str, requested: str | None) -> str:
+        """Resolve a transaction's effect policy. ``isolation`` is the txn's
+        (``"fork"`` or snapshot); bare forks go through
+        `_resolve_standalone_fork_policy` instead — they are a third kind,
+        not a third isolation."""
         defaults = self._effect_defaults()
         if requested is not None:
             return requested
         key = "fork_policy" if isolation == "fork" else "default_policy"
         return str(defaults.get(key) or ("reject" if isolation == "fork" else "allow"))
 
+    def _resolve_standalone_fork_policy(self, requested: str | None) -> str:
+        """Policy for a fork taken outside any transaction (F1).
+
+        Deliberately separate from `_resolve_effect_policy`: the config key
+        is `standalone_fork_policy` (default ``allow``, so today's forks
+        keep writing), not `fork_policy`, which means fork-*backed
+        transactions* and defaults to ``reject``. Only ``allow``/``reject``
+        are honorable here — see `validate_standalone_fork_policy`.
+        """
+        if requested is not None:
+            return requested
+        defaults = self._effect_defaults()
+        return str(defaults.get("standalone_fork_policy") or "allow")
+
+    def validate_standalone_fork_policy(self, effects: str | None) -> str:
+        """Resolve and check a bare fork's effect policy, raising before any
+        fork is created.
+
+        ``defer`` and ``seal`` are refused rather than silently degraded
+        (F1 decision 5): a bare fork has no commit to flush a queue into and
+        no abort for a seal to block, so honoring either name would be a
+        guarantee this cannot keep.
+        """
+        policy = self._resolve_standalone_fork_policy(effects)
+        if policy not in EFFECT_POLICIES:
+            raise ValueError(
+                f"unknown effect policy: {policy!r} (expected one of {EFFECT_POLICIES})"
+            )
+        if policy == "defer":
+            raise ValueError(
+                "effects='defer' is not supported for a bare fork: there is no "
+                "commit to flush the queue into (the promotion hand-off is "
+                "future work). Use 'reject' or 'allow'."
+            )
+        if policy == "seal":
+            raise ValueError(
+                "effects='seal' is not supported for a bare fork: seal makes a "
+                "transaction non-abortable, and a bare fork has no abort to "
+                "block. Use 'reject' or 'allow'."
+            )
+        return policy
+
+    def arm_fork_effect_session(self, fork_id: SandboxId, policy: str) -> None:
+        """Install a bare fork's effect session (F1).
+
+        Called per fork right after it is created, so a gated fork is
+        covered before anything inside it can run. ``allow`` still opens a
+        session, matching the txn paths: counters stay uniform and the gate
+        passes writes through.
+        """
+        self._arm_effect_session(
+            fork_id, policy=policy, txn_id=None, isolation="standalone_fork"
+        )
+
     def _arm_effect_session(
-        self, sandbox_id: SandboxId, *, policy: str, txn_id: str, isolation: str
+        self,
+        sandbox_id: SandboxId,
+        *,
+        policy: str,
+        txn_id: str | None,
+        isolation: str,
     ) -> None:
-        """Open the effect window for a txn. ``allow`` still opens a session
-        so counters and `seal`-style bookkeeping stay uniform; the gate
-        simply passes writes through."""
+        """Open the effect window for a txn, or for a bare fork
+        (``txn_id=None``, F1). ``allow`` still opens a session so counters
+        and `seal`-style bookkeeping stay uniform; the gate simply passes
+        writes through."""
         gate = self.effect_gate
         if gate is None:
             return

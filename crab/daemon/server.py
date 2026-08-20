@@ -362,8 +362,11 @@ class _Routes:
         if count < 1:
             raise _BadRequest("fork count must be >= 1")
         lazy = bool(body.get("lazy", False))
+        effects = body.get("effects")
+        if effects is not None and not isinstance(effects, str):
+            raise _BadRequest("fork effects must be a string")
         try:
-            fork_ids = eng.fork_sandbox(sid, count=count, lazy=lazy)
+            fork_ids = eng.fork_sandbox(sid, count=count, lazy=lazy, effects=effects)
         except (ValueError, RuntimeError) as exc:
             raise _BadRequest(f"fork failed: {exc}") from exc
         forks: list[dict[str, Any]] = []

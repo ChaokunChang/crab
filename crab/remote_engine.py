@@ -782,16 +782,31 @@ class RemoteEngine:
         *,
         count: int = 1,
         lazy: bool = False,
+        effects: str | None = None,
+        gate_effects: bool = True,
     ) -> list[SandboxId]:
         """Fork via the daemon. Mirrors `Engine.fork_sandbox`; the daemon
         runs the whole checkpoint + clone + restore pipeline and returns
         the new sandbox ids. Timeout scales with count the same way
-        checkpoint/restore calls are budgeted (300s each)."""
+        checkpoint/restore calls are budgeted (300s each).
+
+        ``effects`` rides the request so a gated fork (F1) is validated and
+        armed daemon-side, before the fork's processes are restored.
+        ``gate_effects=False`` has no remote counterpart: the daemon owns
+        the fork-txn path itself, so it is only accepted here to keep the
+        in-process signature substitutable."""
         if count < 1:
             raise ValueError("fork count must be >= 1")
+        if not gate_effects and effects is not None:
+            raise ValueError(
+                "effects= is not accepted when the caller owns the effect window"
+            )
+        payload: dict = {"count": int(count), "lazy": bool(lazy)}
+        if effects is not None:
+            payload["effects"] = str(effects)
         response = self._client.post_json(
             f"/sandboxes/{source_sandbox_id}/fork",
-            {"count": int(count), "lazy": bool(lazy)},
+            payload,
             timeout_seconds=300.0 * count,
         )
         return [

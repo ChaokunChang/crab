@@ -199,13 +199,16 @@ service behavior should be validated for each task.
 
 ## Current limitations
 
-- `Sandbox.fork(count, lazy=False)` clones a running sandbox via
-  checkpoint+restore: each fork is an independent, running sandbox sharing
-  the parent's state at fork time (incremental chain sharing applies when
-  available). `lazy=True` restores with CRIU lazy-pages for a faster
-  return. Forks share the parent's `work_dir` host mount. Works both with
-  a local in-process engine and against the daemon (`crab sandbox fork`
-  from the CLI).
+- `Sandbox.fork(count, lazy=False, effects=None)` clones a running sandbox
+  via checkpoint+restore: each fork is an independent, running sandbox
+  sharing the parent's state at fork time (incremental chain sharing
+  applies when available). `lazy=True` restores with CRIU lazy-pages for a
+  faster return. Forks share the parent's `work_dir` host mount.
+  `effects` declares what the fork is *for*, which decides whether its
+  outbound writes are gated — see
+  [Fork intent and outbound writes](#fork-intent-and-outbound-writes).
+  Works both with a local in-process engine and against the daemon
+  (`crab sandbox fork` from the CLI).
 - `Sandbox.begin(label=None)` opens a snapshot-based transaction
   (`with sandbox.begin() as txn:` commits on clean exit, aborts on
   exception; `txn.exec/commit/abort`). Begin takes an adaptive base
@@ -404,6 +407,42 @@ proven. Networking-off deployments are unaffected (no lease to move).
   `"reject"`: a replayed command's write would be the fork's write
   fired **twice**, so it is refused and shows up as a deviation instead.
   Pass `"allow"` to re-issue it.
+
+### Fork intent and outbound writes
+
+Whether a fork's outbound writes are gated depends on what the fork is
+*for*, so `Sandbox.fork(effects=...)` asks (F1):
+
+- **omitted (default)** — an *independent branch*. An RL rollout or a
+  tree-search arm is a first-class timeline whose external effects are
+  intended: N forks legitimately produce N effects, and nothing is gated.
+  Unchanged from before.
+- `effects="reject"` — a *temporal branch*. A speculative fork serves its
+  parent and must not write on its own, so mutating plaintext egress is
+  refused with `503` and counted in the fork's ledger as `rejected`. If the
+  guess pays off, the promoted identity issues the write — once.
+- `effects="allow"` — explicit opt-out, identical to omitting it unless the
+  deployment flipped the default below.
+
+`"defer"` and `"seal"` raise `ValueError`: a bare fork has no commit to
+flush a queue into and no abort for a seal to block, so accepting either
+name would promise something this cannot deliver. Reads are never gated.
+The session is per sandbox and released when the fork is destroyed.
+
+Three config keys govern three different things — the middle two are one
+word apart, so they are always shown together:
+
+| config key | applies to | default |
+|---|---|---|
+| `effects.default_policy` | snapshot transactions | `allow` |
+| `effects.fork_policy` | fork-backed transactions (`begin(isolation="fork")`) | `reject` |
+| `effects.standalone_fork_policy` | `sandbox.fork()` outside any transaction | `allow` |
+
+**Bounded by TLS**: `effects="reject"` on a fork prevents *plaintext*
+mutating egress. HTTPS writes remain unclassifiable and are not blocked, so
+a speculative fork that writes over HTTPS can still double-fire. Closing
+that gap needs TLS interception, which is deliberately out of scope.
+
 - `TxnAbortResult.mutating_egress` counts the mutating flows the
   transaction already fired: the filesystem rollback cannot undo them,
   so the abort reports rather than hides them (holding or rejecting

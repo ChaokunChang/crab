@@ -68,9 +68,14 @@ class _FakeEngine:
         self.fork_calls: list[dict] = []
         self.fork_error: Exception | None = None
 
-    def fork_sandbox(self, source_sandbox_id, *, count=1, lazy=False):
+    def fork_sandbox(self, source_sandbox_id, *, count=1, lazy=False, effects=None):
         self.fork_calls.append(
-            {"source": str(source_sandbox_id), "count": count, "lazy": lazy}
+            {
+                "source": str(source_sandbox_id),
+                "count": count,
+                "lazy": lazy,
+                "effects": effects,
+            }
         )
         if self.fork_error is not None:
             raise self.fork_error
@@ -118,7 +123,7 @@ class ForkRouteHandlerTests(unittest.TestCase):
         self.assertEqual(response["forks"], [{"sandbox_id": "src-fork-0"}])
         self.assertEqual(
             self.engine.fork_calls,
-            [{"source": "src", "count": 1, "lazy": False}],
+            [{"source": "src", "count": 1, "lazy": False, "effects": None}],
         )
 
     def test_fork_propagates_count_and_lazy_and_registers(self) -> None:
@@ -131,7 +136,7 @@ class ForkRouteHandlerTests(unittest.TestCase):
         )
         self.assertEqual(
             self.engine.fork_calls,
-            [{"source": "src", "count": 2, "lazy": True}],
+            [{"source": "src", "count": 2, "lazy": True, "effects": None}],
         )
         # Forks land in the daemon registry so /sandboxes lists them and
         # daemon shutdown tears them down.
@@ -140,6 +145,20 @@ class ForkRouteHandlerTests(unittest.TestCase):
         # (the SDK-side seeding is a no-op shim in daemon mode).
         self.assertIn(("upsert_snapshot", "src-fork-0", True), self.engine.log)
         self.assertIn(("upsert_snapshot", "src-fork-1", True), self.engine.log)
+
+    def test_fork_propagates_the_effect_policy(self) -> None:
+        # F1: the policy has to reach the daemon-side engine, which is where
+        # it is validated and armed before the fork's processes restore.
+        self.routes.fork_sandbox({"effects": "reject"}, sandbox_id="src")
+        self.assertEqual(
+            self.engine.fork_calls,
+            [{"source": "src", "count": 1, "lazy": False, "effects": "reject"}],
+        )
+
+    def test_fork_rejects_a_non_string_effect_policy(self) -> None:
+        with self.assertRaises(_BadRequest):
+            self.routes.fork_sandbox({"effects": 7}, sandbox_id="src")
+        self.assertEqual(self.engine.fork_calls, [])
 
 
     def test_fork_rejects_bad_count(self) -> None:
@@ -252,6 +271,34 @@ class RemoteEngineForkTests(unittest.TestCase):
         engine = RemoteEngine(client, info=self._INFO)
         with self.assertRaises(ValueError):
             engine.fork_sandbox(SandboxId("src"), count=0)
+        self.assertEqual(client.requests, [])
+
+    def test_fork_sandbox_sends_the_effect_policy_only_when_given(self) -> None:
+        # F1 over RPC. Omitting `effects` must not add the key at all, so a
+        # newer SDK keeps working against a daemon that predates it.
+        client = _FakeDaemonClient(
+            {"ok": True, "forks": [{"sandbox_id": "src-fork-a"}]}
+        )
+        engine = RemoteEngine(client, info=self._INFO)
+
+        engine.fork_sandbox(SandboxId("src"), count=1)
+        self.assertEqual(client.requests[-1]["payload"], {"count": 1, "lazy": False})
+
+        engine.fork_sandbox(SandboxId("src"), count=1, effects="reject")
+        self.assertEqual(
+            client.requests[-1]["payload"],
+            {"count": 1, "lazy": False, "effects": "reject"},
+        )
+
+    def test_fork_sandbox_refuses_effects_when_the_caller_owns_the_window(self) -> None:
+        # The fork-txn path arms its own session; a standalone policy on top
+        # of it would be two windows on one sandbox.
+        client = _FakeDaemonClient({"ok": True, "forks": []})
+        engine = RemoteEngine(client, info=self._INFO)
+        with self.assertRaises(ValueError):
+            engine.fork_sandbox(
+                SandboxId("src"), count=1, effects="reject", gate_effects=False
+            )
         self.assertEqual(client.requests, [])
 
     def test_sandbox_fork_is_transport_agnostic(self) -> None:
