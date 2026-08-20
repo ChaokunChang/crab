@@ -9,6 +9,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from crab.effects import (
@@ -27,8 +28,9 @@ from crab.effects import (
 from crab.egress import CassetteRecorder, EgressProxyServer, EgressRule
 from crab.cassettes import CassetteStore
 from crab.http_wire import parse_head
-from crab.ids import SandboxId
+from crab.ids import CheckpointId, SandboxId
 from crab.journal import ActionJournal
+from crab.system import logger as _system_logger
 from crab.models import EgressFlow, EgressLedger
 
 
@@ -844,17 +846,16 @@ class StandaloneForkPolicyTests(_EffectSystemHarness):
         self.system.release_fork(self.fork_id)
         self.assertIsNone(self.gate.session_for(self.fork_id))
 
-    def test_an_ungated_fork_gets_no_session(self) -> None:
+    def test_an_ungated_fork_passes_writes(self) -> None:
         # Pins F1's narrowing of D3 decision 10: a fork created WITHOUT
         # effects= is not gated. D3 recorded this in prose only; this is its
         # first executable guarantee, so the default cannot regress silently.
+        #
+        # Note the shape: 'allow' still opens a session (counters stay
+        # uniform with the txn paths) — what "ungated" means is that the
+        # decision is PASS, not that no session exists.
         policy = self.system.validate_standalone_fork_policy(None)
         self.assertEqual(policy, "allow")
-        # The engine only arms when a policy was resolved for gating; with
-        # the default 'allow' the gate still opens a session so counters stay
-        # uniform — but the decision is PASS, nothing is refused. (Policy
-        # names and decision names are separate vocabularies: policy 'allow'
-        # yields decision 'pass'.)
         self.system.arm_fork_effect_session(self.fork_id, policy)
         decision = self.gate.decide_write(
             self.fork_id, host="api.example.com", method="POST", path="/x"
@@ -911,6 +912,110 @@ class ForkPipelineGatingTests(unittest.TestCase):
             engine.fork_sandbox(
                 SandboxId("src"), count=1, effects="reject", gate_effects=False
             )
+
+
+class ForkArmOrderingTests(unittest.TestCase):
+    """The load-bearing order inside `Engine.fork_sandbox`: the gate is armed
+    BEFORE the fork's processes are restored (once they run, an ungated write
+    could already be on the wire), and a restore that fails does not leave
+    the session behind."""
+
+    def _engine_and_log(self, *, restore_ok: bool):
+        from crab.engine import Engine
+
+        events: list[str] = []
+
+        class _Runtime:
+            name = "runc"
+            paths = SimpleNamespace(bundle_root=Path("/tmp/crab-fake-bundles"))
+
+            def bundle_path_for(_self, sandbox_id):
+                return Path("/tmp/crab-fake-bundles") / str(sandbox_id)
+
+        class _System:
+            def validate_standalone_fork_policy(_self, effects):
+                return "reject" if effects is None else str(effects)
+
+            def arm_fork_effect_session(_self, fork_id, policy):
+                events.append("arm")
+
+            def _release_effect_session(_self, sandbox_id):
+                events.append("release")
+
+            def fork_once(_self, source, target, *, target_rootfs_path):
+                events.append("fork_once")
+                return SimpleNamespace(checkpoint_id=CheckpointId("ckpt-1"))
+
+            def restore_once(_self, sandbox_id, checkpoint_id, *, restore_metadata=None):
+                events.append("restore")
+                return SimpleNamespace(
+                    status=SimpleNamespace(value="succeeded" if restore_ok else "failed")
+                )
+
+        engine = Engine.__new__(Engine)
+        engine._system = _System()
+        engine._runtime = _Runtime()
+        engine._network_manager = None
+        engine.repair_network_lease = lambda sandbox_id: None
+        return engine, events
+
+    def _run_fork(self, engine):
+        from crab import forking
+
+        with mock.patch.object(forking, "replicate_bundle_config"), mock.patch(
+            "shutil.copy2"
+        ), mock.patch("pathlib.Path.mkdir"), mock.patch(
+            "pathlib.Path.is_file", return_value=False
+        ):
+            return engine.fork_sandbox(SandboxId("src"), count=1, effects="reject")
+
+    def test_arm_precedes_restore(self) -> None:
+        engine, events = self._engine_and_log(restore_ok=True)
+        self._run_fork(engine)
+        # The whole point: arm lands before restore, never after.
+        self.assertLess(events.index("arm"), events.index("restore"))
+        self.assertNotIn("release", events)
+
+    def test_a_failed_restore_releases_the_armed_session(self) -> None:
+        engine, events = self._engine_and_log(restore_ok=False)
+        with self.assertRaises(RuntimeError):
+            self._run_fork(engine)
+        # Otherwise the session would gate a fork id that never came up.
+        self.assertEqual(events[-1], "release")
+
+
+class MissingGateWarningTests(_EffectSystemHarness):
+    """An explicit gating policy on an engine with no effect gate cannot be
+    enforced. It must not fail the fork (callers legitimately ask for
+    `reject` on unnetworked engines), but it must not pass silently either —
+    that is the hollow guarantee this item refuses elsewhere."""
+
+    def test_explicit_reject_without_a_gate_warns(self) -> None:
+        self.system.effect_gate = None
+        with self.assertLogs(_system_logger, level="WARNING") as captured:
+            policy = self.system.validate_standalone_fork_policy("reject")
+        self.assertEqual(policy, "reject")
+        message = "\n".join(captured.output)
+        self.assertIn("enable_egress_proxy", message)
+        self.assertIn("NOT be gated", message)
+
+    def test_the_config_default_path_stays_quiet(self) -> None:
+        # A deployment that never asked per call has not been promised
+        # anything, so the default resolution must not spam warnings.
+        self.system.effect_gate = None
+        self.system.effect_policy_defaults["standalone_fork_policy"] = "reject"
+        with mock.patch.object(_system_logger, "warning") as warned:
+            self.assertEqual(self.system.validate_standalone_fork_policy(None), "reject")
+        warned.assert_not_called()
+
+    def test_explicit_allow_without_a_gate_is_not_a_warning(self) -> None:
+        # 'allow' promises nothing, so a missing gate is irrelevant to it.
+        self.system.effect_gate = None
+        with mock.patch.object(_system_logger, "warning") as warned:
+            self.assertEqual(
+                self.system.validate_standalone_fork_policy("allow"), "allow"
+            )
+        warned.assert_not_called()
 
 
 class FlushAndDropTests(_EffectSystemHarness):

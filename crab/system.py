@@ -2714,6 +2714,15 @@ class CrabSystem:
         (F1 decision 5): a bare fork has no commit to flush a queue into and
         no abort for a seal to block, so honoring either name would be a
         guarantee this cannot keep.
+
+        A gating policy also needs somewhere to gate. The effect gate only
+        exists when the egress proxy is running, so an explicitly requested
+        `reject` on an engine without it would pass validation and then
+        gate nothing — the same hollow guarantee the refusals above avoid.
+        That combination cannot raise (it would break callers who ask for
+        `reject` on an unnetworked engine, e.g. in tests), so it warns
+        loudly instead. The config-default path stays quiet: a deployment
+        that never asked per call has not been promised anything.
         """
         policy = self._resolve_standalone_fork_policy(effects)
         if policy not in EFFECT_POLICIES:
@@ -2731,6 +2740,14 @@ class CrabSystem:
                 "effects='seal' is not supported for a bare fork: seal makes a "
                 "transaction non-abortable, and a bare fork has no abort to "
                 "block. Use 'reject' or 'allow'."
+            )
+        if effects is not None and policy != "allow" and self.effect_gate is None:
+            logger.warning(
+                "fork(effects=%r) cannot be enforced: this engine has no effect "
+                "gate, which requires the egress proxy "
+                "(enable_egress_proxy=True with enable_sandbox_network=True). "
+                "The fork's writes will NOT be gated.",
+                policy,
             )
         return policy
 

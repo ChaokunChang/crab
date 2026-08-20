@@ -1817,15 +1817,22 @@ class Engine:
             # they run, an ungated write could already be on the wire.
             if fork_effect_policy is not None:
                 system.arm_fork_effect_session(target_sandbox_id, fork_effect_policy)
-            restore_result = system.restore_once(
-                target_sandbox_id,
-                result.checkpoint_id,
-                restore_metadata={"lazy_pages": True} if lazy else None,
-            )
-            if restore_result.status.value != "succeeded":
-                raise RuntimeError(
-                    f"fork restore failed for {target_sandbox_id}: status={restore_result.status.value}"
+            try:
+                restore_result = system.restore_once(
+                    target_sandbox_id,
+                    result.checkpoint_id,
+                    restore_metadata={"lazy_pages": True} if lazy else None,
                 )
+                if restore_result.status.value != "succeeded":
+                    raise RuntimeError(
+                        f"fork restore failed for {target_sandbox_id}: status={restore_result.status.value}"
+                    )
+            except Exception:
+                # The session was armed a moment ago for a fork that never
+                # came up; leaving it behind would gate a dead id forever.
+                if fork_effect_policy is not None:
+                    system._release_effect_session(target_sandbox_id)
+                raise
             self.repair_network_lease(target_sandbox_id)
             fork_ids.append(target_sandbox_id)
         return fork_ids
