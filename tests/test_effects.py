@@ -783,6 +783,136 @@ class PolicyResolutionTests(_EffectSystemHarness):
         )
 
 
+class StandaloneForkPolicyTests(_EffectSystemHarness):
+    """F1: a bare `sandbox.fork()` declares its intent. An independent
+    branch (RL rollout, tree search) legitimately produces N effects from N
+    forks and stays ungated; a speculative branch serves a main line and
+    must produce its effect exactly once, so it opts into `reject`."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.fork_id = SandboxId("sbx-d32-fork-1")
+
+    def test_default_is_allow_and_is_not_the_fork_txn_key(self) -> None:
+        # `fork_policy` (reject) governs fork-BACKED TRANSACTIONS; a bare
+        # fork reads `standalone_fork_policy`. Reading the wrong key would
+        # silently gate today's freely writing forks.
+        self.assertEqual(self.system.validate_standalone_fork_policy(None), "allow")
+        self.assertEqual(self.system._resolve_effect_policy("fork", None), "reject")
+
+    def test_configured_default_can_be_flipped(self) -> None:
+        self.system.effect_policy_defaults["standalone_fork_policy"] = "reject"
+        self.assertEqual(self.system.validate_standalone_fork_policy(None), "reject")
+        # An explicit request still wins over the configured default.
+        self.assertEqual(self.system.validate_standalone_fork_policy("allow"), "allow")
+
+    def test_defer_and_seal_are_refused_not_degraded(self) -> None:
+        # A bare fork has no commit to flush a queue into and no abort for a
+        # seal to block; honoring either name would be a guarantee in name
+        # only (F1 decision 5).
+        with self.assertRaises(ValueError) as deferred:
+            self.system.validate_standalone_fork_policy("defer")
+        self.assertIn("defer", str(deferred.exception))
+        with self.assertRaises(ValueError) as sealed:
+            self.system.validate_standalone_fork_policy("seal")
+        self.assertIn("seal", str(sealed.exception))
+
+    def test_unknown_policy_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            self.system.validate_standalone_fork_policy("nonsense")
+
+    def test_arming_a_fork_session_carries_a_null_txn_id(self) -> None:
+        # First time the ledger sees an effect row with no txn: the query
+        # surface must tolerate it (asserted in the ledger test below).
+        self.system.arm_fork_effect_session(self.fork_id, "reject")
+        session = self.gate.session_for(self.fork_id)
+        self.assertEqual(session.policy, "reject")
+        self.assertIsNone(session.txn_id)
+        # Config-driven knobs still apply to a bare fork's session.
+        self.assertEqual(session.on_unlisted, "reject")
+        self.assertEqual(session.opaque_effects, "allow")
+
+    def test_release_fork_disarms_the_session_and_is_idempotent(self) -> None:
+        self.system.arm_fork_effect_session(self.fork_id, "reject")
+        self.assertIsNotNone(self.gate.session_for(self.fork_id))
+
+        self.system.release_fork(self.fork_id)
+
+        self.assertIsNone(self.gate.session_for(self.fork_id))
+        # A fork with no chain pin returns early inside release_fork, so the
+        # disarm must not depend on that path; a second release is a no-op.
+        self.system.release_fork(self.fork_id)
+        self.assertIsNone(self.gate.session_for(self.fork_id))
+
+    def test_an_ungated_fork_gets_no_session(self) -> None:
+        # Pins F1's narrowing of D3 decision 10: a fork created WITHOUT
+        # effects= is not gated. D3 recorded this in prose only; this is its
+        # first executable guarantee, so the default cannot regress silently.
+        policy = self.system.validate_standalone_fork_policy(None)
+        self.assertEqual(policy, "allow")
+        # The engine only arms when a policy was resolved for gating; with
+        # the default 'allow' the gate still opens a session so counters stay
+        # uniform — but the decision is PASS, nothing is refused. (Policy
+        # names and decision names are separate vocabularies: policy 'allow'
+        # yields decision 'pass'.)
+        self.system.arm_fork_effect_session(self.fork_id, policy)
+        decision = self.gate.decide_write(
+            self.fork_id, host="api.example.com", method="POST", path="/x"
+        )
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision[0], DECISION_PASS)
+
+    def test_a_gated_fork_refuses_writes_but_never_reads(self) -> None:
+        self.system.arm_fork_effect_session(self.fork_id, "reject")
+        write = self.gate.decide_write(
+            self.fork_id, host="api.example.com", method="POST", path="/x"
+        )
+        self.assertEqual(write[0], DECISION_REJECT)
+        # Reads are never gated (D3 decision 9) — decide_write is only
+        # consulted for mutating methods, and opaque flows follow
+        # opaque_effects, which stays 'allow' (the documented TLS hole), so
+        # the decision is PASS even under a rejecting policy.
+        opaque = self.gate.decide_opaque(self.fork_id)
+        self.assertIsNotNone(opaque)
+        self.assertEqual(opaque[0], DECISION_PASS)
+
+
+class ForkPipelineGatingTests(unittest.TestCase):
+    """F1 wiring inside `Engine.fork_sandbox`: when the policy is armed
+    relative to the fork's restore, and who owns the effect window."""
+
+    def _engine(self, system):
+        from crab.engine import Engine
+
+        engine = Engine.__new__(Engine)  # bypass full construction
+        engine._system = system
+        return engine
+
+    def test_policy_is_validated_before_any_fork_is_created(self) -> None:
+        # A refused policy must not leave half a fleet behind, so validation
+        # runs before the first bundle is touched.
+        calls: list[str] = []
+
+        class _System:
+            def validate_standalone_fork_policy(_self, effects):
+                calls.append("validate")
+                raise ValueError("effects='seal' is not supported for a bare fork")
+
+        engine = self._engine(_System())
+        with self.assertRaises(ValueError):
+            engine.fork_sandbox(SandboxId("src"), count=3, effects="seal")
+        # Validation happened, and nothing past it ran (no runtime access:
+        # the fake system has no other attributes to call).
+        self.assertEqual(calls, ["validate"])
+
+    def test_a_caller_owning_the_window_may_not_pass_effects(self) -> None:
+        engine = self._engine(object())
+        with self.assertRaises(ValueError):
+            engine.fork_sandbox(
+                SandboxId("src"), count=1, effects="reject", gate_effects=False
+            )
+
+
 class FlushAndDropTests(_EffectSystemHarness):
     def setUp(self) -> None:
         super().setUp()

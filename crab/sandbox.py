@@ -840,7 +840,9 @@ class Sandbox:
         self._engine.repair_network_lease(self.sandbox_id)
         self._mark_inspector_running()
 
-    def fork(self, count: int = 1, *, lazy: bool = False) -> list["Sandbox"]:
+    def fork(
+        self, count: int = 1, *, lazy: bool = False, effects: str | None = None
+    ) -> list["Sandbox"]:
         """Clone this sandbox via checkpoint+restore. Each fork is an
         independent, running sandbox sharing initial state with the parent
         (fresh checkpoint at call time; incremental chain sharing applies
@@ -850,13 +852,38 @@ class Sandbox:
         call returns as soon as metadata and the eager page set are in
         place, and memory streams in on demand.
 
+        ``effects`` declares what the fork is *for*, which is what decides
+        whether its outbound writes are gated (F1):
+
+        - omitted (default) — an **independent branch**: an RL rollout or a
+          tree-search arm is a first-class timeline whose external effects
+          are intended, so N forks legitimately produce N effects and
+          nothing is gated. Unchanged from before.
+        - ``"reject"`` — a **temporal branch**: a speculative fork that
+          serves this sandbox and must not write on its own. Mutating
+          plaintext egress is refused at the proxy with ``503`` and shows up
+          in the fork's effect ledger; if the guess pays off, the promoted
+          identity issues the write once.
+        - ``"allow"`` — explicit opt-out, same as omitting it unless the
+          deployment flipped ``effects.standalone_fork_policy``.
+
+        ``"defer"`` and ``"seal"`` raise ``ValueError``: a bare fork has no
+        commit to flush a queue into and no abort for a seal to block.
+
+        **Bounded by TLS**: ``effects="reject"`` prevents *plaintext*
+        mutating egress. HTTPS writes stay unclassifiable and are not
+        blocked, so a speculative fork writing over HTTPS can still
+        double-fire.
+
         Note: forks share the parent's ``work_dir`` host mount (fork shares
         initial state by design); pass a fresh work dir to a new sandbox if
         isolation is needed.
         """
         if count < 1:
             raise ValueError("fork count must be >= 1")
-        fork_ids = self._engine.fork_sandbox(self.sandbox_id, count=count, lazy=lazy)
+        fork_ids = self._engine.fork_sandbox(
+            self.sandbox_id, count=count, lazy=lazy, effects=effects
+        )
         forks: list[Sandbox] = []
         for fork_id in fork_ids:
             fork = Sandbox.connect(fork_id, engine=self._engine)

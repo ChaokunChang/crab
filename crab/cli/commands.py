@@ -192,6 +192,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Restore with CRIU lazy-pages: return as soon as metadata is "
         "in place and stream memory on demand.",
     )
+    p_fork.add_argument(
+        "--effects",
+        choices=["allow", "reject"],
+        default=None,
+        help="Effect policy for the fork's outbound writes. Omitted: an "
+        "independent branch, ungated (default). 'reject': a speculative "
+        "branch that must not write — mutating plaintext egress is refused "
+        "with 503. HTTPS writes stay unclassifiable either way.",
+    )
     p_fork.set_defaults(func=_cmd_sandbox_fork)
 
     p_merge = sandbox_sub.add_parser(
@@ -736,9 +745,12 @@ def _cmd_sandbox_fork(args: argparse.Namespace) -> int:
         socket_path,
         timeout_seconds=max(args.timeout, 300.0 * args.count),
     )
+    payload: dict = {"count": int(args.count), "lazy": bool(args.lazy)}
+    if getattr(args, "effects", None) is not None:
+        payload["effects"] = str(args.effects)
     response = client.post_json(
         f"/sandboxes/{args.sandbox_id}/fork",
-        {"count": int(args.count), "lazy": bool(args.lazy)},
+        payload,
     )
     forks = list(response.get("forks") or [])
     if args.json:

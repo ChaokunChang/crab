@@ -425,6 +425,18 @@ class EngineConfig:
     write to the world (roadmap: "multiple forks must not double-fire
     external writes")."""
 
+    effects_standalone_fork_policy: str = "allow"
+    """Policy for a `sandbox.fork()` taken **outside** any transaction
+    (roadmap F1). Distinct from ``effects_fork_policy``, which governs
+    fork-*backed transactions*: an independent branch (RL rollout, tree
+    search) is a first-class timeline whose external effects are intended,
+    so the default stays ``allow`` and today's forks keep writing. A
+    speculative fork — one that serves a main line and must produce its
+    effect exactly once — opts in per call via ``fork(effects="reject")``
+    or by flipping this default. Only ``allow``/``reject`` apply; ``defer``
+    and ``seal`` are refused for a bare fork (no commit to flush a queue
+    into, no abort for a seal to block)."""
+
     effects_rules: tuple = ()
     """Endpoints that tolerate deferral, e.g.
     ``({"host_glob": "*.internal", "method": "POST", "path_glob": "/events*"},)``.
@@ -682,6 +694,12 @@ class EngineConfig:
             ),
             effects_fork_policy=str(
                 effects.get("fork_policy", data.get("effects_fork_policy")) or "reject"
+            ),
+            effects_standalone_fork_policy=str(
+                effects.get(
+                    "standalone_fork_policy", data.get("effects_standalone_fork_policy")
+                )
+                or "allow"
             ),
             effects_rules=tuple(effects.get("rules", data.get("effects_rules")) or ()),
             effects_on_unlisted=str(
@@ -1043,6 +1061,7 @@ class Engine:
                 self._system.effect_policy_defaults = {
                     "default_policy": cfg.effects_default_policy,
                     "fork_policy": cfg.effects_fork_policy,
+                    "standalone_fork_policy": cfg.effects_standalone_fork_policy,
                     "on_unlisted": cfg.effects_on_unlisted,
                     "opaque_effects": cfg.effects_opaque_effects,
                     "rules": cfg.effects_rules,
@@ -1725,6 +1744,8 @@ class Engine:
         *,
         count: int = 1,
         lazy: bool = False,
+        effects: str | None = None,
+        gate_effects: bool = True,
     ) -> list[SandboxId]:
         """Fork a running sandbox `count` times via checkpoint+restore.
 
@@ -1733,10 +1754,26 @@ class Engine:
         is enabled, a checkpoint-state clone (CrabSystem.fork_once, with
         incremental chain sharing when available), and a process restore —
         lazily via CRIU lazy-pages when ``lazy=True``.
+
+        ``effects`` is the bare-fork effect policy (F1); it is resolved and
+        validated once, before any fork exists, so a bad value cannot leave
+        half a fleet behind. ``gate_effects=False`` is for callers that own
+        the effect window themselves — a fork-backed transaction arms its
+        own session on the fork (D3), and must not be given a standalone one
+        on top of it.
         """
         if count < 1:
             raise ValueError("fork count must be >= 1")
         system = self.system
+        fork_effect_policy: str | None = None
+        if gate_effects:
+            # Validate before anything is created (F1): a rejected policy
+            # must not leave forks behind.
+            fork_effect_policy = system.validate_standalone_fork_policy(effects)
+        elif effects is not None:
+            raise ValueError(
+                "effects= is not accepted when the caller owns the effect window"
+            )
         runtime = self.runtime
         source_bundle = runtime.bundle_path_for(source_sandbox_id)
         paths = getattr(runtime, "paths", None)
@@ -1776,6 +1813,10 @@ class Engine:
                 target_sandbox_id,
                 target_rootfs_path=target_bundle / "rootfs",
             )
+            # Arm the gate before the fork's processes are restored: once
+            # they run, an ungated write could already be on the wire.
+            if fork_effect_policy is not None:
+                system.arm_fork_effect_session(target_sandbox_id, fork_effect_policy)
             restore_result = system.restore_once(
                 target_sandbox_id,
                 result.checkpoint_id,
@@ -1793,7 +1834,7 @@ class Engine:
         """Fork hook for fork-backed transactions (B3): one fork via the
         standard pipeline, inspector seeded the way Sandbox.fork does
         (there is no SDK Sandbox object on this path)."""
-        [fork_id] = self.fork_sandbox(source_sandbox_id, count=1)
+        [fork_id] = self.fork_sandbox(source_sandbox_id, count=1, gate_effects=False)
         try:
             self.system.inspector.upsert_snapshot(
                 SandboxSnapshot(

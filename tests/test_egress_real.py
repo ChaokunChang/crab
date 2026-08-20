@@ -754,6 +754,96 @@ class EffectGateRealTests(unittest.TestCase):
         self.assertEqual(self.external.requests, ["POST /write"])
 
 
+class StandaloneForkEffectRealTests(unittest.TestCase):
+    """F1 E2E: the external server's request log is the verdict. A fork
+    created with ``effects="reject"`` must not reach it; a fork created
+    without the argument still must (that default is the pinned narrowing of
+    D3 decision 10, and gating it would break RL-rollout style callers)."""
+
+    _IMAGE = "python:3.11-slim"
+
+    def setUp(self) -> None:
+        if not _real_stack_available():
+            self.skipTest("docker/runc/criu/zfs/iptables/root not available")
+        self.host_ip = _host_lan_ip()
+        if self.host_ip is None:
+            self.skipTest("no global-scope host address for the external service")
+        self._tmp = tempfile.TemporaryDirectory(prefix="crab_fork_effects_")
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.external = _CountingHTTPServer()
+        self.addCleanup(self.external.close)
+        self.port = self.external.port
+        self.engine = Engine.start(
+            EngineConfig(
+                runtime="runc",
+                enable_sandbox_network=True,
+                enable_interceptor=False,
+                enable_egress_proxy=True,
+                storage_root=root / "storage",
+                runtime_root=root / "runtime",
+            )
+        )
+        self.addCleanup(self.engine.stop)
+
+    def _post(self, path: str) -> str:
+        return (
+            "python3 -c \"import urllib.request;"
+            f"req=urllib.request.Request('http://{self.host_ip}:{self.port}{path}', data=b'payload', method='POST');"
+            "print(urllib.request.urlopen(req, timeout=10).status)\""
+        )
+
+    def _get(self, path: str) -> str:
+        return (
+            "python3 -c \"import urllib.request;"
+            f"print(urllib.request.urlopen('http://{self.host_ip}:{self.port}{path}', timeout=10).read().decode())\""
+        )
+
+    def test_a_gated_fork_cannot_write_while_the_source_still_can(self) -> None:
+        sandbox = Sandbox(image=self._IMAGE, engine=self.engine)
+        self.addCleanup(sandbox.kill)
+        [fork] = sandbox.fork(effects="reject")
+        self.addCleanup(fork.kill)
+
+        refused = fork.commands.run(self._post("/fork-write"))
+        self.assertNotEqual(refused.returncode, 0, msg="the fork's write was not refused")
+        self.assertIn("503", refused.stderr + refused.stdout)
+        self.assertEqual(
+            self.external.requests, [], "a gated fork's write reached the server"
+        )
+
+        # Reads from the gated fork still work (D3 decision 9).
+        read = fork.commands.run(self._get("/fork-read"))
+        self.assertEqual(read.returncode, 0, msg=read.stderr)
+        self.assertEqual(self.external.requests, ["GET /fork-read"])
+
+        # The session is per sandbox: the source was never gated.
+        source_write = sandbox.commands.run(self._post("/source-write"))
+        self.assertEqual(source_write.returncode, 0, msg=source_write.stderr)
+        self.assertIn("POST /source-write", self.external.requests)
+
+        self.assertEqual(fork.egress().rejected, 1)
+
+    def test_an_ungated_fork_still_writes(self) -> None:
+        # The regression guard for F1 decision 4: omitting `effects` keeps
+        # today's behavior, so independent branches are unaffected.
+        sandbox = Sandbox(image=self._IMAGE, engine=self.engine)
+        self.addCleanup(sandbox.kill)
+        [fork] = sandbox.fork()
+        self.addCleanup(fork.kill)
+
+        result = fork.commands.run(self._post("/ungated"))
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("POST /ungated", self.external.requests)
+
+    def test_defer_and_seal_are_refused_before_forking(self) -> None:
+        sandbox = Sandbox(image=self._IMAGE, engine=self.engine)
+        self.addCleanup(sandbox.kill)
+        for policy in ("defer", "seal"):
+            with self.assertRaises(ValueError):
+                sandbox.fork(effects=policy)
+
+
 class EffectTxnRealTests(unittest.TestCase):
     """D3.2 E2E: the external server's request log decides everything — a
     deferred write appears there only after commit, never after abort."""
