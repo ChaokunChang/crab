@@ -1,21 +1,27 @@
 """Unit tests for crab.tls_ca — CA store and leaf certificate minting.
 
 Covers: CA generation idempotency, key file permissions, leaf SAN correctness,
-per-host caching, and CA→leaf chain verification.
+per-host caching, cache expiry, EKU, clock-skew backdate, capacity eviction,
+host validation, and CA→leaf chain verification.
 """
 
 from __future__ import annotations
 
+import datetime
 import ipaddress
 import os
 import stat
 
 import pytest
 
-from cryptography import x509
-from cryptography.hazmat.primitives.asymmetric import padding
+# Guard: skip entire module when cryptography is not installed (base env).
+cryptography = pytest.importorskip("cryptography")
 
-from crab.tls_ca import CAStore, LeafMinter
+from cryptography import x509  # noqa: E402
+from cryptography.hazmat.primitives import hashes, serialization  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric import padding, rsa  # noqa: E402
+
+from crab.tls_ca import CAStore, LeafMinter, _LEAF_CACHE_MAX  # noqa: E402
 
 
 class TestCAStore:
@@ -76,6 +82,12 @@ class TestCAStore:
         store = CAStore(tmp_path / "tls")
         pem = store.cert_pem()
         assert pem.startswith(b"-----BEGIN CERTIFICATE-----")
+
+    def test_ca_not_valid_before_is_backdated(self, tmp_path):
+        """CA not_valid_before should be <= now (clock-skew backdate)."""
+        now = datetime.datetime.now(datetime.timezone.utc)
+        store = CAStore(tmp_path / "tls")
+        assert store.cert.not_valid_before_utc <= now
 
 
 class TestLeafMinter:
@@ -151,11 +163,12 @@ class TestLeafMinter:
         assert bc.ca is False
 
     def test_leaf_validity_24h(self, minter):
-        """Leaf cert validity period is ~24 hours."""
+        """Leaf cert validity period is ~24h + 5min skew."""
         cert, _ = minter.get_or_mint("ttl.test")
         delta = cert.not_valid_after_utc - cert.not_valid_before_utc
-        # Allow a small window for execution time.
-        assert 23 * 3600 <= delta.total_seconds() <= 25 * 3600
+        # 24h + 5min backdate = ~24h5m total window.
+        total_secs = delta.total_seconds()
+        assert 24 * 3600 <= total_secs <= 25 * 3600
 
     def test_get_cert_and_key_pem(self, minter):
         """get_cert_and_key_pem returns valid PEM bytes."""
@@ -167,3 +180,79 @@ class TestLeafMinter:
         """Leaf issuer field matches CA subject."""
         cert, _ = minter.get_or_mint("issuer.test")
         assert cert.issuer == ca.cert.subject
+
+    # --- New tests from review ---
+
+    def test_leaf_has_server_auth_eku(self, minter):
+        """Leaf cert must include serverAuth EKU."""
+        cert, _ = minter.get_or_mint("eku.test")
+        eku = cert.extensions.get_extension_for_class(
+            x509.ExtendedKeyUsage
+        ).value
+        assert x509.oid.ExtendedKeyUsageOID.SERVER_AUTH in eku
+
+    def test_leaf_not_valid_before_is_backdated(self, minter):
+        """Leaf not_valid_before should be <= now (clock-skew backdate)."""
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cert, _ = minter.get_or_mint("skew.test")
+        assert cert.not_valid_before_utc <= now
+
+    def test_cache_evicts_expired_leaf(self, ca):
+        """Expired cached leaf is re-minted on next access."""
+        minter = LeafMinter(ca)
+        # Mint a valid cert first.
+        cert1, key1 = minter.get_or_mint("expire.test")
+        serial1 = cert1.serial_number
+
+        # Inject a synthetic expired cert into the cache.
+        expired_key = rsa.generate_private_key(
+            public_exponent=65537, key_size=2048
+        )
+        now = datetime.datetime.now(datetime.timezone.utc)
+        expired_cert = (
+            x509.CertificateBuilder()
+            .subject_name(x509.Name([
+                x509.NameAttribute(x509.oid.NameOID.COMMON_NAME, "expire.test")
+            ]))
+            .issuer_name(ca.cert.subject)
+            .public_key(expired_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(hours=48))
+            .not_valid_after(now - datetime.timedelta(hours=1))
+            .add_extension(
+                x509.SubjectAlternativeName([x509.DNSName("expire.test")]),
+                critical=False,
+            )
+            .add_extension(
+                x509.BasicConstraints(ca=False, path_length=None),
+                critical=True,
+            )
+            .sign(ca.key, hashes.SHA256())
+        )
+        # Force inject expired entry.
+        with minter._lock:
+            minter._cache["expire.test"] = (expired_cert, expired_key)
+
+        # Now get_or_mint should detect expiry and re-mint.
+        cert2, key2 = minter.get_or_mint("expire.test")
+        assert cert2.serial_number != expired_cert.serial_number
+        assert cert2.not_valid_after_utc > now
+
+    def test_cache_capacity_limit(self, ca):
+        """Cache respects capacity limit and evicts oldest entries."""
+        small_max = 5
+        minter = LeafMinter(ca, cache_max=small_max)
+        # Fill beyond capacity.
+        for i in range(small_max + 3):
+            minter.get_or_mint(f"host-{i}.test")
+        assert len(minter._cache) == small_max
+
+    def test_mint_rejects_empty_host(self, minter):
+        """Empty host raises ValueError."""
+        with pytest.raises(ValueError, match="must not be empty"):
+            minter.get_or_mint("")
+
+    def test_mint_rejects_host_with_port(self, minter):
+        """Non-IP host containing ':' (port) raises ValueError."""
+        with pytest.raises(ValueError, match="port separator"):
+            minter.get_or_mint("example.com:443")

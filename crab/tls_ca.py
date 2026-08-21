@@ -12,6 +12,7 @@ Public API
 
 from __future__ import annotations
 
+import collections
 import datetime
 import ipaddress
 import os
@@ -39,6 +40,8 @@ _CA_KEY_BITS = 4096
 _LEAF_KEY_BITS = 2048
 _CA_VALIDITY_DAYS = 3650  # ~10 years
 _LEAF_VALIDITY_HOURS = 24
+_LEAF_CACHE_MAX = 1024  # max cached leaf certs (FIFO eviction)
+_CLOCK_SKEW_MINUTES = 5  # backdate not_valid_before to tolerate clock drift
 
 
 def _require_cryptography() -> None:
@@ -56,6 +59,17 @@ def _is_ip(host: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _validate_host(host: str) -> None:
+    """Raise ValueError for empty or malformed host strings."""
+    if not host:
+        raise ValueError("host must not be empty")
+    # For non-IP hosts, reject if it looks like host:port.
+    if not _is_ip(host) and ":" in host:
+        raise ValueError(
+            f"host must not contain a port separator: {host!r}"
+        )
 
 
 class CAStore:
@@ -133,13 +147,14 @@ class CAStore:
             x509.NameAttribute(NameOID.COMMON_NAME, "Crab Local CA"),
         ])
         now = datetime.datetime.now(datetime.timezone.utc)
+        skew = datetime.timedelta(minutes=_CLOCK_SKEW_MINUTES)
         cert = (
             x509.CertificateBuilder()
             .subject_name(subject)
             .issuer_name(issuer)
             .public_key(key.public_key())
             .serial_number(x509.random_serial_number())
-            .not_valid_before(now)
+            .not_valid_before(now - skew)
             .not_valid_after(now + datetime.timedelta(days=_CA_VALIDITY_DAYS))
             .add_extension(
                 x509.BasicConstraints(ca=True, path_length=0),
@@ -161,22 +176,44 @@ class CAStore:
             )
             .sign(key, hashes.SHA256())
         )
-        # Write key first (most sensitive).
-        self._key_path.write_bytes(
+        # Write key atomically with 0600 from creation (no permission window).
+        self._write_key_atomic(
             key.private_bytes(
                 serialization.Encoding.PEM,
                 serialization.PrivateFormat.TraditionalOpenSSL,
                 serialization.NoEncryption(),
             )
         )
-        self._secure_key_file()
         self._cert_path.write_bytes(
             cert.public_bytes(serialization.Encoding.PEM)
         )
         return cert, key
 
+    def _write_key_atomic(self, data: bytes) -> None:
+        """Write key data creating the file with mode 0600 atomically."""
+        path = str(self._key_path)
+        fd = -1
+        try:
+            fd = os.open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                0o600,
+            )
+            os.write(fd, data)
+        except BaseException:
+            if fd >= 0:
+                os.close(fd)
+            # Clean up half-written file.
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise
+        else:
+            os.close(fd)
+
     def _secure_key_file(self) -> None:
-        """Ensure key file is mode 0600."""
+        """Defensive re-enforcement of key file mode 0600 (used on load)."""
         os.chmod(self._key_path, stat.S_IRUSR | stat.S_IWUSR)
 
 
@@ -196,10 +233,15 @@ class LeafMinter:
         The CA whose key signs each leaf.
     """
 
-    def __init__(self, ca_store: CAStore) -> None:
+    def __init__(
+        self, ca_store: CAStore, *, cache_max: int = _LEAF_CACHE_MAX
+    ) -> None:
         _require_cryptography()
         self._ca = ca_store
-        self._cache: dict[str, Tuple[x509.Certificate, rsa.RSAPrivateKey]] = {}
+        self._cache: collections.OrderedDict[
+            str, Tuple[x509.Certificate, rsa.RSAPrivateKey]
+        ] = collections.OrderedDict()
+        self._cache_max = cache_max
         self._lock = threading.Lock()
 
     def get_or_mint(
@@ -207,17 +249,34 @@ class LeafMinter:
     ) -> Tuple["x509.Certificate", "rsa.RSAPrivateKey"]:
         """Return ``(leaf_cert, leaf_key)`` for *host*, minting if needed.
 
-        Results are cached in memory keyed by host.
+        Results are cached in memory keyed by host. Expired entries are
+        evicted transparently.
         """
+        _validate_host(host)
+        now = datetime.datetime.now(datetime.timezone.utc)
         with self._lock:
             if host in self._cache:
-                return self._cache[host]
+                cached_cert, cached_key = self._cache[host]
+                if cached_cert.not_valid_after_utc > now:
+                    # Move to end (most recently used) for FIFO fairness.
+                    self._cache.move_to_end(host)
+                    return cached_cert, cached_key
+                # Expired — remove and re-mint below.
+                del self._cache[host]
         # Mint outside the lock (crypto is CPU-bound), then re-check.
         cert, key = self._mint(host)
         with self._lock:
             # Double-check: another thread may have minted while we were busy.
-            if host not in self._cache:
-                self._cache[host] = (cert, key)
+            if host in self._cache:
+                existing_cert, _ = self._cache[host]
+                if existing_cert.not_valid_after_utc > now:
+                    self._cache.move_to_end(host)
+                    return self._cache[host]
+            self._cache[host] = (cert, key)
+            self._cache.move_to_end(host)
+            # Evict oldest entries if over capacity.
+            while len(self._cache) > self._cache_max:
+                self._cache.popitem(last=False)
             return self._cache[host]
 
     def get_cert_and_key_pem(self, host: str) -> Tuple[bytes, bytes]:
@@ -250,6 +309,7 @@ class LeafMinter:
             key_size=_LEAF_KEY_BITS,
         )
         now = datetime.datetime.now(datetime.timezone.utc)
+        skew = datetime.timedelta(minutes=_CLOCK_SKEW_MINUTES)
 
         # Build SAN: DNS for hostnames, IP for IP-literals.
         if _is_ip(host):
@@ -269,7 +329,7 @@ class LeafMinter:
             .issuer_name(self._ca.cert.subject)
             .public_key(key.public_key())
             .serial_number(x509.random_serial_number())
-            .not_valid_before(now)
+            .not_valid_before(now - skew)
             .not_valid_after(
                 now + datetime.timedelta(hours=_LEAF_VALIDITY_HOURS)
             )
@@ -291,6 +351,12 @@ class LeafMinter:
                     decipher_only=False,
                 ),
                 critical=True,
+            )
+            .add_extension(
+                x509.ExtendedKeyUsage([
+                    x509.oid.ExtendedKeyUsageOID.SERVER_AUTH,
+                ]),
+                critical=False,
             )
             .sign(self._ca.key, hashes.SHA256())
         )
