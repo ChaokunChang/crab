@@ -309,6 +309,12 @@ proven. Networking-off deployments are unaffected (no lease to move).
   automatically injected into the sandbox rootfs and environment
   (`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`,
   `NODE_EXTRA_CA_CERTS`) so that most runtimes trust the proxy.
+  **Note:** For commands launched via `commands.run(env=...)` or sandboxes
+  created with `Sandbox(env=...)`, these CA environment variables can be
+  overridden — which will cause that command to **not** trust the
+  interception CA (effectively opting out of decryption for that
+  invocation). The init-process environment cannot be overridden this way
+  and always trusts the injected CA.
   **Exceptions that cannot be intercepted**: certificate-pinning clients,
   Java (custom keystore not injected in v1), HTTP/2-only flows (ALPN
   without `http/1.1`), and hosts listed in `bypass_hosts`. These remain
