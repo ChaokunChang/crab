@@ -60,6 +60,11 @@ SO_ORIGINAL_DST = 80
 
 _HEAD_PEEK_BYTES = 2048
 _SPLICE_CHUNK = 65536
+# TLS record: 5-byte header + up to 16384 payload (RFC 8446 §5.1).
+# Used to expand the MSG_PEEK for ClientHello sniffing so that SNI/ALPN
+# in large hellos (PQ key_share, many extensions) are not missed.
+# Multi-record fragmented ClientHellos are out-of-scope (extremely rare).
+_TLS_RECORD_MAX_PEEK = 5 + 16384
 _HTTP_METHODS = frozenset(
     {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT"}
 )
@@ -272,7 +277,7 @@ def sniff_tls_alpn(head: bytes) -> list[str] | None:
                     name_len = head[alpn_pos]
                     alpn_pos += 1
                     if alpn_pos + name_len > alpn_end:
-                        break
+                        return None
                     protocols.append(
                         head[alpn_pos:alpn_pos + name_len].decode("ascii", errors="replace")
                     )
@@ -554,6 +559,20 @@ class _EgressHandler(socketserver.BaseRequestHandler):
             # --- TLS interception branch (T1.2) ---
             # Detect ClientHello; if interception is enabled and the
             # pre-filter passes, terminate TLS in-proxy.
+            # Record-length-aware peek: a modern ClientHello with PQ/hybrid
+            # key_share can exceed 2048 bytes, pushing SNI/ALPN past the
+            # initial peek.  Re-peek using the record length from the 5-byte
+            # TLS record header (capped at _TLS_RECORD_MAX_PEEK).
+            if len(head) >= 5 and head[0:1] == b"\x16":
+                record_len = struct.unpack("!H", head[3:5])[0] + 5
+                needed = min(record_len, _TLS_RECORD_MAX_PEEK)
+                if needed > len(head):
+                    client.settimeout(server.head_timeout_seconds)
+                    try:
+                        head = client.recv(needed, socket.MSG_PEEK)
+                    except (socket.timeout, OSError):
+                        pass  # keep whatever we got from first peek
+                    client.settimeout(None)
             sni = sniff_tls_sni(head) if head and head[0:1] == b"\x16" else None
             # ALPN pre-filter (decision 9): if ALPN is present and does
             # NOT include "http/1.1", leave the flow opaque — no

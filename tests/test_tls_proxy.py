@@ -23,7 +23,9 @@ cryptography = pytest.importorskip("cryptography")
 from crab.egress import (
     EgressProxyServer,
     EgressRule,
+    _HEAD_PEEK_BYTES,
     _PLAINTEXT_VISIBLE,
+    _TLS_RECORD_MAX_PEEK,
     classify_flow,
     sniff_http_head,
     sniff_tls_alpn,
@@ -38,9 +40,23 @@ from crab.tls_interceptor import TLSInterceptor, _ALPN_PROTOCOLS, _WEB_PORTS
 # Helpers
 # ============================================================
 
-def _client_hello(server_name: bytes | None, alpn: list[bytes] | None = None) -> bytes:
-    """A minimal but structurally valid TLS 1.2 ClientHello."""
+def _client_hello(
+    server_name: bytes | None,
+    alpn: list[bytes] | None = None,
+    *,
+    padding: int = 0,
+) -> bytes:
+    """A minimal but structurally valid TLS 1.2 ClientHello.
+
+    ``padding`` inserts a dummy extension (type 0x0015 / padding) of the
+    given byte length *before* SNI/ALPN, pushing them further into the
+    record. Useful for testing large-hello handling.
+    """
     extensions = b""
+    if padding > 0:
+        # TLS padding extension (type 0x0015, RFC 7685)
+        pad_data = b"\x00" * padding
+        extensions += struct.pack("!HH", 0x0015, len(pad_data)) + pad_data
     if server_name is not None:
         name_entry = b"\x00" + struct.pack("!H", len(server_name)) + server_name
         sni_body = struct.pack("!H", len(name_entry)) + name_entry
@@ -398,6 +414,12 @@ class TestSniffTLSAlpn:
         hello = _client_hello(b"example.com", alpn=[b"h2"])
         assert sniff_tls_alpn(hello[:20]) is None
 
+    def test_name_truncated_inside_list_returns_none(self):
+        """If a protocol name is partially cut off, return None (not partial list)."""
+        hello = _client_hello(b"example.com", alpn=[b"http/1.1", b"h2"])
+        # Truncate inside the second name ("h2") — cut 1 byte off the end
+        assert sniff_tls_alpn(hello[:-1]) is None
+
 
 # ============================================================
 # B: ALPN pre-filter integration in interception decision
@@ -437,3 +459,62 @@ class TestALPNPreFilter:
         assert alpn_ok is True
         sni = sniff_tls_sni(hello)
         assert ti.should_intercept(sni, 443) is True
+
+
+# ============================================================
+# Large ClientHello: record-length-aware peek
+# ============================================================
+
+class TestLargeClientHello:
+    """Ensure SNI/ALPN extraction works when they sit beyond 2048 bytes."""
+
+    def test_sniff_sni_beyond_2048(self):
+        """SNI at offset > 2048 is still extracted from the full buffer."""
+        hello = _client_hello(b"big.example.com", padding=2500)
+        # Sanity: the hello is bigger than 2048
+        assert len(hello) > _HEAD_PEEK_BYTES
+        assert sniff_tls_sni(hello) == "big.example.com"
+
+    def test_sniff_alpn_beyond_2048(self):
+        """ALPN at offset > 2048 is still extracted from the full buffer."""
+        hello = _client_hello(b"big.example.com", alpn=[b"h2", b"http/1.1"], padding=2500)
+        assert len(hello) > _HEAD_PEEK_BYTES
+        result = sniff_tls_alpn(hello)
+        assert result is not None
+        assert "http/1.1" in result
+
+    def test_record_length_aware_peek_via_socketpair(self):
+        """handle-layer: expanded MSG_PEEK retrieves full ClientHello."""
+        hello = _client_hello(b"peek.example.com", alpn=[b"http/1.1"], padding=2500)
+        assert len(hello) > _HEAD_PEEK_BYTES
+        # Use socketpair to simulate the recv(MSG_PEEK) expansion logic
+        s_client, s_server = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s_client.sendall(hello)
+            # First peek: limited to _HEAD_PEEK_BYTES (mimics handle)
+            head = s_server.recv(_HEAD_PEEK_BYTES, socket.MSG_PEEK)
+            assert len(head) == _HEAD_PEEK_BYTES
+            # Cannot extract SNI from truncated peek
+            assert sniff_tls_sni(head) is None
+            # Record-length-aware expansion (same logic as handle)
+            assert head[0:1] == b"\x16"
+            record_len = struct.unpack("!H", head[3:5])[0] + 5
+            needed = min(record_len, _TLS_RECORD_MAX_PEEK)
+            assert needed > _HEAD_PEEK_BYTES
+            head = s_server.recv(needed, socket.MSG_PEEK)
+            # Now SNI and ALPN are extractable
+            assert sniff_tls_sni(head) == "peek.example.com"
+            alpn = sniff_tls_alpn(head)
+            assert alpn is not None
+            assert "http/1.1" in alpn
+        finally:
+            s_client.close()
+            s_server.close()
+
+    def test_record_length_capped_at_max(self):
+        """A forged record_length > 16389 is capped at _TLS_RECORD_MAX_PEEK."""
+        # Forge a TLS record header claiming 20000 bytes payload
+        fake_head = b"\x16\x03\x01" + struct.pack("!H", 20000) + b"\x01" + b"\x00" * 50
+        record_len = struct.unpack("!H", fake_head[3:5])[0] + 5
+        needed = min(record_len, _TLS_RECORD_MAX_PEEK)
+        assert needed == _TLS_RECORD_MAX_PEEK
