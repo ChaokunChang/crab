@@ -892,6 +892,7 @@ class Engine:
         self._forwarder_base_url: str | None = None
         self._network_manager = None
         self._egress_proxy: Any = None
+        self._tls_interceptor_ref: object | None = None
         self._host_inspector_client: HostInspectorServiceClient | None = None
         self._host_inspector_process: subprocess.Popen[str] | None = None
         self._host_inspector_server: Any = None
@@ -1140,6 +1141,7 @@ class Engine:
                     effect_gate=effect_gate,
                     tls_interceptor=_build_tls_interceptor(cfg),
                 )
+                self._tls_interceptor_ref = proxy.tls_interceptor
                 proxy.start()
                 manager.enable_egress_redirect(proxy.port)
                 # A previous run's deferred queue did not survive; close out
@@ -1689,6 +1691,25 @@ class Engine:
         if len(registered) == 1:
             return str(registered[0].sandbox_id)
         return None
+
+    @property
+    def tls_ca_cert_path(self) -> Path | None:
+        """Host path to the CA certificate when TLS interception is active.
+
+        Returns None when interception is disabled or the engine has not
+        started.  Sandbox trust injection uses this to copy the cert into
+        the rootfs and derive the env overlay.  No cryptography import
+        occurs here — the path is read from the already-constructed
+        TLSInterceptor's CAStore.
+        """
+        ti = self._tls_interceptor_ref
+        if ti is None:
+            return None
+        # ti is a TLSInterceptor; access .ca_store.cert_path
+        try:
+            return Path(ti.ca_store.cert_path)
+        except (AttributeError, TypeError):
+            return None
 
     @property
     def forwarder_base_url(self) -> str | None:
