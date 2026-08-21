@@ -962,10 +962,16 @@ class DaemonServer:
         engine_config: EngineConfig | str | os.PathLike[str] | None = None,
         socket_path: Path | None = None,
         pid_file: Path | None = None,
+        socket_group: str | None = None,
     ) -> None:
         self._engine_config = engine_config
         self._socket_path = (socket_path or default_socket_path()).expanduser().resolve()
         self._pid_file = pid_file.expanduser().resolve() if pid_file else None
+        # Opt-in group sharing (S1): when a group is named the socket is
+        # chgrp'd and opened 0660 so a non-root gateway user in that group
+        # can reach the daemon. Unset → 0600, zero behavior change.
+        self._socket_group = socket_group
+        self._socket_perms = DEFAULT_SOCKET_PERMS if socket_group is None else 0o660
         self._engine: Engine | None = None
         self._server = None
         self._serve_thread: threading.Thread | None = None
@@ -1007,7 +1013,12 @@ class DaemonServer:
         self._engine = engine
         try:
             handler = _build_handler(self)
-            self._server = serve_unix_socket(self._socket_path, handler)
+            self._server = serve_unix_socket(
+                self._socket_path,
+                handler,
+                socket_perms=self._socket_perms,
+                socket_group=self._socket_group,
+            )
         except Exception:
             engine.stop()
             self._engine = None
@@ -1024,7 +1035,7 @@ class DaemonServer:
         logger.info(
             "Crab daemon ready: socket=%s perms=%o pid=%d sandbox_count=%d",
             self._socket_path,
-            DEFAULT_SOCKET_PERMS,
+            self._socket_perms,
             os.getpid(),
             0,
         )
@@ -1130,6 +1141,15 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional PID file path.",
     )
     parser.add_argument(
+        "--socket-group",
+        default=None,
+        help=(
+            "Group name to chgrp the daemon socket to; implies mode 0660 so "
+            "group members (e.g. the crab-gateway user) can connect. "
+            "Unset keeps the 0600 sole-user default."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default=os.environ.get("CRAB_DAEMON_LOG_LEVEL", "INFO"),
         help="Log level (DEBUG/INFO/WARNING/ERROR).",
@@ -1153,6 +1173,7 @@ def main(argv: list[str] | None = None) -> int:
         engine_config=config_arg,
         socket_path=args.socket,
         pid_file=args.pid_file,
+        socket_group=args.socket_group,
     )
     try:
         daemon.start()
