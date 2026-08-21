@@ -28,6 +28,7 @@ sandboxes — the daemon stays running across SDK process exits.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import logging
 import shlex
 import socket
@@ -436,7 +437,7 @@ class Sandbox:
                 "work_dir_host_path": None if work_dir_host_path is None else str(work_dir_host_path),
                 "rootfs_init_dirs": self._rootfs_init_dirs(),
                 "rootfs_copy_paths": rootfs_copy_paths,
-                "shared_rootfs_key": image_id[:32],
+                "shared_rootfs_key": self._shared_rootfs_key(image_id, ca_cert_path),
                 "shared_rootfs_persist": True,
                 "sdk_image": image_tag,
                 "sdk_process_cwd": plan.process_cwd,
@@ -445,6 +446,24 @@ class Sandbox:
             }
         )
         return dict(plan.metadata)
+
+    @staticmethod
+    def _shared_rootfs_key(image_id: str, ca_cert_path: Path | None) -> str:
+        """Compute cache key for the shared-rootfs ZFS snapshot.
+
+        The key incorporates the image identity *and* the TLS CA state so that
+        toggling interception (or rotating the CA) invalidates stale snapshots
+        that lack the injected certificate.
+        """
+        base = image_id[:32]
+        if ca_cert_path is None:
+            return base
+        try:
+            ca_digest = hashlib.sha256(ca_cert_path.read_bytes()).hexdigest()[:16]
+        except OSError:
+            # CA path configured but file missing/unreadable — treat as no-CA.
+            return base
+        return f"{base}-ca{ca_digest}"
 
     def _resolve_work_dir_host_path(self, sandbox_id: SandboxId, *, force: bool = False) -> Path | None:
         if self._work_dir_host is not None:
