@@ -26,9 +26,10 @@ from crab.egress import (
     _PLAINTEXT_VISIBLE,
     classify_flow,
     sniff_http_head,
+    sniff_tls_alpn,
     sniff_tls_sni,
 )
-from crab.engine import EngineConfig
+from crab.engine import EngineConfig, _build_tls_interceptor
 from crab.tls_ca import CAStore, LeafMinter
 from crab.tls_interceptor import TLSInterceptor, _ALPN_PROTOCOLS, _WEB_PORTS
 
@@ -37,13 +38,20 @@ from crab.tls_interceptor import TLSInterceptor, _ALPN_PROTOCOLS, _WEB_PORTS
 # Helpers
 # ============================================================
 
-def _client_hello(server_name: bytes | None) -> bytes:
+def _client_hello(server_name: bytes | None, alpn: list[bytes] | None = None) -> bytes:
     """A minimal but structurally valid TLS 1.2 ClientHello."""
     extensions = b""
     if server_name is not None:
         name_entry = b"\x00" + struct.pack("!H", len(server_name)) + server_name
         sni_body = struct.pack("!H", len(name_entry)) + name_entry
-        extensions = struct.pack("!HH", 0x0000, len(sni_body)) + sni_body
+        extensions += struct.pack("!HH", 0x0000, len(sni_body)) + sni_body
+    if alpn is not None:
+        # ALPN extension (type 0x0010)
+        name_list = b""
+        for proto in alpn:
+            name_list += bytes([len(proto)]) + proto
+        alpn_body = struct.pack("!H", len(name_list)) + name_list
+        extensions += struct.pack("!HH", 0x0010, len(alpn_body)) + alpn_body
     body = (
         b"\x03\x03"
         + b"\x11" * 32
@@ -325,3 +333,107 @@ class TestEgressProxyServerTLSParam:
         server = EgressProxyServer()
         assert server.tls_interceptor is None
         server.server_close()
+
+
+# ============================================================
+# A: _build_tls_interceptor wiring test
+# ============================================================
+
+class TestBuildTLSInterceptor:
+    """_build_tls_interceptor returns TLSInterceptor or None."""
+
+    def test_enabled_returns_interceptor(self, tmp_path):
+        cfg = EngineConfig(
+            storage_root=tmp_path,
+            egress_tls_interception_enabled=True,
+            egress_tls_bypass_hosts=("*.bypass.test",),
+            egress_tls_on_handshake_failure="refuse",
+        )
+        ti = _build_tls_interceptor(cfg)
+        assert ti is not None
+        assert isinstance(ti, TLSInterceptor)
+        assert ti.on_handshake_failure == "refuse"
+        # bypass_hosts wired through
+        assert ti.should_intercept("foo.bypass.test", 443) is False
+
+    def test_disabled_returns_none(self, tmp_path):
+        cfg = EngineConfig(
+            storage_root=tmp_path,
+            egress_tls_interception_enabled=False,
+        )
+        assert _build_tls_interceptor(cfg) is None
+
+
+# ============================================================
+# B: sniff_tls_alpn tests
+# ============================================================
+
+class TestSniffTLSAlpn:
+    """ALPN extraction from ClientHello."""
+
+    def test_no_alpn_extension_returns_none(self):
+        """ClientHello without ALPN → None (not empty list)."""
+        hello = _client_hello(b"example.com")
+        assert sniff_tls_alpn(hello) is None
+
+    def test_h2_only(self):
+        hello = _client_hello(b"example.com", alpn=[b"h2"])
+        assert sniff_tls_alpn(hello) == ["h2"]
+
+    def test_h2_and_http11(self):
+        hello = _client_hello(b"example.com", alpn=[b"h2", b"http/1.1"])
+        result = sniff_tls_alpn(hello)
+        assert result is not None
+        assert "h2" in result
+        assert "http/1.1" in result
+
+    def test_http11_only(self):
+        hello = _client_hello(b"example.com", alpn=[b"http/1.1"])
+        assert sniff_tls_alpn(hello) == ["http/1.1"]
+
+    def test_non_tls_returns_none(self):
+        assert sniff_tls_alpn(b"GET / HTTP/1.1\r\n\r\n") is None
+
+    def test_truncated_returns_none(self):
+        hello = _client_hello(b"example.com", alpn=[b"h2"])
+        assert sniff_tls_alpn(hello[:20]) is None
+
+
+# ============================================================
+# B: ALPN pre-filter integration in interception decision
+# ============================================================
+
+class TestALPNPreFilter:
+    """ALPN pre-filter semantics in the interception decision."""
+
+    def test_h2_only_not_intercepted(self, tmp_path):
+        """ALPN=[h2] → not intercepted (left opaque)."""
+        ti = _make_tls_interceptor(tmp_path)
+        hello = _client_hello(b"api.example.com", alpn=[b"h2"])
+        sni = sniff_tls_sni(hello)
+        alpn = sniff_tls_alpn(hello)
+        alpn_ok = alpn is None or "http/1.1" in alpn
+        # ALPN has only h2 → alpn_ok is False
+        assert alpn_ok is False
+        assert sni == "api.example.com"
+
+    def test_h2_and_http11_intercepted(self, tmp_path):
+        """ALPN=[h2, http/1.1] → intercepted."""
+        ti = _make_tls_interceptor(tmp_path)
+        hello = _client_hello(b"api.example.com", alpn=[b"h2", b"http/1.1"])
+        sni = sniff_tls_sni(hello)
+        alpn = sniff_tls_alpn(hello)
+        alpn_ok = alpn is None or "http/1.1" in alpn
+        assert alpn_ok is True
+        assert ti.should_intercept(sni, 443) is True
+
+    def test_no_alpn_still_intercepted(self, tmp_path):
+        """Missing ALPN → not blocked by ALPN filter."""
+        ti = _make_tls_interceptor(tmp_path)
+        hello = _client_hello(b"api.example.com")  # no ALPN
+        alpn = sniff_tls_alpn(hello)
+        assert alpn is None
+        alpn_ok = alpn is None or "http/1.1" in alpn
+        assert alpn_ok is True
+        sni = sniff_tls_sni(hello)
+        assert ti.should_intercept(sni, 443) is True

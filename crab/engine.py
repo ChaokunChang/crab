@@ -326,6 +326,25 @@ def _coerce_engine_config(config: object | None) -> "EngineConfig":
     raise TypeError(f"unsupported engine config type: {type(config).__name__}")
 
 
+def _build_tls_interceptor(cfg: "EngineConfig") -> object | None:
+    """Construct a TLSInterceptor when TLS interception is enabled.
+
+    The import of ``crab.tls_interceptor`` (and transitively ``cryptography``)
+    is deferred to this function body so that deployments which never enable
+    interception do not need the ``crab[tls]`` extra installed.
+    """
+    if not cfg.egress_tls_interception_enabled:
+        return None
+    from .tls_interceptor import TLSInterceptor  # lazy: requires crab[tls]
+
+    storage_dir = Path(cfg.storage_root) / "tls" if cfg.storage_root else Path("/tmp/crab-tls")
+    return TLSInterceptor(
+        storage_dir,
+        bypass_hosts=cfg.egress_tls_bypass_hosts,
+        on_handshake_failure=cfg.egress_tls_on_handshake_failure,
+    )
+
+
 @dataclass
 class EngineConfig:
     """Engine configuration.
@@ -1119,6 +1138,7 @@ class Engine:
                     cassette_replayer=cassette_replayer,
                     replay_varying_headers=cfg.egress_recording_varying_headers,
                     effect_gate=effect_gate,
+                    tls_interceptor=_build_tls_interceptor(cfg),
                 )
                 proxy.start()
                 manager.enable_egress_redirect(proxy.port)

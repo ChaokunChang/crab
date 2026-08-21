@@ -234,6 +234,56 @@ def sniff_tls_sni(head: bytes) -> str | None:
     return None
 
 
+def sniff_tls_alpn(head: bytes) -> list[str] | None:
+    """Extract ALPN protocol list from a TLS ClientHello, or None.
+
+    Returns None when the bytes are not a ClientHello, the extensions
+    area is truncated, or no ALPN extension (type 0x0010) is present.
+    Returns an empty list only if the extension is present but contains
+    no protocol names (malformed).
+    """
+    if len(head) < 45 or head[0] != 0x16 or head[5] != 0x01:
+        return None
+    try:
+        pos = 9 + 2 + 32
+        session_len = head[pos]
+        pos += 1 + session_len
+        cipher_len, = struct.unpack("!H", head[pos:pos + 2])
+        pos += 2 + cipher_len
+        compression_len = head[pos]
+        pos += 1 + compression_len
+        if pos + 2 > len(head):
+            return None
+        extensions_len, = struct.unpack("!H", head[pos:pos + 2])
+        pos += 2
+        end = min(pos + extensions_len, len(head))
+        while pos + 4 <= end:
+            ext_type, ext_len = struct.unpack("!HH", head[pos:pos + 4])
+            pos += 4
+            if ext_type == 0x0010:  # application_layer_protocol_negotiation
+                # ALPN body: list_len(2) then [name_len(1) name]...
+                if pos + 2 > end:
+                    return None
+                list_len, = struct.unpack("!H", head[pos:pos + 2])
+                alpn_pos = pos + 2
+                alpn_end = min(alpn_pos + list_len, end)
+                protocols: list[str] = []
+                while alpn_pos < alpn_end:
+                    name_len = head[alpn_pos]
+                    alpn_pos += 1
+                    if alpn_pos + name_len > alpn_end:
+                        break
+                    protocols.append(
+                        head[alpn_pos:alpn_pos + name_len].decode("ascii", errors="replace")
+                    )
+                    alpn_pos += name_len
+                return protocols
+            pos += ext_len
+    except (IndexError, struct.error):
+        return None
+    return None
+
+
 class EgressFlowRecorder:
     """Journal-backed sink for completed flows (the effect ledger's only
     store — same ruling as C3: the journal is the durable, ordered,
@@ -505,8 +555,14 @@ class _EgressHandler(socketserver.BaseRequestHandler):
             # Detect ClientHello; if interception is enabled and the
             # pre-filter passes, terminate TLS in-proxy.
             sni = sniff_tls_sni(head) if head and head[0:1] == b"\x16" else None
+            # ALPN pre-filter (decision 9): if ALPN is present and does
+            # NOT include "http/1.1", leave the flow opaque — no
+            # termination.  Missing ALPN is fine (many HTTP clients omit it).
+            alpn = sniff_tls_alpn(head) if sni is not None else None
+            alpn_ok = alpn is None or "http/1.1" in alpn
             if (
                 sni is not None
+                and alpn_ok
                 and tls_interceptor is not None
                 and tls_interceptor.should_intercept(sni, dst_port)
             ):
@@ -925,5 +981,6 @@ __all__ = [
     "original_destination",
     "parse_original_dst",
     "sniff_http_head",
+    "sniff_tls_alpn",
     "sniff_tls_sni",
 ]
