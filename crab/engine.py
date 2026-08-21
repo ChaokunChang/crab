@@ -326,6 +326,25 @@ def _coerce_engine_config(config: object | None) -> "EngineConfig":
     raise TypeError(f"unsupported engine config type: {type(config).__name__}")
 
 
+def _build_tls_interceptor(cfg: "EngineConfig") -> object | None:
+    """Construct a TLSInterceptor when TLS interception is enabled.
+
+    The import of ``crab.tls_interceptor`` (and transitively ``cryptography``)
+    is deferred to this function body so that deployments which never enable
+    interception do not need the ``crab[tls]`` extra installed.
+    """
+    if not cfg.egress_tls_interception_enabled:
+        return None
+    from .tls_interceptor import TLSInterceptor  # lazy: requires crab[tls]
+
+    storage_dir = Path(cfg.storage_root) / "tls" if cfg.storage_root else Path("/tmp/crab-tls")
+    return TLSInterceptor(
+        storage_dir,
+        bypass_hosts=cfg.egress_tls_bypass_hosts,
+        on_handshake_failure=cfg.egress_tls_on_handshake_failure,
+    )
+
+
 @dataclass
 class EngineConfig:
     """Engine configuration.
@@ -392,11 +411,27 @@ class EngineConfig:
     Encrypted flows are ``opaque`` by default because the proxy cannot
     see the method; rules are how a deployment states what it knows."""
 
+    egress_tls_interception_enabled: bool = False
+    """Terminate TLS in the egress proxy to classify HTTPS flows the
+    same way as plaintext HTTP (roadmap T1). Off by default: today's
+    opaque-tunnel behavior is preserved unless explicitly enabled.
+    Requires `crab[tls]` (the cryptography package)."""
+
+    egress_tls_on_handshake_failure: str = "passthrough"
+    """What happens when the sandbox rejects our minted leaf cert
+    (pinning, missing trust). `passthrough` adds the host to a runtime
+    bypass set and closes the connection (client retries go opaque);
+    `refuse` closes the connection with no fallback."""
+
+    egress_tls_bypass_hosts: tuple = ()
+    """Host globs that are never intercepted (matched on SNI before any
+    TLS termination). Uses fnmatch style, e.g. `("*.pinned.example",)`."""
+
     enable_egress_recording: bool = False
     """Record request/response bodies for plaintext HTTP idempotent reads
     into per-sandbox cassettes (roadmap D2), so replays can serve them
     back. Requires the egress proxy. Off by default: it persists response
-    bodies to disk. HTTPS is never recorded (no TLS interception in v1)."""
+    bodies to disk. With TLS interception, HTTPS reads become recordable."""
 
     egress_recording_max_body_bytes: int = 1024 * 1024
     """Per-body cap; larger exchanges are marked truncated and are never
@@ -568,6 +603,9 @@ class EngineConfig:
         host_inspector = _optional_mapping(data.get("host_inspector"), label="host_inspector")
         journal_data = _optional_mapping(data.get("journal"), label="journal")
         egress = _optional_mapping(data.get("egress"), label="egress")
+        tls_interception = _optional_mapping(
+            egress.get("tls_interception"), label="egress.tls_interception"
+        )
         recording = _optional_mapping(egress.get("recording"), label="egress.recording")
         effects = _optional_mapping(data.get("effects"), label="effects")
 
@@ -666,6 +704,25 @@ class EngineConfig:
             )
             or 0,
             egress_rules=tuple(egress.get("rules", data.get("egress_rules")) or ()),
+            egress_tls_interception_enabled=_as_bool(
+                tls_interception.get(
+                    "enabled", data.get("egress_tls_interception_enabled")
+                ),
+                default=False,
+            ),
+            egress_tls_on_handshake_failure=str(
+                tls_interception.get(
+                    "on_handshake_failure",
+                    data.get("egress_tls_on_handshake_failure"),
+                )
+                or "passthrough"
+            ),
+            egress_tls_bypass_hosts=tuple(
+                tls_interception.get(
+                    "bypass_hosts", data.get("egress_tls_bypass_hosts")
+                )
+                or ()
+            ),
             enable_egress_recording=_as_bool(
                 recording.get("enabled", data.get("enable_egress_recording")),
                 default=False,
@@ -1081,6 +1138,7 @@ class Engine:
                     cassette_replayer=cassette_replayer,
                     replay_varying_headers=cfg.egress_recording_varying_headers,
                     effect_gate=effect_gate,
+                    tls_interceptor=_build_tls_interceptor(cfg),
                 )
                 proxy.start()
                 manager.enable_egress_redirect(proxy.port)

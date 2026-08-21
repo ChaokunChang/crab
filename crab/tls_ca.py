@@ -237,6 +237,10 @@ class LeafMinter:
         self, ca_store: CAStore, *, cache_max: int = _LEAF_CACHE_MAX
     ) -> None:
         _require_cryptography()
+        if cache_max <= 0:
+            raise ValueError(
+                f"cache_max must be positive, got {cache_max}"
+            )
         self._ca = ca_store
         self._cache: collections.OrderedDict[
             str, Tuple[x509.Certificate, rsa.RSAPrivateKey]

@@ -7,10 +7,12 @@ flow (HTTP request line + Host, or a TLS ClientHello's SNI), splices
 the bytes both ways untouched, and appends one ``kind="egress"``
 journal record per connection.
 
-Deliberate limits (see .cache/tasks/egress-ledger.md decision log):
-no TLS MITM in v1 — the SNI gives host-level identification, bodies
-are D2's charter; host-bound traffic is never redirected, so the LLM
-interceptor path stays byte-identical; TCP only.
+With TLS interception enabled (roadmap T1), a ClientHello on a standard
+HTTPS port with a valid SNI is terminated in-proxy: the proxy mints a
+leaf cert for the SNI, completes the handshake with the sandbox client,
+re-reads the now-decrypted head, then opens an upstream TLS connection
+to the real server. The decrypted flow enters the same replay → gate →
+record pipeline as plaintext HTTP, with ``scheme="https"``.
 """
 from __future__ import annotations
 
@@ -18,6 +20,7 @@ import fnmatch
 import logging
 import socket
 import socketserver
+import ssl
 import struct
 import threading
 import time
@@ -57,9 +60,17 @@ SO_ORIGINAL_DST = 80
 
 _HEAD_PEEK_BYTES = 2048
 _SPLICE_CHUNK = 65536
+# TLS record: 5-byte header + up to 16384 payload (RFC 8446 §5.1).
+# Used to expand the MSG_PEEK for ClientHello sniffing so that SNI/ALPN
+# in large hellos (PQ key_share, many extensions) are not missed.
+# Multi-record fragmented ClientHellos are out-of-scope (extremely rare).
+_TLS_RECORD_MAX_PEEK = 5 + 16384
 _HTTP_METHODS = frozenset(
     {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT"}
 )
+
+# Schemes whose decrypted head is visible to replay/gate/recording.
+_PLAINTEXT_VISIBLE = frozenset({"http", "https"})
 
 # Sent under cassette_only when nothing matches: hermetic replay must
 # fail loudly instead of quietly reaching the network.
@@ -222,6 +233,56 @@ def sniff_tls_sni(head: bytes) -> str | None:
                 # stay that way — the ledger records host identity, not a
                 # display form (the idna codec rejects error handlers).
                 return name.decode("ascii", errors="replace").lower() if name else None
+            pos += ext_len
+    except (IndexError, struct.error):
+        return None
+    return None
+
+
+def sniff_tls_alpn(head: bytes) -> list[str] | None:
+    """Extract ALPN protocol list from a TLS ClientHello, or None.
+
+    Returns None when the bytes are not a ClientHello, the extensions
+    area is truncated, or no ALPN extension (type 0x0010) is present.
+    Returns an empty list only if the extension is present but contains
+    no protocol names (malformed).
+    """
+    if len(head) < 45 or head[0] != 0x16 or head[5] != 0x01:
+        return None
+    try:
+        pos = 9 + 2 + 32
+        session_len = head[pos]
+        pos += 1 + session_len
+        cipher_len, = struct.unpack("!H", head[pos:pos + 2])
+        pos += 2 + cipher_len
+        compression_len = head[pos]
+        pos += 1 + compression_len
+        if pos + 2 > len(head):
+            return None
+        extensions_len, = struct.unpack("!H", head[pos:pos + 2])
+        pos += 2
+        end = min(pos + extensions_len, len(head))
+        while pos + 4 <= end:
+            ext_type, ext_len = struct.unpack("!HH", head[pos:pos + 4])
+            pos += 4
+            if ext_type == 0x0010:  # application_layer_protocol_negotiation
+                # ALPN body: list_len(2) then [name_len(1) name]...
+                if pos + 2 > end:
+                    return None
+                list_len, = struct.unpack("!H", head[pos:pos + 2])
+                alpn_pos = pos + 2
+                alpn_end = min(alpn_pos + list_len, end)
+                protocols: list[str] = []
+                while alpn_pos < alpn_end:
+                    name_len = head[alpn_pos]
+                    alpn_pos += 1
+                    if alpn_pos + name_len > alpn_end:
+                        return None
+                    protocols.append(
+                        head[alpn_pos:alpn_pos + name_len].decode("ascii", errors="replace")
+                    )
+                    alpn_pos += name_len
+                return protocols
             pos += ext_len
     except (IndexError, struct.error):
         return None
@@ -486,22 +547,110 @@ class _EgressHandler(socketserver.BaseRequestHandler):
         bytes_in = 0
         record_meta: dict | None = None
         upstream: socket.socket | None = None
+        tls_interceptor = server.tls_interceptor
         try:
             client.settimeout(server.head_timeout_seconds)
             try:
-                head = client.recv(_HEAD_PEEK_BYTES)
+                head = client.recv(_HEAD_PEEK_BYTES, socket.MSG_PEEK)
             except (socket.timeout, OSError):
                 head = b""
             client.settimeout(None)
-            http = sniff_http_head(head)
-            if http is not None:
-                scheme = "http"
-                method, path, host = http
-            else:
-                sni = sniff_tls_sni(head)
-                if sni is not None:
+
+            # --- TLS interception branch (T1.2) ---
+            # Detect ClientHello; if interception is enabled and the
+            # pre-filter passes, terminate TLS in-proxy.
+            # Record-length-aware peek: a modern ClientHello with PQ/hybrid
+            # key_share can exceed 2048 bytes, pushing SNI/ALPN past the
+            # initial peek.  Re-peek using the record length from the 5-byte
+            # TLS record header (capped at _TLS_RECORD_MAX_PEEK).
+            if len(head) >= 5 and head[0:1] == b"\x16":
+                record_len = struct.unpack("!H", head[3:5])[0] + 5
+                needed = min(record_len, _TLS_RECORD_MAX_PEEK)
+                if needed > len(head):
+                    client.settimeout(server.head_timeout_seconds)
+                    try:
+                        head = client.recv(needed, socket.MSG_PEEK)
+                    except (socket.timeout, OSError):
+                        pass  # keep whatever we got from first peek
+                    client.settimeout(None)
+            sni = sniff_tls_sni(head) if head and head[0:1] == b"\x16" else None
+            # ALPN pre-filter (decision 9): if ALPN is present and does
+            # NOT include "http/1.1", leave the flow opaque — no
+            # termination.  Missing ALPN is fine (many HTTP clients omit it).
+            alpn = sniff_tls_alpn(head) if sni is not None else None
+            alpn_ok = alpn is None or "http/1.1" in alpn
+            if (
+                sni is not None
+                and alpn_ok
+                and tls_interceptor is not None
+                and tls_interceptor.should_intercept(sni, dst_port)
+            ):
+                # Attempt server-side TLS termination with minted leaf.
+                try:
+                    server_ctx = tls_interceptor.build_server_context(sni)
+                    client = server_ctx.wrap_socket(
+                        client, server_side=True
+                    )
+                except ssl.SSLError as exc:
+                    logger.debug(
+                        "TLS handshake failed for %s: %s", sni, exc
+                    )
+                    if tls_interceptor.on_handshake_failure == "passthrough":
+                        tls_interceptor.add_runtime_bypass(sni)
+                    # Close: client must retry (will go opaque/bypass).
+                    return
+                # Re-read decrypted head from the now-wrapped socket.
+                client.settimeout(server.head_timeout_seconds)
+                try:
+                    head = client.recv(_HEAD_PEEK_BYTES)
+                except (socket.timeout, OSError):
+                    head = b""
+                client.settimeout(None)
+                http = sniff_http_head(head)
+                if http is not None:
+                    scheme = "https"
+                    method, path, host = http
+                else:
+                    # Decrypted head is not HTTP/1.1: downgrade to opaque
+                    # byte-tunnel (still terminated, bytes spliced, no
+                    # HTTP parsing). Decision 9.
                     scheme = "tls"
                     host = sni
+                    upstream = socket.create_connection(
+                        (dst_ip, dst_port),
+                        timeout=server.connect_timeout_seconds,
+                    )
+                    upstream.settimeout(None)
+                    upstream_ctx = tls_interceptor.build_upstream_context(sni)
+                    upstream = upstream_ctx.wrap_socket(
+                        upstream, server_hostname=sni
+                    )
+                    if head:
+                        upstream.sendall(head)
+                        bytes_out += len(head)
+                    out_extra, in_extra = _splice(client, upstream)
+                    bytes_out += out_extra
+                    bytes_in += in_extra
+                    return  # finally writes journal row
+            else:
+                # Consume head now (non-TLS-interception path).
+                # The peek above was MSG_PEEK; consume it for the legacy path.
+                if head:
+                    client.settimeout(server.head_timeout_seconds)
+                    try:
+                        head = client.recv(_HEAD_PEEK_BYTES)
+                    except (socket.timeout, OSError):
+                        head = b""
+                    client.settimeout(None)
+                http = sniff_http_head(head)
+                if http is not None:
+                    scheme = "http"
+                    method, path, host = http
+                else:
+                    sni_check = sniff_tls_sni(head)
+                    if sni_check is not None:
+                        scheme = "tls"
+                        host = sni_check
             # ---- replay (D2): a cassette hit never opens an upstream
             # connection. The gate is recomputed here with the current
             # rules, and only reads are eligible — mutating and opaque
@@ -509,7 +658,7 @@ class _EgressHandler(socketserver.BaseRequestHandler):
             replayer = server.cassette_replayer
             session = None if replayer is None or sandbox_id is None else replayer.session_for(sandbox_id)
             if session is not None:
-                eligible = scheme == "http" and classify_flow(
+                eligible = scheme in _PLAINTEXT_VISIBLE and classify_flow(
                     {"host": host or dst_ip, "method": method, "scheme": scheme},
                     server.rules,
                 ) == CLASSIFICATION_IDEMPOTENT_READ
@@ -558,7 +707,7 @@ class _EgressHandler(socketserver.BaseRequestHandler):
             if gate is not None and sandbox_id is not None:
                 decision = None
                 gate_session = None
-                if scheme == "http":
+                if scheme in _PLAINTEXT_VISIBLE:
                     verdict = classify_flow(
                         {"host": host or dst_ip, "method": method, "scheme": scheme},
                         server.rules,
@@ -642,6 +791,12 @@ class _EgressHandler(socketserver.BaseRequestHandler):
                 (dst_ip, dst_port), timeout=server.connect_timeout_seconds
             )
             upstream.settimeout(None)
+            # If this is an intercepted HTTPS flow, wrap upstream in TLS.
+            if scheme == "https" and tls_interceptor is not None:
+                upstream_ctx = tls_interceptor.build_upstream_context(host or sni or dst_ip)
+                upstream = upstream_ctx.wrap_socket(
+                    upstream, server_hostname=host or sni or dst_ip
+                )
             if head:
                 upstream.sendall(head)
                 bytes_out += len(head)
@@ -650,7 +805,7 @@ class _EgressHandler(socketserver.BaseRequestHandler):
             # the ledger uses, so "recordable" has one definition.
             recorder = server.cassette_recorder
             assembler = None
-            if recorder is not None and scheme == "http":
+            if recorder is not None and scheme in _PLAINTEXT_VISIBLE:
                 probe = {"host": host or dst_ip, "method": method, "scheme": scheme}
                 if classify_flow(probe, server.rules) == CLASSIFICATION_IDEMPOTENT_READ:
                     assembler = ResponseAssembler(limit=recorder.max_body_bytes)
@@ -739,7 +894,10 @@ def _splice(
             pass
         finally:
             try:
-                dst.shutdown(socket.SHUT_WR)
+                if isinstance(dst, ssl.SSLSocket):
+                    dst.unwrap()
+                else:
+                    dst.shutdown(socket.SHUT_WR)
             except OSError:
                 pass
 
@@ -773,6 +931,7 @@ class EgressProxyServer(socketserver.ThreadingTCPServer):
         replay_varying_headers: Sequence[str] = DEFAULT_VARYING_HEADERS,
         effect_gate: object | None = None,
         max_deferred_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
+        tls_interceptor: object | None = None,
     ) -> None:
         """``host`` should be the bridge's own address: REDIRECT rewrites
         each flow's destination to it, so binding there receives all
@@ -785,6 +944,7 @@ class EgressProxyServer(socketserver.ThreadingTCPServer):
         self.max_deferred_body_bytes = int(max_deferred_body_bytes)
         self.replay_varying_headers = tuple(replay_varying_headers)
         self.rules = tuple(rules)
+        self.tls_interceptor = tls_interceptor
         self._sandbox_id_resolver = sandbox_id_resolver
         self.head_timeout_seconds = head_timeout_seconds
         self.connect_timeout_seconds = connect_timeout_seconds
@@ -840,5 +1000,6 @@ __all__ = [
     "original_destination",
     "parse_original_dst",
     "sniff_http_head",
+    "sniff_tls_alpn",
     "sniff_tls_sni",
 ]
