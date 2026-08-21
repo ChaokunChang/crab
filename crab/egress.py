@@ -7,10 +7,12 @@ flow (HTTP request line + Host, or a TLS ClientHello's SNI), splices
 the bytes both ways untouched, and appends one ``kind="egress"``
 journal record per connection.
 
-Deliberate limits (see .cache/tasks/egress-ledger.md decision log):
-no TLS MITM in v1 — the SNI gives host-level identification, bodies
-are D2's charter; host-bound traffic is never redirected, so the LLM
-interceptor path stays byte-identical; TCP only.
+With TLS interception enabled (roadmap T1), a ClientHello on a standard
+HTTPS port with a valid SNI is terminated in-proxy: the proxy mints a
+leaf cert for the SNI, completes the handshake with the sandbox client,
+re-reads the now-decrypted head, then opens an upstream TLS connection
+to the real server. The decrypted flow enters the same replay → gate →
+record pipeline as plaintext HTTP, with ``scheme="https"``.
 """
 from __future__ import annotations
 
@@ -18,6 +20,7 @@ import fnmatch
 import logging
 import socket
 import socketserver
+import ssl
 import struct
 import threading
 import time
@@ -60,6 +63,9 @@ _SPLICE_CHUNK = 65536
 _HTTP_METHODS = frozenset(
     {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT"}
 )
+
+# Schemes whose decrypted head is visible to replay/gate/recording.
+_PLAINTEXT_VISIBLE = frozenset({"http", "https"})
 
 # Sent under cassette_only when nothing matches: hermetic replay must
 # fail loudly instead of quietly reaching the network.
@@ -486,22 +492,90 @@ class _EgressHandler(socketserver.BaseRequestHandler):
         bytes_in = 0
         record_meta: dict | None = None
         upstream: socket.socket | None = None
+        tls_interceptor = server.tls_interceptor
         try:
             client.settimeout(server.head_timeout_seconds)
             try:
-                head = client.recv(_HEAD_PEEK_BYTES)
+                head = client.recv(_HEAD_PEEK_BYTES, socket.MSG_PEEK)
             except (socket.timeout, OSError):
                 head = b""
             client.settimeout(None)
-            http = sniff_http_head(head)
-            if http is not None:
-                scheme = "http"
-                method, path, host = http
-            else:
-                sni = sniff_tls_sni(head)
-                if sni is not None:
+
+            # --- TLS interception branch (T1.2) ---
+            # Detect ClientHello; if interception is enabled and the
+            # pre-filter passes, terminate TLS in-proxy.
+            sni = sniff_tls_sni(head) if head and head[0:1] == b"\x16" else None
+            if (
+                sni is not None
+                and tls_interceptor is not None
+                and tls_interceptor.should_intercept(sni, dst_port)
+            ):
+                # Attempt server-side TLS termination with minted leaf.
+                try:
+                    server_ctx = tls_interceptor.build_server_context(sni)
+                    client = server_ctx.wrap_socket(
+                        client, server_side=True
+                    )
+                except ssl.SSLError as exc:
+                    logger.debug(
+                        "TLS handshake failed for %s: %s", sni, exc
+                    )
+                    if tls_interceptor.on_handshake_failure == "passthrough":
+                        tls_interceptor.add_runtime_bypass(sni)
+                    # Close: client must retry (will go opaque/bypass).
+                    return
+                # Re-read decrypted head from the now-wrapped socket.
+                client.settimeout(server.head_timeout_seconds)
+                try:
+                    head = client.recv(_HEAD_PEEK_BYTES)
+                except (socket.timeout, OSError):
+                    head = b""
+                client.settimeout(None)
+                http = sniff_http_head(head)
+                if http is not None:
+                    scheme = "https"
+                    method, path, host = http
+                else:
+                    # Decrypted head is not HTTP/1.1: downgrade to opaque
+                    # byte-tunnel (still terminated, bytes spliced, no
+                    # HTTP parsing). Decision 9.
                     scheme = "tls"
                     host = sni
+                    upstream = socket.create_connection(
+                        (dst_ip, dst_port),
+                        timeout=server.connect_timeout_seconds,
+                    )
+                    upstream.settimeout(None)
+                    upstream_ctx = tls_interceptor.build_upstream_context(sni)
+                    upstream = upstream_ctx.wrap_socket(
+                        upstream, server_hostname=sni
+                    )
+                    if head:
+                        upstream.sendall(head)
+                        bytes_out += len(head)
+                    out_extra, in_extra = _splice(client, upstream)
+                    bytes_out += out_extra
+                    bytes_in += in_extra
+                    return  # finally writes journal row
+            else:
+                # Consume head now (non-TLS-interception path).
+                # The peek above was MSG_PEEK; consume it for the legacy path.
+                if head:
+                    client.settimeout(server.head_timeout_seconds)
+                    try:
+                        head = client.recv(_HEAD_PEEK_BYTES)
+                    except (socket.timeout, OSError):
+                        head = b""
+                    client.settimeout(None)
+                http = sniff_http_head(head)
+                if http is not None:
+                    scheme = "http"
+                    method, path, host = http
+                else:
+                    sni_check = sniff_tls_sni(head)
+                    if sni_check is not None:
+                        scheme = "tls"
+                        host = sni_check
             # ---- replay (D2): a cassette hit never opens an upstream
             # connection. The gate is recomputed here with the current
             # rules, and only reads are eligible — mutating and opaque
@@ -509,7 +583,7 @@ class _EgressHandler(socketserver.BaseRequestHandler):
             replayer = server.cassette_replayer
             session = None if replayer is None or sandbox_id is None else replayer.session_for(sandbox_id)
             if session is not None:
-                eligible = scheme == "http" and classify_flow(
+                eligible = scheme in _PLAINTEXT_VISIBLE and classify_flow(
                     {"host": host or dst_ip, "method": method, "scheme": scheme},
                     server.rules,
                 ) == CLASSIFICATION_IDEMPOTENT_READ
@@ -558,7 +632,7 @@ class _EgressHandler(socketserver.BaseRequestHandler):
             if gate is not None and sandbox_id is not None:
                 decision = None
                 gate_session = None
-                if scheme == "http":
+                if scheme in _PLAINTEXT_VISIBLE:
                     verdict = classify_flow(
                         {"host": host or dst_ip, "method": method, "scheme": scheme},
                         server.rules,
@@ -642,6 +716,12 @@ class _EgressHandler(socketserver.BaseRequestHandler):
                 (dst_ip, dst_port), timeout=server.connect_timeout_seconds
             )
             upstream.settimeout(None)
+            # If this is an intercepted HTTPS flow, wrap upstream in TLS.
+            if scheme == "https" and tls_interceptor is not None:
+                upstream_ctx = tls_interceptor.build_upstream_context(host or sni or dst_ip)
+                upstream = upstream_ctx.wrap_socket(
+                    upstream, server_hostname=host or sni or dst_ip
+                )
             if head:
                 upstream.sendall(head)
                 bytes_out += len(head)
@@ -650,7 +730,7 @@ class _EgressHandler(socketserver.BaseRequestHandler):
             # the ledger uses, so "recordable" has one definition.
             recorder = server.cassette_recorder
             assembler = None
-            if recorder is not None and scheme == "http":
+            if recorder is not None and scheme in _PLAINTEXT_VISIBLE:
                 probe = {"host": host or dst_ip, "method": method, "scheme": scheme}
                 if classify_flow(probe, server.rules) == CLASSIFICATION_IDEMPOTENT_READ:
                     assembler = ResponseAssembler(limit=recorder.max_body_bytes)
@@ -739,7 +819,10 @@ def _splice(
             pass
         finally:
             try:
-                dst.shutdown(socket.SHUT_WR)
+                if isinstance(dst, ssl.SSLSocket):
+                    dst.unwrap()
+                else:
+                    dst.shutdown(socket.SHUT_WR)
             except OSError:
                 pass
 
@@ -773,6 +856,7 @@ class EgressProxyServer(socketserver.ThreadingTCPServer):
         replay_varying_headers: Sequence[str] = DEFAULT_VARYING_HEADERS,
         effect_gate: object | None = None,
         max_deferred_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
+        tls_interceptor: object | None = None,
     ) -> None:
         """``host`` should be the bridge's own address: REDIRECT rewrites
         each flow's destination to it, so binding there receives all
@@ -785,6 +869,7 @@ class EgressProxyServer(socketserver.ThreadingTCPServer):
         self.max_deferred_body_bytes = int(max_deferred_body_bytes)
         self.replay_varying_headers = tuple(replay_varying_headers)
         self.rules = tuple(rules)
+        self.tls_interceptor = tls_interceptor
         self._sandbox_id_resolver = sandbox_id_resolver
         self.head_timeout_seconds = head_timeout_seconds
         self.connect_timeout_seconds = connect_timeout_seconds
