@@ -18,6 +18,7 @@ from unittest import mock
 from crab.egress import (
     EgressFlowRecorder,
     EgressProxyServer,
+    _strip_port_for_sni,
     parse_original_dst,
     sniff_http_head,
     sniff_tls_sni,
@@ -1779,3 +1780,37 @@ class ReplayCounterConcurrencyTests(unittest.TestCase):
         self.assertEqual(missed, bumps * workers)
         self.assertEqual(passed, bumps * workers)
         self.assertEqual(hosts, ("api.example.com",))
+
+
+class StripPortForSniTests(unittest.TestCase):
+    """Unit tests for _strip_port_for_sni helper."""
+
+    def test_domain_with_port(self):
+        self.assertEqual(_strip_port_for_sni("api.example.com:8443"), "api.example.com")
+
+    def test_domain_without_port(self):
+        self.assertEqual(_strip_port_for_sni("api.example.com"), "api.example.com")
+
+    def test_domain_default_https_port(self):
+        self.assertEqual(_strip_port_for_sni("example.com:443"), "example.com")
+
+    def test_ipv6_bracketed_with_port(self):
+        self.assertEqual(_strip_port_for_sni("[::1]:8443"), "::1")
+
+    def test_ipv6_bracketed_without_port(self):
+        self.assertEqual(_strip_port_for_sni("[::1]"), "::1")
+
+    def test_ipv6_bare(self):
+        self.assertEqual(_strip_port_for_sni("::1"), "::1")
+
+    def test_ipv6_full_bracketed_with_port(self):
+        self.assertEqual(
+            _strip_port_for_sni("[2001:db8::1]:443"), "2001:db8::1"
+        )
+
+    def test_empty_string(self):
+        self.assertEqual(_strip_port_for_sni(""), "")
+
+    def test_localhost_with_port(self):
+        self.assertEqual(_strip_port_for_sni("localhost:9090"), "localhost")
+

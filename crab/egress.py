@@ -100,6 +100,32 @@ _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 
+def _strip_port_for_sni(host: str) -> str:
+    """Strip the port suffix from *host* for use as TLS server_hostname.
+
+    TLS certificates carry bare domain names (no port), so the value passed
+    to ``wrap_socket(server_hostname=...)`` must never include ``:port``.
+    IPv6 addresses wrapped in brackets are also unwrapped:
+
+    * ``"example.com:8443"`` → ``"example.com"``
+    * ``"[::1]:8443"`` → ``"::1"``
+    * ``"example.com"`` → ``"example.com"`` (unchanged)
+    * ``"::1"`` → ``"::1"`` (unchanged)
+    """
+    if host.startswith("["):
+        closing = host.find("]")
+        if closing == -1:
+            return host  # malformed, return as-is
+        # Strip brackets and any trailing :port
+        return host[1:closing]
+    # A single colon with digits after → host:port; multiple colons → bare IPv6.
+    if host.count(":") == 1:
+        name, _, port = host.rpartition(":")
+        if port.isdigit():
+            return name
+    return host
+
+
 @dataclass(frozen=True)
 class EgressRule:
     """Host-scoped classification override, e.g. mark a known read-only
@@ -793,9 +819,10 @@ class _EgressHandler(socketserver.BaseRequestHandler):
             upstream.settimeout(None)
             # If this is an intercepted HTTPS flow, wrap upstream in TLS.
             if scheme == "https" and tls_interceptor is not None:
-                upstream_ctx = tls_interceptor.build_upstream_context(host or sni or dst_ip)
+                _sni_host = _strip_port_for_sni(host or sni or dst_ip)
+                upstream_ctx = tls_interceptor.build_upstream_context(_sni_host)
                 upstream = upstream_ctx.wrap_socket(
-                    upstream, server_hostname=host or sni or dst_ip
+                    upstream, server_hostname=_sni_host
                 )
             if head:
                 upstream.sendall(head)

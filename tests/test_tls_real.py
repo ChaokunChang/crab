@@ -484,10 +484,14 @@ class TestTLSHandshakeFailurePassthrough(unittest.TestCase):
         # The proxy terminates with minted leaf, sandbox rejects it → handshake
         # failure. Under passthrough, the host is added to runtime bypass.
         # Second attempt (retry): goes opaque directly.
+        # NOTE: SSL_CERT_FILE is unset so the sandbox uses only system CAs
+        # (not the injected crab CA).  This simulates a client that does not
+        # trust the interception proxy.
         sandbox.commands.run(
             "python3 -c \""
-            "import socket, ssl\n"
-            "ctx = ssl.create_default_context()\n"  # uses system CA, not crab CA
+            "import os, socket, ssl\n"
+            "os.environ.pop('SSL_CERT_FILE', None)\n"
+            "ctx = ssl.create_default_context()\n"  # system CA only
             f"s = socket.create_connection(('{self.tls_server.hostname}', {self.tls_server.port}), timeout=10)\n"
             "try:\n"
             f"    ctx.wrap_socket(s, server_hostname='{self.tls_server.hostname}')\n"
@@ -557,10 +561,13 @@ class TestTLSHandshakeFailureRefuse(unittest.TestCase):
 
         # Sandbox uses system CA (not the crab CA) — handshake will fail.
         # Under refuse mode: no bypass, just close. Server should NOT see the request.
+        # NOTE: SSL_CERT_FILE is unset so the sandbox only trusts system CAs,
+        # not the injected crab CA — simulating a client that refuses the proxy cert.
         result = sandbox.commands.run(
             "python3 -c \""
-            "import socket, ssl\n"
-            "ctx = ssl.create_default_context()\n"  # system CA
+            "import os, socket, ssl\n"
+            "os.environ.pop('SSL_CERT_FILE', None)\n"
+            "ctx = ssl.create_default_context()\n"  # system CA only
             f"s = socket.create_connection(('{self.tls_server.hostname}', {self.tls_server.port}), timeout=10)\n"
             "try:\n"
             f"    ctx.wrap_socket(s, server_hostname='{self.tls_server.hostname}')\n"
