@@ -300,8 +300,21 @@ proven. Networking-off deployments are unaffected (no lease to move).
   into a host-side transparent proxy that records one journal row per
   flow: host (HTTP `Host` header or TLS SNI), destination ip/port,
   scheme (`http`/`tls`/`tcp`), method/path for plaintext HTTP, byte
-  counts and duration. Nothing is decrypted (no CA injection in v1) and
-  bytes are spliced untouched. Host-bound traffic is never redirected,
+  counts and duration. With **TLS interception** enabled
+  (`egress.tls_interception.enabled: true`, requires `crab[tls]`), most
+  HTTPS flows are decrypted in-proxy: the proxy mints a per-SNI leaf
+  certificate, terminates the handshake, and re-reads the decrypted
+  head — making HTTPS `GET`/`POST`/etc. classifiable and recordable
+  exactly like plaintext HTTP (`scheme="https"`). The CA certificate is
+  automatically injected into the sandbox rootfs and environment
+  (`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`,
+  `NODE_EXTRA_CA_CERTS`) so that most runtimes trust the proxy.
+  **Exceptions that cannot be intercepted**: certificate-pinning clients,
+  Java (custom keystore not injected in v1), HTTP/2-only flows (ALPN
+  without `http/1.1`), and hosts listed in `bypass_hosts`. These remain
+  `scheme="tls"` (opaque). When interception is off (default), bytes are
+  spliced untouched and all encrypted flows are opaque as before.
+  Host-bound traffic is never redirected,
   so the LLM interceptor path is unaffected. Flows opened inside a
   transaction carry its `txn_id`.
 - `Sandbox.egress(txn_id=None, since_seq=None)` returns the
@@ -322,11 +335,10 @@ proven. Networking-off deployments are unaffected (no lease to move).
   (`crab sandbox egress`).
 - **Egress recording (D2)** is opt-in via
   `EngineConfig(enable_egress_recording=True)` (config:
-  `egress.recording.enabled`) and requires the egress proxy. For
-  **plaintext HTTP idempotent reads only** — HTTPS bodies are never
-  recorded (no TLS interception), so this covers `http://` traffic and
-  hosts a rule marks as `idempotent_read`. Each recorded exchange lands
-  in a per-sandbox cassette under
+  `egress.recording.enabled`) and requires the egress proxy. Records
+  **idempotent reads** (GET/HEAD/OPTIONS/TRACE) for both plaintext HTTP
+  and — with TLS interception enabled — HTTPS. Each recorded exchange
+  lands in a per-sandbox cassette under
   `{storage_root}/cassettes/<sandbox_id>/`, content-addressed, and the
   ledger flow gains `recorded`, `request_key`, `status` and `truncated`.
   Responses larger than `egress.recording.max_body_bytes` (default 1
@@ -343,8 +355,9 @@ proven. Networking-off deployments are unaffected (no lease to move).
   of the network (D2). A hit never opens an upstream connection;
   `cassette_first` falls through to the network on a miss, while
   `cassette_only` answers a miss with `504` + `X-Crab-Replay: miss` for
-  hermetic replay. **Mutating and encrypted/raw flows always pass through
-  in both modes** — replay is a read cache, not an effect gate (holding
+  hermetic replay. **Mutating and opaque/raw flows always pass through
+  in both modes** (with TLS interception, intercepted HTTPS reads become
+  replayable too) — replay is a read cache, not an effect gate (holding
   writes is D3). Eligibility is re-evaluated at replay time with the
   current `egress_rules`, so a host reclassified as `mutating`/`opaque`
   stops being served even though its cassettes remain on disk.

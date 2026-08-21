@@ -413,6 +413,14 @@ class Sandbox:
             image_rootfs_dir=exported_rootfs,
         )
         self._write_sdk_bundle_process(bundle_dir, image_defaults)
+        # TLS trust injection: add CA cert to rootfs copy paths.
+        rootfs_copy_paths = [{"source": str(exported_rootfs), "destination": "/"}]
+        ca_cert_path = getattr(self._engine, "tls_ca_cert_path", None)
+        if ca_cert_path is not None:
+            from .tls_trust import _SANDBOX_CA_CERT_PATH  # no cryptography dep
+            rootfs_copy_paths.append(
+                {"source": str(ca_cert_path), "destination": _SANDBOX_CA_CERT_PATH}
+            )
         plan.bundle_dir = bundle_dir
         plan.image = image_tag
         plan.work_dir_host = work_dir_host_path
@@ -427,7 +435,7 @@ class Sandbox:
                 "bundle_path": str(bundle_dir),
                 "work_dir_host_path": None if work_dir_host_path is None else str(work_dir_host_path),
                 "rootfs_init_dirs": self._rootfs_init_dirs(),
-                "rootfs_copy_paths": [{"source": str(exported_rootfs), "destination": "/"}],
+                "rootfs_copy_paths": rootfs_copy_paths,
                 "shared_rootfs_key": image_id[:32],
                 "shared_rootfs_persist": True,
                 "sdk_image": image_tag,
@@ -656,6 +664,7 @@ class Sandbox:
                 "PYTHONUNBUFFERED=1",
                 f"CRAB_SANDBOX_ID={self.sandbox_id}",
                 *[f"{key}={value}" for key, value in self._user_env.items()],
+                *self._tls_ca_env_assignments(),
             ],
         )
         process["env"] = env
@@ -1201,6 +1210,11 @@ class Sandbox:
         Agent-specific LLM env is supplied by `Agent.command_env(...)`.
         """
         merged: dict[str, str] = {}
+        # TLS CA env injection (exec path) — before user env so user can
+        # override if needed.
+        ca_env = self._tls_ca_env_dict()
+        if ca_env:
+            merged.update(ca_env)
         if self._user_env:
             merged.update(self._user_env)
         if overrides:
@@ -1217,6 +1231,33 @@ class Sandbox:
         if isinstance(rootfs, str) and rootfs:
             return Path(rootfs)
         raise RuntimeError("runtime does not expose a host rootfs path")
+
+    # ------------------------------------------------------------------
+    # TLS trust injection (§3.3)
+    # ------------------------------------------------------------------
+
+    def _tls_ca_env_dict(self) -> dict[str, str] | None:
+        """Return CA env overlay dict when TLS interception is active, else None."""
+        ca_path = getattr(self._engine, "tls_ca_cert_path", None)
+        if ca_path is None:
+            return None
+        from .tls_trust import tls_ca_env_overlay  # no cryptography dep
+        return tls_ca_env_overlay()
+
+    def _tls_ca_env_assignments(self) -> list[str]:
+        """Return CA env as KEY=VALUE assignment strings for init env."""
+        overlay = self._tls_ca_env_dict()
+        if not overlay:
+            return []
+        return [f"{k}={v}" for k, v in overlay.items()]
+
+    def _inject_tls_ca_into_rootfs(self, rootfs_path: Path) -> None:
+        """Copy the CA cert into the sandbox rootfs when interception is on."""
+        ca_path = getattr(self._engine, "tls_ca_cert_path", None)
+        if ca_path is None:
+            return
+        from .tls_trust import inject_ca_into_rootfs  # no cryptography dep
+        inject_ca_into_rootfs(rootfs_path, ca_path)
 
 
 __all__ = ["Sandbox"]
