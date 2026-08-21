@@ -87,7 +87,7 @@ class TestCAStore:
         """CA not_valid_before should be <= now (clock-skew backdate)."""
         now = datetime.datetime.now(datetime.timezone.utc)
         store = CAStore(tmp_path / "tls")
-        assert store.cert.not_valid_before_utc <= now
+        assert store.cert.not_valid_before <= now.replace(tzinfo=None)
 
 
 class TestLeafMinter:
@@ -165,7 +165,7 @@ class TestLeafMinter:
     def test_leaf_validity_24h(self, minter):
         """Leaf cert validity period is ~24h + 5min skew."""
         cert, _ = minter.get_or_mint("ttl.test")
-        delta = cert.not_valid_after_utc - cert.not_valid_before_utc
+        delta = cert.not_valid_after - cert.not_valid_before
         # 24h + 5min backdate = ~24h5m total window.
         total_secs = delta.total_seconds()
         assert 24 * 3600 <= total_secs <= 25 * 3600
@@ -195,7 +195,7 @@ class TestLeafMinter:
         """Leaf not_valid_before should be <= now (clock-skew backdate)."""
         now = datetime.datetime.now(datetime.timezone.utc)
         cert, _ = minter.get_or_mint("skew.test")
-        assert cert.not_valid_before_utc <= now
+        assert cert.not_valid_before <= now.replace(tzinfo=None)
 
     def test_cache_evicts_expired_leaf(self, ca):
         """Expired cached leaf is re-minted on next access."""
@@ -236,7 +236,7 @@ class TestLeafMinter:
         # Now get_or_mint should detect expiry and re-mint.
         cert2, key2 = minter.get_or_mint("expire.test")
         assert cert2.serial_number != expired_cert.serial_number
-        assert cert2.not_valid_after_utc > now
+        assert cert2.not_valid_after > now.replace(tzinfo=None)
 
     def test_cache_capacity_limit(self, ca):
         """Cache respects capacity limit and evicts oldest entries."""

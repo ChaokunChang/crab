@@ -44,6 +44,21 @@ _LEAF_CACHE_MAX = 1024  # max cached leaf certs (FIFO eviction)
 _CLOCK_SKEW_MINUTES = 5  # backdate not_valid_before to tolerate clock drift
 
 
+def _cert_not_valid_after(cert) -> datetime.datetime:
+    """Compat helper: return UTC-aware expiry for any cryptography version.
+
+    cryptography >= 42 has ``not_valid_after_utc``; older versions have
+    ``not_valid_after`` returning a naive UTC datetime.
+    """
+    try:
+        return cert.not_valid_after_utc
+    except AttributeError:
+        naive = cert.not_valid_after
+        if naive.tzinfo is None:
+            return naive.replace(tzinfo=datetime.timezone.utc)
+        return naive
+
+
 def _require_cryptography() -> None:
     if not _HAS_CRYPTOGRAPHY:
         raise ImportError(
@@ -261,7 +276,7 @@ class LeafMinter:
         with self._lock:
             if host in self._cache:
                 cached_cert, cached_key = self._cache[host]
-                if cached_cert.not_valid_after_utc > now:
+                if _cert_not_valid_after(cached_cert) > now:
                     # Move to end (most recently used) for FIFO fairness.
                     self._cache.move_to_end(host)
                     return cached_cert, cached_key
@@ -273,7 +288,7 @@ class LeafMinter:
             # Double-check: another thread may have minted while we were busy.
             if host in self._cache:
                 existing_cert, _ = self._cache[host]
-                if existing_cert.not_valid_after_utc > now:
+                if _cert_not_valid_after(existing_cert) > now:
                     self._cache.move_to_end(host)
                     return self._cache[host]
             self._cache[host] = (cert, key)
