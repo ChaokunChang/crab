@@ -1,0 +1,169 @@
+"""Unit tests for crab.tls_ca — CA store and leaf certificate minting.
+
+Covers: CA generation idempotency, key file permissions, leaf SAN correctness,
+per-host caching, and CA→leaf chain verification.
+"""
+
+from __future__ import annotations
+
+import ipaddress
+import os
+import stat
+
+import pytest
+
+from cryptography import x509
+from cryptography.hazmat.primitives.asymmetric import padding
+
+from crab.tls_ca import CAStore, LeafMinter
+
+
+class TestCAStore:
+    """CA generation and persistence."""
+
+    def test_generates_ca_on_first_use(self, tmp_path):
+        """First instantiation creates ca.crt and ca.key."""
+        store = CAStore(tmp_path / "tls")
+        assert (tmp_path / "tls" / "ca.crt").exists()
+        assert (tmp_path / "tls" / "ca.key").exists()
+        assert store.cert is not None
+        assert store.key is not None
+
+    def test_idempotent_reload(self, tmp_path):
+        """Second instantiation loads the same CA, not a new one."""
+        d = tmp_path / "tls"
+        store1 = CAStore(d)
+        serial1 = store1.cert.serial_number
+
+        store2 = CAStore(d)
+        serial2 = store2.cert.serial_number
+
+        assert serial1 == serial2, "CA must be idempotent: same serial on reload"
+
+    def test_key_file_permission_0600(self, tmp_path):
+        """Private key file must be chmod 0600."""
+        store = CAStore(tmp_path / "tls")
+        key_stat = os.stat(store.key_path)
+        mode = stat.S_IMODE(key_stat.st_mode)
+        assert mode == 0o600, f"Expected 0600, got {oct(mode)}"
+
+    def test_key_permission_enforced_on_reload(self, tmp_path):
+        """Even if someone loosens the permission, reload re-enforces 0600."""
+        d = tmp_path / "tls"
+        CAStore(d)
+        # Loosen permission.
+        os.chmod(d / "ca.key", 0o644)
+        # Re-load.
+        CAStore(d)
+        mode = stat.S_IMODE(os.stat(d / "ca.key").st_mode)
+        assert mode == 0o600
+
+    def test_ca_is_self_signed(self, tmp_path):
+        """CA cert issuer == subject (self-signed)."""
+        store = CAStore(tmp_path / "tls")
+        assert store.cert.issuer == store.cert.subject
+
+    def test_ca_has_basic_constraints_ca_true(self, tmp_path):
+        """CA cert must have BasicConstraints(ca=True)."""
+        store = CAStore(tmp_path / "tls")
+        bc = store.cert.extensions.get_extension_for_class(
+            x509.BasicConstraints
+        ).value
+        assert bc.ca is True
+
+    def test_cert_pem_returns_bytes(self, tmp_path):
+        """cert_pem() returns valid PEM bytes."""
+        store = CAStore(tmp_path / "tls")
+        pem = store.cert_pem()
+        assert pem.startswith(b"-----BEGIN CERTIFICATE-----")
+
+
+class TestLeafMinter:
+    """Leaf certificate minting and caching."""
+
+    @pytest.fixture()
+    def ca(self, tmp_path):
+        return CAStore(tmp_path / "tls")
+
+    @pytest.fixture()
+    def minter(self, ca):
+        return LeafMinter(ca)
+
+    def test_leaf_has_dns_san_for_hostname(self, minter):
+        """Hostname leaf gets a DNSName SAN."""
+        cert, _key = minter.get_or_mint("example.com")
+        san = cert.extensions.get_extension_for_class(
+            x509.SubjectAlternativeName
+        ).value
+        dns_names = san.get_values_for_type(x509.DNSName)
+        assert "example.com" in dns_names
+
+    def test_leaf_has_ip_san_for_ip_literal(self, minter):
+        """IP-literal leaf gets an IPAddress SAN."""
+        cert, _key = minter.get_or_mint("192.168.1.1")
+        san = cert.extensions.get_extension_for_class(
+            x509.SubjectAlternativeName
+        ).value
+        ips = san.get_values_for_type(x509.IPAddress)
+        assert ipaddress.IPv4Address("192.168.1.1") in ips
+
+    def test_leaf_has_ip_san_for_ipv6(self, minter):
+        """IPv6 literal leaf gets an IPAddress SAN."""
+        cert, _key = minter.get_or_mint("::1")
+        san = cert.extensions.get_extension_for_class(
+            x509.SubjectAlternativeName
+        ).value
+        ips = san.get_values_for_type(x509.IPAddress)
+        assert ipaddress.IPv6Address("::1") in ips
+
+    def test_leaf_cached_per_host(self, minter):
+        """Same host returns cached (same object) on second call."""
+        cert1, key1 = minter.get_or_mint("cached.test")
+        cert2, key2 = minter.get_or_mint("cached.test")
+        assert cert1 is cert2
+        assert key1 is key2
+
+    def test_different_hosts_get_different_certs(self, minter):
+        """Different hosts produce different certificates."""
+        cert_a, _ = minter.get_or_mint("a.test")
+        cert_b, _ = minter.get_or_mint("b.test")
+        assert cert_a.serial_number != cert_b.serial_number
+
+    def test_leaf_signed_by_ca(self, ca, minter):
+        """Leaf certificate is verifiable against the CA public key."""
+        cert, _key = minter.get_or_mint("verify.test")
+        # Verify signature: the CA public key should verify the leaf cert.
+        ca_public_key = ca.key.public_key()
+        # This will raise InvalidSignature if verification fails.
+        ca_public_key.verify(
+            cert.signature,
+            cert.tbs_certificate_bytes,
+            padding.PKCS1v15(),
+            cert.signature_hash_algorithm,
+        )
+
+    def test_leaf_not_ca(self, minter):
+        """Leaf cert must have BasicConstraints(ca=False)."""
+        cert, _ = minter.get_or_mint("notca.test")
+        bc = cert.extensions.get_extension_for_class(
+            x509.BasicConstraints
+        ).value
+        assert bc.ca is False
+
+    def test_leaf_validity_24h(self, minter):
+        """Leaf cert validity period is ~24 hours."""
+        cert, _ = minter.get_or_mint("ttl.test")
+        delta = cert.not_valid_after_utc - cert.not_valid_before_utc
+        # Allow a small window for execution time.
+        assert 23 * 3600 <= delta.total_seconds() <= 25 * 3600
+
+    def test_get_cert_and_key_pem(self, minter):
+        """get_cert_and_key_pem returns valid PEM bytes."""
+        cert_pem, key_pem = minter.get_cert_and_key_pem("pem.test")
+        assert cert_pem.startswith(b"-----BEGIN CERTIFICATE-----")
+        assert key_pem.startswith(b"-----BEGIN RSA PRIVATE KEY-----")
+
+    def test_leaf_issuer_matches_ca_subject(self, ca, minter):
+        """Leaf issuer field matches CA subject."""
+        cert, _ = minter.get_or_mint("issuer.test")
+        assert cert.issuer == ca.cert.subject
