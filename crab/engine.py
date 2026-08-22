@@ -924,22 +924,56 @@ class Engine:
         cls,
         socket: str | os.PathLike[str] | None = None,
         *,
+        url: str | None = None,
+        api_key: str | None = None,
         timeout_seconds: float = 30.0,
     ) -> "Engine":
-        """Connect to a running Crab daemon and return a `RemoteEngine`.
+        """Connect to a running Crab daemon (or gateway) — returns a `RemoteEngine`.
 
         The returned object exposes the same attribute surface SDK code
         already reads from a local Engine (`.runtime`, `.config`,
         `.storage_root` and friends, `.register_upstream`, …) — it just
-        translates each call into one of the daemon's HTTP-over-Unix-socket
-        endpoints. Returned as `Engine` for static-typing convenience;
-        the runtime type is `crab.remote_engine.RemoteEngine`.
+        translates each call into the daemon's HTTP endpoints. Returned
+        as `Engine` for static-typing convenience; the runtime type is
+        `crab.remote_engine.RemoteEngine`.
 
-        `socket` defaults to `default_socket_path()` from
-        `crab.daemon`. The daemon must already be running — start it
-        with `crab daemon start` (or `python -m crab.daemon`)."""
-        from .daemon import DaemonClient
+        Two modes, dispatched on argument shape:
+
+        - **Local daemon** (default): `socket` is a Unix-socket path,
+          defaulting to `default_socket_path()` from `crab.daemon`. The
+          daemon must already be running — start it with
+          `crab daemon start` (or `python -m crab.daemon`).
+        - **Cloud**: pass `url="https://gateway.example.com"` (or give an
+          `http(s)://` string as the first positional argument) plus
+          `api_key=` — or set `$CRAB_API_KEY`. Requests travel over TCP
+          to a crab-gateway's `/v1` API with Bearer auth; gateway errors
+          surface as the typed exceptions in `crab.cloud_client`."""
         from .remote_engine import RemoteEngine
+
+        # Shape dispatch: an http(s):// string in the positional slot is
+        # a gateway URL, not a socket path.
+        if url is None and isinstance(socket, str) and socket.startswith(
+            ("http://", "https://")
+        ):
+            url, socket = socket, None
+        if url is not None:
+            if socket is not None:
+                raise ValueError("pass either socket= or url=, not both")
+            from .cloud_client import CloudClient, CloudConnectionError, CloudRequestError
+
+            cloud = CloudClient(url, api_key, timeout_seconds=timeout_seconds)
+            try:
+                info = cloud.get_json("/info")
+            except (CloudRequestError, CloudConnectionError):
+                raise
+            except Exception as exc:
+                raise RuntimeError(
+                    f"failed to connect to crab gateway at {cloud.base_url}: {exc}"
+                ) from exc
+            return RemoteEngine(cloud, info=info)  # type: ignore[return-value]
+        if api_key is not None:
+            raise ValueError("api_key= is only meaningful with url= (cloud mode)")
+        from .daemon import DaemonClient
 
         client = DaemonClient(socket, timeout_seconds=timeout_seconds)
         try:
