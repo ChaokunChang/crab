@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from ..daemon.transport import DaemonClient, DaemonRequestError
+from ..resources import parse_memory_bytes
 from .server import (
     DEFAULT_BIND_HOST,
     DEFAULT_BIND_PORT,
@@ -86,10 +87,29 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_tenants_create(args: argparse.Namespace) -> int:
+def _memory_arg(value: str) -> int:
+    """argparse type for memory caps: bytes or a K/M/G/T-suffixed size."""
+    try:
+        return parse_memory_bytes(value, field="max_memory")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _quotas_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    """Shared quota assembly for `tenants create` / `quotas set` — the
+    keys match the registry's quota_json spelling (design doc §4 S3)."""
     quotas: dict[str, Any] = {}
     if args.max_sandboxes is not None:
         quotas["max_sandboxes"] = args.max_sandboxes
+    if args.max_memory is not None:
+        quotas["max_memory_bytes"] = args.max_memory
+    if args.max_cpu is not None:
+        quotas["max_cpu"] = args.max_cpu
+    return quotas
+
+
+def _cmd_tenants_create(args: argparse.Namespace) -> int:
+    quotas = _quotas_from_args(args)
     body: dict[str, Any] = {"name": args.name}
     if quotas:
         body["quotas"] = quotas
@@ -109,9 +129,7 @@ def _cmd_keys_revoke(args: argparse.Namespace) -> int:
 
 
 def _cmd_quotas_set(args: argparse.Namespace) -> int:
-    quotas: dict[str, Any] = {}
-    if args.max_sandboxes is not None:
-        quotas["max_sandboxes"] = args.max_sandboxes
+    quotas = _quotas_from_args(args)
     return _run_admin(args, "POST", "/admin/quotas", {"tenant_id": args.tenant, "quotas": quotas})
 
 
@@ -122,6 +140,23 @@ def _add_admin_socket_arg(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Gateway admin Unix socket path (default: $CRAB_GATEWAY_SOCKET "
         "or the conventional runtime-dir location).",
+    )
+
+
+def _add_quota_resource_args(parser: argparse.ArgumentParser) -> None:
+    """S3 aggregate caps, shared by `tenants create` and `quotas set`."""
+    parser.add_argument(
+        "--max-memory",
+        type=_memory_arg,
+        default=None,
+        help="Quota: total memory across live sandboxes, as bytes or a "
+        "K/M/G/T size (e.g. 2G). Stored as max_memory_bytes.",
+    )
+    parser.add_argument(
+        "--max-cpu",
+        type=int,
+        default=None,
+        help="Quota: total CPUs across live sandboxes.",
     )
 
 
@@ -170,6 +205,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Quota: maximum live sandboxes (unset = unlimited).",
     )
+    _add_quota_resource_args(tenants_create)
     _add_admin_socket_arg(tenants_create)
     tenants_create.set_defaults(fn=_cmd_tenants_create)
     tenants_list = tenants_sub.add_parser("list", help="List tenants.")
@@ -199,6 +235,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Quota: maximum live sandboxes (omit to clear the cap).",
     )
+    _add_quota_resource_args(quotas_set)
     _add_admin_socket_arg(quotas_set)
     quotas_set.set_defaults(fn=_cmd_quotas_set)
 

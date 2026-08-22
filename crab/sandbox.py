@@ -226,13 +226,15 @@ class Sandbox:
         engine: "Engine | None" = None,
         autostart: bool = True,
         network: bool | None = None,
-        # Forward-compatible kwargs (resources, timeout, labels) — stored as
-        # metadata for now and exposed via `Sandbox.metadata`.
+        # `resources` is enforced (S3): normalized at construction and
+        # applied as cgroup limits on the runc launch path. `timeout` and
+        # `labels` remain advisory metadata exposed via `Sandbox.metadata`.
         resources: dict[str, object] | None = None,
         timeout: float | None = None,
         labels: dict[str, str] | None = None,
     ) -> None:
         from .engine import get_default_engine
+        from .resources import normalize_resources
 
         self._engine = engine if engine is not None else get_default_engine()
         self._lock = threading.Lock()
@@ -240,6 +242,9 @@ class Sandbox:
         self._sandbox_id: SandboxId | None = None
         self._launch_plan: _LaunchPlan | None = None
         self._user_env = dict(env or {})
+        # Loud at construction: an invalid resources shape must fail before
+        # any launch work happens (enforced limits, not advisory metadata).
+        self._resource_claim = normalize_resources(resources)
         self._metadata = {
             "resources": dict(resources or {}),
             "timeout": timeout,
@@ -297,6 +302,10 @@ class Sandbox:
             launch_metadata = self._prepare_runc_launch(plan, sandbox_id)
         else:
             launch_metadata = {"sandbox_id": str(sandbox_id), **dict(plan.metadata)}
+        if self._resource_claim:
+            # The normalized claim rides the launch metadata so the gateway
+            # (cloud mode) can meter per-tenant aggregate quotas (§4 S3).
+            launch_metadata = {**launch_metadata, "resources": dict(self._resource_claim)}
         sandbox_id = runtime.launch(runtime_name, launch_metadata)
         self._sandbox_id = sandbox_id
         self._mark_inspector_running()
@@ -341,6 +350,7 @@ class Sandbox:
             sandbox_id,
             force=self._template is not None,
         )
+        resource_limits = self._bundle_resource_limits()
 
         if self._template is not None:
             sandbox_bundle.write_bundle_config(
@@ -354,6 +364,7 @@ class Sandbox:
                 network_namespace_path=network_namespace_path,
                 image_defaults=None,
                 image_rootfs_dir=None,
+                resource_limits=resource_limits,
             )
             template_data = self._template.configure_runc_bundle(
                 engine=self._engine,
@@ -412,6 +423,7 @@ class Sandbox:
             network_namespace_path=network_namespace_path,
             image_defaults=image_defaults,
             image_rootfs_dir=exported_rootfs,
+            resource_limits=resource_limits,
         )
         self._write_sdk_bundle_process(bundle_dir, image_defaults)
         # TLS trust injection: add CA cert to rootfs copy paths.
@@ -446,6 +458,20 @@ class Sandbox:
             }
         )
         return dict(plan.metadata)
+
+    def _bundle_resource_limits(self) -> "object | None":
+        """Normalized claim -> `SandboxResourceLimits` for the bundle spec
+        (`linux.resources`); None when no limits were requested so the
+        written spec is identical to the unlimited one."""
+        if not self._resource_claim:
+            return None
+        from integrations.sandboxes.runtime import bundle as sandbox_bundle
+
+        return sandbox_bundle.SandboxResourceLimits(
+            cpus=self._resource_claim.get("cpus"),
+            memory_bytes=self._resource_claim.get("memory_bytes"),
+            pids_limit=self._resource_claim.get("pids"),
+        )
 
     @staticmethod
     def _shared_rootfs_key(image_id: str, ca_cert_path: Path | None) -> str:

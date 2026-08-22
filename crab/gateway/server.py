@@ -47,6 +47,7 @@ from ..daemon.transport import (
     DaemonRequestError,
     serve_unix_socket,
 )
+from ..resources import validate_claim
 from .registry import GatewayRegistry, QuotaExceeded
 
 logger = logging.getLogger(__name__)
@@ -199,10 +200,17 @@ class _GatewayRoutes:
         assert tenant_id is not None
         name_raw = body.get("name")
         name = name_raw if isinstance(name_raw, str) else None
-        # Phase one: durable intent + quota gate (409 on exhaustion).
-        intent_id = self._gateway.registry.begin_create(tenant_id, name=name)
-        daemon_body = dict(body)
         metadata = dict(body.get("metadata") or {})
+        # S3: the SDK ships the normalized resources claim in the launch
+        # metadata; re-validate at the trust boundary (malformed -> 400).
+        try:
+            claim = validate_claim(metadata.get("resources"))
+        except ValueError as exc:
+            raise _BadRequest(f"invalid resources: {exc}") from exc
+        # Phase one: durable intent + quota gate (409 on exhaustion),
+        # including the per-tenant aggregate resource caps.
+        intent_id = self._gateway.registry.begin_create(tenant_id, name=name, resources=claim)
+        daemon_body = dict(body)
         metadata[GATEWAY_INTENT_METADATA_KEY] = intent_id
         daemon_body["metadata"] = metadata
         try:
@@ -239,22 +247,29 @@ class _GatewayRoutes:
         self, tenant_id: str | None, body: dict[str, Any], *, sandbox_id: str, **_: Any
     ) -> dict[str, Any]:
         assert tenant_id is not None
-        self._gateway.require_owned(tenant_id, sandbox_id)
+        source_row = self._gateway.require_owned(tenant_id, sandbox_id)
         try:
             count = int(body.get("count", 1))
         except (TypeError, ValueError):
             count = 1  # malformed counts are the daemon's 400 to give
         # Forks create sandboxes, so they hit the same quota gate as
-        # create. Children are registered post-hoc (their ids are
-        # daemon-assigned), not two-phase — see the design doc.
-        self._gateway.registry.ensure_capacity(tenant_id, additional=max(count, 0))
+        # create. Children inherit the source's resource claim (§4 S3 —
+        # forks copy the source's limits), so each child counts it against
+        # the aggregate caps. Children are registered post-hoc (their ids
+        # are daemon-assigned), not two-phase — see the design doc.
+        claim = dict(source_row.get("resources") or {})
+        self._gateway.registry.ensure_capacity(
+            tenant_id, additional=max(count, 0), resources=claim
+        )
         result = self._gateway.proxy(
             "POST", f"/sandboxes/{sandbox_id}/fork", body, _SLOW_TIMEOUT_S
         )
         for fork in result.get("forks") or []:
             fork_id = fork.get("sandbox_id")
             if fork_id:
-                self._gateway.registry.register_sandbox(tenant_id, str(fork_id))
+                self._gateway.registry.register_sandbox(
+                    tenant_id, str(fork_id), resources=claim
+                )
         return result
 
 

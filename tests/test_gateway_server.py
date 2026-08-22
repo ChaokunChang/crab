@@ -278,10 +278,18 @@ class GatewayTestBase(unittest.TestCase):
         self.addCleanup(self.gateway.stop)
         self.admin = DaemonClient(self.base / "admin.sock")
 
-    def make_tenant(self, name: str, max_sandboxes: int | None = None):
+    def make_tenant(
+        self,
+        name: str,
+        max_sandboxes: int | None = None,
+        quotas: dict[str, Any] | None = None,
+    ):
         body: dict[str, Any] = {"name": name}
+        merged: dict[str, Any] = dict(quotas or {})
         if max_sandboxes is not None:
-            body["quotas"] = {"max_sandboxes": max_sandboxes}
+            merged["max_sandboxes"] = max_sandboxes
+        if merged:
+            body["quotas"] = merged
         tenant = self.admin.post_json("/admin/tenants", body)["tenant"]
         key = self.admin.post_json("/admin/keys", {"tenant_id": tenant["id"]})["api_key"]
         return tenant, key
@@ -477,6 +485,93 @@ class QuotaTests(GatewayLiveTestBase):
         self.assertEqual(statuses.count(200), 3)
         self.assertEqual(statuses.count(409), 5)
         self.assertEqual(self.gateway.registry.live_count(tenant["id"]), 3)
+
+
+# ---------------------------------------------------------------------------
+# Aggregate resource quota gate (S3) — claims ride create metadata
+# ---------------------------------------------------------------------------
+
+
+MIB = 1024 * 1024
+
+
+class AggregateQuotaHttpTests(GatewayLiveTestBase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.tenant, self.key = self.make_tenant(
+            "metered", quotas={"max_memory_bytes": 1024 * MIB, "max_cpu": 4}
+        )
+
+    def _create(self, claim: dict[str, Any] | None) -> tuple[int, dict[str, Any]]:
+        body: dict[str, Any] = {}
+        if claim is not None:
+            body["metadata"] = {"resources": claim}
+        return self.request("POST", "/v1/sandboxes", api_key=self.key, body=body)
+
+    def test_over_cap_create_is_409_with_arithmetic(self) -> None:
+        status, _ = self._create({"memory_bytes": 768 * MIB, "cpus": 2})
+        self.assertEqual(status, 200)
+        status, payload = self._create({"memory_bytes": 512 * MIB, "cpus": 1})
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["error_type"], "quota_exceeded")
+        self.assertEqual(
+            payload["quota"],
+            {
+                "max_memory_bytes": 1024 * MIB,
+                "live_memory_bytes": 768 * MIB,
+                "requested_memory_bytes": 512 * MIB,
+            },
+        )
+
+    def test_undeclared_limits_on_capped_tenant_are_409(self) -> None:
+        status, payload = self._create(None)
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["error_type"], "quota_exceeded")
+        self.assertIsNone(payload["quota"]["requested_memory_bytes"])
+
+    def test_malformed_resources_are_400_not_500(self) -> None:
+        for bad in ({"memory": "512M"}, {"cpus": "two"}, ["cpus"]):
+            status, payload = self._create(bad)  # type: ignore[arg-type]
+            self.assertEqual(status, 400, repr(bad))
+            self.assertIn("invalid resources", payload["error"])
+
+    def test_kill_releases_aggregate_quota(self) -> None:
+        claim = {"memory_bytes": 768 * MIB, "cpus": 2}
+        status, payload = self._create(claim)
+        self.assertEqual(status, 200)
+        sandbox_id = payload["sandbox_id"]
+        status, _ = self._create(claim)
+        self.assertEqual(status, 409)
+        self.request("DELETE", f"/v1/sandboxes/{sandbox_id}", api_key=self.key)
+        status, _ = self._create(claim)
+        self.assertEqual(status, 200)
+
+    def test_fork_children_inherit_claim_and_count(self) -> None:
+        claim = {"memory_bytes": 256 * MIB, "cpus": 1}
+        status, payload = self._create(claim)
+        self.assertEqual(status, 200)
+        sandbox_id = payload["sandbox_id"]
+        # Three children fit exactly (256M source + 3*256M == 1024M cap);
+        # four do not (256M + 4*256M > 1024M).
+        status, payload = self.request(
+            "POST", f"/v1/sandboxes/{sandbox_id}/fork", api_key=self.key, body={"count": 4}
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["quota"]["requested_memory_bytes"], 1024 * MIB)
+        status, payload = self.request(
+            "POST", f"/v1/sandboxes/{sandbox_id}/fork", api_key=self.key, body={"count": 2}
+        )
+        self.assertEqual(status, 200)
+        for fork in payload["forks"]:
+            row = self.gateway.registry.get_sandbox(fork["sandbox_id"])
+            self.assertEqual(row["resources"], claim)
+
+    def test_uncapped_tenant_is_unaffected(self) -> None:
+        # Zero-breakage: without aggregate caps the gate never engages.
+        _tenant, key = self.make_tenant("free")
+        for body in ({}, {"metadata": {"resources": {"memory_bytes": 1 << 60}}}):
+            status, _ = self.request("POST", "/v1/sandboxes", api_key=key, body=body)
+            self.assertEqual(status, 200)
 
 
 # ---------------------------------------------------------------------------

@@ -250,7 +250,16 @@ def replicate_bundle_config(
                 rewritten_source = raw_source.replace(source_token, target_token)
                 rewritten_path = Path(rewritten_source)
                 try:
-                    rewritten_path.mkdir(parents=True, exist_ok=True)
+                    if Path(raw_source).is_file():
+                        # File bind (e.g. the cpu-visibility overlay written
+                        # for cpu-limited sandboxes): mkdir would plant a
+                        # directory where runc expects a file, so copy the
+                        # source file instead.
+                        rewritten_path.parent.mkdir(parents=True, exist_ok=True)
+                        if not rewritten_path.exists():
+                            shutil.copy2(raw_source, rewritten_path)
+                    else:
+                        rewritten_path.mkdir(parents=True, exist_ok=True)
                     new_mount["source"] = rewritten_source
                 except OSError:
                     pass
@@ -269,6 +278,15 @@ def replicate_bundle_config(
                 target_linux["cgroupsPath"] = cgroups_path.replace(
                     str(source_sandbox_id), str(target_sandbox_id)
                 )
+                changed = True
+        source_resources = source_linux.get("resources")
+        if isinstance(source_resources, dict) and source_resources:
+            # S3: forks inherit the source's cgroup limits — the fork's own
+            # cgroup (rewritten above) gets the same `linux.resources`.
+            # Absent on the source -> absent on the fork (no limits).
+            target_linux = target_cfg.setdefault("linux", {})
+            if isinstance(target_linux, dict):
+                target_linux["resources"] = copy.deepcopy(source_resources)
                 changed = True
     source_process = source_cfg.get("process")
     if isinstance(source_process, dict):
