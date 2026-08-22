@@ -40,7 +40,8 @@ PENDING_ID_PREFIX = "pending:"
 before the daemon has assigned the real id."""
 
 LIVE_STATUSES = ("pending", "active")
-"""Statuses that count against the tenant's `max_sandboxes` quota."""
+"""Statuses that count against the tenant's quotas (`max_sandboxes` and
+the S3 aggregate resource caps)."""
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tenants (
@@ -59,7 +60,8 @@ CREATE TABLE IF NOT EXISTS sandboxes (
     tenant_id TEXT NOT NULL REFERENCES tenants(id),
     name TEXT,
     created_at TEXT NOT NULL,
-    status TEXT NOT NULL
+    status TEXT NOT NULL,
+    resources_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -77,7 +79,8 @@ def hash_api_key(plaintext: str) -> str:
 
 
 class QuotaExceeded(Exception):
-    """A create/fork would push the tenant past `max_sandboxes`.
+    """A create/fork would push the tenant past `max_sandboxes` or one of
+    the S3 aggregate resource caps (`max_memory_bytes`, `max_cpu`).
 
     Carries the quota arithmetic so the HTTP layer can put it in the
     409 error body, per the design doc."""
@@ -110,6 +113,20 @@ class GatewayRegistry:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(_SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Additive migrations for registries created by older gateways.
+        S3 added `sandboxes.resources_json` (per-sandbox claim, feeds the
+        aggregate quota gate); pre-S3 rows read as `{}` — no limits."""
+        columns = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(sandboxes)").fetchall()
+        }
+        if "resources_json" not in columns:
+            self._conn.execute(
+                "ALTER TABLE sandboxes ADD COLUMN resources_json TEXT NOT NULL DEFAULT '{}'"
+            )
 
     @property
     def path(self) -> Path:
@@ -210,22 +227,31 @@ class GatewayRegistry:
 
     # ----- sandboxes: two-phase create ----------------------------------
 
-    def begin_create(self, tenant_id: str, name: str | None = None) -> str:
+    def begin_create(
+        self,
+        tenant_id: str,
+        name: str | None = None,
+        resources: dict[str, Any] | None = None,
+    ) -> str:
         """Phase one: durably record the create intent, gated by quota.
 
         Runs quota check + insert under BEGIN IMMEDIATE so concurrent
         creates serialize on the write lock and cannot both pass the
-        check. Returns the intent id the caller must inject into the
-        daemon create request's metadata."""
+        check. `resources` is the sandbox's normalized claim; it is
+        stored on the pending row so the aggregate gate already counts
+        in-flight creates. Returns the intent id the caller must inject
+        into the daemon create request's metadata."""
         intent_id = PENDING_ID_PREFIX + uuid.uuid4().hex
+        claim = dict(resources or {})
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
-                self._check_capacity_locked(tenant_id, additional=1)
+                self._check_capacity_locked(tenant_id, additional=1, resources=claim)
                 self._conn.execute(
-                    "INSERT INTO sandboxes (sandbox_id, tenant_id, name, created_at, status)"
-                    " VALUES (?, ?, ?, ?, 'pending')",
-                    (intent_id, tenant_id, name, _utc_now()),
+                    "INSERT INTO sandboxes"
+                    " (sandbox_id, tenant_id, name, created_at, status, resources_json)"
+                    " VALUES (?, ?, ?, ?, 'pending', ?)",
+                    (intent_id, tenant_id, name, _utc_now(), json.dumps(claim)),
                 )
                 self._conn.execute("COMMIT")
             except BaseException:
@@ -252,15 +278,30 @@ class GatewayRegistry:
                 (intent_id,),
             )
 
-    def ensure_capacity(self, tenant_id: str, additional: int) -> None:
+    def ensure_capacity(
+        self,
+        tenant_id: str,
+        additional: int,
+        resources: dict[str, Any] | None = None,
+    ) -> None:
         """Quota pre-check without an insert — used by fork, which learns
         the children's ids only after the daemon call (they are then
         registered via `register_sandbox`; the fork children are not
-        two-phase, see the design doc)."""
+        two-phase, see the design doc). `resources` is the *per-child*
+        claim (forks inherit the source's limits), counted `additional`
+        times by the aggregate gate."""
         with self._lock:
-            self._check_capacity_locked(tenant_id, additional=additional)
+            self._check_capacity_locked(
+                tenant_id, additional=additional, resources=dict(resources or {})
+            )
 
-    def _check_capacity_locked(self, tenant_id: str, *, additional: int) -> None:
+    def _check_capacity_locked(
+        self,
+        tenant_id: str,
+        *,
+        additional: int,
+        resources: dict[str, Any] | None = None,
+    ) -> None:
         tenant_row = self._conn.execute(
             "SELECT quota_json FROM tenants WHERE id = ?", (tenant_id,)
         ).fetchone()
@@ -278,6 +319,66 @@ class GatewayRegistry:
                     "requested": additional,
                 },
             )
+        claim = resources or {}
+        self._check_aggregate_locked(
+            tenant_id,
+            quotas,
+            additional=additional,
+            claim_key="memory_bytes",
+            cap_key="max_memory_bytes",
+            claim_value=claim.get("memory_bytes"),
+            unit="memory",
+        )
+        self._check_aggregate_locked(
+            tenant_id,
+            quotas,
+            additional=additional,
+            claim_key="cpus",
+            cap_key="max_cpu",
+            claim_value=claim.get("cpus"),
+            unit="cpu",
+        )
+
+    def _check_aggregate_locked(
+        self,
+        tenant_id: str,
+        quotas: dict[str, Any],
+        *,
+        additional: int,
+        claim_key: str,
+        cap_key: str,
+        claim_value: Any,
+        unit: str,
+    ) -> None:
+        """One S3 aggregate gate (§4 S3): with `cap_key` configured, the sum
+        of live claims plus the request must stay within the cap. A capped
+        tenant's sandboxes must declare the corresponding limit — an
+        undeclared (unbounded) sandbox would escape the accounting, so it
+        is refused outright. Uncapped tenants skip the gate entirely.
+
+        Payload arithmetic keys are per-dimension: `max_memory_bytes` /
+        `live_memory_bytes` / `requested_memory_bytes` (and the `_cpu`
+        analogs, with `max_cpu` matching the quota_json spelling).
+        """
+        cap_raw = quotas.get(cap_key)
+        if cap_raw is None:
+            return
+        cap = int(cap_raw)
+        live_key = "live_cpu" if unit == "cpu" else "live_memory_bytes"
+        requested_key = "requested_cpu" if unit == "cpu" else "requested_memory_bytes"
+        live_sum = self._live_resource_sum_locked(tenant_id, claim_key)
+        if claim_value is None:
+            raise QuotaExceeded(
+                f"tenant {tenant_id} has a {cap_key} quota; sandboxes must declare"
+                f" a {unit} limit in resources",
+                {cap_key: cap, live_key: live_sum, requested_key: None},
+            )
+        requested = int(claim_value) * max(int(additional), 0)
+        if live_sum + requested > cap:
+            raise QuotaExceeded(
+                f"{unit} quota exceeded for tenant {tenant_id}",
+                {cap_key: cap, live_key: live_sum, requested_key: requested},
+            )
 
     # ----- sandboxes: ownership and status -------------------------------
 
@@ -287,22 +388,31 @@ class GatewayRegistry:
         sandbox_id: str,
         name: str | None = None,
         status: str = "active",
+        resources: dict[str, Any] | None = None,
     ) -> None:
         with self._lock:
             self._conn.execute(
-                "INSERT INTO sandboxes (sandbox_id, tenant_id, name, created_at, status)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (sandbox_id, tenant_id, name, _utc_now(), status),
+                "INSERT INTO sandboxes"
+                " (sandbox_id, tenant_id, name, created_at, status, resources_json)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (sandbox_id, tenant_id, name, _utc_now(), status, json.dumps(dict(resources or {}))),
             )
+
+    @staticmethod
+    def _row_dict(row: sqlite3.Row) -> dict[str, Any]:
+        """Row -> dict with `resources_json` parsed into a `resources` claim."""
+        out = dict(row)
+        out["resources"] = json.loads(out.pop("resources_json", None) or "{}")
+        return out
 
     def get_sandbox(self, sandbox_id: str) -> dict[str, Any] | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT sandbox_id, tenant_id, name, created_at, status"
+                "SELECT sandbox_id, tenant_id, name, created_at, status, resources_json"
                 " FROM sandboxes WHERE sandbox_id = ?",
                 (sandbox_id,),
             ).fetchone()
-        return None if row is None else dict(row)
+        return None if row is None else self._row_dict(row)
 
     def set_status(self, sandbox_id: str, status: str) -> None:
         with self._lock:
@@ -318,19 +428,19 @@ class GatewayRegistry:
         with self._lock:
             if wanted is None:
                 rows = self._conn.execute(
-                    "SELECT sandbox_id, tenant_id, name, created_at, status"
+                    "SELECT sandbox_id, tenant_id, name, created_at, status, resources_json"
                     " FROM sandboxes WHERE tenant_id = ? ORDER BY created_at",
                     (tenant_id,),
                 ).fetchall()
             else:
                 placeholders = ",".join("?" for _ in wanted)
                 rows = self._conn.execute(
-                    "SELECT sandbox_id, tenant_id, name, created_at, status"
+                    "SELECT sandbox_id, tenant_id, name, created_at, status, resources_json"
                     f" FROM sandboxes WHERE tenant_id = ? AND status IN ({placeholders})"
                     " ORDER BY created_at",
                     (tenant_id, *wanted),
                 ).fetchall()
-        return [dict(row) for row in rows]
+        return [self._row_dict(row) for row in rows]
 
     def live_count(self, tenant_id: str) -> int:
         with self._lock:
@@ -345,15 +455,33 @@ class GatewayRegistry:
         ).fetchone()
         return int(row[0])
 
+    def _live_resource_sum_locked(self, tenant_id: str, claim_key: str) -> int:
+        """Sum of one claim dimension over the tenant's live rows. Python-side
+        integer arithmetic over the JSON column; runs under the same lock
+        (and, from `begin_create`, the same BEGIN IMMEDIATE transaction) as
+        the gate that consumes it, so concurrent creates stay precise."""
+        placeholders = ",".join("?" for _ in LIVE_STATUSES)
+        rows = self._conn.execute(
+            "SELECT resources_json FROM sandboxes"
+            f" WHERE tenant_id = ? AND status IN ({placeholders})",
+            (tenant_id, *LIVE_STATUSES),
+        ).fetchall()
+        total = 0
+        for row in rows:
+            value = (json.loads(row["resources_json"] or "{}")).get(claim_key)
+            if value is not None:
+                total += int(value)
+        return total
+
     # ----- reconciliation helpers (startup pass) --------------------------
 
     def pending_rows(self) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT sandbox_id, tenant_id, name, created_at, status"
+                "SELECT sandbox_id, tenant_id, name, created_at, status, resources_json"
                 " FROM sandboxes WHERE status = 'pending'"
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [self._row_dict(row) for row in rows]
 
     def all_tracked_ids(self) -> set[str]:
         """Every non-pending sandbox id the registry knows (any status) —
