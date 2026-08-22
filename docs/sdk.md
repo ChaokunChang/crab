@@ -518,6 +518,11 @@ that gap needs TLS interception, which is deliberately out of scope.
   such requests is D3).
 - Daemon restart rehydration is not implemented.
 - Exec output is buffered; streaming and PTY support are not implemented.
-- `resources`, `timeout`, and `labels` constructor arguments are currently
-  advisory metadata, not enforced resource limits or lifecycle policies.
+- `resources` is enforced (S3): `Sandbox(resources={"cpus": 2, "memory":
+  "512M", "pids": 256})` lands in the runc spec's `linux.resources`
+  (cpu quota/period, memory limit, pids limit) and forks inherit the
+  source's limits. `memory` accepts bytes or binary-suffixed strings
+  (`K`/`M`/`G`/`T`, 1024-based); invalid values fail loudly at
+  construction. There is no live resize — limits are fixed at create.
+  `timeout` and `labels` remain advisory metadata, not lifecycle policies.
 - Only OpenAI-compatible and Anthropic LLM base-URL conventions are built in.
