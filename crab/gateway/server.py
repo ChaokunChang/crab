@@ -267,7 +267,9 @@ def _make_passthrough(gateway: "GatewayServer", method: str, timeout: float):
     ) -> dict[str, Any]:
         assert tenant_id is not None
         gateway.require_owned(tenant_id, sandbox_id)
-        payload = body if method == "POST" else None
+        # POST and DELETE both forward their body verbatim (the daemon's
+        # checkpoint DELETE accepts a `{"cascade": true}` body).
+        payload = body if method in ("POST", "DELETE") else None
         return gateway.proxy(method, path[len(API_PREFIX):], payload, timeout)
 
     return handler
@@ -622,6 +624,16 @@ class GatewayServer:
             if method == "GET":
                 return self._client.get_json(daemon_path, timeout_seconds=timeout)
             if method == "DELETE":
+                if body:
+                    # `DaemonClient.delete` is body-less; the daemon's
+                    # checkpoint DELETE takes an optional JSON body
+                    # (cascade), so drop to the private request seam.
+                    return self._client._request_json(
+                        "DELETE",
+                        daemon_path,
+                        body=json.dumps(body).encode("utf-8"),
+                        timeout_seconds=timeout,
+                    )
                 return self._client.delete(daemon_path, timeout_seconds=timeout)
             return self._client.post_json(daemon_path, body or None, timeout_seconds=timeout)
         except DaemonRequestError as exc:

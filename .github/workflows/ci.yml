@@ -49,7 +49,8 @@ jobs:
             tests.test_sdk_sandbox \
             tests.test_iflow_trace_replay \
             tests.test_gateway_registry \
-            tests.test_gateway_server
+            tests.test_gateway_server \
+            tests.test_cloud_client
 
       - name: Run TLS tests
         if: matrix.extras == 'tls'

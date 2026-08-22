@@ -47,6 +47,10 @@ class _StubDaemonState:
         self.counter = 0
         self.requests: list[tuple[str, str, dict[str, Any]]] = []
         self.stop_delay_s = 0.0
+        # Runtime name reported by /info. Cloud-mode SDK tests set this to
+        # "docker" so `Sandbox._launch` takes the metadata-only path instead
+        # of the host-coupled runc bundle prep.
+        self.runtime = "runc"
 
     def add_sandbox(self, sandbox_id: str, metadata: dict[str, Any] | None = None) -> None:
         with self.lock:
@@ -93,7 +97,7 @@ def _build_stub_daemon_handler(state: _StubDaemonState):
                     "ok": True,
                     "version": 1,
                     "pid": state.pid,
-                    "runtime": "runc",
+                    "runtime": state.runtime,
                     "default_image": "ubuntu:22.04",
                     "storage_root": "/secret/storage",
                     "runtime_root": "/secret/runtime",
@@ -185,7 +189,22 @@ def _build_stub_daemon_handler(state: _StubDaemonState):
             if method == "GET" and sub == ["checkpoints"]:
                 return HTTPStatus.OK, {"ok": True, "checkpoints": []}
             if method == "POST" and sub == ["checkpoints"]:
-                return HTTPStatus.OK, {"ok": True, "checkpoint": {"checkpoint_id": "ck-1"}}
+                # Top-level checkpoint_id mirrors the real daemon response
+                # (`_SystemShim.checkpoint_once` reads it there).
+                return HTTPStatus.OK, {
+                    "ok": True,
+                    "checkpoint_id": "ck-1",
+                    "checkpoint": {"checkpoint_id": "ck-1"},
+                }
+            if (
+                method == "POST"
+                and len(sub) == 3
+                and sub[0] == "checkpoints"
+                and sub[2] == "restore"
+            ):
+                return HTTPStatus.OK, {"ok": True, "status": "succeeded"}
+            if method == "DELETE" and len(sub) == 2 and sub[0] == "checkpoints":
+                return HTTPStatus.OK, {"ok": True, "deleted": [sub[1]]}
             if method == "POST" and sub == ["processes", "merge"]:
                 # The daemon supports this route; the gateway must not
                 # expose it in v0 (design doc §5.1).
@@ -506,6 +525,26 @@ class FacadeTests(GatewayLiveTestBase):
         self.assertEqual(status, 400)
         # The daemon's exact error body, not a gateway rewrite.
         self.assertEqual(payload, {"ok": False, "error": "exec requires non-empty argv"})
+
+    def test_delete_body_is_forwarded(self) -> None:
+        # `delete_checkpoint(cascade=True)` rides a DELETE with a JSON
+        # body; the passthrough must relay it, not silently drop it.
+        _, payload = self.request("POST", "/v1/sandboxes", api_key=self.key, body={})
+        sandbox_id = payload["sandbox_id"]
+        status, _ = self.request(
+            "DELETE",
+            f"/v1/sandboxes/{sandbox_id}/checkpoints/ck-1",
+            api_key=self.key,
+            body={"cascade": True},
+        )
+        self.assertEqual(status, 200)
+        with self.state.lock:
+            seen = [
+                b
+                for m, p, b in self.state.requests
+                if (m, p) == ("DELETE", f"/sandboxes/{sandbox_id}/checkpoints/ck-1")
+            ]
+        self.assertEqual(seen, [{"cascade": True}])
 
     def test_info_is_redacted_and_tenant_scoped(self) -> None:
         self.request("POST", "/v1/sandboxes", api_key=self.key, body={})
