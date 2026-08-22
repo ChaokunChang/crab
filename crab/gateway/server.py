@@ -542,6 +542,35 @@ class _AdminRoutes:
             raise _NotFound(str(exc.args[0] if exc.args else exc)) from exc
         return {"ok": True, "tenant": tenant}
 
+    def adopt_sandboxes(self, body: dict[str, Any], **_: Any) -> dict[str, Any]:
+        """Adopt daemon-side sandboxes into a tenant's registry."""
+        tenant_ref = body.get("tenant")
+        if not isinstance(tenant_ref, str) or not tenant_ref:
+            raise _BadRequest("sandboxes adopt requires 'tenant' (name or id)")
+        sandbox_ids = body.get("sandbox_ids")
+        if not isinstance(sandbox_ids, list) or not sandbox_ids:
+            raise _BadRequest("sandboxes adopt requires non-empty 'sandbox_ids' list")
+        resources = body.get("resources")  # optional per-sandbox claim
+        if resources is not None and not isinstance(resources, dict):
+            raise _BadRequest("resources must be a JSON object or null")
+
+        tenant = self._gateway.registry.resolve_tenant(tenant_ref)
+        if tenant is None:
+            raise _NotFound(f"unknown tenant: {tenant_ref}")
+        tenant_id = tenant["id"]
+
+        adopted = []
+        skipped = []
+        for sid in sandbox_ids:
+            if not isinstance(sid, str) or not sid:
+                continue
+            ok = self._gateway.registry.adopt_sandbox(tenant_id, sid, resources)
+            if ok:
+                adopted.append(sid)
+            else:
+                skipped.append(sid)
+        return {"ok": True, "adopted": adopted, "skipped": skipped}
+
 
 def _build_admin_handler(gateway: "GatewayServer"):
     routes = _AdminRoutes(gateway)
@@ -551,6 +580,7 @@ def _build_admin_handler(gateway: "GatewayServer"):
         ("POST", "/admin/keys", routes.create_key),
         ("POST", "/admin/keys/revoke", routes.revoke_key),
         ("POST", "/admin/quotas", routes.set_quotas),
+        ("POST", "/admin/sandboxes/adopt", routes.adopt_sandboxes),
     ]
 
     class AdminHandler(_JsonHandler):

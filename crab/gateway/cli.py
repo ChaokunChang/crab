@@ -133,6 +133,21 @@ def _cmd_quotas_set(args: argparse.Namespace) -> int:
     return _run_admin(args, "POST", "/admin/quotas", {"tenant_id": args.tenant, "quotas": quotas})
 
 
+def _cmd_sandboxes_adopt(args: argparse.Namespace) -> int:
+    body: dict[str, Any] = {
+        "tenant": args.tenant,
+        "sandbox_ids": args.sandbox_ids,
+    }
+    if args.resources:
+        import json as _json
+        try:
+            body["resources"] = _json.loads(args.resources)
+        except _json.JSONDecodeError as exc:
+            print(f"invalid --resources JSON: {exc}", file=sys.stderr)
+            return 2
+    return _run_admin(args, "POST", "/admin/sandboxes/adopt", body)
+
+
 def _add_admin_socket_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--admin-socket",
@@ -238,6 +253,26 @@ def main(argv: list[str] | None = None) -> int:
     _add_quota_resource_args(quotas_set)
     _add_admin_socket_arg(quotas_set)
     quotas_set.set_defaults(fn=_cmd_quotas_set)
+
+    sandboxes_p = sub.add_parser("sandboxes", help="Sandbox administration (local-only).")
+    sandboxes_sub = sandboxes_p.add_subparsers(dest="sandboxes_command", required=True)
+    sandboxes_adopt = sandboxes_sub.add_parser(
+        "adopt", help="Adopt daemon-side sandboxes into a tenant's registry."
+    )
+    sandboxes_adopt.add_argument(
+        "--tenant", required=True,
+        help="Tenant name or id to associate the sandboxes with.",
+    )
+    sandboxes_adopt.add_argument(
+        "--resources", default=None,
+        help='Optional JSON resource claim for adopted sandboxes (e.g. \'{"memory":"512M"}\').',
+    )
+    sandboxes_adopt.add_argument(
+        "sandbox_ids", nargs="+", metavar="SANDBOX_ID",
+        help="One or more sandbox IDs to adopt.",
+    )
+    _add_admin_socket_arg(sandboxes_adopt)
+    sandboxes_adopt.set_defaults(fn=_cmd_sandboxes_adopt)
 
     args = parser.parse_args(argv)
     if getattr(args, "fn", None) is None:

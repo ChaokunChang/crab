@@ -162,6 +162,23 @@ class GatewayRegistry:
             return None
         return {"id": row["id"], "name": row["name"], "quotas": json.loads(row["quota_json"])}
 
+    def get_tenant_by_name(self, name: str) -> dict[str, Any] | None:
+        """Look up a tenant by its human-readable name."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, name, quota_json FROM tenants WHERE name = ?", (name,)
+            ).fetchone()
+        if row is None:
+            return None
+        return {"id": row["id"], "name": row["name"], "quotas": json.loads(row["quota_json"])}
+
+    def resolve_tenant(self, tenant_ref: str) -> dict[str, Any] | None:
+        """Resolve a tenant by id or name (tries id first)."""
+        tenant = self.get_tenant(tenant_ref)
+        if tenant is None:
+            tenant = self.get_tenant_by_name(tenant_ref)
+        return tenant
+
     def list_tenants(self) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
@@ -397,6 +414,29 @@ class GatewayRegistry:
                 " VALUES (?, ?, ?, ?, ?, ?)",
                 (sandbox_id, tenant_id, name, _utc_now(), status, json.dumps(dict(resources or {}))),
             )
+
+    def adopt_sandbox(
+        self,
+        tenant_id: str,
+        sandbox_id: str,
+        resources: dict[str, Any] | None = None,
+    ) -> bool:
+        """Register an existing daemon sandbox into a tenant. Idempotent:
+        returns True if newly adopted, False if already registered."""
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT sandbox_id FROM sandboxes WHERE sandbox_id = ?",
+                (sandbox_id,),
+            ).fetchone()
+            if existing is not None:
+                return False
+            self._conn.execute(
+                "INSERT INTO sandboxes"
+                " (sandbox_id, tenant_id, name, created_at, status, resources_json)"
+                " VALUES (?, ?, ?, ?, 'active', ?)",
+                (sandbox_id, tenant_id, None, _utc_now(), json.dumps(dict(resources or {}))),
+            )
+            return True
 
     @staticmethod
     def _row_dict(row: sqlite3.Row) -> dict[str, Any]:

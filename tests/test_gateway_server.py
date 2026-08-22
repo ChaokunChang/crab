@@ -881,3 +881,110 @@ class TransportSocketPermsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Sandboxes adopt (admin plane)
+# ---------------------------------------------------------------------------
+
+
+class AdoptSandboxTests(GatewayLiveTestBase):
+    """Tests for the `POST /admin/sandboxes/adopt` admin route."""
+
+    def test_adopt_single(self) -> None:
+        tenant, _key = self.make_tenant("acme")
+        # The daemon has a sandbox the gateway doesn't know about
+        self.state.add_sandbox("sbx-orphan1")
+        result = self.admin.post_json(
+            "/admin/sandboxes/adopt",
+            {"tenant": "acme", "sandbox_ids": ["sbx-orphan1"]},
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["adopted"], ["sbx-orphan1"])
+        self.assertEqual(result["skipped"], [])
+        # Verify it's now in the registry
+        sb = self.gateway.registry.get_sandbox("sbx-orphan1")
+        self.assertIsNotNone(sb)
+        self.assertEqual(sb["tenant_id"], tenant["id"])
+        self.assertEqual(sb["status"], "active")
+
+    def test_adopt_multiple(self) -> None:
+        tenant, _key = self.make_tenant("multi")
+        self.state.add_sandbox("sbx-a")
+        self.state.add_sandbox("sbx-b")
+        result = self.admin.post_json(
+            "/admin/sandboxes/adopt",
+            {"tenant": tenant["id"], "sandbox_ids": ["sbx-a", "sbx-b"]},
+        )
+        self.assertTrue(result["ok"])
+        self.assertCountEqual(result["adopted"], ["sbx-a", "sbx-b"])
+        self.assertEqual(result["skipped"], [])
+
+    def test_adopt_already_registered_is_skipped(self) -> None:
+        tenant, _key = self.make_tenant("skip")
+        self.state.add_sandbox("sbx-dup")
+        # First adopt
+        self.admin.post_json(
+            "/admin/sandboxes/adopt",
+            {"tenant": "skip", "sandbox_ids": ["sbx-dup"]},
+        )
+        # Second adopt of same id → skipped
+        result = self.admin.post_json(
+            "/admin/sandboxes/adopt",
+            {"tenant": "skip", "sandbox_ids": ["sbx-dup", "sbx-new"]},
+        )
+        self.assertTrue(result["ok"])
+        self.assertIn("sbx-dup", result["skipped"])
+        self.assertIn("sbx-new", result["adopted"])
+
+    def test_adopt_unknown_tenant_is_404(self) -> None:
+        from crab.daemon.transport import DaemonRequestError
+        with self.assertRaises(DaemonRequestError) as ctx:
+            self.admin.post_json(
+                "/admin/sandboxes/adopt",
+                {"tenant": "nonexistent", "sandbox_ids": ["sbx-x"]},
+            )
+        self.assertIn("unknown tenant", str(ctx.exception))
+
+    def test_adopt_by_tenant_name(self) -> None:
+        tenant, _key = self.make_tenant("byname")
+        result = self.admin.post_json(
+            "/admin/sandboxes/adopt",
+            {"tenant": "byname", "sandbox_ids": ["sbx-named"]},
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["adopted"], ["sbx-named"])
+
+    def test_adopt_sandbox_not_in_daemon_still_works(self) -> None:
+        """Gateway adopt is registry-only; daemon presence is not required."""
+        self.make_tenant("lax")
+        # sbx-ghost is NOT added to self.state (daemon doesn't know it)
+        result = self.admin.post_json(
+            "/admin/sandboxes/adopt",
+            {"tenant": "lax", "sandbox_ids": ["sbx-ghost"]},
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["adopted"], ["sbx-ghost"])
+
+    def test_adopt_with_resources(self) -> None:
+        tenant, _key = self.make_tenant("res")
+        result = self.admin.post_json(
+            "/admin/sandboxes/adopt",
+            {
+                "tenant": "res",
+                "sandbox_ids": ["sbx-r1"],
+                "resources": {"memory_bytes": 536870912},
+            },
+        )
+        self.assertTrue(result["ok"])
+        sb = self.gateway.registry.get_sandbox("sbx-r1")
+        self.assertEqual(sb["resources"], {"memory_bytes": 536870912})
+
+    def test_adopt_empty_ids_is_bad_request(self) -> None:
+        self.make_tenant("empty")
+        from crab.daemon.transport import DaemonRequestError
+        with self.assertRaises(DaemonRequestError):
+            self.admin.post_json(
+                "/admin/sandboxes/adopt",
+                {"tenant": "empty", "sandbox_ids": []},
+            )
