@@ -13,13 +13,16 @@ import json
 import stat
 import tempfile
 import threading
+import time
 import unittest
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from crab.daemon.transport import DEFAULT_SOCKET_PERMS, DaemonClient, serve_unix_socket
+from crab.gateway import server as gateway_server
 from crab.gateway.cli import main as gateway_cli_main
 from crab.gateway.registry import PENDING_ID_PREFIX, GatewayRegistry
 from crab.gateway.server import (
@@ -43,6 +46,7 @@ class _StubDaemonState:
         self.sandboxes: dict[str, dict[str, Any]] = {}
         self.counter = 0
         self.requests: list[tuple[str, str, dict[str, Any]]] = []
+        self.stop_delay_s = 0.0
 
     def add_sandbox(self, sandbox_id: str, metadata: dict[str, Any] | None = None) -> None:
         with self.lock:
@@ -163,6 +167,12 @@ def _build_stub_daemon_handler(state: _StubDaemonState):
                         "stderr": "",
                     },
                 }
+            if method == "POST" and sub == ["stop"]:
+                # Optionally outlast the gateway's per-call timeout (the
+                # 504 regression test dials the route timeout down).
+                if state.stop_delay_s:
+                    time.sleep(state.stop_delay_s)
+                return HTTPStatus.OK, {"ok": True, "sandbox_id": sandbox_id, "stopped": True}
             if method == "POST" and sub == ["fork"]:
                 count = int(body.get("count", 1))
                 forks = []
@@ -191,12 +201,16 @@ def _build_stub_daemon_handler(state: _StubDaemonState):
 
         def _send_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
             body = json.dumps(payload).encode("utf-8")
-            self.send_response(int(status))
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.send_response(int(status))
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                # The gateway gave up on us (per-call timeout) — fine.
+                pass
 
     return Handler
 
@@ -525,6 +539,48 @@ class FacadeTests(GatewayLiveTestBase):
         status, payload = self.request("GET", "/v1/sandboxes", api_key=self.key)
         self.assertEqual(status, 502)
         self.assertEqual(payload["error_type"], "daemon_unreachable")
+
+
+# ---------------------------------------------------------------------------
+# Timeout mapping (PR #29 review regression) — a daemon call that exceeds
+# its per-route timeout must surface as 504 daemon_timeout, not fall into
+# the generic 500 handler. On Python >= 3.10 `socket.timeout` *is*
+# `TimeoutError` (bpo-42413), which `GatewayServer.proxy` catches; this
+# test pins that empirically instead of by argument.
+# ---------------------------------------------------------------------------
+
+
+class TimeoutTests(GatewayTestBase):
+    def test_daemon_timeout_maps_to_504(self) -> None:
+        # Dial the /stop route's per-call timeout down so the test does
+        # not sit through the real 30s fast tier. The route table bakes
+        # timeouts in at start(), so patch before starting the gateway.
+        short_routes = [
+            (method, subpath, 0.3 if subpath == "/stop" else timeout)
+            for method, subpath, timeout in gateway_server._PASSTHROUGH_SANDBOX_ROUTES
+        ]
+        with mock.patch.object(
+            gateway_server, "_PASSTHROUGH_SANDBOX_ROUTES", short_routes
+        ):
+            self.start_gateway()
+        _tenant, key = self.make_tenant("acme")
+        status, payload = self.request("POST", "/v1/sandboxes", api_key=key, body={})
+        self.assertEqual(status, 200)
+        sandbox_id = payload["sandbox_id"]
+
+        self.state.stop_delay_s = 1.5  # well past the 0.3s route timeout
+        status, payload = self.request(
+            "POST", f"/v1/sandboxes/{sandbox_id}/stop", api_key=key, body={}
+        )
+        self.assertEqual(status, 504)
+        self.assertEqual(payload["error_type"], "daemon_timeout")
+        self.assertIn("timed out", payload["error"])
+
+        # The gateway is still healthy afterwards — the timeout was
+        # per-call, not a wedged worker thread.
+        self.state.stop_delay_s = 0.0
+        status, _ = self.request("GET", f"/v1/sandboxes/{sandbox_id}", api_key=key)
+        self.assertEqual(status, 200)
 
 
 # ---------------------------------------------------------------------------
