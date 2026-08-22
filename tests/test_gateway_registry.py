@@ -1,8 +1,11 @@
 """Unit tests for the gateway registry (track S, S1): WAL mode, tenants,
 hashed API keys, the two-phase create protocol, quota arithmetic, and
-reconciliation helpers. Host-runnable — no daemon, no root."""
+reconciliation helpers. S3 added the aggregate resource caps
+(`max_memory_bytes`/`max_cpu`) and the `resources_json` column — covered
+below. Host-runnable — no daemon, no root."""
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -212,6 +215,165 @@ class ReconciliationHelperTests(RegistryTestCase):
         self.registry.set_meta("daemon_boot_id", "42")
         self.registry.set_meta("daemon_boot_id", "43")
         self.assertEqual(self.registry.get_meta("daemon_boot_id"), "43")
+
+
+class AggregateQuotaTests(RegistryTestCase):
+    """S3 per-tenant aggregate caps: sums over live claims, fork
+    multiplication, release on kill, and 409 payload arithmetic."""
+
+    MEM = 512 * 1024 * 1024  # one sandbox's memory claim
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.tenant = self.registry.create_tenant(
+            "metered", {"max_memory_bytes": 2 * self.MEM, "max_cpu": 4}
+        )
+        self.claim = {"cpus": 2, "memory_bytes": self.MEM}
+
+    def test_within_cap_accepted_and_stored(self) -> None:
+        intent = self.registry.begin_create(self.tenant["id"], resources=self.claim)
+        self.assertEqual(self.registry.get_sandbox(intent)["resources"], self.claim)
+        self.registry.complete_create(intent, "sb-1")
+        # complete_create rekeys the row; the claim must survive.
+        self.assertEqual(self.registry.get_sandbox("sb-1")["resources"], self.claim)
+
+    def test_memory_cap_blocks_with_arithmetic(self) -> None:
+        self.registry.register_sandbox(self.tenant["id"], "sb-1", resources=self.claim)
+        self.registry.register_sandbox(
+            self.tenant["id"], "sb-2", resources={"memory_bytes": self.MEM}
+        )
+        with self.assertRaises(QuotaExceeded) as ctx:
+            self.registry.begin_create(
+                self.tenant["id"], resources={"memory_bytes": 1, "cpus": 1}
+            )
+        self.assertEqual(
+            ctx.exception.quota,
+            {
+                "max_memory_bytes": 2 * self.MEM,
+                "live_memory_bytes": 2 * self.MEM,
+                "requested_memory_bytes": 1,
+            },
+        )
+
+    def test_cpu_cap_blocks_with_arithmetic(self) -> None:
+        self.registry.register_sandbox(self.tenant["id"], "sb-1", resources=self.claim)
+        with self.assertRaises(QuotaExceeded) as ctx:
+            self.registry.begin_create(
+                self.tenant["id"], resources={"cpus": 3, "memory_bytes": 1}
+            )
+        self.assertEqual(
+            ctx.exception.quota,
+            {"max_cpu": 4, "live_cpu": 2, "requested_cpu": 3},
+        )
+
+    def test_capped_tenant_must_declare_limits(self) -> None:
+        # An undeclared (unbounded) sandbox would escape the accounting.
+        with self.assertRaises(QuotaExceeded) as ctx:
+            self.registry.begin_create(self.tenant["id"])
+        self.assertEqual(ctx.exception.quota["max_memory_bytes"], 2 * self.MEM)
+        self.assertIsNone(ctx.exception.quota["requested_memory_bytes"])
+        with self.assertRaises(QuotaExceeded):
+            self.registry.begin_create(
+                self.tenant["id"], resources={"memory_bytes": self.MEM}
+            )  # memory declared, cpus not — the max_cpu gate still refuses
+
+    def test_kill_releases_aggregate_quota(self) -> None:
+        self.registry.register_sandbox(self.tenant["id"], "sb-1", resources=self.claim)
+        self.registry.register_sandbox(self.tenant["id"], "sb-2", resources=self.claim)
+        with self.assertRaises(QuotaExceeded):
+            self.registry.begin_create(self.tenant["id"], resources=self.claim)
+        self.registry.set_status("sb-1", "killed")
+        self.registry.begin_create(self.tenant["id"], resources=self.claim)  # room again
+
+    def test_fork_counts_claim_per_child(self) -> None:
+        self.registry.register_sandbox(self.tenant["id"], "sb-src", resources=self.claim)
+        # One inherited child fits (memory 2*MEM cap), two do not.
+        self.registry.ensure_capacity(self.tenant["id"], additional=1, resources=self.claim)
+        with self.assertRaises(QuotaExceeded) as ctx:
+            self.registry.ensure_capacity(
+                self.tenant["id"], additional=2, resources=self.claim
+            )
+        self.assertEqual(ctx.exception.quota["requested_memory_bytes"], 2 * self.MEM)
+
+    def test_uncapped_tenant_ignores_resources(self) -> None:
+        # Zero-breakage: no aggregate caps -> no gate, declared or not.
+        tenant = self.registry.create_tenant("free", {"max_sandboxes": 10})
+        self.registry.begin_create(tenant["id"])
+        self.registry.begin_create(tenant["id"], resources={"memory_bytes": 1 << 60})
+        self.assertEqual(self.registry.live_count(tenant["id"]), 2)
+
+    def test_concurrent_creates_respect_memory_cap(self) -> None:
+        # 2*MEM cap, MEM per claim: exactly two of twelve may pass.
+        outcomes: list[str] = []
+        lock = threading.Lock()
+
+        def worker() -> None:
+            try:
+                self.registry.begin_create(self.tenant["id"], resources=self.claim)
+                result = "ok"
+            except QuotaExceeded:
+                result = "quota"
+            with lock:
+                outcomes.append(result)
+
+        threads = [threading.Thread(target=worker) for _ in range(12)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(outcomes.count("ok"), 2)
+        self.assertEqual(outcomes.count("quota"), 10)
+
+
+class ResourcesMigrationTests(unittest.TestCase):
+    def test_pre_s3_registry_gains_resources_column(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "gateway.sqlite3"
+            # A registry file created by the S1/S2 gateway — no
+            # resources_json column.
+            conn = sqlite3.connect(str(db_path))
+            conn.executescript(
+                """
+                CREATE TABLE tenants (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    quota_json TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE TABLE api_keys (
+                    key_sha256 TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL REFERENCES tenants(id),
+                    created_at TEXT NOT NULL,
+                    revoked INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE sandboxes (
+                    sandbox_id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL REFERENCES tenants(id),
+                    name TEXT,
+                    created_at TEXT NOT NULL,
+                    status TEXT NOT NULL
+                );
+                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO tenants (id, name) VALUES ('tn_old', 'legacy');
+                INSERT INTO sandboxes (sandbox_id, tenant_id, name, created_at, status)
+                    VALUES ('sb-old', 'tn_old', NULL, '2026-01-01T00:00:00+00:00', 'active');
+                """
+            )
+            conn.commit()
+            conn.close()
+
+            registry = GatewayRegistry(db_path)
+            try:
+                # Pre-S3 rows read as "no limits".
+                self.assertEqual(registry.get_sandbox("sb-old")["resources"], {})
+                # And the upgraded registry accepts claims.
+                registry.register_sandbox(
+                    "tn_old", "sb-new", resources={"memory_bytes": 1024}
+                )
+                self.assertEqual(
+                    registry.get_sandbox("sb-new")["resources"], {"memory_bytes": 1024}
+                )
+            finally:
+                registry.close()
 
 
 if __name__ == "__main__":

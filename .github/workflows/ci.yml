@@ -47,6 +47,7 @@ jobs:
             tests.test_remote_engine_checkpoint \
             tests.test_image_runtime \
             tests.test_sdk_sandbox \
+            tests.test_resources \
             tests.test_iflow_trace_replay \
             tests.test_gateway_registry \
             tests.test_gateway_server \

@@ -219,6 +219,30 @@ class CloudErrorTests(CloudLiveTestBase):
         self.assertEqual(ctx.exception.quota["max_sandboxes"], 1)
         self.assertEqual(ctx.exception.quota["live_sandboxes"], 1)
 
+    def test_aggregate_quota_exceeded_is_typed_with_arithmetic(self) -> None:
+        # S3 aggregate caps: the SDK's `resources=` claim rides create
+        # metadata and the gateway's sum gate answers with the same typed
+        # 409 + arithmetic payload the count gate uses.
+        mib = 1024 * 1024
+        _, metered_key = self.make_tenant(
+            "metered", quotas={"max_memory_bytes": 1024 * mib}
+        )
+        engine = Engine.connect(url=self.gateway_url, api_key=metered_key)
+        first = Sandbox(engine=engine, resources={"memory": "768M"})
+        row = self.gateway.registry.get_sandbox(str(first.sandbox_id))
+        self.assertEqual(row["resources"], {"memory_bytes": 768 * mib})
+        with self.assertRaises(QuotaExceeded) as ctx:
+            Sandbox(engine=engine, resources={"memory": "512M"})
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertEqual(
+            ctx.exception.quota,
+            {
+                "max_memory_bytes": 1024 * mib,
+                "live_memory_bytes": 768 * mib,
+                "requested_memory_bytes": 512 * mib,
+            },
+        )
+
     def test_lost_sandbox_is_410(self) -> None:
         engine = self.connect(self.key)
         sbx = Sandbox(engine=engine)
