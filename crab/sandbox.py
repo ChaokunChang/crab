@@ -36,10 +36,10 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable, Iterator
 
 from .ids import CheckpointId, SandboxId
-from .models import EgressLedger, JobStatus, MergeReport, ObservationReport, ProcessMergeReport, SandboxExecResult, SandboxSnapshot, utc_now
+from .models import EgressLedger, ExecDone, ExecEvent, JobStatus, MergeReport, ObservationReport, ProcessMergeReport, SandboxExecResult, SandboxSnapshot, utc_now
 from .templates import SandboxTemplate
 
 if TYPE_CHECKING:
@@ -125,6 +125,44 @@ class _CommandsNamespace:
                 f"stderr={result.stderr!r}"
             )
         return result
+
+    def stream(
+        self,
+        cmd: str | list[str] | None = None,
+        *,
+        argv: list[str] | None = None,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        user: str | None = None,
+        timeout: float | None = None,
+    ) -> Iterator[ExecEvent | ExecDone]:
+        """Streaming exec: yields ExecEvent/ExecDone as output arrives.
+
+        Usage::
+
+            for event in sandbox.commands.stream("ls -la"):
+                if isinstance(event, ExecEvent):
+                    print(f"[{event.channel}] {event.text}", end="")
+                elif isinstance(event, ExecDone):
+                    print(f"exit code: {event.returncode}")
+        """
+        if argv is None:
+            if isinstance(cmd, list):
+                argv = cmd
+            elif isinstance(cmd, str):
+                argv = ["/bin/sh", "-c", cmd]
+            else:
+                raise TypeError("commands.stream requires either cmd or argv")
+        merged_env = self._sandbox._command_env(env)
+        runtime = self._sandbox._engine.runtime
+        return runtime.stream_exec(
+            self._sandbox.sandbox_id,
+            argv,
+            cwd=cwd,
+            env=merged_env,
+            user=user,
+            timeout_s=timeout,
+        )
 
 
 class _FilesNamespace:
