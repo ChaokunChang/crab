@@ -47,7 +47,9 @@ jobs:
             tests.test_remote_engine_checkpoint \
             tests.test_image_runtime \
             tests.test_sdk_sandbox \
-            tests.test_iflow_trace_replay
+            tests.test_iflow_trace_replay \
+            tests.test_gateway_registry \
+            tests.test_gateway_server
 
       - name: Run TLS tests
         if: matrix.extras == 'tls'
@@ -131,3 +133,4 @@ jobs:
           /tmp/crab-wheel-smoke/bin/python -c "import crab; print(crab.__file__)"
           /tmp/crab-wheel-smoke/bin/crab --help >/dev/null
           /tmp/crab-wheel-smoke/bin/crabd --help >/dev/null
+          /tmp/crab-wheel-smoke/bin/crab-gateway --help >/dev/null

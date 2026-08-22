@@ -40,6 +40,11 @@ crab = "crab.cli:main"
 # `crab daemon start [--foreground]`.
 crabd = "crab.daemon.server:main"
 
+# Service gateway (track S). Equivalent to `python -m crab.gateway`.
+# `crab-gateway serve` runs the process; `tenants`/`keys`/`quotas`
+# subcommands administer a running gateway over its local Unix socket.
+crab-gateway = "crab.gateway.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["crab*", "integrations*", "benchmarks*"]
