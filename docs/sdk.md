@@ -524,5 +524,12 @@ that gap needs TLS interception, which is deliberately out of scope.
   source's limits. `memory` accepts bytes or binary-suffixed strings
   (`K`/`M`/`G`/`T`, 1024-based); invalid values fail loudly at
   construction. There is no live resize — limits are fixed at create.
+  Operational semantics for gateway tenants: a tenant with no
+  `max_memory_bytes`/`max_cpu` quota behaves exactly as in S1/S2 — the
+  aggregate gate never engages, with or without per-sandbox `resources`.
+  Once an aggregate cap is configured, every create/fork for that tenant
+  must declare the corresponding `resources` limit; undeclared requests
+  are refused with 409 `QuotaExceeded` (`requested_*` is `null` in the
+  quota payload).
   `timeout` and `labels` remain advisory metadata, not lifecycle policies.
 - Only OpenAI-compatible and Anthropic LLM base-URL conventions are built in.
