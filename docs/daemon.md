@@ -159,7 +159,10 @@ root or ZFS pool.
 ## Current limitations
 
 - one root-owned, single-user daemon per host;
-- no remote or multi-host daemon API;
+- no remote daemon API on the daemon itself — remote/multi-tenant access
+  goes through `crab-gateway` and the SDK's cloud mode
+  (`Engine.connect(url=..., api_key=...)`); the Unix socket stays the
+  only daemon ingress;
 - no restart rehydration;
 - no exec streaming or PTY;
 - no rootless runc/CRIU/ZFS backend;

@@ -197,6 +197,49 @@ sandbox = Sandbox(template=template, engine=engine)
 This is a translation layer, not a general Docker Compose runtime. Multi-
 service behavior should be validated for each task.
 
+## Cloud mode (crab-gateway)
+
+The same `Sandbox` surface works over the network against a `crab-gateway`
+(the multi-tenant HTTP facade in front of a daemon). Pass a gateway URL and
+API key instead of a socket path:
+
+```python
+from crab import Engine, Sandbox
+
+with Engine.connect(
+    url="https://crab.example.com",
+    api_key="crab_sk_...",           # or set CRAB_API_KEY
+) as engine:
+    sandbox = Sandbox.connect("sbx-abc123", engine=engine)
+    print(sandbox.commands.run("uname -a").stdout)
+```
+
+`Engine.connect` dispatches on argument shape: a path (or nothing) means
+the local Unix socket, an `http(s)://` URL means a gateway. Local and cloud
+engines are interchangeable everywhere the SDK accepts an `engine=`
+argument; `get_default_engine()` still means the local socket.
+
+Gateway errors surface as typed exceptions from `crab.cloud_client`:
+`CloudAuthError` (401), `SandboxNotFound` (404 — including another
+tenant's ids), `QuotaExceeded` (409, with the quota arithmetic on
+`.quota`), `SandboxLost` (410, daemon restarted), `DaemonUnreachableError`
+(502), `GatewayTimeoutError` (504). A timeout of the client's own request
+raises plain `TimeoutError`, as in local-daemon mode.
+
+Cloud-mode limitations (v0):
+
+- Creating a **new** sandbox with `Sandbox(image=...)` against a runc
+  daemon requires the SDK and daemon to share a filesystem (client-side
+  image export and bundle prep), so it does not work from a second
+  machine yet. Attach to existing sandboxes with `Sandbox.connect(id)`;
+  exec/checkpoint/restore/fork/kill all work over the gateway.
+- Host-coupled helpers (bundle spec writing, upstream registration,
+  network leases, host-inspector filters, process merge) raise
+  `CloudUnsupportedOperation` before any network traffic; best-effort
+  cleanup paths (e.g. inside `Sandbox.kill()`) degrade silently.
+- Host paths (`engine.storage_root` and friends) are not resolvable and
+  raise `RuntimeError` — the gateway's `/info` deliberately omits them.
+
 ## Current limitations
 
 - `Sandbox.fork(count, lazy=False, effects=None)` clones a running sandbox
