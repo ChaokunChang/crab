@@ -418,7 +418,9 @@ def _build_handler(gateway: "GatewayServer"):
 
     class Handler(_JsonHandler):
         def _dispatch(self, method: str) -> None:
-            path = self.path.split("?", 1)[0]
+            raw_path = self.path
+            path = raw_path.split("?", 1)[0]
+            query_string = raw_path.split("?", 1)[1] if "?" in raw_path else ""
             try:
                 fn, variables, requires_auth = _match(method, path)
                 if fn is None:
@@ -426,6 +428,19 @@ def _build_handler(gateway: "GatewayServer"):
                     return
                 tenant_id = self._authenticate() if requires_auth else None
                 body = self._read_body()
+                # Streaming exec fork: if exec route + stream=1, relay chunked
+                if (
+                    "stream=1" in query_string
+                    and method == "POST"
+                    and variables
+                    and "sandbox_id" in variables
+                    and path.endswith("/exec")
+                ):
+                    assert tenant_id is not None
+                    self._handle_stream_exec(
+                        tenant_id, body, variables["sandbox_id"]
+                    )
+                    return
                 result = fn(tenant_id, body, path=path, **(variables or {}))
                 self._send_json(HTTPStatus.OK, result)
             except _Unauthorized as exc:
@@ -482,6 +497,57 @@ def _build_handler(gateway: "GatewayServer"):
             if tenant_id is None:
                 raise _Unauthorized("invalid or revoked API key")
             return tenant_id
+
+        def _handle_stream_exec(
+            self, tenant_id: str, body: dict[str, Any], sandbox_id: str
+        ) -> None:
+            """Relay chunked NDJSON from daemon's streaming exec to client."""
+            try:
+                gateway.require_owned(tenant_id, sandbox_id)
+            except (_NotFound, _SandboxLost) as exc:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND if isinstance(exc, _NotFound) else HTTPStatus.GONE,
+                    {"ok": False, "error": str(exc)},
+                )
+                return
+            # Open streaming connection to daemon
+            daemon_path = f"/sandboxes/{sandbox_id}/exec?stream=1"
+            try:
+                stream = gateway._client.stream_post(daemon_path, body)
+            except FileNotFoundError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_GATEWAY,
+                    {"ok": False, "error": str(exc), "error_type": "daemon_unreachable"},
+                )
+                return
+            except Exception as exc:
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"ok": False, "error": f"{type(exc).__name__}: {exc}"},
+                )
+                return
+            # Send chunked response headers
+            self.send_response(200)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                for event in stream:
+                    line = (json.dumps(event) + "\n").encode("utf-8")
+                    self.wfile.write(f"{len(line):x}\r\n".encode("ascii"))
+                    self.wfile.write(line)
+                    self.wfile.write(b"\r\n")
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                stream.close()
+                try:
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
 
     return Handler
 
