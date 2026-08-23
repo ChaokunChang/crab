@@ -127,6 +127,11 @@ class _Routes:
         eng = self._daemon.require_engine()
         runtime_name = str(body.get("runtime_name") or eng.runtime.name)
         metadata = dict(body.get("metadata") or {})
+        # S5 full-access: if metadata carries 'image' without 'bundle_path',
+        # the client is in remote mode and the daemon must do server-side
+        # bundle preparation (docker export + runc spec + config).
+        if "image" in metadata and "bundle_path" not in metadata:
+            metadata = self._prepare_image_launch(eng, metadata)
         sandbox_id = eng.runtime.launch(runtime_name, metadata)
         # Track in the daemon-side registry so /sandboxes lists it and
         # /shutdown can tear it down. The SDK Sandbox is the lifecycle
@@ -134,6 +139,134 @@ class _Routes:
         self._daemon.register_sandbox(sandbox_id)
         _seed_inspector_running(eng, sandbox_id)
         return {"ok": True, "sandbox_id": str(sandbox_id)}
+
+    def _prepare_image_launch(
+        self, eng: Any, metadata: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Server-side bundle prep for remote creates (S5 full-access).
+
+        Performs the same work as Sandbox._prepare_runc_launch() but runs
+        entirely on the daemon host which has docker + ZFS + root."""
+        from integrations.sandboxes.runtime import bundle as sandbox_bundle
+        from integrations.sandboxes.runtime import image as sandbox_image
+
+        image_tag = str(metadata["image"])
+        sandbox_id_str = str(metadata.get("sandbox_id") or str(SandboxId.new()))
+
+        # Resolve paths from engine's runtime
+        rt = eng.runtime
+        bundle_dir = rt._paths.bundle_root / sandbox_id_str
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. Base runc spec
+        rt.write_bundle_spec(bundle_dir)
+
+        # 2. Image export
+        image_id = sandbox_image.inspect_image_id(tag=image_tag)
+        image_defaults = sandbox_image.inspect_image_runtime_defaults(
+            tag=image_tag, cache_root=eng.image_cache_root
+        )
+        exported_rootfs = sandbox_image.export_image_rootfs(
+            tag=image_tag,
+            output_dir=eng.image_cache_root / image_id,
+            cache_root=eng.image_cache_root,
+        )
+
+        # 3. Resource limits
+        resource_limits = None
+        resources = metadata.get("resources")
+        if resources and isinstance(resources, dict):
+            resource_limits = sandbox_bundle.SandboxResourceLimits(
+                cpus=resources.get("cpus"),
+                memory_bytes=resources.get("memory_bytes"),
+                pids_limit=resources.get("pids"),
+            )
+
+        # 4. Network lease (optional)
+        network_namespace_path = None
+        if metadata.get("network"):
+            try:
+                lease = eng.allocate_network_lease(SandboxId(sandbox_id_str))
+                if lease:
+                    network_namespace_path = lease.namespace_path
+                    metadata["guest_ip"] = str(lease.guest_ip)
+            except Exception:
+                logger.debug("network lease allocation skipped", exc_info=True)
+
+        # 5. Write bundle config (mounts, namespaces, cgroups)
+        sandbox_bundle.write_bundle_config(
+            bundle_dir=bundle_dir,
+            llm_base_url="",
+            provider="openai",
+            sandbox_name=sandbox_id_str,
+            status_port=0,
+            cgroup_path=f"crab-sdk/{sandbox_id_str}",
+            work_dir_host_path=None,
+            network_namespace_path=network_namespace_path,
+            image_defaults=image_defaults,
+            image_rootfs_dir=exported_rootfs,
+            resource_limits=resource_limits,
+        )
+
+        # 6. Write process section (sleep infinity idle init)
+        self._write_daemon_bundle_process(
+            bundle_dir, image_defaults, sandbox_id_str,
+            metadata.get("env"),
+        )
+
+        # 7. Build complete launch metadata
+        rootfs_copy_paths = [{"source": str(exported_rootfs), "destination": "/"}]
+        shared_rootfs_key = image_id[:32]
+        metadata.update({
+            "sandbox_id": sandbox_id_str,
+            "bundle_path": str(bundle_dir),
+            "work_dir_host_path": None,
+            "rootfs_init_dirs": ["/work", "/tmp"],
+            "rootfs_copy_paths": rootfs_copy_paths,
+            "shared_rootfs_key": shared_rootfs_key,
+            "shared_rootfs_persist": True,
+            "sdk_image": image_tag,
+            "sdk_process_cwd": "/work",
+        })
+        return metadata
+
+    @staticmethod
+    def _write_daemon_bundle_process(
+        bundle_dir: "Path",
+        image_defaults: Any,
+        sandbox_id_str: str,
+        user_env: dict[str, str] | None,
+    ) -> None:
+        """Write process section into config.json for daemon-side creates."""
+        import json as _json
+        config_path = bundle_dir / "config.json"
+        cfg = _json.loads(config_path.read_text(encoding="utf-8"))
+        process = dict(cfg.get("process") or {})
+        process["terminal"] = False
+        process["cwd"] = "/work"
+        process["args"] = ["/bin/sh", "-lc", "exec sleep infinity"]
+        # Merge environment: image defaults + SDK basics + user env
+        defaults_env = (
+            getattr(image_defaults, "environment", ()) if image_defaults else ()
+        )
+        env_map: dict[str, str] = {}
+        for item in defaults_env:
+            key, sep, value = str(item).partition("=")
+            if sep:
+                env_map[key] = value
+        base_env = {
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "HOME": "/root",
+            "PYTHONUNBUFFERED": "1",
+            "CRAB_SANDBOX_ID": sandbox_id_str,
+        }
+        env_map.update(base_env)
+        if user_env:
+            env_map.update(user_env)
+        process["env"] = [f"{k}={v}" for k, v in env_map.items()]
+        cfg["process"] = process
+        cfg["root"] = {"path": "rootfs", "readonly": False}
+        config_path.write_text(_json.dumps(cfg, indent=2), encoding="utf-8")
 
     def exec_sandbox(self, body: dict[str, Any], *, sandbox_id: str) -> dict[str, Any]:
         eng = self._daemon.require_engine()

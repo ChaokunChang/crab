@@ -23,12 +23,11 @@ Two deliberate design points:
    changes.
 
 2. **Host-shim guard.** The gateway does not expose the daemon's
-   host-coupled helper routes (`/shutdown`, `/runtime/*`, and per-sandbox
-   `upstream` / `network/lease` / `host_inspector/filters` /
-   `processes/merge`). Rather than let those calls travel to the gateway
-   and come back as opaque 404s — indistinguishable from "sandbox not
-   found" — the client refuses them *before the wire* with
-   `CloudUnsupportedOperation`. See the design doc's §5.1 tension note.
+   `/shutdown` route (an operator action, not a tenant API). All other
+   daemon routes (per-sandbox lifecycle, upstream, network lease,
+   inspector filters, process merge, runtime helpers) are now proxied
+   through the gateway for full remote-access parity (S5 full-access
+   unlock). See the design doc's §5.1 tension note.
 
 Standard library only, matching the rest of the SDK.
 """
@@ -111,35 +110,16 @@ class CloudUnsupportedOperation(NotImplementedError):
 # Unexposed-route guard.
 # ---------------------------------------------------------------------------
 
-_UNEXPOSED_SANDBOX_SUFFIXES: tuple[tuple[str, ...], ...] = (
-    ("upstream",),
-    ("network", "lease"),
-    ("host_inspector", "filters"),
-    ("processes", "merge"),
-)
-"""Per-sandbox route suffixes the gateway deliberately does not expose."""
-
 
 def _unexposed_route_reason(path: str) -> str | None:
     """Return a human explanation if `path` is a daemon route the gateway
-    does not expose, else None."""
+    does not expose, else None.
+
+    As of S5 full-access, only `/shutdown` is blocked (operator-only).
+    All per-sandbox and runtime routes are now proxied through the gateway."""
     parts = tuple(p for p in path.split("/") if p)
     if parts == ("shutdown",):
         return "daemon shutdown is an operator action, not a tenant API"
-    if parts and parts[0] == "runtime":
-        return (
-            "runtime helper routes (bundle spec, host-inspector filters) "
-            "assume a shared host filesystem"
-        )
-    if len(parts) >= 3 and parts[0] == "sandboxes":
-        suffix = parts[2:]
-        for unexposed in _UNEXPOSED_SANDBOX_SUFFIXES:
-            if suffix == unexposed:
-                return (
-                    f"per-sandbox route '{'/'.join(unexposed)}' is host-coupled "
-                    "(upstream registry, network leases, host inspector, "
-                    "process merge) and is not part of the gateway API"
-                )
     return None
 
 

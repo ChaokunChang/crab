@@ -122,6 +122,8 @@ def _build_stub_daemon_handler(state: _StubDaemonState):
                     sandbox_id = f"sb-{state.counter}"
                     state.sandboxes[sandbox_id] = dict(body.get("metadata") or {})
                 return HTTPStatus.OK, {"ok": True, "sandbox_id": sandbox_id}
+            if (method, path) == ("POST", "/runtime/write_bundle_spec"):
+                return HTTPStatus.OK, {"ok": True}
             if len(parts) >= 2 and parts[0] == "sandboxes":
                 sandbox_id = parts[1]
                 with state.lock:
@@ -206,9 +208,29 @@ def _build_stub_daemon_handler(state: _StubDaemonState):
             if method == "DELETE" and len(sub) == 2 and sub[0] == "checkpoints":
                 return HTTPStatus.OK, {"ok": True, "deleted": [sub[1]]}
             if method == "POST" and sub == ["processes", "merge"]:
-                # The daemon supports this route; the gateway must not
-                # expose it in v0 (design doc §5.1).
-                return HTTPStatus.OK, {"ok": True, "merged": True}
+                return HTTPStatus.OK, {"ok": True, "report": {
+                    "source_sandbox_id": sandbox_id,
+                    "fork_sandbox_id": body.get("fork_sandbox_id", "fork-1"),
+                    "strategy": "promote",
+                    "source_processes": 1,
+                    "replayed": [],
+                    "deviations": 0,
+                    "stopped_early": False,
+                }}
+            if method == "POST" and sub == ["upstream"]:
+                return HTTPStatus.OK, {"ok": True}
+            if method == "DELETE" and sub == ["upstream"]:
+                return HTTPStatus.OK, {"ok": True}
+            if method == "POST" and sub == ["network", "lease"]:
+                return HTTPStatus.OK, {"ok": True, "lease": {
+                    "namespace_path": "/run/netns/test",
+                    "guest_ip": "10.100.0.2",
+                    "bridge_ip": "10.100.0.1",
+                }}
+            if method == "DELETE" and sub == ["network", "lease"]:
+                return HTTPStatus.OK, {"ok": True}
+            if method == "POST" and sub == ["host_inspector", "filters"]:
+                return HTTPStatus.OK, {"ok": True}
             return HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"}
 
         def _read_body(self) -> dict[str, Any]:
@@ -654,11 +676,17 @@ class FacadeTests(GatewayLiveTestBase):
         _, payload = self.request("GET", "/v1/info", api_key=key_b)
         self.assertEqual(payload["sandbox_count"], 0)
 
-    def test_host_internal_routes_are_not_exposed(self) -> None:
+    def test_shutdown_route_is_not_exposed(self) -> None:
+        # Only /shutdown remains blocked (operator-only).
+        status, _ = self.request("POST", "/v1/shutdown", api_key=self.key, body={})
+        self.assertEqual(status, 404, "POST /v1/shutdown must not be exposed")
+
+    def test_previously_hidden_routes_are_now_exposed(self) -> None:
+        """S5 full-access: all per-sandbox host-coupled routes + runtime
+        are now proxied through the gateway."""
         _, payload = self.request("POST", "/v1/sandboxes", api_key=self.key, body={})
         sandbox_id = payload["sandbox_id"]
         for method, path in (
-            ("POST", "/v1/shutdown"),
             ("POST", "/v1/runtime/write_bundle_spec"),
             ("POST", f"/v1/sandboxes/{sandbox_id}/processes/merge"),
             ("POST", f"/v1/sandboxes/{sandbox_id}/upstream"),
@@ -666,7 +694,7 @@ class FacadeTests(GatewayLiveTestBase):
             ("POST", f"/v1/sandboxes/{sandbox_id}/host_inspector/filters"),
         ):
             status, _ = self.request(method, path, api_key=self.key, body={})
-            self.assertEqual(status, 404, f"{method} {path} must not be exposed")
+            self.assertEqual(status, 200, f"{method} {path} should now be exposed")
 
     def test_daemon_unreachable_is_502(self) -> None:
         self._stop_stub_daemon()
