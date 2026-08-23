@@ -988,3 +988,123 @@ class AdoptSandboxTests(GatewayLiveTestBase):
                 "/admin/sandboxes/adopt",
                 {"tenant": "empty", "sandbox_ids": []},
             )
+
+
+# ---------------------------------------------------------------------------
+# Periodic reconciliation (S5)
+# ---------------------------------------------------------------------------
+
+
+class PeriodicReconciliationTests(GatewayTestBase):
+    """Tests for _periodic_reconcile(): lightweight daemon→registry sync."""
+
+    def test_periodic_marks_missing_sandbox_lost(self) -> None:
+        # Seed daemon with sbx-1 and sbx-2; registry has sbx-1, sbx-2, sbx-3.
+        self.state.add_sandbox("sbx-1")
+        self.state.add_sandbox("sbx-2")
+        self.start_gateway()
+        tenant, key = self.make_tenant("acme")
+        self.gateway.registry.register_sandbox(tenant["id"], "sbx-1")
+        self.gateway.registry.register_sandbox(tenant["id"], "sbx-2")
+        self.gateway.registry.register_sandbox(tenant["id"], "sbx-3")
+
+        self.gateway._periodic_reconcile()
+
+        self.assertEqual(self.gateway.registry.get_sandbox("sbx-1")["status"], "active")
+        self.assertEqual(self.gateway.registry.get_sandbox("sbx-2")["status"], "active")
+        self.assertEqual(self.gateway.registry.get_sandbox("sbx-3")["status"], "lost")
+
+    def test_periodic_releases_ports_of_lost_sandbox(self) -> None:
+        self.state.add_sandbox("sbx-1")
+        self.start_gateway()
+        tenant, key = self.make_tenant("acme")
+        self.gateway.registry.register_sandbox(tenant["id"], "sbx-1")
+        self.gateway.registry.register_sandbox(tenant["id"], "sbx-gone")
+
+        # Allocate a port for sbx-gone
+        import socket
+        echo_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        echo_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        echo_sock.bind(("127.0.0.1", 0))
+        echo_sock.listen(1)
+        echo_port = echo_sock.getsockname()[1]
+        self.addCleanup(echo_sock.close)
+
+        host_port = self.gateway.port_manager.allocate("sbx-gone", "127.0.0.1", echo_port)
+        self.gateway.registry.allocate_port("sbx-gone", tenant["id"], echo_port, host_port)
+
+        self.gateway._periodic_reconcile()
+
+        # sbx-gone marked lost
+        self.assertEqual(self.gateway.registry.get_sandbox("sbx-gone")["status"], "lost")
+        # Port released from registry
+        self.assertEqual(self.gateway.registry.list_ports("sbx-gone"), [])
+        # Forwarder stopped — connecting should fail
+        time.sleep(0.2)
+        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client.settimeout(1.0)
+        with self.assertRaises(OSError):
+            client.connect(("127.0.0.1", host_port))
+        client.close()
+
+    def test_daemon_unreachable_skips_safely(self) -> None:
+        self.start_gateway()
+        tenant, key = self.make_tenant("acme")
+        self.gateway.registry.register_sandbox(tenant["id"], "sbx-1")
+
+        # Kill the daemon
+        self._stop_stub_daemon()
+
+        # Should not raise and should not mark anything lost
+        self.gateway._periodic_reconcile()
+
+        self.assertEqual(self.gateway.registry.get_sandbox("sbx-1")["status"], "active")
+
+    def test_healthy_sandboxes_unaffected(self) -> None:
+        self.state.add_sandbox("sbx-1")
+        self.state.add_sandbox("sbx-2")
+        self.start_gateway()
+        tenant, key = self.make_tenant("acme")
+        self.gateway.registry.register_sandbox(tenant["id"], "sbx-1")
+        self.gateway.registry.register_sandbox(tenant["id"], "sbx-2")
+
+        self.gateway._periodic_reconcile()
+
+        self.assertEqual(self.gateway.registry.get_sandbox("sbx-1")["status"], "active")
+        self.assertEqual(self.gateway.registry.get_sandbox("sbx-2")["status"], "active")
+
+    def test_serve_forever_triggers_at_interval(self) -> None:
+        self.state.add_sandbox("sbx-1")
+        self.start_gateway()
+        tenant, key = self.make_tenant("acme")
+        self.gateway.registry.register_sandbox(tenant["id"], "sbx-1")
+        self.gateway.registry.register_sandbox(tenant["id"], "sbx-vanish")
+
+        # Set very short reconcile interval
+        self.gateway._reconcile_interval = 1.0
+
+        # Patch _periodic_reconcile to count calls
+        call_count = [0]
+        orig = self.gateway._periodic_reconcile
+
+        def counting_reconcile():
+            orig()
+            call_count[0] += 1
+
+        self.gateway._periodic_reconcile = counting_reconcile  # type: ignore[method-assign]
+
+        # Run serve_forever in a background thread
+        t = threading.Thread(target=self.gateway.serve_forever, daemon=True)
+        t.start()
+        # Wait enough for at least one reconcile tick
+        time.sleep(2.5)
+
+        # Verify reconciliation happened and had effect (before shutdown)
+        self.assertGreaterEqual(call_count[0], 1)
+        row = self.gateway.registry.get_sandbox("sbx-vanish")
+        self.assertEqual(row["status"], "lost")
+        row = self.gateway.registry.get_sandbox("sbx-1")
+        self.assertEqual(row["status"], "active")
+
+        self.gateway.request_shutdown()
+        t.join(timeout=5.0)
