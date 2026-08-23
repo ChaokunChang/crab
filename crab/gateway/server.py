@@ -48,6 +48,7 @@ from ..daemon.transport import (
     serve_unix_socket,
 )
 from ..resources import validate_claim
+from .ports import PortManager
 from .registry import GatewayRegistry, QuotaExceeded
 
 logger = logging.getLogger(__name__)
@@ -237,6 +238,10 @@ class _GatewayRoutes:
     ) -> dict[str, Any]:
         assert tenant_id is not None
         self._gateway.require_owned(tenant_id, sandbox_id)
+        # S4: release port allocations before killing the sandbox
+        host_ports = self._gateway.registry.release_all_ports(sandbox_id)
+        if host_ports:
+            self._gateway.port_manager.release_all(sandbox_id, host_ports)
         result = self._gateway.proxy(
             "DELETE", f"/sandboxes/{sandbox_id}", None, _SLOW_TIMEOUT_S
         )
@@ -271,6 +276,75 @@ class _GatewayRoutes:
                     tenant_id, str(fork_id), resources=claim
                 )
         return result
+
+    # ----- port exposure (S4) -----------------------------------------------
+
+    _MAX_PORTS_PER_TENANT = 10
+
+    def expose_port(
+        self, tenant_id: str | None, body: dict[str, Any], *, sandbox_id: str, **_: Any
+    ) -> dict[str, Any]:
+        assert tenant_id is not None
+        self._gateway.require_owned(tenant_id, sandbox_id)
+        guest_port = body.get("port")
+        if guest_port is None:
+            raise _BadRequest("missing 'port' in body")
+        try:
+            guest_port = int(guest_port)
+        except (TypeError, ValueError):
+            raise _BadRequest("'port' must be an integer")
+        if not (1 <= guest_port <= 65535):
+            raise _BadRequest("'port' must be between 1 and 65535")
+        # Quota check
+        count = self._gateway.registry.count_tenant_ports(tenant_id)
+        if count >= self._MAX_PORTS_PER_TENANT:
+            raise QuotaExceeded(
+                f"port quota exceeded for tenant {tenant_id}",
+                {"max_ports": self._MAX_PORTS_PER_TENANT, "current_ports": count},
+            )
+        # Get guest IP from daemon
+        raw = self._gateway.proxy(
+            "GET", f"/sandboxes/{sandbox_id}", None, _FAST_TIMEOUT_S
+        )
+        metadata = raw.get("metadata") or {}
+        guest_ip = metadata.get("guest_ip") or "127.0.0.1"
+        # Allocate host port and start forwarder
+        host_port = self._gateway.port_manager.allocate(
+            sandbox_id, guest_ip, guest_port
+        )
+        self._gateway.registry.allocate_port(
+            sandbox_id, tenant_id, guest_port, host_port
+        )
+        host = self._gateway._host
+        return {
+            "ok": True,
+            "host_port": host_port,
+            "guest_port": guest_port,
+            "url": f"tcp://{host}:{host_port}",
+        }
+
+    def list_ports(
+        self, tenant_id: str | None, body: dict[str, Any], *, sandbox_id: str, **_: Any
+    ) -> dict[str, Any]:
+        assert tenant_id is not None
+        self._gateway.require_owned(tenant_id, sandbox_id)
+        ports = self._gateway.registry.list_ports(sandbox_id)
+        return {"ok": True, "ports": ports}
+
+    def release_port(
+        self, tenant_id: str | None, body: dict[str, Any], *, sandbox_id: str, guest_port: str, **_: Any
+    ) -> dict[str, Any]:
+        assert tenant_id is not None
+        self._gateway.require_owned(tenant_id, sandbox_id)
+        try:
+            gp = int(guest_port)
+        except (TypeError, ValueError):
+            raise _BadRequest("invalid guest_port")
+        host_port = self._gateway.registry.release_port(sandbox_id, gp)
+        if host_port is None:
+            raise _NotFound(f"no allocation for port {gp}")
+        self._gateway.port_manager.release(host_port)
+        return {"ok": True, "released_host_port": host_port}
 
 
 def _make_passthrough(gateway: "GatewayServer", method: str, timeout: float):
@@ -402,6 +476,10 @@ def _build_handler(gateway: "GatewayServer"):
         ("POST", f"{API_PREFIX}/sandboxes", True, routes.launch_sandbox),
         ("DELETE", f"{API_PREFIX}/sandboxes/{{sandbox_id}}", True, routes.kill_sandbox),
         ("POST", f"{API_PREFIX}/sandboxes/{{sandbox_id}}/fork", True, routes.fork_sandbox),
+        # S4: port exposure routes
+        ("POST", f"{API_PREFIX}/sandboxes/{{sandbox_id}}/ports", True, routes.expose_port),
+        ("GET", f"{API_PREFIX}/sandboxes/{{sandbox_id}}/ports", True, routes.list_ports),
+        ("DELETE", f"{API_PREFIX}/sandboxes/{{sandbox_id}}/ports/{{guest_port}}", True, routes.release_port),
     ]
     for method, subpath, timeout in _PASSTHROUGH_SANDBOX_ROUTES:
         pattern = f"{API_PREFIX}/sandboxes/{{sandbox_id}}{subpath}"
@@ -703,6 +781,7 @@ class GatewayServer:
         self._admin_server = None
         self._threads: list[threading.Thread] = []
         self._stop_event = threading.Event()
+        self._port_manager = PortManager()
 
     @property
     def registry(self) -> GatewayRegistry:
@@ -710,6 +789,10 @@ class GatewayServer:
         if registry is None:
             raise RuntimeError("gateway is not started")
         return registry
+
+    @property
+    def port_manager(self) -> PortManager:
+        return self._port_manager
 
     @property
     def port(self) -> int:
@@ -891,6 +974,7 @@ class GatewayServer:
         if self._registry is not None:
             self._registry.close()
             self._registry = None
+        self._port_manager.shutdown()
 
     def request_shutdown(self) -> None:
         self._stop_event.set()
