@@ -314,7 +314,7 @@ class _GatewayRoutes:
             sandbox_id, guest_ip, guest_port
         )
         self._gateway.registry.allocate_port(
-            sandbox_id, tenant_id, guest_port, host_port
+            sandbox_id, tenant_id, guest_port, host_port, guest_ip=guest_ip
         )
         host = self._gateway._host
         return {
@@ -953,6 +953,45 @@ class GatewayServer:
                 "periodic reconcile: %d daemon orphans (not in registry)", len(orphans)
             )
 
+    def _rehydrate_ports(self) -> None:
+        """Restart forwarders for persisted port allocations (S5).
+
+        Called once at startup after reconcile(). Skips allocations whose
+        sandbox is no longer active; removes DB rows for ports that cannot
+        be re-bound (occupied by another process)."""
+        allocations = self.registry.list_all_port_allocations()
+        if not allocations:
+            return
+        # Only rehydrate for sandboxes that are still active
+        active_ids = self.registry.active_sandbox_ids()
+        rebuilt = 0
+        cleaned = 0
+        for alloc in allocations:
+            sid = alloc["sandbox_id"]
+            if sid not in active_ids:
+                # Sandbox is lost/killed — clean up stale DB row
+                self.registry.release_port(sid, alloc["guest_port"])
+                cleaned += 1
+                continue
+            try:
+                self._port_manager.rehydrate(
+                    alloc["host_port"], alloc["guest_ip"], alloc["guest_port"]
+                )
+                rebuilt += 1
+            except OSError:
+                # Port occupied — release the DB row
+                self.registry.release_port(sid, alloc["guest_port"])
+                cleaned += 1
+                logger.warning(
+                    "port rehydration: cannot bind host_port %d for %s:%d — released",
+                    alloc["host_port"], sid, alloc["guest_port"],
+                )
+        if rebuilt or cleaned:
+            logger.info(
+                "port rehydration: rebuilt %d forwarders, cleaned %d stale rows",
+                rebuilt, cleaned,
+            )
+
     # ----- lifecycle ------------------------------------------------------
 
     def start(self) -> None:
@@ -964,6 +1003,7 @@ class GatewayServer:
             # Fail fast when the daemon is unreachable at boot — a gateway
             # that cannot see its daemon has nothing truthful to serve.
             self.reconcile()
+            self._rehydrate_ports()
             handler = _build_handler(self)
             self._http_server = ThreadingHTTPServer((self._host, self._port), handler)
             self._http_server.daemon_threads = True

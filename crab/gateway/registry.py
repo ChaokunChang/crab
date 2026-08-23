@@ -533,6 +533,14 @@ class GatewayRegistry:
             ).fetchall()
         return {str(row["sandbox_id"]) for row in rows}
 
+    def active_sandbox_ids(self) -> set[str]:
+        """Only sandbox ids with status='active' (for port rehydration)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT sandbox_id FROM sandboxes WHERE status = 'active'"
+            ).fetchall()
+        return {str(row["sandbox_id"]) for row in rows}
+
     def mark_all_active_lost(self) -> int:
         """Boot-identity mismatch: the daemon restarted and (pre-S5) lost
         every sandbox — flip all active rows to `lost` so their routes
@@ -561,7 +569,7 @@ class GatewayRegistry:
     # ----- port allocations -----------------------------------------------
 
     def _migrate_ports(self) -> None:
-        """S4 migration: add port_allocations table for port exposure."""
+        """S4/S5 migration: port_allocations table + guest_ip column."""
         with self._lock:
             self._conn.execute(
                 "CREATE TABLE IF NOT EXISTS port_allocations ("
@@ -573,17 +581,30 @@ class GatewayRegistry:
                 "  created_at TEXT NOT NULL"
                 ")"
             )
+            # S5: add guest_ip column for port rehydration
+            cols = {
+                row[1]
+                for row in self._conn.execute(
+                    "PRAGMA table_info(port_allocations)"
+                ).fetchall()
+            }
+            if "guest_ip" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE port_allocations"
+                    " ADD COLUMN guest_ip TEXT NOT NULL DEFAULT '127.0.0.1'"
+                )
 
     def allocate_port(
-        self, sandbox_id: str, tenant_id: str, guest_port: int, host_port: int
+        self, sandbox_id: str, tenant_id: str, guest_port: int, host_port: int,
+        *, guest_ip: str = "127.0.0.1",
     ) -> int:
         """Record a port allocation; returns the row id."""
         with self._lock:
             cursor = self._conn.execute(
                 "INSERT INTO port_allocations"
-                " (sandbox_id, tenant_id, guest_port, host_port, created_at)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (sandbox_id, tenant_id, int(guest_port), int(host_port), _utc_now()),
+                " (sandbox_id, tenant_id, guest_port, host_port, guest_ip, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (sandbox_id, tenant_id, int(guest_port), int(host_port), guest_ip, _utc_now()),
             )
             return cursor.lastrowid  # type: ignore[return-value]
 
@@ -638,6 +659,15 @@ class GatewayRegistry:
                 (tenant_id,),
             ).fetchone()
             return int(row[0])
+
+    def list_all_port_allocations(self) -> list[dict[str, Any]]:
+        """All port allocations (for rehydration at startup)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT sandbox_id, guest_port, host_port, guest_ip, tenant_id"
+                " FROM port_allocations"
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     # ----- meta -----------------------------------------------------------
 
