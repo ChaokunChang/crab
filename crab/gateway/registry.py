@@ -114,6 +114,7 @@ class GatewayRegistry:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(_SCHEMA)
         self._migrate()
+        self._migrate_ports()
 
     def _migrate(self) -> None:
         """Additive migrations for registries created by older gateways.
@@ -556,6 +557,87 @@ class GatewayRegistry:
                     (sandbox_id,),
                 )
         return missing
+
+    # ----- port allocations -----------------------------------------------
+
+    def _migrate_ports(self) -> None:
+        """S4 migration: add port_allocations table for port exposure."""
+        with self._lock:
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS port_allocations ("
+                "  id INTEGER PRIMARY KEY,"
+                "  sandbox_id TEXT NOT NULL,"
+                "  guest_port INTEGER NOT NULL,"
+                "  host_port INTEGER NOT NULL UNIQUE,"
+                "  tenant_id TEXT NOT NULL,"
+                "  created_at TEXT NOT NULL"
+                ")"
+            )
+
+    def allocate_port(
+        self, sandbox_id: str, tenant_id: str, guest_port: int, host_port: int
+    ) -> int:
+        """Record a port allocation; returns the row id."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "INSERT INTO port_allocations"
+                " (sandbox_id, tenant_id, guest_port, host_port, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (sandbox_id, tenant_id, int(guest_port), int(host_port), _utc_now()),
+            )
+            return cursor.lastrowid  # type: ignore[return-value]
+
+    def release_port(self, sandbox_id: str, guest_port: int) -> int | None:
+        """Release one allocation; returns the host_port freed (or None)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT host_port FROM port_allocations"
+                " WHERE sandbox_id = ? AND guest_port = ?",
+                (sandbox_id, int(guest_port)),
+            ).fetchone()
+            if row is None:
+                return None
+            host_port = int(row["host_port"])
+            self._conn.execute(
+                "DELETE FROM port_allocations"
+                " WHERE sandbox_id = ? AND guest_port = ?",
+                (sandbox_id, int(guest_port)),
+            )
+            return host_port
+
+    def release_all_ports(self, sandbox_id: str) -> list[int]:
+        """Release all port allocations for a sandbox; returns freed host_ports."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT host_port FROM port_allocations WHERE sandbox_id = ?",
+                (sandbox_id,),
+            ).fetchall()
+            host_ports = [int(row["host_port"]) for row in rows]
+            if host_ports:
+                self._conn.execute(
+                    "DELETE FROM port_allocations WHERE sandbox_id = ?",
+                    (sandbox_id,),
+                )
+            return host_ports
+
+    def list_ports(self, sandbox_id: str) -> list[dict[str, Any]]:
+        """List all port allocations for a sandbox."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, sandbox_id, tenant_id, guest_port, host_port, created_at"
+                " FROM port_allocations WHERE sandbox_id = ? ORDER BY guest_port",
+                (sandbox_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def count_tenant_ports(self, tenant_id: str) -> int:
+        """Count total port allocations across all sandboxes for a tenant."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM port_allocations WHERE tenant_id = ?",
+                (tenant_id,),
+            ).fetchone()
+            return int(row[0])
 
     # ----- meta -----------------------------------------------------------
 
