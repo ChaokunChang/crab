@@ -226,19 +226,20 @@ tenant's ids), `QuotaExceeded` (409, with the quota arithmetic on
 (502), `GatewayTimeoutError` (504). A timeout of the client's own request
 raises plain `TimeoutError`, as in local-daemon mode.
 
-Cloud-mode limitations (v0):
+Cloud-mode limitations:
 
-- Creating a **new** sandbox with `Sandbox(image=...)` against a runc
-  daemon requires the SDK and daemon to share a filesystem (client-side
-  image export and bundle prep), so it does not work from a second
-  machine yet. Attach to existing sandboxes with `Sandbox.connect(id)`;
-  exec/checkpoint/restore/fork/kill all work over the gateway.
-- Host-coupled helpers (bundle spec writing, upstream registration,
-  network leases, host-inspector filters, process merge) raise
-  `CloudUnsupportedOperation` before any network traffic; best-effort
-  cleanup paths (e.g. inside `Sandbox.kill()`) degrade silently.
+- ~~Creating a new sandbox with `Sandbox(image=...)` required client-side
+  bundle prep.~~ **Resolved in PR-S5.3**: remote creation is now fully
+  supported — the daemon performs bundle prep server-side (docker export,
+  ZFS clone, runc spec) when it receives `{"image": "..."}` metadata
+  without a `bundle_path`.
+- ~~Host-coupled helpers (upstream, network lease, inspector filters,
+  process merge) raised `CloudUnsupportedOperation`.~~ **Resolved in
+  PR-S5.3**: all per-sandbox daemon routes are now proxied through the
+  gateway; only `/shutdown` remains blocked (operator-only).
 - Host paths (`engine.storage_root` and friends) are not resolvable and
-  raise `RuntimeError` — the gateway's `/info` deliberately omits them.
+  raise `RuntimeError` — the gateway's `/info` deliberately omits them
+  (this is by design, not a limitation to resolve).
 
 ## Current limitations
 
