@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import tempfile
 import threading
 import time
@@ -460,6 +461,48 @@ class StreamIteratorTests(unittest.TestCase):
         si = StreamIterator(FakeResponse(), FakeConn())
         events = list(si)
         self.assertEqual(events, [])
+
+
+# ---------------------------------------------------------------------------
+# Real daemon E2E test (gate-controlled)
+# ---------------------------------------------------------------------------
+
+
+@unittest.skipUnless(
+    os.environ.get("CRAB_REAL_HOST_TESTS"), "requires real daemon"
+)
+class RealDaemonStreamTests(unittest.TestCase):
+    """End-to-end streaming exec against a real running daemon."""
+
+    def test_real_stream_exec_incremental(self) -> None:
+        import crab
+
+        sandbox = crab.Sandbox()
+        try:
+            events: list = []
+            for event in sandbox.commands.stream(
+                "echo hello && sleep 0.5 && echo world"
+            ):
+                events.append(event)
+
+            # Should have at least 2 stdout events (hello, world) + ExecDone
+            stdout_events = [
+                e for e in events if isinstance(e, ExecEvent) and e.channel == "stdout"
+            ]
+            self.assertGreaterEqual(
+                len(stdout_events), 2,
+                f"expected >=2 stdout events, got {stdout_events}",
+            )
+            # Verify content
+            combined = "".join(e.text for e in stdout_events)
+            self.assertIn("hello", combined)
+            self.assertIn("world", combined)
+
+            # Last event should be ExecDone with rc=0
+            self.assertIsInstance(events[-1], ExecDone)
+            self.assertEqual(events[-1].returncode, 0)
+        finally:
+            sandbox.kill()
 
 
 if __name__ == "__main__":

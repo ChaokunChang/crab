@@ -927,7 +927,7 @@ def _build_handler(daemon: "DaemonServer"):
                     return
                 body = self._read_body()
                 # Stream fork: if this is exec + stream=1, use streaming handler
-                if fn is routes.exec_sandbox and "stream=1" in query_string:
+                if getattr(fn, "__func__", None) is _Routes.exec_sandbox and "stream=1" in query_string:
                     self._handle_stream_exec(body, variables or {})
                     return
                 result = fn(body, **(variables or {}))
