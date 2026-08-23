@@ -365,9 +365,20 @@ def _make_passthrough(gateway: "GatewayServer", method: str, timeout: float):
     return handler
 
 
+def _make_global_passthrough(gateway: "GatewayServer", method: str, timeout: float):
+    """Non-sandbox passthrough: proxy to daemon with no ownership check."""
+
+    def handler(
+        tenant_id: str | None, body: dict[str, Any], *, path: str, **_: Any
+    ) -> dict[str, Any]:
+        payload = body if method in ("POST", "DELETE") else None
+        return gateway.proxy(method, path[len(API_PREFIX):], payload, timeout)
+
+    return handler
+
+
 # Per-sandbox passthrough routes: (method, subpath, per-call timeout).
-# `processes/merge` is deliberately absent (deferred in v0), as are all
-# host-internal daemon routes (design doc §5.1).
+# All per-sandbox daemon routes are proxied (S5 full-access unlock).
 _PASSTHROUGH_SANDBOX_ROUTES: list[tuple[str, str, float]] = [
     ("GET", "", _FAST_TIMEOUT_S),  # describe
     ("POST", "/exec", _SLOW_TIMEOUT_S),
@@ -388,6 +399,13 @@ _PASSTHROUGH_SANDBOX_ROUTES: list[tuple[str, str, float]] = [
     ("POST", "/actions", _FAST_TIMEOUT_S),
     ("POST", "/egress", _FAST_TIMEOUT_S),
     ("POST", "/egress/replay", _SLOW_TIMEOUT_S),
+    # S5 full-access: previously host-coupled routes now proxied
+    ("POST", "/upstream", _FAST_TIMEOUT_S),
+    ("DELETE", "/upstream", _FAST_TIMEOUT_S),
+    ("POST", "/network/lease", _FAST_TIMEOUT_S),
+    ("DELETE", "/network/lease", _FAST_TIMEOUT_S),
+    ("POST", "/host_inspector/filters", _FAST_TIMEOUT_S),
+    ("POST", "/processes/merge", _SLOW_TIMEOUT_S),
 ]
 
 
@@ -481,6 +499,9 @@ def _build_handler(gateway: "GatewayServer"):
         ("POST", f"{API_PREFIX}/sandboxes/{{sandbox_id}}/ports", True, routes.expose_port),
         ("GET", f"{API_PREFIX}/sandboxes/{{sandbox_id}}/ports", True, routes.list_ports),
         ("DELETE", f"{API_PREFIX}/sandboxes/{{sandbox_id}}/ports/{{guest_port}}", True, routes.release_port),
+        # S5 full-access: runtime helper route
+        ("POST", f"{API_PREFIX}/runtime/write_bundle_spec", True,
+         _make_global_passthrough(gateway, "POST", _FAST_TIMEOUT_S)),
     ]
     for method, subpath, timeout in _PASSTHROUGH_SANDBOX_ROUTES:
         pattern = f"{API_PREFIX}/sandboxes/{{sandbox_id}}{subpath}"

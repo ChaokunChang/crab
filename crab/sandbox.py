@@ -383,7 +383,10 @@ class Sandbox:
         )
         self._launch_plan = plan
         self._sandbox_id = sandbox_id
-        if runtime_name == "runc":
+        if self._is_remote_runtime(runtime):
+            # S5 full-access: remote mode — daemon handles all bundle prep.
+            launch_metadata = self._build_remote_launch_metadata(plan, sandbox_id)
+        elif runtime_name == "runc":
             launch_metadata = self._prepare_runc_launch(plan, sandbox_id)
         else:
             launch_metadata = {"sandbox_id": str(sandbox_id), **dict(plan.metadata)}
@@ -401,6 +404,26 @@ class Sandbox:
             runtime_name,
             plan.image,
         )
+
+    @staticmethod
+    def _is_remote_runtime(runtime) -> bool:
+        """True when the runtime is a proxy to a remote daemon (cloud mode)."""
+        # Duck-type: RuntimeProxy has _client; local RuncRuntime does not.
+        return hasattr(runtime, "_client")
+
+    def _build_remote_launch_metadata(
+        self, plan: "_LaunchPlan", sandbox_id: SandboxId
+    ) -> dict[str, object]:
+        """Minimal metadata for daemon-side bundle prep (S5 full-access)."""
+        md: dict[str, object] = {
+            "sandbox_id": str(sandbox_id),
+            "image": plan.image,
+        }
+        if self._user_env:
+            md["env"] = dict(self._user_env)
+        if self._network_requested:
+            md["network"] = True
+        return md
 
     def _default_image(self) -> str | None:
         return self._engine.config.default_image

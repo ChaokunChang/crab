@@ -1,4 +1,4 @@
-"""Full-stack tests for the SDK's cloud mode (track S, S2): a real
+"""Full-stack tests for the SDK's cloud mode (track S, S2+S5): a real
 `GatewayServer` over a scripted stub daemon, driven end to end through
 `CloudClient` + `Engine.connect(url=...)` + the unchanged
 `RemoteEngine`/`Sandbox` surface. Host-runnable — no runc/CRIU/zfs, no
@@ -7,14 +7,12 @@ root, no external network (the "cloud" is 127.0.0.1).
 Covers the S2 exit surface: connect dispatch on argument shape, the
 lifecycle verbs (create/exec/checkpoint/restore/fork/kill), the typed
 error taxonomy (401 auth, cross-tenant 404, quota 409, lost 410, daemon
-502, gateway 504 vs client-side timeout), the host-shim guard for routes
-the gateway does not expose, and the three-verb signature conformance
-between `DaemonClient` and `CloudClient` (design doc §8).
+502, gateway 504 vs client-side timeout), the host-shim guard (only
+/shutdown remains blocked after S5 full-access), and the three-verb
+signature conformance between `DaemonClient` and `CloudClient` (§8).
 
 The stub daemon reports runtime "docker" here so `Sandbox._launch`
-takes the metadata-only path — the runc path does client-side bundle
-prep on a shared filesystem, which is exactly what cloud mode cannot do
-(documented v0 limitation, design doc §4 S2 as-built notes).
+takes the remote-mode path (S5) — no client-side bundle prep.
 """
 from __future__ import annotations
 
@@ -299,8 +297,8 @@ class CloudTimeoutTests(CloudTestBase):
 
 
 # ---------------------------------------------------------------------------
-# Host-shim guard — routes the gateway does not expose fail client-side
-# with a typed, explanatory error (design doc §5.1 tension, resolved S2).
+# Host-shim guard — only /shutdown remains blocked; all other routes are
+# now proxied through the gateway (S5 full-access unlock).
 # ---------------------------------------------------------------------------
 
 
@@ -311,53 +309,48 @@ class HostShimGuardTests(CloudLiveTestBase):
         self.sbx = Sandbox(engine=self.engine)
         self.sandbox_id = self.sbx.sandbox_id
 
-    def _assert_never_hit_the_wire(self, needle: str) -> None:
-        self.assertEqual(self.daemon_requests(needle), [])
+    def _assert_hit_the_wire(self, needle: str) -> None:
+        self.assertTrue(
+            len(self.daemon_requests(needle)) > 0,
+            f"expected daemon request containing '{needle}'",
+        )
 
-    def test_write_bundle_spec_is_guarded(self) -> None:
-        with self.assertRaises(CloudUnsupportedOperation):
-            self.engine.runtime.write_bundle_spec(Path("/tmp/bundle"))
-        self._assert_never_hit_the_wire("/runtime/")
+    def test_write_bundle_spec_goes_through(self) -> None:
+        # No longer guarded; the gateway proxies to daemon.
+        self.engine.runtime.write_bundle_spec(Path("/tmp/bundle"))
+        self._assert_hit_the_wire("/runtime/")
 
-    def test_host_inspector_filters_are_guarded(self) -> None:
-        with self.assertRaises(CloudUnsupportedOperation):
-            self.engine.runtime.update_host_inspector_filters(
-                self.sandbox_id, ignored_path_prefixes=["/tmp"]
-            )
-        self._assert_never_hit_the_wire("host_inspector")
+    def test_host_inspector_filters_go_through(self) -> None:
+        self.engine.runtime.update_host_inspector_filters(
+            self.sandbox_id, ignored_path_prefixes=["/tmp"]
+        )
+        self._assert_hit_the_wire("host_inspector")
 
-    def test_register_upstream_is_guarded(self) -> None:
-        with self.assertRaises(CloudUnsupportedOperation):
-            self.engine.register_upstream(self.sandbox_id, "http://127.0.0.1:9999")
-        self._assert_never_hit_the_wire("upstream")
+    def test_register_upstream_goes_through(self) -> None:
+        self.engine.register_upstream(self.sandbox_id, "http://127.0.0.1:9999")
+        self._assert_hit_the_wire("upstream")
 
-    def test_allocate_network_lease_is_guarded(self) -> None:
-        with self.assertRaises(CloudUnsupportedOperation):
-            self.engine.allocate_network_lease(self.sandbox_id)
-        self._assert_never_hit_the_wire("network/lease")
+    def test_allocate_network_lease_goes_through(self) -> None:
+        self.engine.allocate_network_lease(self.sandbox_id)
+        self._assert_hit_the_wire("network/lease")
 
-    def test_process_merge_is_guarded(self) -> None:
-        with self.assertRaises(CloudUnsupportedOperation):
-            self.engine.system.merge_processes(self.sandbox_id, "some-fork")
-        self._assert_never_hit_the_wire("processes/merge")
+    def test_process_merge_goes_through(self) -> None:
+        self.engine.system.merge_processes(self.sandbox_id, "some-fork")
+        self._assert_hit_the_wire("processes/merge")
 
     def test_daemon_shutdown_is_guarded(self) -> None:
         with self.assertRaises(CloudUnsupportedOperation):
             self.cloud_client(self.key).post_json("/shutdown")
-        self._assert_never_hit_the_wire("shutdown")
 
-    def test_best_effort_cleanup_helpers_degrade_silently(self) -> None:
-        # RemoteEngine swallows these on purpose; the guard must not
-        # change that observable behavior.
+    def test_best_effort_cleanup_helpers_go_through(self) -> None:
+        # RemoteEngine swallows errors; the routes now hit the daemon.
         self.engine.unregister_upstream(self.sandbox_id)
         self.engine.release_network_lease(self.sandbox_id)
-        self._assert_never_hit_the_wire("upstream")
-        self._assert_never_hit_the_wire("network/lease")
+        self._assert_hit_the_wire("upstream")
+        self._assert_hit_the_wire("network/lease")
 
-    def test_kill_completes_despite_guarded_cleanup(self) -> None:
-        # Sandbox.kill() unconditionally calls the upstream/lease cleanup
-        # helpers; the guard fires inside them and is swallowed, so kill
-        # still lands the DELETE and flips the registry row.
+    def test_kill_completes_with_cleanup_going_through(self) -> None:
+        # Sandbox.kill() calls upstream/lease cleanup then DELETE.
         self.sbx.kill()
         row = self.gateway.registry.get_sandbox(str(self.sandbox_id))
         self.assertEqual(row["status"], "killed")
