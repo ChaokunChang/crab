@@ -119,6 +119,14 @@ class ExecDone:
 
 
 @dataclass(frozen=True)
+class PortAllocation:
+    """A port exposure allocation (S4): maps guest_port to host_port."""
+    host_port: int
+    guest_port: int
+    url: str
+
+
+@dataclass(frozen=True)
 class EBPFEvent:
     sandbox_id: SandboxId
     kind: EBPFEventKind

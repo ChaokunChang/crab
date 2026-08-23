@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Iterator
 
 from .ids import CheckpointId, SandboxId
-from .models import EgressLedger, ExecDone, ExecEvent, JobStatus, MergeReport, ObservationReport, ProcessMergeReport, SandboxExecResult, SandboxSnapshot, utc_now
+from .models import EgressLedger, ExecDone, ExecEvent, JobStatus, MergeReport, ObservationReport, PortAllocation, ProcessMergeReport, SandboxExecResult, SandboxSnapshot, utc_now
 from .templates import SandboxTemplate
 
 if TYPE_CHECKING:
@@ -162,6 +162,52 @@ class _CommandsNamespace:
             env=merged_env,
             user=user,
             timeout_s=timeout,
+        )
+
+
+class _PortsNamespace:
+    """`sbx.ports.*` — port exposure (S4).
+
+    Expose sandbox ports through the gateway's L4 proxy so external
+    clients can reach services running inside the sandbox.
+    """
+
+    def __init__(self, sandbox: "Sandbox") -> None:
+        self._sandbox = sandbox
+
+    def expose(self, port: int) -> PortAllocation:
+        """Expose a guest port; returns the allocation with host_port and url."""
+        client = self._sandbox._engine.runtime._client  # type: ignore[attr-defined]
+        result = client.post_json(
+            f"/sandboxes/{self._sandbox.sandbox_id}/ports",
+            {"port": int(port)},
+        )
+        return PortAllocation(
+            host_port=int(result["host_port"]),
+            guest_port=int(result["guest_port"]),
+            url=str(result["url"]),
+        )
+
+    def list(self) -> list[PortAllocation]:
+        """List all port allocations for this sandbox."""
+        client = self._sandbox._engine.runtime._client  # type: ignore[attr-defined]
+        result = client.get_json(
+            f"/sandboxes/{self._sandbox.sandbox_id}/ports",
+        )
+        return [
+            PortAllocation(
+                host_port=int(p["host_port"]),
+                guest_port=int(p["guest_port"]),
+                url=f"tcp://unknown:{p['host_port']}",
+            )
+            for p in result.get("ports") or []
+        ]
+
+    def release(self, port: int) -> None:
+        """Release a port allocation."""
+        client = self._sandbox._engine.runtime._client  # type: ignore[attr-defined]
+        client.delete(
+            f"/sandboxes/{self._sandbox.sandbox_id}/ports/{int(port)}",
         )
 
 
@@ -314,6 +360,7 @@ class Sandbox:
         self.commands = _CommandsNamespace(self)
         self.files = _FilesNamespace(self)
         self.checkpoints = _CheckpointsNamespace(self)
+        self.ports = _PortsNamespace(self)
 
         if autostart:
             self._launch()
