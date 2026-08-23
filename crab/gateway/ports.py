@@ -228,6 +228,16 @@ class PortManager:
         for port in host_ports:
             self.release(port)
 
+    def rehydrate(self, host_port: int, guest_ip: str, guest_port: int) -> None:
+        """Re-create a forwarder for a persisted allocation (S5 startup).
+
+        Binds the exact host_port (no random scan). Raises OSError if the
+        port cannot be bound (caller should clean up the DB row)."""
+        fwd = PortForwarder(host_port, guest_ip, guest_port)
+        fwd.start()  # raises OSError if bind fails
+        with self._lock:
+            self._forwarders[host_port] = fwd
+
     def shutdown(self) -> None:
         """Stop all forwarders."""
         with self._lock:

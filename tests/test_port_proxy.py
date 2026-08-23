@@ -401,6 +401,177 @@ class GatewayPortRouteTests(GatewayPortTestBase):
 
 
 # ---------------------------------------------------------------------------
+# Port rehydration tests (S5)
+# ---------------------------------------------------------------------------
+
+
+class PortRehydrationTests(unittest.TestCase):
+    """Tests for S5 port rehydration at gateway restart."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name)
+        self.daemon_socket = self.base / "daemon.sock"
+        self.state: dict[str, Any] = {
+            "pid": 1000,
+            "guest_ip": "127.0.0.1",
+            "sandboxes": [{"sandbox_id": "sbx-1", "metadata": {"guest_ip": "127.0.0.1"}}],
+        }
+        self._start_stub_daemon()
+        # Start echo server that persists across gateway restarts
+        self.echo_sock, self.echo_port = _start_echo_server()
+        self.addCleanup(self.echo_sock.close)
+
+    def _start_stub_daemon(self) -> None:
+        handler = _build_port_test_handler(self.state)
+        self.daemon_server = serve_unix_socket(self.daemon_socket, handler)
+        thread = threading.Thread(target=self.daemon_server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(self._stop_daemon)
+
+    def _stop_daemon(self) -> None:
+        if self.daemon_server:
+            self.daemon_server.shutdown()
+            self.daemon_server.server_close()
+
+    def _make_gateway(self) -> GatewayServer:
+        gw = GatewayServer(
+            data_dir=self.base / "gw",
+            daemon_socket=self.daemon_socket,
+            host="127.0.0.1",
+            port=0,
+            admin_socket_path=self.base / "admin.sock",
+        )
+        gw.start()
+        return gw
+
+    def test_rehydrate_rebuilds_forwarder_after_restart(self) -> None:
+        # First gateway: allocate a port
+        gw1 = self._make_gateway()
+        admin = DaemonClient(self.base / "admin.sock")
+        tenant = admin.post_json("/admin/tenants", {"name": "t1"})["tenant"]
+        gw1.registry.register_sandbox(tenant["id"], "sbx-1")
+        host_port = gw1.port_manager.allocate("sbx-1", "127.0.0.1", self.echo_port)
+        gw1.registry.allocate_port(
+            "sbx-1", tenant["id"], self.echo_port, host_port, guest_ip="127.0.0.1"
+        )
+        # Verify forwarding works
+        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client.settimeout(5.0)
+        client.connect(("127.0.0.1", host_port))
+        client.sendall(b"before-restart")
+        self.assertEqual(client.recv(1024), b"before-restart")
+        client.close()
+        # Stop gateway (simulates restart)
+        gw1.stop()
+        time.sleep(0.3)
+
+        # Verify port is dead after stop
+        dead = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        dead.settimeout(1.0)
+        with self.assertRaises(OSError):
+            dead.connect(("127.0.0.1", host_port))
+        dead.close()
+
+        # Second gateway: should rehydrate
+        # Need to remove old admin socket
+        admin_sock_path = self.base / "admin.sock"
+        if admin_sock_path.exists():
+            admin_sock_path.unlink()
+        gw2 = self._make_gateway()
+        self.addCleanup(gw2.stop)
+        # Forwarder should be rebuilt — TCP should work
+        time.sleep(0.2)
+        client2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client2.settimeout(5.0)
+        client2.connect(("127.0.0.1", host_port))
+        client2.sendall(b"after-restart")
+        self.assertEqual(client2.recv(1024), b"after-restart")
+        client2.close()
+
+    def test_lost_sandbox_allocation_cleaned_not_rebuilt(self) -> None:
+        # First gateway: allocate a port, then mark sandbox lost
+        gw1 = self._make_gateway()
+        admin = DaemonClient(self.base / "admin.sock")
+        tenant = admin.post_json("/admin/tenants", {"name": "t1"})["tenant"]
+        gw1.registry.register_sandbox(tenant["id"], "sbx-1")
+        host_port = gw1.port_manager.allocate("sbx-1", "127.0.0.1", self.echo_port)
+        gw1.registry.allocate_port(
+            "sbx-1", tenant["id"], self.echo_port, host_port, guest_ip="127.0.0.1"
+        )
+        # Mark sandbox lost (simulates daemon restart)
+        gw1.registry.mark_missing_lost(set())  # all become lost
+        gw1.stop()
+
+        # Second gateway: should clean the DB row, not rebuild
+        admin_sock_path = self.base / "admin.sock"
+        if admin_sock_path.exists():
+            admin_sock_path.unlink()
+        # Remove sbx-1 from daemon listing so reconcile marks it lost again
+        self.state["sandboxes"] = []
+        gw2 = self._make_gateway()
+        self.addCleanup(gw2.stop)
+        # No port allocations should remain
+        self.assertEqual(gw2.registry.list_ports("sbx-1"), [])
+        # Forwarder should NOT be running
+        dead = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        dead.settimeout(1.0)
+        with self.assertRaises(OSError):
+            dead.connect(("127.0.0.1", host_port))
+        dead.close()
+
+    def test_occupied_port_releases_db_row(self) -> None:
+        # First gateway: allocate a port
+        gw1 = self._make_gateway()
+        admin = DaemonClient(self.base / "admin.sock")
+        tenant = admin.post_json("/admin/tenants", {"name": "t1"})["tenant"]
+        gw1.registry.register_sandbox(tenant["id"], "sbx-1")
+        host_port = gw1.port_manager.allocate("sbx-1", "127.0.0.1", self.echo_port)
+        gw1.registry.allocate_port(
+            "sbx-1", tenant["id"], self.echo_port, host_port, guest_ip="127.0.0.1"
+        )
+        gw1.stop()
+
+        # Occupy the port so rehydration fails
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        blocker.bind(("0.0.0.0", host_port))
+        blocker.listen(1)
+        self.addCleanup(blocker.close)
+
+        # Second gateway: rehydration should fail and clean DB row
+        admin_sock_path = self.base / "admin.sock"
+        if admin_sock_path.exists():
+            admin_sock_path.unlink()
+        gw2 = self._make_gateway()
+        self.addCleanup(gw2.stop)
+        # DB row should be gone
+        self.assertEqual(gw2.registry.list_ports("sbx-1"), [])
+
+    def test_guest_ip_migration_idempotent(self) -> None:
+        from crab.gateway.registry import GatewayRegistry
+        # Create a registry without guest_ip column (simulate pre-S5)
+        db_path = self.base / "gw" / "gateway.sqlite3"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        reg1 = GatewayRegistry(db_path)
+        # Check guest_ip column exists after first init
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(port_allocations)").fetchall()}
+        self.assertIn("guest_ip", cols)
+        conn.close()
+        reg1.close()
+        # Open again — migration should be idempotent
+        reg2 = GatewayRegistry(db_path)
+        conn2 = sqlite3.connect(str(db_path))
+        cols2 = {row[1] for row in conn2.execute("PRAGMA table_info(port_allocations)").fetchall()}
+        self.assertIn("guest_ip", cols2)
+        conn2.close()
+        reg2.close()
+
+
+# ---------------------------------------------------------------------------
 # Helper
 # ---------------------------------------------------------------------------
 
