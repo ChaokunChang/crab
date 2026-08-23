@@ -146,7 +146,13 @@ class _Routes:
         """Server-side bundle prep for remote creates (S5 full-access).
 
         Performs the same work as Sandbox._prepare_runc_launch() but runs
-        entirely on the daemon host which has docker + ZFS + root."""
+        entirely on the daemon host which has docker + ZFS + root.
+
+        The sequence is: (1) image export, (2) build metadata with
+        rootfs_copy_paths/shared_rootfs_key, (3) call runtime.prepare_launch
+        which does the ZFS dataset + rootfs materialization, (4) write
+        config.json AFTER the ZFS work is complete.  This ordering ensures
+        config.json is never disturbed by ZFS mount operations."""
         from integrations.sandboxes.runtime import bundle as sandbox_bundle
         from integrations.sandboxes.runtime import image as sandbox_image
 
@@ -156,12 +162,12 @@ class _Routes:
         # Resolve paths from engine's runtime
         rt = eng.runtime
         bundle_dir = rt._paths.bundle_root / sandbox_id_str
+        if bundle_dir.exists():
+            import shutil
+            shutil.rmtree(bundle_dir, ignore_errors=True)
         bundle_dir.mkdir(parents=True, exist_ok=True)
 
-        # 1. Base runc spec
-        rt.write_bundle_spec(bundle_dir)
-
-        # 2. Image export
+        # 1. Image export (creates cached rootfs tarball → directory)
         image_id = sandbox_image.inspect_image_id(tag=image_tag)
         image_defaults = sandbox_image.inspect_image_runtime_defaults(
             tag=image_tag, cache_root=eng.image_cache_root
@@ -172,7 +178,7 @@ class _Routes:
             cache_root=eng.image_cache_root,
         )
 
-        # 3. Resource limits
+        # 2. Resource limits
         resource_limits = None
         resources = metadata.get("resources")
         if resources and isinstance(resources, dict):
@@ -182,7 +188,7 @@ class _Routes:
                 pids_limit=resources.get("pids"),
             )
 
-        # 4. Network lease (optional)
+        # 3. Network lease (optional)
         network_namespace_path = None
         if metadata.get("network"):
             try:
@@ -193,7 +199,30 @@ class _Routes:
             except Exception:
                 logger.debug("network lease allocation skipped", exc_info=True)
 
-        # 5. Write bundle config (mounts, namespaces, cgroups)
+        # 4. Build launch metadata with rootfs directives
+        rootfs_copy_paths = [{"source": str(exported_rootfs), "destination": "/"}]
+        shared_rootfs_key = image_id[:32]
+        metadata.update({
+            "sandbox_id": sandbox_id_str,
+            "bundle_path": str(bundle_dir),
+            "work_dir_host_path": None,
+            "rootfs_init_dirs": ["/work", "/tmp"],
+            "rootfs_copy_paths": rootfs_copy_paths,
+            "shared_rootfs_key": shared_rootfs_key,
+            "shared_rootfs_persist": True,
+            "sdk_image": image_tag,
+            "sdk_process_cwd": "/work",
+        })
+
+        # 5. Let the runtime handle ZFS dataset creation + rootfs
+        #    materialization (shared-clone or fresh copy).  This runs
+        #    prepare_launch which may mount a ZFS dataset at bundle/rootfs.
+        rt.prepare_launch(rt.name, metadata)
+
+        # 6. Write config.json AFTER ZFS work is done (prepare_launch marks
+        #    _crab_runtime_prepared=True, so the second call inside
+        #    runtime.launch() will be a no-op).
+        rt.write_bundle_spec(bundle_dir)
         sandbox_bundle.write_bundle_config(
             bundle_dir=bundle_dir,
             llm_base_url="",
@@ -208,26 +237,11 @@ class _Routes:
             resource_limits=resource_limits,
         )
 
-        # 6. Write process section (sleep infinity idle init)
+        # 7. Write process section (sleep infinity idle init)
         self._write_daemon_bundle_process(
             bundle_dir, image_defaults, sandbox_id_str,
             metadata.get("env"),
         )
-
-        # 7. Build complete launch metadata
-        rootfs_copy_paths = [{"source": str(exported_rootfs), "destination": "/"}]
-        shared_rootfs_key = image_id[:32]
-        metadata.update({
-            "sandbox_id": sandbox_id_str,
-            "bundle_path": str(bundle_dir),
-            "work_dir_host_path": None,
-            "rootfs_init_dirs": ["/work", "/tmp"],
-            "rootfs_copy_paths": rootfs_copy_paths,
-            "shared_rootfs_key": shared_rootfs_key,
-            "shared_rootfs_persist": True,
-            "sdk_image": image_tag,
-            "sdk_process_cwd": "/work",
-        })
         return metadata
 
     @staticmethod
