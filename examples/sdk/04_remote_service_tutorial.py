@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import time
 import traceback
+from urllib.parse import urlparse
 
 from crab import Engine, Sandbox
 from crab.models import ExecEvent, ExecDone
@@ -124,6 +125,9 @@ def main() -> None:
         # ----------------------------------------------------------
         banner("5. 文件变更 (changeset)")
         print("  先写一个测试文件…")
+        # 注意: changeset 依赖 daemon 侧的 inspector gate 优化。
+        # 如果 daemon 未启动 eBPF host inspector（默认配置），gate 可能
+        # 误判为"无变更"而返回空列表。这是已知限制，不影响 API 正确性。
 
         # 先做一次 checkpoint 作为 changeset 的基线
         base_ckpt = safe_run(
@@ -138,10 +142,17 @@ def main() -> None:
             sandbox.commands.run("mkdir -p /opt/demo && echo 123 > /opt/demo/data.txt")
             step_ok("写入了 /tmp/changeset_test.txt 和 /opt/demo/data.txt")
 
+            # 等待一下让 inspector 有机会观察到文件变更（需要 eBPF inspector）
+            time.sleep(2)
+
             # 查询 changeset
             changes = safe_run("查询 changeset", sandbox.changeset, base_ckpt)
             if changes is not None:
                 step_ok(f"changeset 返回 {len(changes)} 条变更")
+                if len(changes) == 0:
+                    print("    (0 条变更: daemon 的 inspector gate 跳过了 diff。")
+                    print("     若需完整 changeset，请在 daemon 配置中启用")
+                    print("     host_inspector.launch_mode='process' 以运行 eBPF inspector)")
                 for entry in changes[:10]:  # 最多显示 10 条
                     print(f"    {entry}")
         else:
@@ -241,22 +252,29 @@ def main() -> None:
 
             # 暴露端口
             allocation = sandbox.ports.expose(8080)
-            step_ok(f"端口暴露成功:")
+            step_ok("端口暴露成功:")
             print(f"    guest_port: {allocation.guest_port}")
             print(f"    host_port:  {allocation.host_port}")
             print(f"    url:        {allocation.url}")
 
             # 尝试从外部验证（使用 urllib，不依赖 requests）
+            # ports.expose 返回的 url 通常是 tcp:// 格式（L4 转发），
+            # 需要用 http:// 协议访问沙箱内的 HTTP server
             print("  尝试从外部访问暴露的端口…")
             try:
                 import urllib.request
-                with urllib.request.urlopen(allocation.url, timeout=5) as resp:
+                # 从 GATEWAY_URL 提取主机名，拼接 host_port 构造 HTTP URL
+                gw_parsed = urlparse(GATEWAY_URL)
+                gw_host = gw_parsed.hostname or "127.0.0.1"
+                http_url = f"http://{gw_host}:{allocation.host_port}/"
+                print(f"    构造 HTTP URL: {http_url}")
+                with urllib.request.urlopen(http_url, timeout=5) as resp:
                     body = resp.read(200).decode("utf-8", errors="replace")
                     step_ok(f"外部访问成功 (HTTP {resp.status}), 响应前 200 字节:")
                     print(f"    {body[:200]}")
             except Exception as fetch_exc:
                 step_fail(f"外部访问失败 (可能网络不通): {fetch_exc}")
-                print("    提示: 端口已暴露，但从当前网络可能无法直接访问。")
+                print("    提示: 端口已暴露，但从当前网络可能无法直接访问 gateway 主机。")
 
         except Exception as port_exc:
             step_fail(f"端口暴露不可用: {port_exc}")
