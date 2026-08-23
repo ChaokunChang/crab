@@ -268,3 +268,89 @@ class DaemonClient:
         if not isinstance(decoded, dict):
             raise DaemonRequestError(status_code, path, payload_bytes)
         return decoded
+
+    def stream_post(
+        self,
+        path: str,
+        payload: Mapping[str, Any] | None = None,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> "StreamIterator":
+        """POST that returns a streaming NDJSON iterator instead of reading
+        the full response body. The caller must close the iterator (or use
+        it as a context manager) to release the connection."""
+        effective = self._timeout if timeout_seconds is None else float(timeout_seconds)
+        body = b"" if payload is None else json.dumps(payload).encode("utf-8")
+        conn = _UnixHTTPConnection(self._socket_path, timeout=effective)
+        headers: dict[str, str] = {"Host": "crab"}
+        if body:
+            headers["Content-Type"] = "application/json"
+        try:
+            conn.request("POST", path, body=body, headers=headers)
+            response = conn.getresponse()
+        except (FileNotFoundError, ConnectionRefusedError) as exc:
+            conn.close()
+            raise FileNotFoundError(
+                f"crab daemon not reachable at {self._socket_path} ({exc.__class__.__name__}); "
+                "start the daemon with `crab daemon start` (or "
+                "`python -m crab.daemon`)."
+            ) from exc
+        except Exception:
+            conn.close()
+            raise
+        if response.status >= 400:
+            try:
+                payload_bytes = response.read()
+            finally:
+                response.close()
+                conn.close()
+            raise DaemonRequestError(response.status, path, payload_bytes)
+        return StreamIterator(response, conn)
+
+
+class StreamIterator:
+    """Iterates over newline-delimited JSON objects from an HTTP streaming
+    response. Implements iterator and context-manager protocols."""
+
+    def __init__(self, response: http.client.HTTPResponse, conn: http.client.HTTPConnection) -> None:
+        self._response = response
+        self._conn = conn
+        self._closed = False
+
+    def __iter__(self) -> "StreamIterator":
+        return self
+
+    def __next__(self) -> dict[str, Any]:
+        if self._closed:
+            raise StopIteration
+        while True:
+            line = self._response.readline()
+            if not line:
+                self.close()
+                raise StopIteration
+            line = line.strip()
+            if not line:
+                continue
+            return json.loads(line)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._response.close()
+        except Exception:
+            pass
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+
+    def __enter__(self) -> "StreamIterator":
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        self.close()

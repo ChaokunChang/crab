@@ -106,6 +106,19 @@ class SandboxExecResult:
 
 
 @dataclass(frozen=True)
+class ExecEvent:
+    """A single streaming exec event: output on a channel."""
+    channel: str  # "stdout" or "stderr"
+    text: str
+
+
+@dataclass(frozen=True)
+class ExecDone:
+    """Terminal event from streaming exec: the process exited."""
+    returncode: int
+
+
+@dataclass(frozen=True)
 class EBPFEvent:
     sandbox_id: SandboxId
     kind: EBPFEventKind

@@ -29,12 +29,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Mapping
+from typing import TYPE_CHECKING, Any, Iterator, Mapping
 
 from .contracts import Runtime
 from .daemon import DaemonClient, DaemonRequestError
 from .ids import CheckpointId, SandboxId
-from .models import ChangesetResult, EgressLedger, EgressReplayReport, JobStatus, MergeReport, ObservationReport, ProcessMergeReport, SandboxDescription, SandboxExecResult, SandboxRuntimeState
+from .models import ChangesetResult, EgressLedger, EgressReplayReport, ExecDone, ExecEvent, JobStatus, MergeReport, ObservationReport, ProcessMergeReport, SandboxDescription, SandboxExecResult, SandboxRuntimeState
 from .journal import ActionRecord
 from .merging import MergeError, MergerHook
 from .process_merge import ProcessMergeConflict
@@ -590,6 +590,43 @@ class RuntimeProxy(Runtime):
             stdout=str(raw.get("stdout") or ""),
             stderr=str(raw.get("stderr") or ""),
         )
+
+    def stream_exec(
+        self,
+        sandbox_id: SandboxId,
+        argv: list[str],
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        user: str | None = None,
+        timeout_s: float | None = None,
+    ) -> Iterator[ExecEvent | ExecDone]:
+        """Streaming exec: yields ExecEvent/ExecDone as output arrives."""
+        payload: dict[str, Any] = {"argv": list(argv)}
+        if cwd is not None:
+            payload["cwd"] = cwd
+        if env is not None:
+            payload["env"] = dict(env)
+        if user is not None:
+            payload["user"] = user
+        if timeout_s is not None:
+            payload["timeout_s"] = float(timeout_s)
+        http_timeout = (float(timeout_s) + 60.0) if timeout_s else None
+        stream = self._client.stream_post(
+            f"/sandboxes/{sandbox_id}/exec?stream=1",
+            payload,
+            timeout_seconds=http_timeout,
+        )
+        try:
+            for event in stream:
+                if event.get("done"):
+                    yield ExecDone(returncode=int(event.get("rc", -1)))
+                    return
+                ch = event.get("ch", "stdout")
+                text = event.get("t", "")
+                yield ExecEvent(channel=ch, text=text)
+        finally:
+            stream.close()
 
     # ----- daemon-only API surface the SDK needs in addition to Runtime -----
 

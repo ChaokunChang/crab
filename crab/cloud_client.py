@@ -41,6 +41,7 @@ from typing import Any, Mapping
 from urllib.parse import urlsplit
 
 from .daemon import DaemonRequestError
+from .daemon.transport import StreamIterator
 
 API_KEY_ENV = "CRAB_API_KEY"
 """Environment variable consulted when no explicit `api_key=` is given."""
@@ -306,3 +307,56 @@ class CloudClient:
         if not isinstance(decoded, dict):
             raise CloudRequestError(status_code, path, payload_bytes)
         return decoded
+
+    def stream_post(
+        self,
+        path: str,
+        payload: Mapping[str, Any] | None = None,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> StreamIterator:
+        """POST that returns a streaming NDJSON iterator.
+
+        The path is checked against the unexposed-route guard and then
+        prefixed with the API version (same as `_request_json`). The
+        caller must close the iterator when done."""
+        reason = _unexposed_route_reason(path)
+        if reason is not None:
+            raise CloudUnsupportedOperation(
+                f"POST {path} is not available in cloud mode: {reason}"
+            )
+        effective = self._timeout if timeout_seconds is None else float(timeout_seconds)
+        body = b"" if payload is None else json.dumps(payload).encode("utf-8")
+        if self._scheme == "https":
+            conn: http.client.HTTPConnection = http.client.HTTPSConnection(
+                self._host, self._port, timeout=effective
+            )
+        else:
+            conn = http.client.HTTPConnection(self._host, self._port, timeout=effective)
+        headers: dict[str, str] = {"Authorization": f"Bearer {self._api_key}"}
+        if body:
+            headers["Content-Type"] = "application/json"
+        target = f"{self._base_path}{_API_PREFIX}{path}"
+        try:
+            conn.request("POST", target, body=body, headers=headers)
+            response = conn.getresponse()
+        except TimeoutError:
+            conn.close()
+            raise
+        except OSError as exc:
+            conn.close()
+            raise CloudConnectionError(
+                f"crab gateway not reachable at {self.base_url} "
+                f"({exc.__class__.__name__}: {exc})"
+            ) from exc
+        except Exception:
+            conn.close()
+            raise
+        if response.status >= 400:
+            try:
+                payload_bytes = response.read()
+            finally:
+                response.close()
+                conn.close()
+            raise _error_from_response(response.status, path, payload_bytes)
+        return StreamIterator(response, conn)

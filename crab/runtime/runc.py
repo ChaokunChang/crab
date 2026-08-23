@@ -4,6 +4,7 @@ import fcntl
 import json
 import logging
 import os
+import selectors
 import shutil
 import subprocess
 import time
@@ -11,6 +12,7 @@ import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from threading import Lock
+from typing import Iterator
 
 from ..contracts import ActionRecorder, Runtime, TelemetrySink
 from ..ids import CheckpointId, SandboxId
@@ -1147,6 +1149,88 @@ class RuncRuntime(Runtime):
             ),
         )
         return SandboxExecResult(args=tuple(command), returncode=int(completed.returncode), stdout=stdout, stderr=stderr)
+
+    def stream_exec(
+        self,
+        sandbox_id: SandboxId,
+        argv: list[str],
+        *,
+        cwd: str | None = None,
+        env: dict[str, object] | None = None,
+        user: str | None = None,
+        timeout_s: float | None = None,
+    ) -> Iterator[tuple[str, str]]:
+        """Streaming exec: yields (channel, text) tuples as output arrives.
+
+        channel is one of 'stdout', 'stderr', or 'exit'. The final yield
+        is always ('exit', str(returncode)).
+        """
+        command = [self._runtime_bin, "--root", str(self._paths.state_root), "exec"]
+        if cwd:
+            command.extend(["--cwd", cwd])
+        if user:
+            command.extend(["--user", user])
+        for key, value in sorted((env or {}).items()):
+            command.extend(["--env", f"{key}={value}"])
+        command.append(str(sandbox_id))
+        command.extend(argv)
+
+        deadline = (time.monotonic() + timeout_s) if timeout_s else None
+        proc = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        with self._active_execs_lock:
+            self._active_execs.setdefault(sandbox_id, set()).add(proc)
+        sel = selectors.DefaultSelector()
+        try:
+            # Set stdout/stderr to non-blocking
+            os.set_blocking(proc.stdout.fileno(), False)
+            os.set_blocking(proc.stderr.fileno(), False)
+            sel.register(proc.stdout, selectors.EVENT_READ, "stdout")
+            sel.register(proc.stderr, selectors.EVENT_READ, "stderr")
+            open_count = 2
+            while open_count > 0:
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        proc.kill()
+                        proc.wait()
+                        yield ("exit", "-1")
+                        return
+                else:
+                    remaining = None
+                events = sel.select(timeout=remaining)
+                if not events:
+                    # select timed out
+                    proc.kill()
+                    proc.wait()
+                    yield ("exit", "-1")
+                    return
+                for key, _ in events:
+                    data = key.fileobj.read(65536)  # type: ignore[union-attr]
+                    if not data:
+                        sel.unregister(key.fileobj)
+                        open_count -= 1
+                        continue
+                    channel = key.data
+                    text = data.decode("utf-8", errors="replace")
+                    yield (channel, text)
+            proc.wait()
+            yield ("exit", str(proc.returncode))
+        finally:
+            sel.close()
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            with self._active_execs_lock:
+                bucket = self._active_execs.get(sandbox_id)
+                if bucket is not None:
+                    bucket.discard(proc)
+                    if not bucket:
+                        self._active_execs.pop(sandbox_id, None)
 
     def _record_exec_action(
         self,

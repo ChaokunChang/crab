@@ -166,6 +166,39 @@ class _Routes:
             },
         }
 
+    def exec_sandbox_stream(self, body: dict[str, Any], *, sandbox_id: str, wfile: Any) -> None:
+        """Streaming exec: writes chunked NDJSON to wfile."""
+        eng = self._daemon.require_engine()
+        sid = SandboxId(sandbox_id)
+        argv = list(body.get("argv") or [])
+        if not argv:
+            raise _BadRequest("exec requires non-empty argv")
+        env_raw = body.get("env")
+        env = {str(k): str(v) for k, v in env_raw.items()} if isinstance(env_raw, dict) else None
+        cwd = body.get("cwd")
+        user = body.get("user")
+        timeout_s = body.get("timeout_s")
+        rc = -1
+        try:
+            for channel, text in eng.runtime.stream_exec(
+                sid, list(argv), cwd=cwd, env=env, user=user, timeout_s=timeout_s
+            ):
+                if channel == "exit":
+                    rc = int(text)
+                else:
+                    line = json.dumps({"ch": channel, "t": text}) + "\n"
+                    _write_chunk(wfile, line.encode("utf-8"))
+            done_line = json.dumps({"done": True, "rc": rc}) + "\n"
+            _write_chunk(wfile, done_line.encode("utf-8"))
+        except BrokenPipeError:
+            return
+        finally:
+            try:
+                wfile.write(b"0\r\n\r\n")
+                wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
     def kill_sandbox(self, body: dict[str, Any], *, sandbox_id: str) -> dict[str, Any]:
         eng = self._daemon.require_engine()
         sid = SandboxId(sandbox_id)
@@ -764,6 +797,14 @@ class _NotFound(Exception):
     pass
 
 
+def _write_chunk(wfile: Any, data: bytes) -> None:
+    """Write a single HTTP chunked-encoding frame."""
+    wfile.write(f"{len(data):x}\r\n".encode("ascii"))
+    wfile.write(data)
+    wfile.write(b"\r\n")
+    wfile.flush()
+
+
 def _build_handler(daemon: "DaemonServer"):
     routes = _Routes(daemon)
 
@@ -875,11 +916,20 @@ def _build_handler(daemon: "DaemonServer"):
 
         def _dispatch(self, method: str) -> None:
             try:
-                fn, variables = _match(method, self.path)
+                # Detect ?stream=1 query param for streaming exec
+                raw_path = self.path
+                query_string = ""
+                if "?" in raw_path:
+                    _, query_string = raw_path.split("?", 1)
+                fn, variables = _match(method, raw_path)
                 if fn is None:
                     self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
                     return
                 body = self._read_body()
+                # Stream fork: if this is exec + stream=1, use streaming handler
+                if getattr(fn, "__func__", None) is _Routes.exec_sandbox and "stream=1" in query_string:
+                    self._handle_stream_exec(body, variables or {})
+                    return
                 result = fn(body, **(variables or {}))
                 self._send_json(HTTPStatus.OK, result)
             except _BadRequest as exc:
@@ -944,6 +994,41 @@ def _build_handler(daemon: "DaemonServer"):
                 self.wfile.write(body)
             except (BrokenPipeError, ConnectionResetError):
                 pass
+
+        def _handle_stream_exec(self, body: dict[str, Any], variables: dict[str, str]) -> None:
+            """Write chunked NDJSON streaming exec response."""
+            try:
+                # Send HTTP headers directly (bypass BaseHTTPRequestHandler's
+                # buffered response to get chunked transfer-encoding).
+                self.send_response(200)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Content-Type", "application/x-ndjson")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                routes.exec_sandbox_stream(body, wfile=self.wfile, **variables)
+            except _BadRequest as exc:
+                # If headers not yet sent this won't work cleanly, but
+                # exec_sandbox_stream raises _BadRequest before any IO
+                # if argv is empty, and we've already sent 200. Write an
+                # error frame instead.
+                err_line = json.dumps({"error": str(exc), "done": True, "rc": -1}) + "\n"
+                try:
+                    _write_chunk(self.wfile, err_line.encode("utf-8"))
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as exc:
+                logger.exception("stream exec failed: %s", self.path)
+                err_line = json.dumps({"error": f"{type(exc).__name__}: {exc}", "done": True, "rc": -1}) + "\n"
+                try:
+                    _write_chunk(self.wfile, err_line.encode("utf-8"))
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
 
     return Handler
 
