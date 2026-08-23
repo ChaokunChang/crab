@@ -37,6 +37,7 @@ import logging
 import os
 import signal
 import threading
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -759,6 +760,8 @@ def _build_admin_handler(gateway: "GatewayServer"):
 class GatewayServer:
     """The crab-gateway process."""
 
+    _RECONCILE_INTERVAL_S: float = 60.0
+
     def __init__(
         self,
         *,
@@ -782,6 +785,9 @@ class GatewayServer:
         self._threads: list[threading.Thread] = []
         self._stop_event = threading.Event()
         self._port_manager = PortManager()
+        self._reconcile_interval: float = float(
+            os.environ.get("CRAB_GATEWAY_RECONCILE_S", self._RECONCILE_INTERVAL_S)
+        )
 
     @property
     def registry(self) -> GatewayRegistry:
@@ -917,6 +923,36 @@ class GatewayServer:
             )
         registry.set_meta("daemon_boot_id", boot_id)
 
+    def _periodic_reconcile(self) -> None:
+        """Lightweight periodic reconciliation: compare daemon listing against
+        the registry and mark vanished sandboxes as lost. Runs every
+        `_reconcile_interval` seconds inside `serve_forever`."""
+        try:
+            listing = self.proxy("GET", "/sandboxes", None, _FAST_TIMEOUT_S)
+        except (_DaemonUnreachable, _GatewayTimeout, FileNotFoundError):
+            logger.debug("periodic reconcile skipped: daemon unreachable")
+            return
+        except Exception as exc:
+            logger.warning("periodic reconcile failed: %s", exc)
+            return
+        present: set[str] = set()
+        for row in listing.get("sandboxes") or []:
+            sid = str(row.get("sandbox_id") or "")
+            if sid:
+                present.add(sid)
+        lost_ids = self.registry.mark_missing_lost(present)
+        if lost_ids:
+            for sid in lost_ids:
+                host_ports = self.registry.release_all_ports(sid)
+                if host_ports:
+                    self._port_manager.release_all(sid, host_ports)
+            logger.warning("periodic reconcile: marked %d sandboxes lost", len(lost_ids))
+        orphans = present - self.registry.all_tracked_ids()
+        if orphans:
+            logger.info(
+                "periodic reconcile: %d daemon orphans (not in registry)", len(orphans)
+            )
+
     # ----- lifecycle ------------------------------------------------------
 
     def start(self) -> None:
@@ -982,9 +1018,13 @@ class GatewayServer:
     def serve_forever(self) -> None:
         """Block until SIGTERM/SIGINT or `request_shutdown()`."""
         self._install_signal_handlers()
+        last_reconcile = time.monotonic()
         try:
             while not self._stop_event.wait(timeout=1.0):
-                continue
+                now = time.monotonic()
+                if now - last_reconcile >= self._reconcile_interval:
+                    last_reconcile = now
+                    self._periodic_reconcile()
         finally:
             self.stop()
 
