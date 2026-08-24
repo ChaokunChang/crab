@@ -54,6 +54,138 @@ logger = logging.getLogger(__name__)
 _LABEL_METADATA_KEY = "user_label"
 
 
+# ---------------------------------------------------------------------------
+# Rich return types for commands.run() / commands.stream()
+# ---------------------------------------------------------------------------
+
+
+class AsyncCheckpoint:
+    """Handle for a background checkpoint. The checkpoint_id is pre-allocated
+    and immediately available; the actual checkpoint runs asynchronously."""
+
+    def __init__(self, checkpoint_id: str, thread: threading.Thread) -> None:
+        self.checkpoint_id = checkpoint_id
+        self._thread = thread
+        self._error: BaseException | None = None
+
+    def wait(self, timeout: float | None = None) -> str:
+        """Block until the checkpoint completes. Returns checkpoint_id.
+        Raises TimeoutError if *timeout* elapses, or propagates the
+        checkpoint failure exception."""
+        self._thread.join(timeout=timeout)
+        if self._thread.is_alive():
+            raise TimeoutError("checkpoint did not complete within timeout")
+        if self._error is not None:
+            raise self._error
+        return self.checkpoint_id
+
+    @property
+    def done(self) -> bool:
+        """Non-blocking check: has the background checkpoint finished?"""
+        return not self._thread.is_alive()
+
+    def __repr__(self) -> str:
+        status = "done" if self.done else "pending"
+        return f"AsyncCheckpoint(id={self.checkpoint_id!r}, {status})"
+
+
+class AsyncChangeset:
+    """Handle for a background changeset computation."""
+
+    def __init__(self, thread: threading.Thread) -> None:
+        self._thread = thread
+        self._result: list[dict] | None = None
+        self._error: BaseException | None = None
+
+    def wait(self, timeout: float | None = None) -> list[dict]:
+        """Block until the changeset completes. Returns the changeset entries."""
+        self._thread.join(timeout=timeout)
+        if self._thread.is_alive():
+            raise TimeoutError("changeset did not complete within timeout")
+        if self._error is not None:
+            raise self._error
+        return self._result or []
+
+    @property
+    def done(self) -> bool:
+        return not self._thread.is_alive()
+
+    def __repr__(self) -> str:
+        status = "done" if self.done else "pending"
+        return f"AsyncChangeset({status})"
+
+
+@dataclass
+class ActionResult:
+    """Rich return value from commands.run() / commands.stream().
+
+    Wraps the original exec result and optionally carries background
+    checkpoint/changeset handles plus inspector observations."""
+
+    returncode: int
+    stdout: str
+    stderr: str
+    args: tuple[str, ...]
+
+    # Optional enrichments (None when not requested)
+    checkpoint: AsyncCheckpoint | None = None
+    changeset: AsyncChangeset | list[dict] | None = None
+    filesystem_changed: bool | None = None
+    process_changed: bool | None = None
+
+
+class ExecStream:
+    """Iterable wrapper for streaming exec that exposes a .result after
+    iteration completes.
+
+    Usage::
+
+        stream = sandbox.commands.stream("make test", checkpoint=True)
+        for event in stream:
+            print(event.text)
+        result = stream.result  # ActionResult
+    """
+
+    def __init__(self, gen: Iterator[ExecEvent | ExecDone], sandbox: "Sandbox", *,
+                 do_checkpoint: bool, do_changeset: bool,
+                 changeset_sync: bool, do_observe: bool) -> None:
+        self._gen = gen
+        self._sandbox = sandbox
+        self._do_checkpoint = do_checkpoint
+        self._do_changeset = do_changeset
+        self._changeset_sync = changeset_sync
+        self._do_observe = do_observe
+        self._result: ActionResult | None = None
+        self._returncode: int = -1
+        self._consumed = False
+
+    def __iter__(self) -> Iterator[ExecEvent | ExecDone]:
+        for event in self._gen:
+            if isinstance(event, ExecDone):
+                self._returncode = event.returncode
+            yield event
+        self._consumed = True
+        self._result = self._sandbox._build_action_result(
+            returncode=self._returncode,
+            stdout="",
+            stderr="",
+            args=(),
+            do_checkpoint=self._do_checkpoint,
+            do_changeset=self._do_changeset,
+            changeset_sync=self._changeset_sync,
+            do_observe=self._do_observe,
+        )
+
+    @property
+    def result(self) -> ActionResult:
+        """Available after iteration completes. Raises if accessed early."""
+        if self._result is None:
+            raise RuntimeError(
+                "ExecStream.result is only available after the stream is fully consumed"
+            )
+        return self._result
+
+
 @dataclass
 class _Mount:
     source: Path
@@ -100,7 +232,19 @@ class _CommandsNamespace:
         timeout: float | None = None,
         capture_output: bool = True,
         check: bool = False,
-    ) -> SandboxExecResult:
+        checkpoint: bool = False,
+        changeset: bool = False,
+        changeset_sync: bool = False,
+        observe: bool = False,
+    ) -> ActionResult:
+        """Execute a command and return an ActionResult.
+
+        Optional enrichments:
+          - ``checkpoint=True``: trigger an async checkpoint after exec
+          - ``changeset=True``: compute filesystem changeset after exec
+          - ``changeset_sync=True``: make changeset synchronous (returns list)
+          - ``observe=True``: peek inspector state (filesystem/process changed)
+        """
         if argv is None:
             if isinstance(cmd, list):
                 argv = cmd
@@ -124,7 +268,18 @@ class _CommandsNamespace:
                 f"sandbox command failed: rc={result.returncode} cmd={cmd!r} "
                 f"stderr={result.stderr!r}"
             )
-        return result
+        # Resolve whether to checkpoint (per-call or sandbox-level auto)
+        do_checkpoint = checkpoint or bool(self._sandbox._auto_checkpoint)
+        return self._sandbox._build_action_result(
+            returncode=result.returncode,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            args=result.args,
+            do_checkpoint=do_checkpoint,
+            do_changeset=changeset,
+            changeset_sync=changeset_sync,
+            do_observe=observe,
+        )
 
     def stream(
         self,
@@ -135,16 +290,24 @@ class _CommandsNamespace:
         env: dict[str, str] | None = None,
         user: str | None = None,
         timeout: float | None = None,
-    ) -> Iterator[ExecEvent | ExecDone]:
-        """Streaming exec: yields ExecEvent/ExecDone as output arrives.
+        checkpoint: bool = False,
+        changeset: bool = False,
+        changeset_sync: bool = False,
+        observe: bool = False,
+    ) -> ExecStream:
+        """Streaming exec that returns an ExecStream.
+
+        Iterate the stream to consume events; after iteration completes,
+        access ``stream.result`` for the ActionResult with checkpoint/
+        changeset/observer information.
 
         Usage::
 
-            for event in sandbox.commands.stream("ls -la"):
+            stream = sandbox.commands.stream("ls -la", checkpoint=True)
+            for event in stream:
                 if isinstance(event, ExecEvent):
                     print(f"[{event.channel}] {event.text}", end="")
-                elif isinstance(event, ExecDone):
-                    print(f"exit code: {event.returncode}")
+            result = stream.result  # ActionResult
         """
         if argv is None:
             if isinstance(cmd, list):
@@ -155,13 +318,21 @@ class _CommandsNamespace:
                 raise TypeError("commands.stream requires either cmd or argv")
         merged_env = self._sandbox._command_env(env)
         runtime = self._sandbox._engine.runtime
-        return runtime.stream_exec(
+        gen = runtime.stream_exec(
             self._sandbox.sandbox_id,
             argv,
             cwd=cwd,
             env=merged_env,
             user=user,
             timeout_s=timeout,
+        )
+        do_checkpoint = checkpoint or bool(self._sandbox._auto_checkpoint)
+        return ExecStream(
+            gen, self._sandbox,
+            do_checkpoint=do_checkpoint,
+            do_changeset=changeset,
+            changeset_sync=changeset_sync,
+            do_observe=observe,
         )
 
 
@@ -316,6 +487,7 @@ class Sandbox:
         resources: dict[str, object] | None = None,
         timeout: float | None = None,
         labels: dict[str, str] | None = None,
+        auto_checkpoint: bool = False,
     ) -> None:
         from .engine import get_default_engine
         from .resources import normalize_resources
@@ -348,6 +520,7 @@ class Sandbox:
         self._agent_ignore_process_rules: list[dict[str, object]] = []
         self._agent_ignored_path_prefixes: list[str] = []
         self._exposed_ports: dict[int, str] = {}
+        self._auto_checkpoint = bool(auto_checkpoint)
         self._desired_name = name
         self._desired_image = image
         self._template = template
@@ -926,6 +1099,96 @@ class Sandbox:
         return self._network_lease is not None
 
     # ------------------------------------------------------------------
+    # Action result builder (checkpoint / changeset / observe)
+    # ------------------------------------------------------------------
+
+    def _build_action_result(
+        self,
+        *,
+        returncode: int,
+        stdout: str,
+        stderr: str,
+        args: tuple[str, ...],
+        do_checkpoint: bool,
+        do_changeset: bool,
+        changeset_sync: bool,
+        do_observe: bool,
+    ) -> ActionResult:
+        """Construct an ActionResult with optional async enrichments."""
+        ckpt_handle: AsyncCheckpoint | None = None
+        cs_handle: AsyncChangeset | list[dict] | None = None
+        fs_changed: bool | None = None
+        proc_changed: bool | None = None
+
+        if do_checkpoint:
+            ckpt_handle = self._start_async_checkpoint()
+
+        if do_changeset:
+            if changeset_sync:
+                cs_handle = self._run_changeset_sync()
+            else:
+                cs_handle = self._start_async_changeset()
+
+        if do_observe:
+            fs_changed, proc_changed = self._peek_inspector()
+
+        return ActionResult(
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+            args=args,
+            checkpoint=ckpt_handle,
+            changeset=cs_handle,
+            filesystem_changed=fs_changed,
+            process_changed=proc_changed,
+        )
+
+    def _start_async_checkpoint(self) -> AsyncCheckpoint:
+        """Pre-allocate a checkpoint_id and run the checkpoint in background."""
+        ckpt_id = f"ckpt-{uuid.uuid4().hex[:12]}"
+        handle = AsyncCheckpoint(ckpt_id, threading.Thread(target=lambda: None))
+
+        def _do_checkpoint() -> None:
+            try:
+                self.checkpoint(checkpoint_id=ckpt_id)
+            except BaseException as exc:
+                handle._error = exc
+
+        t = threading.Thread(target=_do_checkpoint, daemon=True, name="crab-async-ckpt")
+        handle._thread = t
+        t.start()
+        return handle
+
+    def _start_async_changeset(self) -> AsyncChangeset:
+        """Run changeset(force=True) in background."""
+        handle = AsyncChangeset(threading.Thread(target=lambda: None))
+
+        def _do_changeset() -> None:
+            try:
+                handle._result = self.changeset(force=True)
+            except BaseException as exc:
+                handle._error = exc
+
+        t = threading.Thread(target=_do_changeset, daemon=True, name="crab-async-cs")
+        handle._thread = t
+        t.start()
+        return handle
+
+    def _run_changeset_sync(self) -> list[dict]:
+        """Run changeset synchronously with force=True."""
+        return self.changeset(force=True)
+
+    def _peek_inspector(self) -> tuple[bool | None, bool | None]:
+        """Read-only peek at inspector state (no reset)."""
+        try:
+            system = self._engine.system
+            snapshot = system.inspector.inspect(self.sandbox_id)
+            return (bool(snapshot.filesystem_changed), bool(snapshot.process_changed))
+        except Exception:
+            logger.debug("inspector peek failed for sandbox=%s", self._sandbox_id, exc_info=True)
+            return (None, None)
+
+    # ------------------------------------------------------------------
     # Lifecycle ops
     # ------------------------------------------------------------------
 
@@ -979,10 +1242,11 @@ class Sandbox:
     # Checkpoint / restore / fork
     # ------------------------------------------------------------------
 
-    def checkpoint(self, label: str | None = None, *, leave_running: bool = True) -> str:
+    def checkpoint(self, label: str | None = None, *, leave_running: bool = True, checkpoint_id: str | None = None) -> str:
         result = self._engine.system.checkpoint_once(
             self.sandbox_id,
             leave_running=leave_running,
+            checkpoint_id=checkpoint_id,
         )
         if result.manifest is None:
             raise RuntimeError(f"checkpoint failed: status={result.status.value} message={result.message}")
@@ -1073,13 +1337,14 @@ class Sandbox:
             records = records[-limit:]
         return [record.to_json() for record in records]
 
-    def changeset(self, since: str | CheckpointId | None = None) -> list[dict]:
+    def changeset(self, since: str | CheckpointId | None = None, *, force: bool = False) -> list[dict]:
         """Changed rootfs paths (added/modified/removed/renamed) relative
         to a base checkpoint's filesystem snapshot. ``since=None``
         resolves this sandbox's fork point (``fork_created`` journal
-        marker); pass a checkpoint id for an explicit base. Raw truth
-        from the filesystem backend — no ignore filtering (the merge
-        layer applies policies on top).
+        marker); pass a checkpoint id for an explicit base.
+
+        ``force=True`` skips the inspector gate optimization so the
+        backend diff always runs.
 
         Works with both a local in-process engine and the daemon
         (`crab sandbox changeset` from the CLI).
@@ -1091,14 +1356,18 @@ class Sandbox:
                 raise NotImplementedError(
                     "changesets are not available on this engine"
                 )
-            result = fork_changeset(self.sandbox_id)
+            result = fork_changeset(self.sandbox_id, force=force)
         else:
             changeset_since = getattr(system, "changeset_since", None)
             if not callable(changeset_since):
                 raise NotImplementedError(
                     "changesets are not available on this engine"
                 )
-            result = changeset_since(self.sandbox_id, CheckpointId(str(since)))
+            result = changeset_since(
+                self.sandbox_id,
+                CheckpointId(str(since)),
+                use_inspector_gate=not force,
+            )
         return [entry.to_json() for entry in result.entries]
 
     def merge(
@@ -1413,4 +1682,4 @@ class Sandbox:
         inject_ca_into_rootfs(rootfs_path, ca_path)
 
 
-__all__ = ["Sandbox"]
+__all__ = ["Sandbox", "ActionResult", "AsyncCheckpoint", "AsyncChangeset", "ExecStream"]

@@ -376,7 +376,7 @@ class CrabSystem:
                 "Journal lifecycle record failed sandbox=%s event=%s", sandbox_id, event
             )
 
-    def checkpoint_once(self, sandbox_id: SandboxId, leave_running: bool=False) -> CheckpointResult:
+    def checkpoint_once(self, sandbox_id: SandboxId, leave_running: bool=False, *, checkpoint_id: str | None = None) -> CheckpointResult:
         logger.info("Running manual checkpoint for sandbox %s", sandbox_id)
         operation = start_operation(
             self.telemetry,
@@ -388,13 +388,18 @@ class CrabSystem:
         result: CheckpointResult | None = None
         job: CheckpointJob | None = None
         try:
+            checkpoint_metadata = self._build_checkpoint_metadata(sandbox_id, pending_request=pending_request)
+            if checkpoint_id is not None:
+                # Client pre-allocated the checkpoint id; the composite worker
+                # reads it from job metadata instead of minting a fresh one.
+                checkpoint_metadata["checkpoint_id"] = str(checkpoint_id)
             job = CheckpointJob(
                 job_id=JobId.new(),
                 sandbox_id=sandbox_id,
                 requested_at=utc_now(),
                 reason="manual",
                 leave_running=leave_running,
-                metadata=self._build_checkpoint_metadata(sandbox_id, pending_request=pending_request),
+                metadata=checkpoint_metadata,
             )
             result = self.executor.run_checkpoint(job)
             if result.status.value == "succeeded":
@@ -2055,10 +2060,11 @@ class CrabSystem:
         )
         return result
 
-    def fork_changeset(self, target_sandbox_id: SandboxId) -> ChangesetResult:
+    def fork_changeset(self, target_sandbox_id: SandboxId, *, force: bool = False) -> ChangesetResult:
         """Changeset of a fork relative to its fork point (the source
         checkpoint snapshot materialized on the fork's own dataset at
-        clone time)."""
+        clone time). ``force=True`` bypasses the inspector gate so the
+        backend diff always runs."""
         checkpoint_id = self._fork_point_checkpoint_id(target_sandbox_id)
         if checkpoint_id is None:
             raise ValueError(
@@ -2066,7 +2072,9 @@ class CrabSystem:
                 "fork_changeset only works for sandboxes created by fork_once "
                 "with the action journal enabled"
             )
-        return self.changeset_since(target_sandbox_id, checkpoint_id)
+        return self.changeset_since(
+            target_sandbox_id, checkpoint_id, use_inspector_gate=not force
+        )
 
     def _fork_point_checkpoint_id(self, target_sandbox_id: SandboxId) -> CheckpointId | None:
         origin = self._fork_origin(target_sandbox_id)

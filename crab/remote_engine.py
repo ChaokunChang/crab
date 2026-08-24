@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Any, Iterator, Mapping
 from .contracts import Runtime
 from .daemon import DaemonClient, DaemonRequestError
 from .ids import CheckpointId, SandboxId
-from .models import ChangesetResult, EgressLedger, EgressReplayReport, ExecDone, ExecEvent, JobStatus, MergeReport, ObservationReport, ProcessMergeReport, SandboxDescription, SandboxExecResult, SandboxRuntimeState
+from .models import ChangesetResult, EgressLedger, EgressReplayReport, ExecDone, ExecEvent, JobStatus, MergeReport, ObservationReport, ProcessMergeReport, SandboxDescription, SandboxExecResult, SandboxRuntimeState, SandboxSnapshot, utc_now
 from .journal import ActionRecord
 from .merging import MergeError, MergerHook
 from .process_merge import ProcessMergeConflict
@@ -75,13 +75,41 @@ class _LocalInspectorShim:
     the local `Sandbox._mark_inspector_running` call is best-effort
     bookkeeping for the in-process world. Swallow the call so we don't
     have to refactor every existing call site that pokes the inspector
-    pre-launch."""
+    pre-launch.
+
+    ``inspect()`` proxies to the daemon's read-only inspector peek route
+    (``GET /sandboxes/{id}/inspector``) so the SDK can render the observer
+    flags without resetting them."""
+
+    def __init__(self, client: "DaemonClient | None" = None) -> None:
+        self._client = client
 
     def upsert_snapshot(self, *_, **__) -> None:
         return None
 
     def mark_changed(self, *_, **__) -> None:
         return None
+
+    def inspect(self, sandbox_id: SandboxId) -> SandboxSnapshot:
+        """Read-only peek at the daemon's inspector state. Does not reset."""
+        if self._client is None:
+            return SandboxSnapshot(
+                sandbox_id=sandbox_id,
+                runtime_name="",
+                is_running=True,
+                process_changed=False,
+                filesystem_changed=False,
+                observed_at=utc_now(),
+            )
+        response = self._client.get_json(f"/sandboxes/{sandbox_id}/inspector")
+        return SandboxSnapshot(
+            sandbox_id=sandbox_id,
+            runtime_name=str(response.get("runtime_name") or ""),
+            is_running=bool(response.get("is_running", True)),
+            filesystem_changed=bool(response.get("filesystem_changed")),
+            process_changed=bool(response.get("process_changed")),
+            observed_at=utc_now(),
+        )
 
 
 class _RemoteStorageShim:
@@ -166,14 +194,23 @@ class _SystemShim:
     def __init__(self, client: DaemonClient) -> None:
         self._client = client
         self.telemetry = NoopTelemetrySink()
-        self.inspector = _LocalInspectorShim()
+        self.inspector = _LocalInspectorShim(client)
         self.storage = _RemoteStorageShim(client)
         self.journal = _JournalShim(client)
 
-    def checkpoint_once(self, sandbox_id: SandboxId, *, leave_running: bool = True):
+    def checkpoint_once(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        leave_running: bool = True,
+        checkpoint_id: str | None = None,
+    ):
+        payload: dict[str, Any] = {"leave_running": bool(leave_running)}
+        if checkpoint_id is not None:
+            payload["checkpoint_id"] = str(checkpoint_id)
         response = self._client.post_json(
             f"/sandboxes/{sandbox_id}/checkpoints",
-            {"leave_running": bool(leave_running)},
+            payload,
             timeout_seconds=300.0,
         )
         checkpoint_id_raw = response.get("checkpoint_id")
@@ -333,18 +370,26 @@ class _SystemShim:
         *,
         use_inspector_gate: bool = True,
     ) -> ChangesetResult:
-        _ = use_inspector_gate  # gate policy is daemon-side
+        payload: dict[str, Any] = {"since": str(checkpoint_id)}
+        # force=True on the daemon side bypasses the inspector gate.
+        if not use_inspector_gate:
+            payload["force"] = True
         response = self._client.post_json(
             f"/sandboxes/{sandbox_id}/changeset",
-            {"since": str(checkpoint_id)},
+            payload,
             timeout_seconds=300.0,
         )
         return ChangesetResult.from_json(response["changeset"])
 
-    def fork_changeset(self, sandbox_id: SandboxId) -> ChangesetResult:
+    def fork_changeset(
+        self, sandbox_id: SandboxId, *, force: bool = False
+    ) -> ChangesetResult:
+        payload: dict[str, Any] = {}
+        if force:
+            payload["force"] = True
         response = self._client.post_json(
             f"/sandboxes/{sandbox_id}/changeset",
-            {},
+            payload,
             timeout_seconds=300.0,
         )
         return ChangesetResult.from_json(response["changeset"])
