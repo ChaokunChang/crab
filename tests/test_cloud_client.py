@@ -185,6 +185,30 @@ class CloudLifecycleTests(CloudLiveTestBase):
         seen = self.daemon_requests(f"/sandboxes/{sandbox_id}/checkpoints/ck-1")
         self.assertEqual(seen, [("DELETE", f"/sandboxes/{sandbox_id}/checkpoints/ck-1", {"cascade": True})])
 
+    def test_action_result_over_gateway(self) -> None:
+        # feat/sdk-improvements: commands.run() enriched with checkpoint
+        # + observe travels the full gateway -> daemon path. The client
+        # pre-allocates the checkpoint id and the daemon echoes it back.
+        engine = self.connect(self.key)
+        sbx = Sandbox(engine=engine)
+        sandbox_id = str(sbx.sandbox_id)
+        result = sbx.commands.run("echo hi", checkpoint=True, observe=True)
+        self.assertEqual(result.returncode, 0)
+        self.assertIsNotNone(result.checkpoint)
+        assert result.checkpoint is not None
+        returned = result.checkpoint.wait(timeout=5.0)
+        self.assertTrue(returned.startswith("ckpt-"))
+        # Daemon saw the checkpoint_id in the body.
+        seen = self.daemon_requests(f"/sandboxes/{sandbox_id}/checkpoints")
+        post_calls = [(m, p, b) for m, p, b in seen if m == "POST"]
+        self.assertEqual(len(post_calls), 1)
+        self.assertEqual(post_calls[0][2].get("checkpoint_id"), returned)
+        # Observe: inspector peek populated flags without resetting.
+        self.assertTrue(result.filesystem_changed)
+        self.assertFalse(result.process_changed)
+        peek = self.daemon_requests(f"/sandboxes/{sandbox_id}/inspector")
+        self.assertEqual(peek, [("GET", f"/sandboxes/{sandbox_id}/inspector", {})])
+
 
 # ---------------------------------------------------------------------------
 # Error taxonomy — typed exceptions per the gateway error table.

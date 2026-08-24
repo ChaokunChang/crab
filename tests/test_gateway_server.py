@@ -188,15 +188,24 @@ def _build_stub_daemon_handler(state: _StubDaemonState):
                         state.sandboxes[fork_id] = {}
                         forks.append({"sandbox_id": fork_id})
                 return HTTPStatus.OK, {"ok": True, "sandbox_id": sandbox_id, "forks": forks}
+            if method == "GET" and sub == ["inspector"]:
+                # Read-only inspector peek (feat/sdk-improvements). Does not
+                # reset flags; the real daemon serves the same shape.
+                return HTTPStatus.OK, {
+                    "ok": True,
+                    "sandbox_id": sandbox_id,
+                    "filesystem_changed": True,
+                    "process_changed": False,
+                }
             if method == "GET" and sub == ["checkpoints"]:
                 return HTTPStatus.OK, {"ok": True, "checkpoints": []}
             if method == "POST" and sub == ["checkpoints"]:
-                # Top-level checkpoint_id mirrors the real daemon response
-                # (`_SystemShim.checkpoint_once` reads it there).
+                # Honour client-preallocated checkpoint_id when present.
+                client_id = body.get("checkpoint_id") or "ck-1"
                 return HTTPStatus.OK, {
                     "ok": True,
-                    "checkpoint_id": "ck-1",
-                    "checkpoint": {"checkpoint_id": "ck-1"},
+                    "checkpoint_id": client_id,
+                    "checkpoint": {"checkpoint_id": client_id},
                 }
             if (
                 method == "POST"

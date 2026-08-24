@@ -730,8 +730,8 @@ class SandboxChangesetTests(unittest.TestCase):
                 entries=(ChangesetEntry(path="/new.txt", change="added"),),
             )
 
-        def fork_changeset(self, sandbox_id):
-            self.fork_calls.append(sandbox_id)
+        def fork_changeset(self, sandbox_id, *, force=False):
+            self.fork_calls.append((sandbox_id, force))
             return ChangesetResult(
                 sandbox_id=sandbox_id,
                 base_checkpoint_id=CheckpointId("ckpt-forkpoint"),
@@ -761,7 +761,7 @@ class SandboxChangesetTests(unittest.TestCase):
     def test_default_since_resolves_fork_point(self) -> None:
         sandbox, system = self._sandbox()
         entries = sandbox.changeset()
-        self.assertEqual(system.fork_calls, [SandboxId("sbx-sdk")])
+        self.assertEqual(system.fork_calls, [(SandboxId("sbx-sdk"), False)])
         self.assertEqual(
             entries,
             [{"path": "/renamed.txt", "change": "renamed", "renamed_from": "/old.txt"}],

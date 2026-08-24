@@ -381,6 +381,7 @@ def _make_global_passthrough(gateway: "GatewayServer", method: str, timeout: flo
 # All per-sandbox daemon routes are proxied (S5 full-access unlock).
 _PASSTHROUGH_SANDBOX_ROUTES: list[tuple[str, str, float]] = [
     ("GET", "", _FAST_TIMEOUT_S),  # describe
+    ("GET", "/inspector", _FAST_TIMEOUT_S),  # read-only inspector peek
     ("POST", "/exec", _SLOW_TIMEOUT_S),
     ("POST", "/stop", _FAST_TIMEOUT_S),
     ("POST", "/pause", _FAST_TIMEOUT_S),

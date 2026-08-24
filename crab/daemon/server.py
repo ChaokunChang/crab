@@ -477,8 +477,12 @@ class _Routes:
         eng = self._daemon.require_engine()
         sid = SandboxId(sandbox_id)
         leave_running = bool(body.get("leave_running", True))
+        client_checkpoint_id = body.get("checkpoint_id")  # client pre-allocated id
         try:
-            result = eng.system.checkpoint_once(sid, leave_running=leave_running)
+            result = eng.system.checkpoint_once(
+                sid, leave_running=leave_running,
+                checkpoint_id=client_checkpoint_id,
+            )
         except Exception as exc:
             raise _BadRequest(f"checkpoint failed: {exc}") from exc
         return {
@@ -688,17 +692,23 @@ class _Routes:
 
     def changeset_sandbox(self, body: dict[str, Any], *, sandbox_id: str) -> dict[str, Any]:
         """Changed rootfs paths relative to a base checkpoint; without
-        ``since`` the sandbox's fork point is resolved (C1 semantics)."""
+        ``since`` the sandbox's fork point is resolved (C1 semantics).
+        ``force=true`` skips the inspector gate optimization."""
         eng = self._daemon.require_engine()
         sid = SandboxId(sandbox_id)
         from ..ids import CheckpointId
 
         since_raw = body.get("since")
+        force = bool(body.get("force", False))
         try:
             if since_raw:
-                result = eng.system.changeset_since(sid, CheckpointId(str(since_raw)))
+                result = eng.system.changeset_since(
+                    sid,
+                    CheckpointId(str(since_raw)),
+                    use_inspector_gate=not force,
+                )
             else:
-                result = eng.system.fork_changeset(sid)
+                result = eng.system.fork_changeset(sid, force=force)
         except (FileNotFoundError, ValueError) as exc:
             raise _BadRequest(f"changeset failed: {exc}") from exc
         return {"ok": True, "changeset": result.to_json()}
@@ -840,6 +850,21 @@ class _Routes:
         )
         return {"ok": True, "applied": True}
 
+    def inspect_sandbox(self, body: dict[str, Any], *, sandbox_id: str) -> dict[str, Any]:
+        """Read-only peek at inspector state. Does NOT reset flags."""
+        eng = self._daemon.require_engine()
+        sid = SandboxId(sandbox_id)
+        try:
+            snapshot = eng.system.inspector.inspect(sid)
+        except KeyError as exc:
+            raise _NotFound(f"inspector snapshot not found: {sandbox_id}") from exc
+        return {
+            "ok": True,
+            "sandbox_id": sandbox_id,
+            "filesystem_changed": bool(snapshot.filesystem_changed),
+            "process_changed": bool(snapshot.process_changed),
+        }
+
 
 def _seed_inspector_running(engine: Engine, sandbox_id: SandboxId) -> None:
     """Mirror the SDK's local `Sandbox._mark_inspector_running`.
@@ -965,6 +990,7 @@ def _build_handler(daemon: "DaemonServer"):
         ("POST", "/sandboxes", "", routes.launch_sandbox),
         ("POST", "/runtime/write_bundle_spec", "", routes.write_bundle_spec),
         ("GET", "/sandboxes/{sandbox_id}", "", routes.describe_sandbox),
+        ("GET", "/sandboxes/{sandbox_id}/inspector", "", routes.inspect_sandbox),
         ("DELETE", "/sandboxes/{sandbox_id}", "", routes.kill_sandbox),
         ("POST", "/sandboxes/{sandbox_id}/exec", "", routes.exec_sandbox),
         ("POST", "/sandboxes/{sandbox_id}/upstream", "", routes.register_upstream),

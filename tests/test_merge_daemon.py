@@ -63,13 +63,13 @@ class _FakeSystem:
             raise self.merge_error
         return _report(str(source_sandbox_id), str(fork_sandbox_id), policy)
 
-    def changeset_since(self, sandbox_id, checkpoint_id):
+    def changeset_since(self, sandbox_id, checkpoint_id, *, use_inspector_gate=True):
         self.calls.append(("changeset_since", str(sandbox_id), str(checkpoint_id)))
         if self.changeset_error is not None:
             raise self.changeset_error
         return _changeset(str(sandbox_id))
 
-    def fork_changeset(self, sandbox_id):
+    def fork_changeset(self, sandbox_id, *, force=False):
         self.calls.append(("fork_changeset", str(sandbox_id)))
         if self.changeset_error is not None:
             raise self.changeset_error
