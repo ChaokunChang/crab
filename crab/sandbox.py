@@ -521,6 +521,11 @@ class Sandbox:
         self._agent_ignored_path_prefixes: list[str] = []
         self._exposed_ports: dict[int, str] = {}
         self._auto_checkpoint = bool(auto_checkpoint)
+        # Tracks the most recently started (pre-allocated) checkpoint id so
+        # callers using auto_checkpoint can retrieve it without wiring the
+        # AsyncCheckpoint handle through the ActionResult (which is still
+        # returned for explicit `checkpoint=True` callers).
+        self._last_checkpoint_id: str | None = None
         self._desired_name = name
         self._desired_image = image
         self._template = template
@@ -1143,9 +1148,18 @@ class Sandbox:
             process_changed=proc_changed,
         )
 
+    @property
+    def last_checkpoint_id(self) -> str | None:
+        """Most recently pre-allocated checkpoint id (auto_checkpoint /
+        explicit ``checkpoint=True``). ``None`` before the first checkpoint.
+        Available immediately after ``commands.run`` returns — the actual
+        checkpoint may still be running in the background."""
+        return self._last_checkpoint_id
+
     def _start_async_checkpoint(self) -> AsyncCheckpoint:
         """Pre-allocate a checkpoint_id and run the checkpoint in background."""
         ckpt_id = f"ckpt-{uuid.uuid4().hex[:12]}"
+        self._last_checkpoint_id = ckpt_id
         handle = AsyncCheckpoint(ckpt_id, threading.Thread(target=lambda: None))
 
         def _do_checkpoint() -> None:

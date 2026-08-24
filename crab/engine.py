@@ -1649,6 +1649,38 @@ class Engine:
             return None
         return self._interceptor.base_url
 
+    def list_sandboxes(self) -> list[dict[str, Any]]:
+        """Return the engine's registered sandboxes as raw dicts.
+
+        Mirrors :meth:`RemoteEngine.list_sandboxes` so callers can rely on
+        the same shape (``sandbox_id`` / ``runtime_name`` / ``status`` /
+        ``metadata``) regardless of transport."""
+        with self._lock:
+            sandboxes = list(self._sandboxes.values())
+        rows: list[dict[str, Any]] = []
+        for sbx in sandboxes:
+            sid = sbx.sandbox_id
+            if sid is None:
+                continue
+            try:
+                description = self.runtime.describe(sid)
+                status = description.status
+                runtime_name = description.runtime_name
+                metadata = dict(getattr(description, "metadata", {}) or {})
+            except Exception:
+                status = "unknown"
+                runtime_name = self.runtime.name if self._runtime is not None else ""
+                metadata = {}
+            rows.append(
+                {
+                    "sandbox_id": str(sid),
+                    "runtime_name": runtime_name,
+                    "status": status,
+                    "metadata": metadata,
+                }
+            )
+        return rows
+
     # ------------------------------------------------------------------
     # Per-sandbox upstream URL bookkeeping (delegates to the SDK forwarder
     # so the per-sandbox routing lives in one place — same architectural

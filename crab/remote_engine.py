@@ -822,6 +822,15 @@ class RemoteEngine:
 
     # ----- daemon-routed operations -----
 
+    def list_sandboxes(self) -> list[dict[str, Any]]:
+        """Return the caller-visible sandboxes as raw dicts.
+
+        Hits ``GET /sandboxes`` on the daemon (or the gateway's tenant-
+        scoped equivalent). Each entry carries at least ``sandbox_id``,
+        ``runtime_name``, ``status`` and ``metadata``."""
+        response = self._client.get_json("/sandboxes")
+        return list(response.get("sandboxes") or [])
+
     def register_upstream(self, sandbox_id: SandboxId, url: str) -> None:
         if not url:
             return
