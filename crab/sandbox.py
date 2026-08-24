@@ -1131,6 +1131,19 @@ class Sandbox:
         # the concurrent checkpoint (if any) is about to create.
         prev_ckpt_id = self._last_checkpoint_id
 
+        # Observe BEFORE starting the async checkpoint. When a checkpoint
+        # finishes, `mark_checkpoint_complete` resets the inspector's
+        # `filesystem_changed`/`process_changed` cursors (scorched-earth
+        # wipe in host-inspector `reset()`). If we peeked after starting
+        # the checkpoint, the reset could race with — and win against —
+        # the peek, so `observe=True` would report False for actions
+        # that clearly mutated state. Peeking first also matches the
+        # semantic contract in the tutorial: observe answers "did *this
+        # action* mutate?", relative to state before the concurrent
+        # checkpoint snapshots it.
+        if do_observe:
+            fs_changed, proc_changed = self._peek_inspector()
+
         if do_checkpoint:
             ckpt_handle = self._start_async_checkpoint()
 
@@ -1139,9 +1152,6 @@ class Sandbox:
                 cs_handle = self._run_changeset_sync(since=prev_ckpt_id)
             else:
                 cs_handle = self._start_async_changeset(since=prev_ckpt_id)
-
-        if do_observe:
-            fs_changed, proc_changed = self._peek_inspector()
 
         return ActionResult(
             returncode=returncode,

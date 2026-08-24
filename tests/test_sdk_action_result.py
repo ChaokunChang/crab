@@ -374,6 +374,75 @@ class ObserveTests(unittest.TestCase):
         self.assertIsNone(result.process_changed)
         self.assertEqual(inspector.inspect_calls, [])
 
+    def test_peek_runs_before_async_checkpoint_reset(self) -> None:
+        # Regression: `observe=True` combined with `checkpoint=True` used
+        # to race with the background checkpoint's `mark_checkpoint_complete`
+        # → inspector `reset()` (scorched-earth wipe of the dirty cursors).
+        # For remote SDK clients the peek RTT (SDK → gateway → daemon) is
+        # slower than the daemon-local reset, so the reset won and the
+        # ActionResult reported `filesystem_changed=False` for an action
+        # that clearly mutated the FS. The fix reorders `_build_action_result`
+        # to peek BEFORE `_start_async_checkpoint` spawns its worker, so
+        # the peek is guaranteed to see the pre-reset state.
+        #
+        # We express the invariant deterministically by having the fake
+        # `checkpoint_once` mirror the real reset side-effect (zeroing the
+        # inspector's dirty flags). If peek ran after the checkpoint thread
+        # had already run, it would observe the post-reset False; because
+        # peek now runs first on the main thread, it captures True.
+        inspector = _FakeInspector(filesystem_changed=True, process_changed=True)
+        sbx, system, _runtime = _make_sandbox(inspector=inspector)
+
+        call_order: list[str] = []
+        orig_inspect = inspector.inspect
+
+        def tracking_inspect(sandbox_id):
+            call_order.append("peek")
+            return orig_inspect(sandbox_id)
+
+        inspector.inspect = tracking_inspect  # type: ignore[assignment]
+
+        orig_checkpoint = system.checkpoint_once
+
+        def resetting_checkpoint(sandbox_id, *, leave_running=True, checkpoint_id=None):
+            # Mirror host-inspector's `reset()` triggered by
+            # `mark_checkpoint_complete`: scorched-earth wipe of both
+            # dirty axes. Any peek reading the inspector after this
+            # point would incorrectly see False.
+            inspector.filesystem_changed = False
+            inspector.process_changed = False
+            call_order.append("checkpoint")
+            return orig_checkpoint(
+                sandbox_id,
+                leave_running=leave_running,
+                checkpoint_id=checkpoint_id,
+            )
+
+        system.checkpoint_once = resetting_checkpoint  # type: ignore[assignment]
+
+        result = sbx.commands.run("touch x", checkpoint=True, observe=True)
+        assert result.checkpoint is not None
+        result.checkpoint.wait(timeout=5.0)
+
+        # Peek must be recorded before the checkpoint side-effect. This
+        # is deterministic under the fix: peek runs synchronously on the
+        # main thread before `_start_async_checkpoint` spawns the worker.
+        self.assertEqual(
+            call_order[0],
+            "peek",
+            f"observe peek must precede the checkpoint reset; got {call_order}",
+        )
+        # And the ActionResult snapshots the pre-reset value.
+        self.assertTrue(result.filesystem_changed)
+        self.assertTrue(result.process_changed)
+        # Sanity: the reset side-effect did in fact run (via the bg thread),
+        # proving this scenario would corrupt the peek result if peek were
+        # ordered after `_start_async_checkpoint`.
+        self.assertFalse(inspector.filesystem_changed)
+        self.assertFalse(inspector.process_changed)
+        self.assertEqual(inspector.inspect_calls, [SandboxId("sbx-test")])
+        self.assertEqual(len(system.checkpoint_calls), 1)
+
 
 # ---------------------------------------------------------------------------
 # ExecStream: iterate, then read .result

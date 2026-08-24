@@ -124,6 +124,15 @@ def main() -> None:
         #     返回；后台线程执行真正的 checkpoint。
         #   * observe=True 会调用 daemon 的只读 inspector peek 路由，
         #     不重置任何游标。
+        #
+        # 语义（重要）：observe 返回的 filesystem_changed / process_changed
+        # 表示 “本次 action 是否改变了状态” —— SDK 在 *启动后台 checkpoint
+        # 之前* 就完成 peek，因此读到的是 checkpoint 重置游标之前的干净
+        # 状态。checkpoint 完成后会调 host-inspector.reset() 把两个游标
+        # 清零；若 peek 排在 checkpoint 之后，就会与该 reset 竞争而报 False
+        # （这是一个历史 bug，已修复；参见 test_peek_runs_before_async_
+        # checkpoint_reset）。所以下面 mutating 的命令应该稳定看到
+        # filesystem_changed=True。
         banner("5. 富返回值 — checkpoint + observe")
         result = sandbox.commands.run(
             "echo 'hello' > /tmp/observed.txt && mkdir -p /opt/new",
