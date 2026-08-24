@@ -73,6 +73,7 @@ class _FakeSystem:
         self.inspector = inspector or _FakeInspector()
         self.checkpoint_calls: list[dict] = []
         self.fork_calls: list[tuple[SandboxId, bool]] = []
+        self.since_calls: list[tuple[SandboxId, CheckpointId, bool]] = []
         self.checkpoint_barrier: threading.Event | None = None
 
     def checkpoint_once(self, sandbox_id, *, leave_running=True, checkpoint_id=None):
@@ -104,10 +105,11 @@ class _FakeSystem:
         )
 
     def changeset_since(self, sandbox_id, checkpoint_id, *, use_inspector_gate=True):
+        self.since_calls.append((sandbox_id, checkpoint_id, use_inspector_gate))
         return ChangesetResult(
             sandbox_id=sandbox_id,
             base_checkpoint_id=checkpoint_id,
-            entries=(),
+            entries=(ChangesetEntry(path="/since.txt", change="added"),),
         )
 
 
@@ -267,17 +269,75 @@ class AutoCheckpointTests(unittest.TestCase):
 
 
 class ChangesetActionTests(unittest.TestCase):
-    def test_changeset_async_default(self) -> None:
+    def test_changeset_async_default_no_prev_falls_back_to_fork(self) -> None:
+        # No prior checkpoint -> the async changeset can only diff against
+        # the fork point, so it falls back to fork_changeset (which errors
+        # on non-fork sandboxes in reality, but our fake returns entries).
         sbx, system, _runtime = _make_sandbox()
         result = sbx.commands.run("touch x", changeset=True)
         self.assertIsInstance(result.changeset, AsyncChangeset)
         entries = result.changeset.wait(timeout=5.0)
         self.assertEqual(entries, [{"path": "/new.txt", "change": "added"}])
         self.assertTrue(result.changeset.done)
-        # Async changeset forces the backend diff (force=True).
+        # No prev checkpoint -> fork_changeset(force=True), no since call.
         self.assertEqual(system.fork_calls, [(SandboxId("sbx-test"), True)])
+        self.assertEqual(system.since_calls, [])
+
+    def test_changeset_async_uses_previous_checkpoint_as_since(self) -> None:
+        # After a checkpoint=True run, the next changeset=True must diff
+        # against the *previous* checkpoint id, not the fresh one being
+        # created concurrently (semantics: "what did this action change?").
+        sbx, system, _runtime = _make_sandbox()
+        # Establish a prior checkpoint (populates last_checkpoint_id).
+        first = sbx.commands.run("echo prep", checkpoint=True)
+        first_ckpt = first.checkpoint.wait(timeout=5.0)
+        self.assertEqual(sbx.last_checkpoint_id, first_ckpt)
+        # Now issue a changeset-only run: it must call changeset_since
+        # with `first_ckpt` and skip fork_changeset entirely.
+        result = sbx.commands.run("touch x", changeset=True)
+        entries = result.changeset.wait(timeout=5.0)
+        self.assertEqual(entries, [{"path": "/since.txt", "change": "added"}])
+        self.assertEqual(len(system.since_calls), 1)
+        called_sid, called_ckpt, use_gate = system.since_calls[0]
+        self.assertEqual(called_sid, SandboxId("sbx-test"))
+        self.assertEqual(str(called_ckpt), first_ckpt)
+        self.assertFalse(use_gate)  # force=True flips use_inspector_gate off
+        # fork_changeset must NOT be called on the second run.
+        self.assertEqual(system.fork_calls, [])
+
+    def test_changeset_uses_prev_when_checkpoint_and_changeset_both_true(self) -> None:
+        # checkpoint=True + changeset=True on the same run: the changeset
+        # must use the *previous* checkpoint as since, NOT the fresh one
+        # allocated by this run (which hasn't captured pre-exec state).
+        sbx, system, _runtime = _make_sandbox()
+        first = sbx.commands.run("echo prep", checkpoint=True)
+        first_ckpt = first.checkpoint.wait(timeout=5.0)
+        result = sbx.commands.run("touch x", checkpoint=True, changeset=True)
+        # A fresh checkpoint id was pre-allocated, and last_checkpoint_id
+        # advanced. But the changeset was tied to the prior id.
+        new_ckpt = result.checkpoint.checkpoint_id
+        self.assertNotEqual(new_ckpt, first_ckpt)
+        self.assertEqual(sbx.last_checkpoint_id, new_ckpt)
+        result.checkpoint.wait(timeout=5.0)
+        entries = result.changeset.wait(timeout=5.0)
+        self.assertEqual(entries, [{"path": "/since.txt", "change": "added"}])
+        called_ckpt = system.since_calls[0][1]
+        self.assertEqual(str(called_ckpt), first_ckpt)
 
     def test_changeset_sync_returns_list(self) -> None:
+        # Sync mode with a prior checkpoint uses changeset_since directly.
+        sbx, system, _runtime = _make_sandbox()
+        first = sbx.commands.run("echo prep", checkpoint=True)
+        first_ckpt = first.checkpoint.wait(timeout=5.0)
+        result = sbx.commands.run(
+            "touch x", changeset=True, changeset_sync=True
+        )
+        self.assertIsInstance(result.changeset, list)
+        self.assertEqual(result.changeset, [{"path": "/since.txt", "change": "added"}])
+        self.assertEqual(system.since_calls[0][1], CheckpointId(first_ckpt))
+
+    def test_changeset_sync_falls_back_to_fork_without_prev(self) -> None:
+        # Sync mode without a prior checkpoint also falls back to fork.
         sbx, system, _runtime = _make_sandbox()
         result = sbx.commands.run("touch x", changeset=True, changeset_sync=True)
         self.assertIsInstance(result.changeset, list)
@@ -289,6 +349,7 @@ class ChangesetActionTests(unittest.TestCase):
         result = sbx.commands.run("noop")
         self.assertIsNone(result.changeset)
         self.assertEqual(system.fork_calls, [])
+        self.assertEqual(system.since_calls, [])
 
 
 # ---------------------------------------------------------------------------

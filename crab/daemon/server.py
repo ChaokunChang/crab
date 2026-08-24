@@ -851,16 +851,34 @@ class _Routes:
         return {"ok": True, "applied": True}
 
     def inspect_sandbox(self, body: dict[str, Any], *, sandbox_id: str) -> dict[str, Any]:
-        """Read-only peek at inspector state. Does NOT reset flags."""
+        """Read-only peek at inspector state. Does NOT reset flags.
+
+        Self-heals on KeyError: if the sandbox exists in the runtime but
+        the inspector never got seeded (crash / race between launch and
+        the seed call), lazily register a clean baseline snapshot and
+        retry once. Only if the runtime itself doesn't know the sandbox
+        do we return 404."""
         eng = self._daemon.require_engine()
         sid = SandboxId(sandbox_id)
         try:
             snapshot = eng.system.inspector.inspect(sid)
-        except KeyError as exc:
-            raise _NotFound(f"inspector snapshot not found: {sandbox_id}") from exc
+        except KeyError:
+            try:
+                eng.runtime.describe(sid)
+            except KeyError as exc:
+                raise _NotFound(f"unknown sandbox: {sandbox_id}") from exc
+            _seed_inspector_running(eng, sid)
+            try:
+                snapshot = eng.system.inspector.inspect(sid)
+            except KeyError as exc:
+                raise _NotFound(
+                    f"inspector snapshot could not be seeded for {sandbox_id}"
+                ) from exc
         return {
             "ok": True,
             "sandbox_id": sandbox_id,
+            "runtime_name": eng.runtime.name,
+            "is_running": bool(getattr(snapshot, "is_running", True)),
             "filesystem_changed": bool(snapshot.filesystem_changed),
             "process_changed": bool(snapshot.process_changed),
         }

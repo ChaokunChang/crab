@@ -148,8 +148,10 @@ def main() -> None:
         # 演示 changeset 的两种模式：
         #   * changeset=True     -> AsyncChangeset，后台线程计算，.wait() 阻塞取
         #   * changeset_sync=True -> 立即返回 list，同步计算
-        # 两种模式都隐式使用 force=True，绕过 inspector gate 优化，
-        # 无需等 host inspector 观察到变更即可拿到 diff。
+        # 两种模式都隐式使用 force=True 绕过 inspector gate。SDK 会
+        # 自动用 *上一个* checkpoint（此处是 step 5 的 checkpoint）作
+        # 为 since，只 diff 本次 run 引入的变更；这也避免了对普通（非
+        # fork）沙箱走 fork_changeset 路径而 400。
         banner("6. 富返回值 — changeset (异步 + 同步)")
 
         # 6a. 异步 changeset

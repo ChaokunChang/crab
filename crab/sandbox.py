@@ -1125,14 +1125,20 @@ class Sandbox:
         fs_changed: bool | None = None
         proc_changed: bool | None = None
 
+        # Snapshot the checkpoint id that existed *before* this action.
+        # Changeset semantics: "what changed since the last checkpoint",
+        # so we must diff against the previous id, not the fresh one that
+        # the concurrent checkpoint (if any) is about to create.
+        prev_ckpt_id = self._last_checkpoint_id
+
         if do_checkpoint:
             ckpt_handle = self._start_async_checkpoint()
 
         if do_changeset:
             if changeset_sync:
-                cs_handle = self._run_changeset_sync()
+                cs_handle = self._run_changeset_sync(since=prev_ckpt_id)
             else:
-                cs_handle = self._start_async_changeset()
+                cs_handle = self._start_async_changeset(since=prev_ckpt_id)
 
         if do_observe:
             fs_changed, proc_changed = self._peek_inspector()
@@ -1173,13 +1179,19 @@ class Sandbox:
         t.start()
         return handle
 
-    def _start_async_changeset(self) -> AsyncChangeset:
-        """Run changeset(force=True) in background."""
+    def _start_async_changeset(self, *, since: str | None = None) -> AsyncChangeset:
+        """Run ``changeset(since=..., force=True)`` in background.
+
+        ``since`` should be the checkpoint id the caller wants to diff
+        against — typically the previous ``last_checkpoint_id``. When
+        ``None``, the call falls back to ``fork_changeset``, which only
+        works for sandboxes produced by ``fork_once`` (see
+        :meth:`changeset`)."""
         handle = AsyncChangeset(threading.Thread(target=lambda: None))
 
         def _do_changeset() -> None:
             try:
-                handle._result = self.changeset(force=True)
+                handle._result = self.changeset(since=since, force=True)
             except BaseException as exc:
                 handle._error = exc
 
@@ -1188,18 +1200,28 @@ class Sandbox:
         t.start()
         return handle
 
-    def _run_changeset_sync(self) -> list[dict]:
-        """Run changeset synchronously with force=True."""
-        return self.changeset(force=True)
+    def _run_changeset_sync(self, *, since: str | None = None) -> list[dict]:
+        """Run ``changeset(since=..., force=True)`` synchronously."""
+        return self.changeset(since=since, force=True)
 
     def _peek_inspector(self) -> tuple[bool | None, bool | None]:
-        """Read-only peek at inspector state (no reset)."""
+        """Read-only peek at inspector state (no reset).
+
+        Returns ``(None, None)`` if the peek fails; the reason is logged
+        at WARNING so tutorials / CLI users can see why ``observe=True``
+        did not surface real flags (e.g. daemon snapshot not registered,
+        gateway 404, connection error)."""
         try:
             system = self._engine.system
             snapshot = system.inspector.inspect(self.sandbox_id)
             return (bool(snapshot.filesystem_changed), bool(snapshot.process_changed))
-        except Exception:
-            logger.debug("inspector peek failed for sandbox=%s", self._sandbox_id, exc_info=True)
+        except Exception as exc:
+            logger.warning(
+                "inspector peek failed for sandbox=%s: %s",
+                self._sandbox_id,
+                exc,
+            )
+            logger.debug("inspector peek traceback", exc_info=True)
             return (None, None)
 
     # ------------------------------------------------------------------
