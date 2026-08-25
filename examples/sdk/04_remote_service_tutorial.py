@@ -25,8 +25,8 @@ from crab.models import ExecEvent, ExecDone
 # ============================================================
 # ★ 用户配置区 ★  —— 修改下面两行即可
 # ============================================================
-GATEWAY_URL = "http://YOUR_GATEWAY_HOST:8900"  # Gateway 地址（含端口）
-API_KEY = "YOUR_API_KEY"                       # 在 Gateway 上创建的 tenant key
+GATEWAY_URL = "http://11.164.176.165:8900"  # Gateway 地址（含端口）
+API_KEY = "crab_sk_69c85f1d6c5169e310d7d2f1170a8664a46399fb20481d8a"                       # 在 Gateway 上创建的 tenant key
 
 # 创建沙箱时使用的镜像和资源配置
 SANDBOX_IMAGE = "ubuntu:22.04"
@@ -164,6 +164,62 @@ def main() -> None:
             step_fail(f"等待 checkpoint 失败: {exc}")
 
         # ----------------------------------------------------------
+        # 5b. 背压 — 上一个后台 checkpoint 阻塞下一个 run
+        # ----------------------------------------------------------
+        # daemon 侧 per-sandbox 背压：新的 /action 到来时，如果该 sandbox
+        # 还有后台 checkpoint 在跑，daemon 会先等它完成再开始 exec。用户
+        # 感知为 "上一个 checkpoint 慢了，这次请求就稍等一等"。
+        #
+        # 如何 *隔离* 出背压带来的额外延迟（否则会被 exec 本身的耗时淹没）：
+        #   run#A: 触发一个后台 checkpoint（不等待）——制造一个 pending ckpt
+        #   run#B: 紧跟 run#A 发起 -> 其 exec 返回时间 *包含* 等待 run#A
+        #          checkpoint 的背压时间
+        #   run#C: 等到完全空闲后再发起相同的命令 -> 无背压，作为基线
+        #   背压额外延迟 ≈ run#B 延迟 - run#C 延迟
+        #
+        # 重要事实：本项目 checkpoint 走 ZFS 快照，是 O(1) 写时复制，
+        # 与文件数量基本无关（实测 10240 个新文件 vs 空沙箱都 ~0.1s）。
+        # 所以真实环境下背压额外延迟通常只有 ~0.1s；背压逻辑本身由
+        # 单元测试 tests/test_daemon_action_backpressure.py 注入 1s 延迟
+        # 做了严格验证。
+        banner("5b. 背压 — 上一个后台 checkpoint 阻塞下一个 run")
+        # run#A：制造一个 pending 后台 checkpoint（创建一批文件后 checkpoint）
+        sandbox.commands.run(
+            "mkdir -p /opt/many && cd /opt/many && "
+            "for i in $(seq 1 10240); do echo x > f$i; done",
+            checkpoint=True,
+        )
+        step_ok("run#A 已触发后台 checkpoint（不等待，制造 pending 状态）")
+        # run#B：紧跟发起 -> 被 run#A 的后台 checkpoint 背压阻塞
+        t1 = time.time()
+        result_blocked = sandbox.commands.run("echo blocked", checkpoint=True)
+        blocked_latency = time.time() - t1
+        step_ok(f"run#B (紧跟 run#A) exec 返回 ⏱ {blocked_latency:.3f}s (含背压等待)")
+        # 等到完全空闲
+        try:
+            result_blocked.checkpoint.wait(timeout=120.0)
+        except Exception as exc:
+            step_fail(f"等待 run#B checkpoint 失败: {exc}")
+        # run#C：空闲基线 -> 无 pending checkpoint，无背压
+        t2 = time.time()
+        result_idle = sandbox.commands.run("echo idle", checkpoint=True)
+        idle_latency = time.time() - t2
+        step_ok(f"run#C (空闲基线) exec 返回 ⏱ {idle_latency:.3f}s (无背压)")
+        try:
+            result_idle.checkpoint.wait(timeout=120.0)
+        except Exception as exc:
+            step_fail(f"等待 run#C checkpoint 失败: {exc}")
+        delta_ms = (blocked_latency - idle_latency) * 1000.0
+        print(
+            f"  → 背压额外延迟 ≈ {delta_ms:.0f}ms "
+            f"(run#B {blocked_latency:.3f}s - run#C {idle_latency:.3f}s)"
+        )
+        if blocked_latency > idle_latency:
+            step_ok("背压生效：紧跟的 run#B 比空闲的 run#C 慢（等待了上一个 checkpoint）")
+        else:
+            print("  (注: ZFS 快照 O(1)，checkpoint ~0.1s，背压额外延迟很小/接近噪声)")
+
+        # ----------------------------------------------------------
         # 6. 富返回值 — changeset (异步 + 同步)
         # ----------------------------------------------------------
         # 演示 changeset 的两种模式：
@@ -213,7 +269,10 @@ def main() -> None:
             sandboxes_to_kill.append(auto_sb)
             step_ok(f"auto_checkpoint 沙箱创建成功: {auto_sb.sandbox_id}")
             t0 = time.time()
-            auto_sb.commands.run("echo step1 > /tmp/s1")
+            # auto_sb.commands.run("echo step1 > /tmp/s1")
+            # auto_sb.commands.run("dd if=/dev/zero of=/tmp/s1 bs=1M count=512")
+            auto_sb.commands.run("mkdir -p /tmp/smallfiles")
+            auto_sb.commands.run('seq 1 10240 | xargs -P 8 -I {} fallocate -l 1K "smallfiles/file_{}.dat"')
             step_ok(f"自动 checkpoint: {auto_sb.last_checkpoint_id} ⏱ {time.time()-t0:.3f}s")
             t0 = time.time()
             auto_sb.commands.run("echo step2 > /tmp/s2")

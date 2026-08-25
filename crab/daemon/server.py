@@ -98,6 +98,61 @@ _job_store = _JobStore()
 
 
 # ---------------------------------------------------------------------------
+# Per-sandbox checkpoint backpressure — a new /action must wait for that
+# sandbox's in-flight background checkpoint (if any) to finish before it
+# starts exec, so a slow checkpoint delays (never drops) the next request.
+# ---------------------------------------------------------------------------
+
+_BACKPRESSURE_TIMEOUT_SECONDS: float = 600.0
+
+
+class _CheckpointBackpressure:
+    """Per-sandbox gate around background checkpoint work.
+
+    Each sandbox owns a ``threading.Event``:
+      * ``is_set()`` (idle)  -> no background checkpoint is in flight
+      * cleared     (busy)   -> a background checkpoint is running
+
+    A request calls :meth:`wait_idle` before exec; if a prior checkpoint is
+    still running it blocks until that checkpoint's thread sets the event
+    again (bounded by *timeout*). The background thread must call
+    :meth:`begin` before starting and ``event.set()`` in a ``finally``.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._events: dict[str, threading.Event] = {}
+
+    def _event_for(self, sandbox_id: str) -> threading.Event:
+        with self._lock:
+            ev = self._events.get(sandbox_id)
+            if ev is None:
+                ev = threading.Event()
+                ev.set()  # a freshly-seen sandbox starts idle
+                self._events[sandbox_id] = ev
+            return ev
+
+    def wait_idle(self, sandbox_id: str, timeout: float) -> bool:
+        """Block until no background checkpoint is in flight for *sandbox_id*.
+        Returns True if idle (or became idle), False if *timeout* elapsed."""
+        ev = self._event_for(sandbox_id)
+        if ev.is_set():
+            return True
+        return ev.wait(timeout=timeout)
+
+    def begin(self, sandbox_id: str) -> threading.Event:
+        """Mark a background checkpoint as starting; returns the event so the
+        background thread can ``set()`` it on completion."""
+        ev = self._event_for(sandbox_id)
+        ev.clear()
+        return ev
+
+
+# Module-level singleton (lives for daemon process lifetime).
+_ckpt_backpressure = _CheckpointBackpressure()
+
+
+# ---------------------------------------------------------------------------
 # Route table — each handler runs in a worker thread and is given the
 # parsed request body + path variables. Keeping routes small and explicit
 # is preferable to a framework dependency.
@@ -943,6 +998,19 @@ class _Routes:
         eng = self._daemon.require_engine()
         sid = SandboxId(sandbox_id)
 
+        # --- 0. checkpoint backpressure ---
+        # If a previous background checkpoint for this sandbox is still
+        # running, wait for it to finish before starting exec. This delays
+        # (but never drops) the request; a slow checkpoint just makes the
+        # next run a little slower. Bounded so a stuck checkpoint can't wedge
+        # the sandbox forever.
+        if not _ckpt_backpressure.wait_idle(sandbox_id, timeout=_BACKPRESSURE_TIMEOUT_SECONDS):
+            logger.warning(
+                "checkpoint backpressure timed out after %.0fs for sandbox %s; "
+                "proceeding with exec anyway",
+                _BACKPRESSURE_TIMEOUT_SECONDS, sandbox_id,
+            )
+
         # --- 1. exec (required) ---
         exec_spec = body.get("exec")
         if not isinstance(exec_spec, dict):
@@ -1007,6 +1075,10 @@ class _Routes:
             # Capture closure vars for the background thread.
             changeset_since_raw = body.get("changeset_since")
 
+            # Mark this sandbox busy *before* starting the thread so a
+            # closely-following request observes the backpressure.
+            ckpt_event = _ckpt_backpressure.begin(sandbox_id)
+
             def _background() -> None:
                 result: dict[str, Any] = {}
                 try:
@@ -1040,6 +1112,10 @@ class _Routes:
                     _job_store.complete(job_id, result)
                 except Exception as exc:
                     _job_store.fail(job_id, str(exc))
+                finally:
+                    # Release backpressure so the next /action can proceed,
+                    # even if the checkpoint/changeset failed.
+                    ckpt_event.set()
 
             t = threading.Thread(target=_background, daemon=True,
                                  name=f"action-bg-{job_id}")
