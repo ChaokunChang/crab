@@ -486,11 +486,15 @@ class ExecStreamTests(unittest.TestCase):
 
 
 class _FakeRuntimeWithBatchAction(_FakeRuntime):
-    """Fake runtime that also exposes batch_action (simulating RuntimeProxy)."""
+    """Fake runtime that also exposes batch_action + poll_job (simulating
+    RuntimeProxy with daemon-side async checkpoint/changeset)."""
 
     def __init__(self) -> None:
         super().__init__()
         self.batch_calls: list[dict] = []
+        self._job_results: dict[str, dict] = {}
+        self._delayed_results: dict[str, dict | None] = {}
+        self._job_counter = 0
 
     def batch_action(
         self,
@@ -523,17 +527,44 @@ class _FakeRuntimeWithBatchAction(_FakeRuntime):
         if observe:
             response["filesystem_changed"] = True
             response["process_changed"] = False
-        if checkpoint and checkpoint_id:
-            response["checkpoint_id"] = checkpoint_id
-        if changeset:
-            # Mirror real daemon format: ChangesetResult.to_json() dict
-            response["changeset"] = {
-                "sandbox_id": str(sandbox_id),
-                "base_checkpoint_id": changeset_since or "ckpt-forkpoint",
-                "entries": [{"path": "/tmp/x", "change": "added"}],
-                "skipped_by_gate": False,
-            }
+
+        # Simulate async checkpoint/changeset: return pending + job_id.
+        if checkpoint or changeset:
+            self._job_counter += 1
+            job_id = checkpoint_id or f"job-fake-{self._job_counter}"
+            response["job_id"] = job_id
+            # Build what the "background" result would be.
+            job_result: dict = {}
+            if checkpoint:
+                response["checkpoint_status"] = "pending"
+                response["checkpoint_id"] = job_id
+                job_result["checkpoint_id"] = job_id
+            if changeset:
+                response["changeset_status"] = "pending"
+                job_result["changeset"] = {
+                    "sandbox_id": str(sandbox_id),
+                    "base_checkpoint_id": changeset_since or "ckpt-forkpoint",
+                    "entries": [{"path": "/tmp/x", "change": "added"}],
+                    "skipped_by_gate": False,
+                }
+            # Store as immediately completed (simulate fast background work).
+            self._job_results[job_id] = {"status": "completed", "result": job_result}
+
         return response
+
+    def poll_job(self, sandbox_id, job_id: str) -> dict:
+        """Simulate GET /sandboxes/{id}/jobs/{job_id}."""
+        return self._job_results.get(job_id, {"status": "pending"})
+
+    def delay_job(self, job_id: str) -> None:
+        """Remove job result to simulate still-pending state."""
+        self._delayed_results[job_id] = self._job_results.pop(job_id, None)
+
+    def release_job(self, job_id: str) -> None:
+        """Restore a delayed job result."""
+        result = self._delayed_results.pop(job_id, None)
+        if result:
+            self._job_results[job_id] = result
 
 
 def _make_batch_sandbox(*, auto_checkpoint=False):
@@ -562,10 +593,39 @@ class BatchActionTests(unittest.TestCase):
         result = sbx.commands.run("echo hi", checkpoint=True)
         self.assertEqual(len(runtime.batch_calls), 1)
         self.assertIsNotNone(result.checkpoint)
+        # After .wait() (fake returns completed immediately on poll)
+        ckpt_id = result.checkpoint.wait(timeout=2.0)
         self.assertTrue(result.checkpoint.done)
-        ckpt_id = result.checkpoint.checkpoint_id
         self.assertTrue(ckpt_id.startswith("ckpt-"))
         self.assertEqual(sbx.last_checkpoint_id, ckpt_id)
+
+    def test_batch_checkpoint_initially_pending_then_completes(self) -> None:
+        """Verify the async flow: daemon returns pending, SDK polls until complete."""
+        sbx, _system, runtime = _make_batch_sandbox()
+        # Make the job stay pending initially.
+        orig_batch_action = runtime.batch_action
+
+        def _delayed_batch(*args, **kwargs):
+            resp = orig_batch_action(*args, **kwargs)
+            # Delay the job so first poll returns pending.
+            job_id = resp.get("job_id")
+            if job_id:
+                runtime.delay_job(job_id)
+            return resp
+
+        runtime.batch_action = _delayed_batch
+
+        result = sbx.commands.run("echo hi", checkpoint=True)
+        self.assertIsNotNone(result.checkpoint)
+        # Initially pending — first .done poll returns False.
+        self.assertFalse(result.checkpoint.done)
+
+        # Release the job — next poll should find it.
+        job_id = runtime.batch_calls[-1]["checkpoint_id"]
+        runtime.release_job(job_id)
+        ckpt_id = result.checkpoint.wait(timeout=2.0)
+        self.assertTrue(result.checkpoint.done)
+        self.assertEqual(ckpt_id, job_id)
 
     def test_batch_used_when_changeset_true(self) -> None:
         sbx, _system, runtime = _make_batch_sandbox()
@@ -574,9 +634,9 @@ class BatchActionTests(unittest.TestCase):
         result = sbx.commands.run("touch x", changeset=True)
         self.assertEqual(len(runtime.batch_calls), 1)
         self.assertEqual(runtime.batch_calls[0]["changeset_since"], "ckpt-prev")
-        # Changeset should be an AsyncChangeset wrapper
+        # Changeset should be an AsyncChangeset wrapper (poll-based)
         self.assertIsInstance(result.changeset, AsyncChangeset)
-        entries = result.changeset.wait(timeout=1.0)
+        entries = result.changeset.wait(timeout=2.0)
         self.assertEqual(entries, [{"path": "/tmp/x", "change": "added"}])
 
     def test_batch_changeset_sync_returns_list(self) -> None:
@@ -612,8 +672,9 @@ class BatchActionTests(unittest.TestCase):
         self.assertTrue(call["changeset"])
         self.assertTrue(call["observe"])
         self.assertEqual(call["changeset_since"], "ckpt-base")
-        # All fields populated
+        # All fields populated after wait
         self.assertIsNotNone(result.checkpoint)
+        result.checkpoint.wait(timeout=2.0)
         self.assertIsNotNone(result.changeset)
         self.assertTrue(result.filesystem_changed)
         self.assertFalse(result.process_changed)

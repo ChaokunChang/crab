@@ -409,6 +409,8 @@ _PASSTHROUGH_SANDBOX_ROUTES: list[tuple[str, str, float]] = [
     ("POST", "/processes/merge", _SLOW_TIMEOUT_S),
     # Batch action (exec + observe + checkpoint + changeset in one round-trip)
     ("POST", "/action", _SLOW_TIMEOUT_S),
+    # Background job polling
+    ("GET", "/jobs/{job_id}", _FAST_TIMEOUT_S),
 ]
 
 

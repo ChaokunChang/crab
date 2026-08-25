@@ -124,18 +124,20 @@ def main() -> None:
         # 5. 富返回值 — checkpoint + observe
         # ----------------------------------------------------------
         # 演示 commands.run(checkpoint=True, observe=True) 的富返回值：
-        #   * checkpoint_id 在客户端侧预分配（ckpt-<uuid>），run() 立刻
-        #     返回；后台线程执行真正的 checkpoint。
+        #   * checkpoint_id 在客户端侧预分配（ckpt-<uuid>），daemon 的
+        #     /action 端点做完 exec + observe 后 *立即返回*，checkpoint
+        #     在 daemon 后台线程异步执行。
         #   * observe=True 会调用 daemon 的只读 inspector peek 路由，
         #     不重置任何游标。
         #
+        # 异步行为（重要）：run() 的返回延迟 *不包含* checkpoint 开销。
+        # 返回时 result.checkpoint.done == False（后台正在做）；调用
+        # result.checkpoint.wait() 会轮询 daemon 的 jobs 端点直到完成。
+        #
         # 语义（重要）：observe 返回的 filesystem_changed / process_changed
-        # 表示 “本次 action 是否改变了状态” —— SDK 在 *启动后台 checkpoint
-        # 之前* 就完成 peek，因此读到的是 checkpoint 重置游标之前的干净
-        # 状态。checkpoint 完成后会调 host-inspector.reset() 把两个游标
-        # 清零；若 peek 排在 checkpoint 之后，就会与该 reset 竞争而报 False
-        # （这是一个历史 bug，已修复；参见 test_peek_runs_before_async_
-        # checkpoint_reset）。所以下面 mutating 的命令应该稳定看到
+        # 表示 “本次 action 是否改变了状态” —— daemon 在 *启动后台
+        # checkpoint 之前* 就完成 peek，因此读到的是 checkpoint 重置游标
+        # 之前的干净状态。所以下面 mutating 的命令应该稳定看到
         # filesystem_changed=True。
         banner("5. 富返回值 — checkpoint + observe")
         t0 = time.time()
@@ -144,15 +146,20 @@ def main() -> None:
             checkpoint=True,
             observe=True,
         )
-        step_ok(f"返回码: {result.returncode} ⏱ {time.time()-t0:.3f}s")
+        exec_latency = time.time() - t0
+        step_ok(f"返回码: {result.returncode} (exec+observe 返回) ⏱ {exec_latency:.3f}s")
         print(f"  checkpoint_id (预分配): {result.checkpoint.checkpoint_id}")
-        print(f"  checkpoint 完成?: {result.checkpoint.done}")
+        print(f"  checkpoint 完成?: {result.checkpoint.done}")  # 期望 False（后台异步）
         print(f"  filesystem_changed: {result.filesystem_changed}")
         print(f"  process_changed: {result.process_changed}")
-        # 阻塞等待后台 checkpoint 完成
+        # 阻塞等待后台 checkpoint 完成（轮询 daemon jobs 端点）
         try:
+            t1 = time.time()
             ckpt_id = result.checkpoint.wait(timeout=60.0)
-            step_ok(f"checkpoint 已完成: {ckpt_id}")
+            wait_latency = time.time() - t1
+            step_ok(f"checkpoint 已完成: {ckpt_id} (wait 轮询) ⏱ {wait_latency:.3f}s")
+            print(f"  checkpoint 完成?: {result.checkpoint.done}")  # 期望 True
+            print(f"  → exec 返回 {exec_latency:.3f}s + checkpoint 等待 {wait_latency:.3f}s")
         except Exception as exc:
             step_fail(f"等待 checkpoint 失败: {exc}")
 

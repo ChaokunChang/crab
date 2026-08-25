@@ -725,6 +725,13 @@ class RuntimeProxy(Runtime):
             timeout_seconds=http_timeout,
         )
 
+    def poll_job(self, sandbox_id: SandboxId, job_id: str) -> dict[str, Any]:
+        """Poll a daemon background job (checkpoint/changeset) status.
+
+        Returns a dict with at least ``status`` ('pending'|'completed'|'failed')
+        and on completion a ``result`` sub-dict carrying checkpoint_id / changeset."""
+        return self._client.get_json(f"/sandboxes/{sandbox_id}/jobs/{job_id}")
+
     def update_host_inspector_filters(
         self,
         sandbox_id: SandboxId,

@@ -30,6 +30,7 @@ import os
 import signal
 import sys
 import threading
+import time as _time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
@@ -48,6 +49,52 @@ from .transport import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Background job tracking — stores checkpoint/changeset results so the SDK
+# can poll for completion via GET /sandboxes/{id}/jobs/{job_id}.
+# ---------------------------------------------------------------------------
+
+_JOB_TTL_SECONDS: float = 300.0  # 5 minutes
+
+
+class _JobStore:
+    """Thread-safe in-memory store for async job results."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        # job_id → {"status": "pending"|"completed"|"failed", "result": ..., "ts": float}
+        self._jobs: dict[str, dict[str, Any]] = {}
+
+    def register(self, job_id: str) -> None:
+        with self._lock:
+            self._jobs[job_id] = {"status": "pending", "result": None, "ts": _time.time()}
+
+    def complete(self, job_id: str, result: dict[str, Any]) -> None:
+        with self._lock:
+            self._jobs[job_id] = {"status": "completed", "result": result, "ts": _time.time()}
+
+    def fail(self, job_id: str, error: str) -> None:
+        with self._lock:
+            self._jobs[job_id] = {"status": "failed", "error": error, "ts": _time.time()}
+
+    def get(self, job_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            self._gc()
+            return self._jobs.get(job_id)
+
+    def _gc(self) -> None:
+        """Remove expired entries (unlocked; caller holds lock)."""
+        now = _time.time()
+        expired = [k for k, v in self._jobs.items()
+                   if v["status"] != "pending" and (now - v["ts"]) > _JOB_TTL_SECONDS]
+        for k in expired:
+            del self._jobs[k]
+
+
+# Module-level singleton (lives for daemon process lifetime).
+_job_store = _JobStore()
 
 
 # ---------------------------------------------------------------------------
@@ -885,12 +932,13 @@ class _Routes:
 
     def action_sandbox(self, body: dict[str, Any], *, sandbox_id: str) -> dict[str, Any]:
         """Batch action: exec + optional observe/checkpoint/changeset in
-        one round-trip.  Execution order matches the SDK-side fix for the
-        observe/checkpoint race:
-          1. exec (required)
-          2. observe / inspector peek (before checkpoint)
-          3. checkpoint
-          4. changeset
+        one round-trip.  Execution order:
+          1. exec (required) — synchronous
+          2. observe / inspector peek — synchronous (before checkpoint)
+          3. checkpoint + changeset — asynchronous (daemon background thread)
+        The response returns immediately after exec + observe; checkpoint
+        and changeset run in the background. The SDK polls
+        GET /sandboxes/{id}/jobs/{job_id} for completion.
         """
         eng = self._daemon.require_engine()
         sid = SandboxId(sandbox_id)
@@ -936,45 +984,78 @@ class _Routes:
                     response["filesystem_changed"] = None
                     response["process_changed"] = None
 
-        # --- 3. checkpoint ---
-        checkpoint_id_out: str | None = None
-        if body.get("checkpoint"):
+        # --- 3. checkpoint + changeset (async background) ---
+        do_checkpoint = bool(body.get("checkpoint"))
+        do_changeset = bool(body.get("changeset"))
+
+        if do_checkpoint or do_changeset:
+            # Determine the job_id: use client-supplied checkpoint_id or generate one.
             client_ckpt_id = body.get("checkpoint_id")
-            try:
-                ckpt_result = eng.system.checkpoint_once(
-                    sid, leave_running=True, checkpoint_id=client_ckpt_id,
-                )
-                checkpoint_id_out = (
-                    str(ckpt_result.checkpoint_id) if ckpt_result.checkpoint_id else None
-                )
-                response["checkpoint_id"] = checkpoint_id_out
-            except Exception as exc:
-                response["checkpoint_id"] = None
-                response["checkpoint_error"] = str(exc)
+            job_id = str(client_ckpt_id) if client_ckpt_id else f"job-{threading.current_thread().ident}"
+            if do_checkpoint:
+                job_id = str(client_ckpt_id) if client_ckpt_id else f"ckpt-daemon-{id(eng)}-{_time.time_ns()}"
 
-        # --- 4. changeset ---
-        if body.get("changeset"):
-            from ..ids import CheckpointId
+            _job_store.register(job_id)
+            response["job_id"] = job_id
 
-            since_raw = body.get("changeset_since")
-            try:
-                if since_raw:
-                    cs_result = eng.system.changeset_since(
-                        sid, CheckpointId(str(since_raw)), use_inspector_gate=False,
-                    )
-                elif checkpoint_id_out:
-                    # Use the freshly-created checkpoint's predecessor as
-                    # since — but we don't track it here. Fall back to
-                    # fork_changeset for simplicity (force=True).
-                    cs_result = eng.system.fork_changeset(sid, force=True)
-                else:
-                    cs_result = eng.system.fork_changeset(sid, force=True)
-                response["changeset"] = cs_result.to_json()
-            except Exception as exc:
-                response["changeset"] = None
-                response["changeset_error"] = str(exc)
+            if do_checkpoint:
+                response["checkpoint_status"] = "pending"
+                response["checkpoint_id"] = job_id  # provisional
+            if do_changeset:
+                response["changeset_status"] = "pending"
+
+            # Capture closure vars for the background thread.
+            changeset_since_raw = body.get("changeset_since")
+
+            def _background() -> None:
+                result: dict[str, Any] = {}
+                try:
+                    # 3a. checkpoint
+                    if do_checkpoint:
+                        ckpt_result = eng.system.checkpoint_once(
+                            sid, leave_running=True, checkpoint_id=client_ckpt_id,
+                        )
+                        resolved_id = (
+                            str(ckpt_result.checkpoint_id)
+                            if ckpt_result.checkpoint_id else job_id
+                        )
+                        result["checkpoint_id"] = resolved_id
+
+                    # 3b. changeset
+                    if do_changeset:
+                        from ..ids import CheckpointId
+                        try:
+                            if changeset_since_raw:
+                                cs_result = eng.system.changeset_since(
+                                    sid, CheckpointId(str(changeset_since_raw)),
+                                    use_inspector_gate=False,
+                                )
+                            else:
+                                cs_result = eng.system.fork_changeset(sid, force=True)
+                            result["changeset"] = cs_result.to_json()
+                        except Exception as cs_exc:
+                            result["changeset"] = None
+                            result["changeset_error"] = str(cs_exc)
+
+                    _job_store.complete(job_id, result)
+                except Exception as exc:
+                    _job_store.fail(job_id, str(exc))
+
+            t = threading.Thread(target=_background, daemon=True,
+                                 name=f"action-bg-{job_id}")
+            t.start()
+        else:
+            # No async work needed.
+            pass
 
         return response
+
+    def get_job(self, body: dict[str, Any], *, sandbox_id: str, job_id: str) -> dict[str, Any]:
+        """Poll a background job's status (checkpoint + changeset)."""
+        entry = _job_store.get(job_id)
+        if entry is None:
+            raise _BadRequest(f"unknown job_id: {job_id}")
+        return entry
 
 
 def _seed_inspector_running(engine: Engine, sandbox_id: SandboxId) -> None:
@@ -1158,6 +1239,8 @@ def _build_handler(daemon: "DaemonServer"):
         ("POST", "/sandboxes/{sandbox_id}/processes/merge", "", routes.merge_processes_sandbox),
         # Batch action (exec + observe + checkpoint + changeset in one round-trip)
         ("POST", "/sandboxes/{sandbox_id}/action", "", routes.action_sandbox),
+        # Background job polling
+        ("GET", "/sandboxes/{sandbox_id}/jobs/{job_id}", "", routes.get_job),
     ]
 
     def _match(method: str, path: str):

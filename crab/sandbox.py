@@ -33,10 +33,11 @@ import logging
 import shlex
 import socket
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, Iterator
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator
 
 from .ids import CheckpointId, SandboxId
 from .models import EgressLedger, ExecDone, ExecEvent, JobStatus, MergeReport, ObservationReport, PortAllocation, ProcessMergeReport, SandboxExecResult, SandboxSnapshot, utc_now
@@ -61,28 +62,87 @@ _LABEL_METADATA_KEY = "user_label"
 
 class AsyncCheckpoint:
     """Handle for a background checkpoint. The checkpoint_id is pre-allocated
-    and immediately available; the actual checkpoint runs asynchronously."""
+    and immediately available; the actual checkpoint runs asynchronously.
 
-    def __init__(self, checkpoint_id: str, thread: threading.Thread) -> None:
+    Two modes:
+      - Thread-based (local engine): wait via thread.join()
+      - Poll-based (remote engine): wait by polling GET /jobs/{job_id}
+    """
+
+    def __init__(
+        self,
+        checkpoint_id: str,
+        thread: threading.Thread | None = None,
+        *,
+        poll_fn: Callable[[], dict[str, Any]] | None = None,
+    ) -> None:
         self.checkpoint_id = checkpoint_id
         self._thread = thread
+        self._poll_fn = poll_fn
         self._error: BaseException | None = None
+        # Do NOT eagerly cache done-ness: an unstarted thread reports
+        # is_alive()==False, and _start_async_checkpoint constructs the
+        # handle with a placeholder thread before reassigning the real one.
+        self._done = False
 
     def wait(self, timeout: float | None = None) -> str:
         """Block until the checkpoint completes. Returns checkpoint_id.
         Raises TimeoutError if *timeout* elapses, or propagates the
         checkpoint failure exception."""
-        self._thread.join(timeout=timeout)
-        if self._thread.is_alive():
-            raise TimeoutError("checkpoint did not complete within timeout")
-        if self._error is not None:
-            raise self._error
-        return self.checkpoint_id
+        if self._done:
+            if self._error is not None:
+                raise self._error
+            return self.checkpoint_id
+
+        if self._thread is not None:
+            # Thread-based (local mode)
+            self._thread.join(timeout=timeout)
+            if self._thread.is_alive():
+                raise TimeoutError("checkpoint did not complete within timeout")
+            self._done = True
+            if self._error is not None:
+                raise self._error
+            return self.checkpoint_id
+
+        # Poll-based (remote mode)
+        if self._poll_fn is None:
+            raise RuntimeError("AsyncCheckpoint has no thread or poll_fn")
+        deadline = time.time() + (timeout if timeout is not None else 300.0)
+        while time.time() < deadline:
+            resp = self._poll_fn()
+            status = resp.get("status", "pending")
+            if status == "completed":
+                self._done = True
+                result = resp.get("result") or {}
+                resolved = result.get("checkpoint_id")
+                if resolved:
+                    self.checkpoint_id = str(resolved)
+                return self.checkpoint_id
+            if status == "failed":
+                err_msg = resp.get("error", "checkpoint failed")
+                self._error = RuntimeError(err_msg)
+                self._done = True
+                raise self._error
+            time.sleep(0.15)
+        raise TimeoutError("checkpoint did not complete within timeout")
 
     @property
     def done(self) -> bool:
         """Non-blocking check: has the background checkpoint finished?"""
-        return not self._thread.is_alive()
+        if self._done:
+            return True
+        if self._thread is not None:
+            self._done = not self._thread.is_alive()
+            return self._done
+        # For poll-based: quick non-blocking check
+        if self._poll_fn is not None:
+            try:
+                resp = self._poll_fn()
+                if resp.get("status") in ("completed", "failed"):
+                    self._done = True
+            except Exception:
+                pass
+        return self._done
 
     def __repr__(self) -> str:
         status = "done" if self.done else "pending"
@@ -90,25 +150,84 @@ class AsyncCheckpoint:
 
 
 class AsyncChangeset:
-    """Handle for a background changeset computation."""
+    """Handle for a background changeset computation.
 
-    def __init__(self, thread: threading.Thread) -> None:
+    Two modes:
+      - Thread-based (local engine): wait via thread.join()
+      - Poll-based (remote engine): wait by polling GET /jobs/{job_id}
+    """
+
+    def __init__(
+        self,
+        thread: threading.Thread | None = None,
+        *,
+        poll_fn: Callable[[], dict[str, Any]] | None = None,
+    ) -> None:
         self._thread = thread
+        self._poll_fn = poll_fn
         self._result: list[dict] | None = None
         self._error: BaseException | None = None
+        # See AsyncCheckpoint: unstarted placeholder threads report
+        # is_alive()==False, so compute done-ness lazily instead.
+        self._done = False
 
     def wait(self, timeout: float | None = None) -> list[dict]:
         """Block until the changeset completes. Returns the changeset entries."""
-        self._thread.join(timeout=timeout)
-        if self._thread.is_alive():
-            raise TimeoutError("changeset did not complete within timeout")
-        if self._error is not None:
-            raise self._error
-        return self._result or []
+        if self._done:
+            if self._error is not None:
+                raise self._error
+            return self._result or []
+
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+            if self._thread.is_alive():
+                raise TimeoutError("changeset did not complete within timeout")
+            self._done = True
+            if self._error is not None:
+                raise self._error
+            return self._result or []
+
+        # Poll-based (remote mode)
+        if self._poll_fn is None:
+            raise RuntimeError("AsyncChangeset has no thread or poll_fn")
+        deadline = time.time() + (timeout if timeout is not None else 300.0)
+        while time.time() < deadline:
+            resp = self._poll_fn()
+            status = resp.get("status", "pending")
+            if status == "completed":
+                self._done = True
+                result = resp.get("result") or {}
+                raw_cs = result.get("changeset")
+                if isinstance(raw_cs, dict):
+                    self._result = raw_cs.get("entries") or []
+                elif isinstance(raw_cs, list):
+                    self._result = raw_cs
+                else:
+                    self._result = []
+                return self._result
+            if status == "failed":
+                err_msg = resp.get("error", "changeset failed")
+                self._error = RuntimeError(err_msg)
+                self._done = True
+                raise self._error
+            time.sleep(0.15)
+        raise TimeoutError("changeset did not complete within timeout")
 
     @property
     def done(self) -> bool:
-        return not self._thread.is_alive()
+        if self._done:
+            return True
+        if self._thread is not None:
+            self._done = not self._thread.is_alive()
+            return self._done
+        if self._poll_fn is not None:
+            try:
+                resp = self._poll_fn()
+                if resp.get("status") in ("completed", "failed"):
+                    self._done = True
+            except Exception:
+                pass
+        return self._done
 
     def __repr__(self) -> str:
         status = "done" if self.done else "pending"
@@ -352,44 +471,67 @@ class _CommandsNamespace:
                 f"stderr={stderr!r}"
             )
 
-        # Build checkpoint handle (already done server-side; wrap as resolved)
+        # Build checkpoint and changeset handles.
+        # The daemon now runs checkpoint/changeset asynchronously and returns
+        # job_id + status="pending". The SDK creates poll-based Async handles.
         ckpt_handle: AsyncCheckpoint | None = None
-        if do_checkpoint and ckpt_id:
-            # Create an already-completed AsyncCheckpoint handle
-            done_thread = threading.Thread(target=lambda: None)
-            done_thread.start()
-            done_thread.join()
-            ckpt_handle = AsyncCheckpoint(ckpt_id, done_thread)
-            # The server response may carry its own id; reconcile
-            server_ckpt = response.get("checkpoint_id")
-            if server_ckpt and server_ckpt != ckpt_id:
-                ckpt_handle.checkpoint_id = str(server_ckpt)
-                sandbox._last_checkpoint_id = str(server_ckpt)
-
-        # Build changeset handle
         cs_handle: AsyncChangeset | list[dict] | None = None
-        if changeset:
-            raw_cs = response.get("changeset")
-            # Daemon returns ChangesetResult.to_json() which is a dict
-            # with an "entries" key; normalise to a plain list of dicts.
-            if isinstance(raw_cs, dict):
-                entries_list: list[dict] = raw_cs.get("entries") or []
-            elif isinstance(raw_cs, list):
-                entries_list = raw_cs
-            else:
-                entries_list = []
 
-            if changeset_sync:
-                cs_handle = entries_list
+        job_id = response.get("job_id")
+        ckpt_status = response.get("checkpoint_status")
+        cs_status = response.get("changeset_status")
+
+        # Build a poll_fn closure if the daemon gave us a job_id.
+        poll_fn: Callable[[], dict[str, Any]] | None = None
+        if job_id and hasattr(runtime, "poll_job"):
+            _sid = sandbox.sandbox_id
+            _jid = job_id
+            _rt = runtime
+            poll_fn = lambda: _rt.poll_job(_sid, _jid)  # noqa: E731
+
+        if do_checkpoint and ckpt_id:
+            if ckpt_status == "pending" and poll_fn is not None:
+                # Daemon is working in background — poll for result.
+                ckpt_handle = AsyncCheckpoint(ckpt_id, poll_fn=poll_fn)
             else:
-                # Wrap in an already-resolved AsyncChangeset so callers
-                # can uniformly call .wait() regardless of batch/local mode.
+                # Daemon completed synchronously (or test fake).
                 done_thread = threading.Thread(target=lambda: None)
                 done_thread.start()
                 done_thread.join()
-                handle = AsyncChangeset(done_thread)
-                handle._result = entries_list
-                cs_handle = handle
+                ckpt_handle = AsyncCheckpoint(ckpt_id, done_thread)
+                server_ckpt = response.get("checkpoint_id")
+                if server_ckpt and server_ckpt != ckpt_id:
+                    ckpt_handle.checkpoint_id = str(server_ckpt)
+                    sandbox._last_checkpoint_id = str(server_ckpt)
+
+        if changeset:
+            if cs_status == "pending" and poll_fn is not None:
+                # Daemon is working in background — poll for result.
+                if changeset_sync:
+                    # Caller wants sync result: block here.
+                    handle = AsyncChangeset(poll_fn=poll_fn)
+                    cs_handle = handle.wait(timeout=300.0)
+                else:
+                    cs_handle = AsyncChangeset(poll_fn=poll_fn)
+            else:
+                # Daemon returned result synchronously (changeset already in response).
+                raw_cs = response.get("changeset")
+                if isinstance(raw_cs, dict):
+                    entries_list: list[dict] = raw_cs.get("entries") or []
+                elif isinstance(raw_cs, list):
+                    entries_list = raw_cs
+                else:
+                    entries_list = []
+
+                if changeset_sync:
+                    cs_handle = entries_list
+                else:
+                    done_thread = threading.Thread(target=lambda: None)
+                    done_thread.start()
+                    done_thread.join()
+                    handle = AsyncChangeset(done_thread)
+                    handle._result = entries_list
+                    cs_handle = handle
 
         # Observer flags
         fs_changed = response.get("filesystem_changed")
