@@ -883,6 +883,99 @@ class _Routes:
             "process_changed": bool(snapshot.process_changed),
         }
 
+    def action_sandbox(self, body: dict[str, Any], *, sandbox_id: str) -> dict[str, Any]:
+        """Batch action: exec + optional observe/checkpoint/changeset in
+        one round-trip.  Execution order matches the SDK-side fix for the
+        observe/checkpoint race:
+          1. exec (required)
+          2. observe / inspector peek (before checkpoint)
+          3. checkpoint
+          4. changeset
+        """
+        eng = self._daemon.require_engine()
+        sid = SandboxId(sandbox_id)
+
+        # --- 1. exec (required) ---
+        exec_spec = body.get("exec")
+        if not isinstance(exec_spec, dict):
+            raise _BadRequest("action requires 'exec' object")
+        argv = list(exec_spec.get("argv") or [])
+        if not argv:
+            raise _BadRequest("action exec requires non-empty argv")
+        env_raw = exec_spec.get("env")
+        env = {str(k): str(v) for k, v in env_raw.items()} if isinstance(env_raw, dict) else None
+        cwd = exec_spec.get("cwd")
+        user = exec_spec.get("user")
+        timeout_s = exec_spec.get("timeout_s")
+        exec_result = eng.runtime.exec(
+            sid, argv, cwd=cwd, env=env, user=user, timeout_s=timeout_s,
+            capture_output=True,
+        )
+        response: dict[str, Any] = {
+            "ok": True,
+            "exec": {
+                "returncode": int(exec_result.returncode),
+                "stdout": exec_result.stdout,
+                "stderr": exec_result.stderr,
+            },
+        }
+
+        # --- 2. observe (before checkpoint to avoid reset race) ---
+        if body.get("observe"):
+            try:
+                snapshot = eng.system.inspector.inspect(sid)
+                response["filesystem_changed"] = bool(snapshot.filesystem_changed)
+                response["process_changed"] = bool(snapshot.process_changed)
+            except KeyError:
+                _seed_inspector_running(eng, sid)
+                try:
+                    snapshot = eng.system.inspector.inspect(sid)
+                    response["filesystem_changed"] = bool(snapshot.filesystem_changed)
+                    response["process_changed"] = bool(snapshot.process_changed)
+                except KeyError:
+                    response["filesystem_changed"] = None
+                    response["process_changed"] = None
+
+        # --- 3. checkpoint ---
+        checkpoint_id_out: str | None = None
+        if body.get("checkpoint"):
+            client_ckpt_id = body.get("checkpoint_id")
+            try:
+                ckpt_result = eng.system.checkpoint_once(
+                    sid, leave_running=True, checkpoint_id=client_ckpt_id,
+                )
+                checkpoint_id_out = (
+                    str(ckpt_result.checkpoint_id) if ckpt_result.checkpoint_id else None
+                )
+                response["checkpoint_id"] = checkpoint_id_out
+            except Exception as exc:
+                response["checkpoint_id"] = None
+                response["checkpoint_error"] = str(exc)
+
+        # --- 4. changeset ---
+        if body.get("changeset"):
+            from ..ids import CheckpointId
+
+            since_raw = body.get("changeset_since")
+            try:
+                if since_raw:
+                    cs_result = eng.system.changeset_since(
+                        sid, CheckpointId(str(since_raw)), use_inspector_gate=False,
+                    )
+                elif checkpoint_id_out:
+                    # Use the freshly-created checkpoint's predecessor as
+                    # since — but we don't track it here. Fall back to
+                    # fork_changeset for simplicity (force=True).
+                    cs_result = eng.system.fork_changeset(sid, force=True)
+                else:
+                    cs_result = eng.system.fork_changeset(sid, force=True)
+                response["changeset"] = cs_result.to_json()
+            except Exception as exc:
+                response["changeset"] = None
+                response["changeset_error"] = str(exc)
+
+        return response
+
 
 def _seed_inspector_running(engine: Engine, sandbox_id: SandboxId) -> None:
     """Mirror the SDK's local `Sandbox._mark_inspector_running`.
@@ -1063,6 +1156,8 @@ def _build_handler(daemon: "DaemonServer"):
         ("POST", "/sandboxes/{sandbox_id}/egress/replay", "", routes.sandbox_egress_replay),
         # Process merge (C4)
         ("POST", "/sandboxes/{sandbox_id}/processes/merge", "", routes.merge_processes_sandbox),
+        # Batch action (exec + observe + checkpoint + changeset in one round-trip)
+        ("POST", "/sandboxes/{sandbox_id}/action", "", routes.action_sandbox),
     ]
 
     def _match(method: str, path: str):

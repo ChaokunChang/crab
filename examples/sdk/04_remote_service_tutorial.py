@@ -77,8 +77,9 @@ def main() -> None:
     banner("1. 连接 Gateway")
     print(f"  URL: {GATEWAY_URL}")
 
+    t0 = time.time()
     engine = Engine.connect(url=GATEWAY_URL, api_key=API_KEY)
-    step_ok("Engine 连接成功")
+    step_ok(f"Engine 连接成功 ⏱ {time.time()-t0:.3f}s")
     print(f"  Engine 类型: {type(engine).__name__}")
 
     try:
@@ -89,13 +90,14 @@ def main() -> None:
         print(f"  镜像: {SANDBOX_IMAGE}")
         print(f"  资源: {SANDBOX_RESOURCES}")
 
+        t0 = time.time()
         sandbox = Sandbox(
             image=SANDBOX_IMAGE,
             resources=SANDBOX_RESOURCES,
             engine=engine,
         )
         sandboxes_to_kill.append(sandbox)
-        step_ok(f"沙箱创建成功, id = {sandbox.sandbox_id}")
+        step_ok(f"沙箱创建成功, id = {sandbox.sandbox_id} ⏱ {time.time()-t0:.3f}s")
 
         # ----------------------------------------------------------
         # 3. 列出当前 tenant 的沙箱 (engine.list_sandboxes)
@@ -103,8 +105,9 @@ def main() -> None:
         # 演示新增的 list_sandboxes()：走 GET /sandboxes 路由，返回
         # 当前 API key 可见的所有沙箱条目（gateway 会按 tenant 过滤）。
         banner("3. 列出沙箱 (engine.list_sandboxes)")
+        t0 = time.time()
         sandboxes = safe_run("列出沙箱", engine.list_sandboxes) or []
-        step_ok(f"当前沙箱列表: {len(sandboxes)} 个")
+        step_ok(f"当前沙箱列表: {len(sandboxes)} 个 ⏱ {time.time()-t0:.3f}s")
         for s in sandboxes:
             print(f"    {s.get('sandbox_id')} - {s.get('status', '?')}")
 
@@ -112,8 +115,9 @@ def main() -> None:
         # 4. 执行命令（一次性）
         # ----------------------------------------------------------
         banner("4. 执行命令 (commands.run)")
+        t0 = time.time()
         result = sandbox.commands.run("echo hello && uname -a && whoami")
-        step_ok(f"返回码: {result.returncode}")
+        step_ok(f"返回码: {result.returncode} ⏱ {time.time()-t0:.3f}s")
         print(f"  stdout:\n{result.stdout.rstrip()}")
 
         # ----------------------------------------------------------
@@ -134,12 +138,13 @@ def main() -> None:
         # checkpoint_reset）。所以下面 mutating 的命令应该稳定看到
         # filesystem_changed=True。
         banner("5. 富返回值 — checkpoint + observe")
+        t0 = time.time()
         result = sandbox.commands.run(
             "echo 'hello' > /tmp/observed.txt && mkdir -p /opt/new",
             checkpoint=True,
             observe=True,
         )
-        step_ok(f"返回码: {result.returncode}")
+        step_ok(f"返回码: {result.returncode} ⏱ {time.time()-t0:.3f}s")
         print(f"  checkpoint_id (预分配): {result.checkpoint.checkpoint_id}")
         print(f"  checkpoint 完成?: {result.checkpoint.done}")
         print(f"  filesystem_changed: {result.filesystem_changed}")
@@ -164,19 +169,21 @@ def main() -> None:
         banner("6. 富返回值 — changeset (异步 + 同步)")
 
         # 6a. 异步 changeset
+        t0 = time.time()
         result = sandbox.commands.run("touch /tmp/async_test", changeset=True)
         try:
             entries = result.changeset.wait(timeout=60.0)
-            step_ok(f"异步 changeset: {len(entries)} 条变更")
+            step_ok(f"异步 changeset: {len(entries)} 条变更 ⏱ {time.time()-t0:.3f}s")
         except Exception as exc:
             step_fail(f"等待异步 changeset 失败: {exc}")
 
         # 6b. 同步 changeset
+        t0 = time.time()
         result = sandbox.commands.run(
             "rm /tmp/async_test", changeset=True, changeset_sync=True
         )
         if isinstance(result.changeset, list):
-            step_ok(f"同步 changeset: {len(result.changeset)} 条变更")
+            step_ok(f"同步 changeset: {len(result.changeset)} 条变更 ⏱ {time.time()-t0:.3f}s")
         else:
             step_fail(f"同步 changeset 返回类型异常: {type(result.changeset).__name__}")
 
@@ -198,10 +205,12 @@ def main() -> None:
         if auto_sb is not None:
             sandboxes_to_kill.append(auto_sb)
             step_ok(f"auto_checkpoint 沙箱创建成功: {auto_sb.sandbox_id}")
+            t0 = time.time()
             auto_sb.commands.run("echo step1 > /tmp/s1")
-            step_ok(f"自动 checkpoint: {auto_sb.last_checkpoint_id}")
+            step_ok(f"自动 checkpoint: {auto_sb.last_checkpoint_id} ⏱ {time.time()-t0:.3f}s")
+            t0 = time.time()
             auto_sb.commands.run("echo step2 > /tmp/s2")
-            step_ok(f"第二次自动 checkpoint: {auto_sb.last_checkpoint_id}")
+            step_ok(f"第二次自动 checkpoint: {auto_sb.last_checkpoint_id} ⏱ {time.time()-t0:.3f}s")
         else:
             step_fail("auto_checkpoint 沙箱不可用，跳过后续演示")
 
@@ -212,6 +221,7 @@ def main() -> None:
         print("  命令: for i in 1 2 3; do echo step-$i; sleep 0.5; done")
         print("  输出:")
 
+        t0 = time.time()
         for event in sandbox.commands.stream(
             "for i in 1 2 3; do echo step-$i; sleep 0.5; done"
         ):
@@ -220,7 +230,7 @@ def main() -> None:
             elif isinstance(event, ExecDone):
                 print(f"    [exit] returncode={event.returncode}")
 
-        step_ok("流式执行完成")
+        step_ok(f"流式执行完成 ⏱ {time.time()-t0:.3f}s")
 
         # ----------------------------------------------------------
         # 9. 查看文件变更 (changeset with force)
@@ -232,19 +242,21 @@ def main() -> None:
         print("  先写一个测试文件…")
 
         # 先做一次 checkpoint 作为 changeset 的基线
+        t0 = time.time()
         base_ckpt = safe_run(
             "创建基线 checkpoint",
             sandbox.checkpoint,
             "changeset-base",
         )
         if base_ckpt:
-            step_ok(f"基线 checkpoint: {base_ckpt}")
+            step_ok(f"基线 checkpoint: {base_ckpt} ⏱ {time.time()-t0:.3f}s")
             # 写入测试文件
             sandbox.commands.run("echo 'hello changeset' > /tmp/changeset_test.txt")
             sandbox.commands.run("mkdir -p /opt/demo && echo 123 > /opt/demo/data.txt")
             step_ok("写入了 /tmp/changeset_test.txt 和 /opt/demo/data.txt")
 
             # force=True: 无需等 inspector 观察到变更即可拿到结果
+            t0 = time.time()
             changes = safe_run(
                 "查询 changeset(force=True)",
                 sandbox.changeset,
@@ -252,7 +264,7 @@ def main() -> None:
                 force=True,
             )
             if changes is not None:
-                step_ok(f"changeset 返回 {len(changes)} 条变更 (force 跳过 inspector gate)")
+                step_ok(f"changeset 返回 {len(changes)} 条变更 (force 跳过 inspector gate) ⏱ {time.time()-t0:.3f}s")
                 for entry in changes[:10]:  # 最多显示 10 条
                     print(f"    {entry}")
         else:
@@ -262,9 +274,10 @@ def main() -> None:
         # 10. Checkpoint
         # ----------------------------------------------------------
         banner("10. Checkpoint")
+        t0 = time.time()
         ckpt_id = safe_run("创建 checkpoint", sandbox.checkpoint, "tutorial-ckpt")
         if ckpt_id:
-            step_ok(f"Checkpoint 创建成功: {ckpt_id}")
+            step_ok(f"Checkpoint 创建成功: {ckpt_id} ⏱ {time.time()-t0:.3f}s")
         else:
             step_fail("Checkpoint 不可用 (可能缺少 CRIU 或权限不足)")
 
@@ -272,11 +285,12 @@ def main() -> None:
         # 11. Fork
         # ----------------------------------------------------------
         banner("11. Fork")
+        t0 = time.time()
         forks = safe_run("Fork 沙箱", sandbox.fork, 1)
         if forks:
             fork_sbx = forks[0]
             sandboxes_to_kill.append(fork_sbx)
-            step_ok(f"Fork 成功, fork id = {fork_sbx.sandbox_id}")
+            step_ok(f"Fork 成功, fork id = {fork_sbx.sandbox_id} ⏱ {time.time()-t0:.3f}s")
 
             # 在 fork 里做一些修改
             fork_result = fork_sbx.commands.run(
@@ -296,17 +310,20 @@ def main() -> None:
         # 12. Transaction
         # ----------------------------------------------------------
         banner("12. Transaction (begin / exec / commit|abort)")
+        t0 = time.time()
         txn = safe_run("开启事务", sandbox.begin, "tutorial-txn")
         if txn:
-            step_ok(f"事务已开启: {txn}")
+            step_ok(f"事务已开启: {txn} ⏱ {time.time()-t0:.3f}s")
             # 在事务内执行操作
             try:
+                t0 = time.time()
                 txn_result = txn.exec("echo 'inside txn' > /tmp/txn_file.txt")
-                step_ok(f"事务内 exec 返回码: {txn_result.returncode}")
+                step_ok(f"事务内 exec 返回码: {txn_result.returncode} ⏱ {time.time()-t0:.3f}s")
 
                 # 提交事务
+                t0 = time.time()
                 commit_result = txn.commit()
-                step_ok(f"事务提交成功: {commit_result}")
+                step_ok(f"事务提交成功: {commit_result} ⏱ {time.time()-t0:.3f}s")
             except Exception as exc:
                 step_fail(f"事务操作失败, 尝试 abort: {exc}")
                 try:
@@ -328,8 +345,9 @@ def main() -> None:
         existing_id = sandbox.sandbox_id
         print(f"  重新连接到: {existing_id}")
 
+        t0 = time.time()
         reconnected = Sandbox.connect(existing_id, engine=engine)
-        step_ok(f"重新连接成功, id = {reconnected.sandbox_id}")
+        step_ok(f"重新连接成功, id = {reconnected.sandbox_id} ⏱ {time.time()-t0:.3f}s")
 
         # 验证可以执行命令
         re_result = reconnected.commands.run("echo 'reconnected!'")
@@ -351,8 +369,9 @@ def main() -> None:
             time.sleep(1)
 
             # 暴露端口
+            t0 = time.time()
             allocation = sandbox.ports.expose(8080)
-            step_ok("端口暴露成功:")
+            step_ok(f"端口暴露成功 ⏱ {time.time()-t0:.3f}s:")
             print(f"    guest_port: {allocation.guest_port}")
             print(f"    host_port:  {allocation.host_port}")
             print(f"    url:        {allocation.url}")
@@ -388,8 +407,9 @@ def main() -> None:
         for sbx in sandboxes_to_kill:
             try:
                 sid = sbx.sandbox_id
+                t0 = time.time()
                 sbx.kill()
-                step_ok(f"已清理沙箱: {sid}")
+                step_ok(f"已清理沙箱: {sid} ⏱ {time.time()-t0:.3f}s")
             except Exception as kill_exc:
                 step_fail(f"清理沙箱失败: {kill_exc}")
 

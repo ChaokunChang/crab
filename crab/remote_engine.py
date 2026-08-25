@@ -675,6 +675,56 @@ class RuntimeProxy(Runtime):
 
     # ----- daemon-only API surface the SDK needs in addition to Runtime -----
 
+    def batch_action(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        argv: list[str],
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        user: str | None = None,
+        timeout_s: float | None = None,
+        checkpoint: bool = False,
+        checkpoint_id: str | None = None,
+        changeset: bool = False,
+        changeset_since: str | None = None,
+        observe: bool = False,
+    ) -> dict[str, Any]:
+        """Single-round-trip batch action: exec + observe + checkpoint + changeset.
+
+        Returns the raw response dict from the daemon's
+        ``POST /sandboxes/{id}/action`` endpoint.  The SDK interprets
+        this into an ``ActionResult`` without further network calls."""
+        exec_spec: dict[str, Any] = {"argv": list(argv)}
+        if cwd is not None:
+            exec_spec["cwd"] = cwd
+        if env is not None:
+            exec_spec["env"] = dict(env)
+        if user is not None:
+            exec_spec["user"] = user
+        if timeout_s is not None:
+            exec_spec["timeout_s"] = float(timeout_s)
+
+        payload: dict[str, Any] = {"exec": exec_spec}
+        if observe:
+            payload["observe"] = True
+        if checkpoint:
+            payload["checkpoint"] = True
+            if checkpoint_id is not None:
+                payload["checkpoint_id"] = str(checkpoint_id)
+        if changeset:
+            payload["changeset"] = True
+            if changeset_since is not None:
+                payload["changeset_since"] = str(changeset_since)
+
+        # Timeout: exec may block for the full task timeout; add headroom.
+        http_timeout = (float(timeout_s) + 120.0) if timeout_s else 600.0
+        return self._client.post_json(
+            f"/sandboxes/{sandbox_id}/action",
+            payload,
+            timeout_seconds=http_timeout,
+        )
+
     def update_host_inspector_filters(
         self,
         sandbox_id: SandboxId,

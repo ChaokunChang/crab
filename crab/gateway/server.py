@@ -407,6 +407,8 @@ _PASSTHROUGH_SANDBOX_ROUTES: list[tuple[str, str, float]] = [
     ("DELETE", "/network/lease", _FAST_TIMEOUT_S),
     ("POST", "/host_inspector/filters", _FAST_TIMEOUT_S),
     ("POST", "/processes/merge", _SLOW_TIMEOUT_S),
+    # Batch action (exec + observe + checkpoint + changeset in one round-trip)
+    ("POST", "/action", _SLOW_TIMEOUT_S),
 ]
 
 

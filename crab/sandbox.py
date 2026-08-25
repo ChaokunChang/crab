@@ -253,7 +253,21 @@ class _CommandsNamespace:
             else:
                 raise TypeError("commands.run requires either cmd or argv")
         merged_env = self._sandbox._command_env(env)
+
+        # Resolve whether to checkpoint (per-call or sandbox-level auto)
+        do_checkpoint = checkpoint or bool(self._sandbox._auto_checkpoint)
+
+        # If any enrichment is requested AND we're in remote mode, use the
+        # batch action endpoint to save round-trips.
         runtime = self._sandbox._engine.runtime
+        if (do_checkpoint or changeset or observe) and hasattr(runtime, "batch_action"):
+            return self._run_batch(
+                argv=argv, cwd=cwd, env=merged_env, user=user,
+                timeout=timeout, check=check,
+                do_checkpoint=do_checkpoint, changeset=changeset,
+                changeset_sync=changeset_sync, observe=observe,
+            )
+
         result = runtime.exec(
             self._sandbox.sandbox_id,
             argv,
@@ -268,8 +282,6 @@ class _CommandsNamespace:
                 f"sandbox command failed: rc={result.returncode} cmd={cmd!r} "
                 f"stderr={result.stderr!r}"
             )
-        # Resolve whether to checkpoint (per-call or sandbox-level auto)
-        do_checkpoint = checkpoint or bool(self._sandbox._auto_checkpoint)
         return self._sandbox._build_action_result(
             returncode=result.returncode,
             stdout=result.stdout,
@@ -279,6 +291,112 @@ class _CommandsNamespace:
             do_changeset=changeset,
             changeset_sync=changeset_sync,
             do_observe=observe,
+        )
+
+    def _run_batch(
+        self,
+        *,
+        argv: list[str],
+        cwd: str | None,
+        env: dict[str, str] | None,
+        user: str | None,
+        timeout: float | None,
+        check: bool,
+        do_checkpoint: bool,
+        changeset: bool,
+        changeset_sync: bool,
+        observe: bool,
+    ) -> ActionResult:
+        """Execute via the daemon batch action endpoint (one round-trip)."""
+        sandbox = self._sandbox
+        runtime = sandbox._engine.runtime
+
+        # Snapshot the previous checkpoint id BEFORE we overwrite it.
+        prev_ckpt_id = sandbox._last_checkpoint_id
+
+        # Pre-allocate checkpoint id client-side (mirrors _start_async_checkpoint)
+        ckpt_id: str | None = None
+        if do_checkpoint:
+            ckpt_id = f"ckpt-{uuid.uuid4().hex[:12]}"
+            sandbox._last_checkpoint_id = ckpt_id
+
+        # Determine changeset_since: the previous checkpoint id (same
+        # semantics as the local path in _build_action_result).
+        changeset_since: str | None = None
+        if changeset and prev_ckpt_id:
+            changeset_since = prev_ckpt_id
+
+        response = runtime.batch_action(
+            sandbox.sandbox_id,
+            argv=argv,
+            cwd=cwd,
+            env=env,
+            user=user,
+            timeout_s=timeout,
+            checkpoint=do_checkpoint,
+            checkpoint_id=ckpt_id,
+            changeset=changeset,
+            changeset_since=changeset_since,
+            observe=observe,
+        )
+
+        # Parse exec result
+        exec_data = response.get("exec") or {}
+        returncode = int(exec_data.get("returncode", -1))
+        stdout = str(exec_data.get("stdout") or "")
+        stderr = str(exec_data.get("stderr") or "")
+
+        if check and returncode != 0:
+            raise RuntimeError(
+                f"sandbox command failed: rc={returncode} cmd={argv!r} "
+                f"stderr={stderr!r}"
+            )
+
+        # Build checkpoint handle (already done server-side; wrap as resolved)
+        ckpt_handle: AsyncCheckpoint | None = None
+        if do_checkpoint and ckpt_id:
+            # Create an already-completed AsyncCheckpoint handle
+            done_thread = threading.Thread(target=lambda: None)
+            done_thread.start()
+            done_thread.join()
+            ckpt_handle = AsyncCheckpoint(ckpt_id, done_thread)
+            # The server response may carry its own id; reconcile
+            server_ckpt = response.get("checkpoint_id")
+            if server_ckpt and server_ckpt != ckpt_id:
+                ckpt_handle.checkpoint_id = str(server_ckpt)
+                sandbox._last_checkpoint_id = str(server_ckpt)
+
+        # Build changeset handle
+        cs_handle: AsyncChangeset | list[dict] | None = None
+        if changeset:
+            raw_cs = response.get("changeset")
+            if isinstance(raw_cs, list):
+                if changeset_sync:
+                    cs_handle = raw_cs
+                else:
+                    # Wrap in an already-resolved AsyncChangeset
+                    done_thread = threading.Thread(target=lambda: None)
+                    done_thread.start()
+                    done_thread.join()
+                    handle = AsyncChangeset(done_thread)
+                    handle._result = raw_cs
+                    cs_handle = handle
+            else:
+                cs_handle = None
+
+        # Observer flags
+        fs_changed = response.get("filesystem_changed")
+        proc_changed = response.get("process_changed")
+
+        return ActionResult(
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+            args=tuple(argv),
+            checkpoint=ckpt_handle,
+            changeset=cs_handle,
+            filesystem_changed=fs_changed,
+            process_changed=proc_changed,
         )
 
     def stream(

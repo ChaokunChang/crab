@@ -480,5 +480,138 @@ class ExecStreamTests(unittest.TestCase):
         self.assertEqual(system.fork_calls, [(SandboxId("sbx-test"), True)])
 
 
+# ---------------------------------------------------------------------------
+# Batch action: remote-mode single-round-trip path
+# ---------------------------------------------------------------------------
+
+
+class _FakeRuntimeWithBatchAction(_FakeRuntime):
+    """Fake runtime that also exposes batch_action (simulating RuntimeProxy)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.batch_calls: list[dict] = []
+
+    def batch_action(
+        self,
+        sandbox_id,
+        *,
+        argv,
+        cwd=None,
+        env=None,
+        user=None,
+        timeout_s=None,
+        checkpoint=False,
+        checkpoint_id=None,
+        changeset=False,
+        changeset_since=None,
+        observe=False,
+    ):
+        self.batch_calls.append({
+            "sandbox_id": sandbox_id,
+            "argv": argv,
+            "checkpoint": checkpoint,
+            "checkpoint_id": checkpoint_id,
+            "changeset": changeset,
+            "changeset_since": changeset_since,
+            "observe": observe,
+        })
+        response = {
+            "ok": True,
+            "exec": {"returncode": 0, "stdout": "batch-ok\n", "stderr": ""},
+        }
+        if observe:
+            response["filesystem_changed"] = True
+            response["process_changed"] = False
+        if checkpoint and checkpoint_id:
+            response["checkpoint_id"] = checkpoint_id
+        if changeset:
+            response["changeset"] = [{"path": "/tmp/x", "change": "added"}]
+        return response
+
+
+def _make_batch_sandbox(*, auto_checkpoint=False):
+    system = _FakeSystem()
+    runtime = _FakeRuntimeWithBatchAction()
+    engine = _FakeEngine(system, runtime)
+    sbx = Sandbox(engine=engine, autostart=False, auto_checkpoint=auto_checkpoint)
+    sbx._sandbox_id = SandboxId("sbx-batch")
+    return sbx, system, runtime
+
+
+class BatchActionTests(unittest.TestCase):
+    def test_batch_used_when_observe_true(self) -> None:
+        sbx, _system, runtime = _make_batch_sandbox()
+        result = sbx.commands.run("echo hi", observe=True)
+        # Should use batch path, not individual exec
+        self.assertEqual(len(runtime.batch_calls), 1)
+        self.assertEqual(len(runtime.exec_calls), 0)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "batch-ok\n")
+        self.assertTrue(result.filesystem_changed)
+        self.assertFalse(result.process_changed)
+
+    def test_batch_used_when_checkpoint_true(self) -> None:
+        sbx, _system, runtime = _make_batch_sandbox()
+        result = sbx.commands.run("echo hi", checkpoint=True)
+        self.assertEqual(len(runtime.batch_calls), 1)
+        self.assertIsNotNone(result.checkpoint)
+        self.assertTrue(result.checkpoint.done)
+        ckpt_id = result.checkpoint.checkpoint_id
+        self.assertTrue(ckpt_id.startswith("ckpt-"))
+        self.assertEqual(sbx.last_checkpoint_id, ckpt_id)
+
+    def test_batch_used_when_changeset_true(self) -> None:
+        sbx, _system, runtime = _make_batch_sandbox()
+        # Set a previous checkpoint for changeset_since
+        sbx._last_checkpoint_id = "ckpt-prev"
+        result = sbx.commands.run("touch x", changeset=True)
+        self.assertEqual(len(runtime.batch_calls), 1)
+        self.assertEqual(runtime.batch_calls[0]["changeset_since"], "ckpt-prev")
+        # Changeset should be an AsyncChangeset wrapper
+        self.assertIsInstance(result.changeset, AsyncChangeset)
+        entries = result.changeset.wait(timeout=1.0)
+        self.assertEqual(entries, [{"path": "/tmp/x", "change": "added"}])
+
+    def test_batch_changeset_sync_returns_list(self) -> None:
+        sbx, _system, runtime = _make_batch_sandbox()
+        sbx._last_checkpoint_id = "ckpt-prev"
+        result = sbx.commands.run("touch x", changeset=True, changeset_sync=True)
+        self.assertIsInstance(result.changeset, list)
+        self.assertEqual(result.changeset, [{"path": "/tmp/x", "change": "added"}])
+
+    def test_batch_not_used_for_plain_exec(self) -> None:
+        sbx, _system, runtime = _make_batch_sandbox()
+        result = sbx.commands.run("echo hi")
+        # No enrichments -> normal exec path
+        self.assertEqual(len(runtime.exec_calls), 1)
+        self.assertEqual(len(runtime.batch_calls), 0)
+
+    def test_batch_auto_checkpoint_triggers_batch(self) -> None:
+        sbx, _system, runtime = _make_batch_sandbox(auto_checkpoint=True)
+        result = sbx.commands.run("echo hi")
+        # auto_checkpoint means do_checkpoint=True -> batch path
+        self.assertEqual(len(runtime.batch_calls), 1)
+        self.assertIsNotNone(result.checkpoint)
+
+    def test_batch_all_enrichments_combined(self) -> None:
+        sbx, _system, runtime = _make_batch_sandbox()
+        sbx._last_checkpoint_id = "ckpt-base"
+        result = sbx.commands.run(
+            "echo hi", checkpoint=True, changeset=True, observe=True
+        )
+        self.assertEqual(len(runtime.batch_calls), 1)
+        call = runtime.batch_calls[0]
+        self.assertTrue(call["checkpoint"])
+        self.assertTrue(call["changeset"])
+        self.assertTrue(call["observe"])
+        self.assertEqual(call["changeset_since"], "ckpt-base")
+        # All fields populated
+        self.assertIsNotNone(result.checkpoint)
+        self.assertIsNotNone(result.changeset)
+        self.assertTrue(result.filesystem_changed)
+        self.assertFalse(result.process_changed)
+
+
 if __name__ == "__main__":
     unittest.main()
