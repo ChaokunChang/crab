@@ -96,6 +96,29 @@ def main() -> None:
     step_ok(f"Engine 连接成功 ⏱ {time.time()-t0:.3f}s")
     print(f"  Engine 类型: {type(engine).__name__}")
 
+    # ----------------------------------------------------------
+    # 1.5 清理残留沙箱（确保从干净配额开始）
+    # ----------------------------------------------------------
+    # 上一次跑 tutorial 可能留下未清理的沙箱，占用 tenant 配额——例如
+    # 3 个残留沙箱 × 2G 就会占满 6G 配额，导致后面 step 11 的 fork
+    # 因配额不足而失败。这里在创建任何新沙箱 *之前*，先把当前 API key
+    # 可见的沙箱全部 kill 掉。友好容错：任一步失败都只打印告警、不中断。
+    banner("1.5 清理残留沙箱")
+    t0 = time.time()
+    existing = safe_run("列出残留沙箱", engine.list_sandboxes) or []
+    cleaned = 0
+    for s in existing:
+        sid = s.get("sandbox_id")
+        if not sid:
+            continue
+        try:
+            Sandbox.connect(sid, engine=engine).kill()
+            cleaned += 1
+            print(f"    已清理: {sid}")
+        except Exception as exc:
+            step_fail(f"清理 {sid} 失败（忽略）: {exc}")
+    step_ok(f"清理了 {cleaned}/{len(existing)} 个残留沙箱 ⏱ {time.time()-t0:.3f}s")
+
     try:
         # ----------------------------------------------------------
         # 2. 远程创建沙箱
@@ -289,14 +312,23 @@ def main() -> None:
             # `runc exec` 的管道继承阻塞——否则光加 `&` 会一直阻塞到进程退出。
             # detach 只解除“管道继承阻塞”，不改变进程生命周期：命令自身
             # 仍须用 `&` 后台化，run 才会立即返回；detach 模式不返回输出。
-            # 这个占用 512m 内存、sleep 10 的后台进程会被本次 auto_checkpoint 捕获。
-            auto_sb.commands.run(
-                "bash -c 'x=$(head -c 512m /dev/zero); sleep 10' &", detach=True
+            # 这个占用 512m 内存、sleep 30 的后台进程会被本次 auto_checkpoint 捕获。
+            # observe=True 在 exec 之后、checkpoint 之前做一次只读 inspector peek。
+            # process_changed 由 host-inspector 对比“当前 cgroup 活进程集”与“上次
+            # checkpoint 基线”得出（实时读 cgroup PID，不是靠消费 eBPF 事件），所以
+            # 只要后台进程还活着 process_changed 就稳定为 True；本命令没写磁盘，
+            # 因此 filesystem_changed=False（VM 实测：proc=True / fs=False）。
+            tmp1 = auto_sb.commands.run(
+                "bash -c 'x=$(head -c 512m /dev/zero); sleep 30' &", detach=True, observe=True
             )
             step_ok(f"自动 checkpoint: {auto_sb.last_checkpoint_id} ⏱ {time.time()-t0:.3f}s")
+            print(f"  filesystem_changed: {tmp1.filesystem_changed}")
+            print(f"  process_changed: {tmp1.process_changed}")
             t0 = time.time()
-            tmp2 = auto_sb.commands.run("echo step2 > /tmp/s2")
+            tmp2 = auto_sb.commands.run("echo step2 > /tmp/s2", observe=True)
             step_ok(f"第二次自动 checkpoint（含背压）: {auto_sb.last_checkpoint_id} ⏱ {time.time()-t0:.3f}s")
+            print(f"  filesystem_changed: {tmp2.filesystem_changed}")
+            print(f"  process_changed: {tmp2.process_changed}")
             try:
                 tmp2.checkpoint.wait(timeout=120.0)
             except Exception as exc:
