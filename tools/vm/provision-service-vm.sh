@@ -7,8 +7,16 @@
 #   bash tools/vm/provision-service-vm.sh          # provision & start
 #   bash tools/vm/provision-service-vm.sh --stop   # shut down the service VM
 #   bash tools/vm/provision-service-vm.sh --status # show running state
+#   bash tools/vm/provision-service-vm.sh --reset  # wipe ALL crab state & rebuild
 #
 # Idempotent: re-running on a live VM syncs code and confirms service health.
+#
+# --reset wipes everything on a *running* service VM and rebuilds a clean stack:
+#   stops gateway + daemon, deletes all sandboxes (runc containers + per-sandbox
+#   ZFS datasets + bundle/checkpoint/metadata dirs), deletes the gateway registry
+#   SQLite (all tenants + API keys), restarts the daemon (--config) + gateway, and
+#   recreates a fresh default tenant + API key (printed once). Image rootfs caches
+#   are preserved so the first post-reset launch stays fast.
 
 set -euo pipefail
 
@@ -28,6 +36,14 @@ MAX_MEMORY=${MAX_MEMORY:-6G}  # leave ~2G for system overhead
 
 # Gateway listen port inside the VM (matches the host-side forward target)
 VM_GATEWAY_PORT=8900
+
+# Reset-related paths inside the VM (source of truth for --reset teardown).
+# The service VM runs the daemon as `python3 -m crab.daemon --config <path>`.
+CRAB_CONFIG_PATH=${CRAB_CONFIG_PATH:-/etc/crab/config.yaml}
+GATEWAY_DATA_DIR=${GATEWAY_DATA_DIR:-/var/lib/crab/gateway}
+# The deployed crab lives at /root/crab and is loaded via PYTHONPATH (the stock
+# dist-packages copy is older); restart daemon/gateway the same way on --reset.
+VM_CODE_PATH=${VM_CODE_PATH:-/root/crab}
 
 # =============================================================================
 # Source vm-lib.sh to reuse shared variables and helpers
@@ -156,6 +172,135 @@ if [ "${1:-}" = "--status" ]; then
         echo "Service VM: NOT RUNNING"
         [ -f "$SVC_DISK" ] && echo "  Disk exists: $SVC_DISK"
     fi
+    exit 0
+fi
+
+# =============================================================================
+# --reset: wipe ALL crab state on a running service VM and rebuild a clean stack
+# =============================================================================
+
+if [ "${1:-}" = "--reset" ]; then
+    svc_vm_running || die "Service VM is not running; start it first: bash tools/vm/provision-service-vm.sh"
+    svc_vm_wait_ssh 30 || die "SSH to service VM not available"
+
+    log "RESET: syncing latest repo into service VM..."
+    svc_vm_rsync_repo
+
+    log "RESET: stopping gateway + daemon..."
+    svc_vm_ssh "fuser -k ${VM_GATEWAY_PORT}/tcp 2>/dev/null || true"
+    # The bracket trick (crab[.]daemon) keeps pkill's own cmdline from matching.
+    svc_vm_ssh 'pkill -f "crab[.]gateway" 2>/dev/null || true; pkill -f "crab[.]daemon" 2>/dev/null || true; sleep 2; rm -f /run/crab/crab.sock'
+
+    log "RESET: deleting all sandboxes (runc containers + ZFS datasets + state dirs)..."
+    svc_vm_ssh "CRAB_CONFIG_PATH='$CRAB_CONFIG_PATH' bash -s" <<'REMOTE'
+set -u
+CONFIG="${CRAB_CONFIG_PATH:-/etc/crab/config.yaml}"
+
+# Derive storage roots from the daemon config (fall back to standard defaults).
+eval "$(python3 - "$CONFIG" <<'PY'
+import sys, yaml
+cfg = {}
+try:
+    with open(sys.argv[1]) as fh:
+        cfg = yaml.safe_load(fh) or {}
+except Exception:
+    pass
+p = cfg.get("storage_planes", {}) or {}
+print('RUNTIME_ROOT="%s"' % p.get("runtime_root", "/var/lib/crab/runtime"))
+print('STORAGE_ROOT="%s"' % p.get("storage_root", "/var/lib/crab/checkpoints"))
+PY
+)"
+echo "  runtime_root=$RUNTIME_ROOT  storage_root=$STORAGE_ROOT"
+
+# 1. runc containers.
+if command -v runc >/dev/null 2>&1; then
+    for c in $(runc list -q 2>/dev/null); do
+        echo "  runc delete $c"
+        runc delete --force "$c" 2>/dev/null || true
+    done
+fi
+
+# 2. Per-sandbox ZFS datasets, identified by the /sbx- component. This catches
+#    every dataset tree (e.g. crab/sandboxes/sbx-*, stale crab/<run>/sbx-*) while
+#    leaving image rootfs caches (…-cache-…, no /sbx-) intact.
+if command -v zfs >/dev/null 2>&1; then
+    for ds in $(zfs list -H -o name 2>/dev/null | grep '/sbx-' || true); do
+        echo "  zfs destroy -rf $ds"
+        zfs destroy -rf "$ds" 2>/dev/null || true
+    done
+fi
+
+# 3. Bundle / checkpoint / metadata directories.
+if [ -n "${RUNTIME_ROOT:-}" ]; then
+    rm -rf "$RUNTIME_ROOT"/bundles/* "$RUNTIME_ROOT"/checkpoints/* \
+           "$RUNTIME_ROOT"/runtime-state/* "$RUNTIME_ROOT"/sandbox-meta/* 2>/dev/null || true
+fi
+if [ -n "${STORAGE_ROOT:-}" ]; then
+    rm -rf "$STORAGE_ROOT"/artifacts/* "$STORAGE_ROOT"/manifests/* \
+           "$STORAGE_ROOT"/journal/* 2>/dev/null || true
+fi
+echo "  sandbox state dirs cleaned"
+REMOTE
+
+    log "RESET: deleting gateway registry (all tenants + API keys)..."
+    svc_vm_ssh "rm -f '$GATEWAY_DATA_DIR'/gateway.sqlite3 '$GATEWAY_DATA_DIR'/gateway.sqlite3-wal '$GATEWAY_DATA_DIR'/gateway.sqlite3-shm"
+
+    log "RESET: restarting daemon (--config $CRAB_CONFIG_PATH)..."
+    svc_vm_ssh 'mkdir -p /run/crab'
+    svc_vm_ssh_daemon "cd / && setsid env PYTHONPATH='$VM_CODE_PATH' python3 -m crab.daemon --config '$CRAB_CONFIG_PATH' </dev/null >/var/log/crabd.log 2>&1"
+    for _ in $(seq 1 30); do
+        svc_vm_ssh '[ -S /run/crab/crab.sock ]' 2>/dev/null && break
+        sleep 1
+    done
+    svc_vm_ssh '[ -S /run/crab/crab.sock ]' 2>/dev/null \
+        || { svc_vm_ssh 'tail -20 /var/log/crabd.log' >&2; die "daemon socket not ready after reset"; }
+    log "daemon socket ready"
+
+    log "RESET: restarting gateway..."
+    svc_vm_ssh_daemon "cd / && setsid env PYTHONPATH='$VM_CODE_PATH' python3 -m crab.gateway serve \
+        --bind 0.0.0.0:${VM_GATEWAY_PORT} \
+        --daemon-socket /run/crab/crab.sock \
+        --log-level INFO </dev/null >/var/log/crab-gateway.log 2>&1"
+    for _ in $(seq 1 30); do
+        svc_vm_ssh "curl -sf http://localhost:${VM_GATEWAY_PORT}/healthz" >/dev/null 2>&1 && break
+        sleep 1
+    done
+    svc_vm_ssh "curl -sf http://localhost:${VM_GATEWAY_PORT}/healthz" >/dev/null 2>&1 \
+        || { svc_vm_ssh 'tail -30 /var/log/crab-gateway.log' >&2; die "gateway not healthy after reset"; }
+    log "gateway healthy"
+
+    # Recreate a fresh default tenant + API key.
+    log "RESET: creating fresh tenant '$TENANT_NAME'..."
+    TENANT_CREATE_OUT=$(svc_vm_ssh "cd / && PYTHONPATH='$VM_CODE_PATH' python3 -m crab.gateway tenants create '$TENANT_NAME' \
+        --max-sandboxes $MAX_SANDBOXES --max-memory '$MAX_MEMORY'" 2>&1) || true
+    TENANT_ID=$(svc_vm_ssh "cd / && PYTHONPATH='$VM_CODE_PATH' python3 -m crab.gateway tenants list" 2>/dev/null | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for t in data.get('tenants', []):
+    if t.get('name') == '$TENANT_NAME':
+        print(t['id']); break
+" 2>/dev/null || echo "")
+    [ -n "$TENANT_ID" ] || die "could not determine tenant id after reset (output: $TENANT_CREATE_OUT)"
+
+    API_KEY_OUTPUT=$(svc_vm_ssh "cd / && PYTHONPATH='$VM_CODE_PATH' python3 -m crab.gateway keys create --tenant '$TENANT_ID'") \
+        || die "failed to create API key after reset"
+    API_KEY=$(echo "$API_KEY_OUTPUT" | grep -oP 'crab_sk_\w+' | head -1 || echo "")
+    [ -n "$API_KEY" ] || API_KEY="(check gateway output: $API_KEY_OUTPUT)"
+
+    HOST_IP=$(get_host_ip)
+    cat <<EOF
+
+====== Crab Service VM RESET complete ======
+Gateway: http://${HOST_IP}:${SERVICE_VM_GATEWAY_PORT}
+Tenant:  ${TENANT_NAME} (id: ${TENANT_ID})
+API Key: ${API_KEY}
+
+All previous tenants, API keys, and sandboxes were wiped; image caches kept.
+Export the new credentials to use the tutorial:
+  export CRAB_GATEWAY_URL=http://${HOST_IP}:${SERVICE_VM_GATEWAY_PORT}
+  export CRAB_API_KEY=${API_KEY}
+=============================================
+EOF
     exit 0
 fi
 

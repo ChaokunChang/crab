@@ -8,13 +8,18 @@
 使用前准备:
   1. 确保目标机器已部署 crab-gateway（或 daemon）并在监听 HTTP 端口。
   2. 安装 SDK: pip install crab  （或在项目根目录 pip install -e .）
-  3. 修改下方 GATEWAY_URL 和 API_KEY 为你的实际值。
+  3. 通过环境变量提供 Gateway 地址和 API key（不要把凭证写死进源码）：
+         export CRAB_GATEWAY_URL=http://your-gateway-host:8900
+         export CRAB_API_KEY=crab_sk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 运行:
+    export CRAB_GATEWAY_URL=http://host:8900 CRAB_API_KEY=crab_sk_xxx
     python examples/sdk/04_remote_service_tutorial.py
 """
 from __future__ import annotations
 
+import os
+import sys
 import time
 import traceback
 from urllib.parse import urlparse
@@ -23,12 +28,14 @@ from crab import Engine, Sandbox
 from crab.models import ExecEvent, ExecDone
 
 # ============================================================
-# ★ 用户配置区 ★  —— 修改下面两行即可
+# ★ 用户配置区 ★  —— 通过环境变量提供凭证（勿硬编码真实 key/URL）
 # ============================================================
-GATEWAY_URL = "http://11.164.176.165:8900"  # Gateway 地址（含端口）
-API_KEY = "crab_sk_69c85f1d6c5169e310d7d2f1170a8664a46399fb20481d8a"                       # 在 Gateway 上创建的 tenant key
+# export CRAB_GATEWAY_URL=http://your-gateway-host:8900
+# export CRAB_API_KEY=crab_sk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+GATEWAY_URL = os.environ.get("CRAB_GATEWAY_URL", "http://YOUR_GATEWAY_HOST:8900")
+API_KEY = os.environ.get("CRAB_API_KEY", "YOUR_API_KEY")
 
-# 创建沙箱时使用的镜像和资源配置
+# 创建沙箱时使用的镜像和资源配置（非敏感，可直接改）
 SANDBOX_IMAGE = "ubuntu:22.04"
 SANDBOX_RESOURCES = {"memory": "2G", "cpus": 2}
 
@@ -68,6 +75,13 @@ def safe_run(description: str, func, *args, **kwargs):
 # ============================================================
 
 def main() -> None:
+    # 凭证检查：未设置环境变量时友好提示并退出
+    if API_KEY == "YOUR_API_KEY" or GATEWAY_URL == "http://YOUR_GATEWAY_HOST:8900":
+        print("请先设置环境变量后再运行:")
+        print("  export CRAB_GATEWAY_URL=http://your-gateway-host:8900")
+        print("  export CRAB_API_KEY=crab_sk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+        sys.exit(1)
+
     # 用于最终统一清理的沙箱列表
     sandboxes_to_kill: list[Sandbox] = []
 
