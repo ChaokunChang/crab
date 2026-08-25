@@ -645,9 +645,13 @@ class RuntimeProxy(Runtime):
         env: dict[str, str] | None = None,
         user: str | None = None,
         timeout_s: float | None = None,
+        capture_output: bool = True,
     ) -> Iterator[ExecEvent | ExecDone]:
         """Streaming exec: yields ExecEvent/ExecDone as output arrives."""
-        payload: dict[str, Any] = {"argv": list(argv)}
+        payload: dict[str, Any] = {
+            "argv": list(argv),
+            "capture_output": bool(capture_output),
+        }
         if cwd is not None:
             payload["cwd"] = cwd
         if env is not None:
@@ -684,6 +688,7 @@ class RuntimeProxy(Runtime):
         env: dict[str, str] | None = None,
         user: str | None = None,
         timeout_s: float | None = None,
+        capture_output: bool = True,
         checkpoint: bool = False,
         checkpoint_id: str | None = None,
         changeset: bool = False,
@@ -695,7 +700,10 @@ class RuntimeProxy(Runtime):
         Returns the raw response dict from the daemon's
         ``POST /sandboxes/{id}/action`` endpoint.  The SDK interprets
         this into an ``ActionResult`` without further network calls."""
-        exec_spec: dict[str, Any] = {"argv": list(argv)}
+        exec_spec: dict[str, Any] = {
+            "argv": list(argv),
+            "capture_output": bool(capture_output),
+        }
         if cwd is not None:
             exec_spec["cwd"] = cwd
         if env is not None:

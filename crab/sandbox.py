@@ -340,6 +340,35 @@ class _CommandsNamespace:
     def __init__(self, sandbox: "Sandbox") -> None:
         self._sandbox = sandbox
 
+    @staticmethod
+    def _detach_wrap(argv: list[str]) -> list[str]:
+        """Wrap ``argv`` so its stdio is redirected to ``/dev/null`` *inside*
+        the container before the command runs.
+
+        This is what makes ``detach=True`` actually return promptly for a
+        ``"... &"`` command. ``runc exec`` (no ``-d``) relays the container
+        process's stdout/stderr through an internal pipe and waits for that
+        pipe to reach EOF; a ``&``-backgrounded child inherits the pipe and
+        keeps it open until it exits, so ``run`` blocks even though the
+        foreground shell already returned. Merely discarding output on the
+        host side (``capture_output=False``) does *not* help — the relay pipe
+        still exists. Reopening fd1/fd2 to ``/dev/null`` with ``exec`` closes
+        the child's handle on the relay pipe, so ``runc exec`` sees EOF as
+        soon as the foreground shell exits.
+        """
+        if (
+            len(argv) >= 3
+            and argv[0] in ("/bin/sh", "/bin/bash", "sh", "bash")
+            and argv[1] == "-c"
+        ):
+            # Shell-string form: prepend the redirect to the script itself.
+            wrapped = list(argv)
+            wrapped[2] = f"exec 1>/dev/null 2>&1; {argv[2]}"
+            return wrapped
+        # Direct argv form: run under a shell that redirects, then execs it.
+        quoted = " ".join(shlex.quote(a) for a in argv)
+        return ["/bin/sh", "-c", f"exec 1>/dev/null 2>&1; {quoted}"]
+
     def run(
         self,
         cmd: str | list[str] | None = None,
@@ -350,6 +379,7 @@ class _CommandsNamespace:
         user: str | None = None,
         timeout: float | None = None,
         capture_output: bool = True,
+        detach: bool = False,
         check: bool = False,
         checkpoint: bool = False,
         changeset: bool = False,
@@ -363,6 +393,27 @@ class _CommandsNamespace:
           - ``changeset=True``: compute filesystem changeset after exec
           - ``changeset_sync=True``: make changeset synchronous (returns list)
           - ``observe=True``: peek inspector state (filesystem/process changed)
+
+        ``detach=True`` is for launching background processes. It (1) sets
+        ``capture_output=False`` and (2) redirects the command's stdout/stderr
+        to ``/dev/null`` *inside* the container. Without (2), a command like
+        ``"myserver &"`` would *hang* ``run`` even though the shell returned:
+        ``runc exec`` relays the container process's stdio through an internal
+        pipe and waits for EOF, and the ``&``-backgrounded child inherits that
+        pipe and holds it open until it exits (discarding output host-side is
+        not enough — the relay pipe still exists). The in-container redirect
+        closes the child's handle on the pipe so ``run`` returns as soon as
+        the foreground shell exits.
+
+        Note the boundary: ``detach`` removes the *pipe-inheritance* block, not
+        the *process-lifecycle* block. ``runc exec`` still waits for the
+        foreground process to exit, so ``run("sleep 3", detach=True)`` (no
+        ``&``) still blocks ~3s. To return immediately the command must
+        background itself (``"... &"``) or already be a daemon. Because output
+        is sent to ``/dev/null``, the returned ``ActionResult`` has empty
+        ``stdout``/``stderr``; enrichments (checkpoint/changeset/observe)
+        still work, and a subsequent checkpoint captures the process while it
+        is alive.
         """
         if argv is None:
             if isinstance(cmd, list):
@@ -371,6 +422,9 @@ class _CommandsNamespace:
                 argv = ["/bin/sh", "-c", cmd]
             else:
                 raise TypeError("commands.run requires either cmd or argv")
+        if detach:
+            capture_output = False
+            argv = self._detach_wrap(argv)
         merged_env = self._sandbox._command_env(env)
 
         # Resolve whether to checkpoint (per-call or sandbox-level auto)
@@ -382,7 +436,7 @@ class _CommandsNamespace:
         if (do_checkpoint or changeset or observe) and hasattr(runtime, "batch_action"):
             return self._run_batch(
                 argv=argv, cwd=cwd, env=merged_env, user=user,
-                timeout=timeout, check=check,
+                timeout=timeout, capture_output=capture_output, check=check,
                 do_checkpoint=do_checkpoint, changeset=changeset,
                 changeset_sync=changeset_sync, observe=observe,
             )
@@ -420,6 +474,7 @@ class _CommandsNamespace:
         env: dict[str, str] | None,
         user: str | None,
         timeout: float | None,
+        capture_output: bool = True,
         check: bool,
         do_checkpoint: bool,
         changeset: bool,
@@ -452,6 +507,7 @@ class _CommandsNamespace:
             env=env,
             user=user,
             timeout_s=timeout,
+            capture_output=capture_output,
             checkpoint=do_checkpoint,
             checkpoint_id=ckpt_id,
             changeset=changeset,
@@ -557,6 +613,7 @@ class _CommandsNamespace:
         env: dict[str, str] | None = None,
         user: str | None = None,
         timeout: float | None = None,
+        detach: bool = False,
         checkpoint: bool = False,
         changeset: bool = False,
         changeset_sync: bool = False,
@@ -567,6 +624,12 @@ class _CommandsNamespace:
         Iterate the stream to consume events; after iteration completes,
         access ``stream.result`` for the ActionResult with checkpoint/
         changeset/observer information.
+
+        ``detach=True`` mirrors ``run(detach=True)``: it redirects the
+        command's stdout/stderr to ``/dev/null`` inside the container (so no
+        ``ExecEvent`` output is produced) which is what actually releases the
+        pipe-inheritance block a ``&``-backgrounded child would otherwise
+        impose; see ``run`` for the full stdio semantics.
 
         Usage::
 
@@ -583,6 +646,8 @@ class _CommandsNamespace:
                 argv = ["/bin/sh", "-c", cmd]
             else:
                 raise TypeError("commands.stream requires either cmd or argv")
+        if detach:
+            argv = self._detach_wrap(argv)
         merged_env = self._sandbox._command_env(env)
         runtime = self._sandbox._engine.runtime
         gen = runtime.stream_exec(
@@ -592,6 +657,7 @@ class _CommandsNamespace:
             env=merged_env,
             user=user,
             timeout_s=timeout,
+            capture_output=not detach,
         )
         do_checkpoint = checkpoint or bool(self._sandbox._auto_checkpoint)
         return ExecStream(

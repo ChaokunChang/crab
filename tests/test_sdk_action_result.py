@@ -118,10 +118,12 @@ class _FakeRuntime:
 
     def __init__(self) -> None:
         self.exec_calls: list[list[str]] = []
+        self.exec_capture_output: list[bool] = []
 
     def exec(self, sandbox_id, argv, *, cwd=None, env=None, user=None,
              timeout_s=None, capture_output=True):
         self.exec_calls.append(argv)
+        self.exec_capture_output.append(capture_output)
         return SandboxExecResult(
             args=tuple(argv),
             returncode=0,
@@ -130,7 +132,8 @@ class _FakeRuntime:
         )
 
     def stream_exec(self, sandbox_id, argv, *, cwd=None, env=None, user=None,
-                    timeout_s=None):
+                    timeout_s=None, capture_output=True):
+        self.stream_capture_output = capture_output
         yield ExecEvent(channel="stdout", text="line1\n")
         yield ExecEvent(channel="stdout", text="line2\n")
         yield ExecDone(returncode=0)
@@ -179,6 +182,63 @@ class ActionResultBasicsTests(unittest.TestCase):
         result = sbx.commands.run(argv=["ls", "-la"])
         self.assertEqual(result.args, ("ls", "-la"))
         self.assertEqual(runtime.exec_calls, [["ls", "-la"]])
+
+    def test_default_run_captures_output(self) -> None:
+        sbx, _system, runtime = _make_sandbox()
+        sbx.commands.run("echo hi")
+        self.assertEqual(runtime.exec_capture_output, [True])
+
+    def test_detach_disables_capture_output(self) -> None:
+        # detach=True on the plain (non-batch) exec path must plumb
+        # capture_output=False down to the runtime AND redirect the
+        # command's stdio to /dev/null inside the container.
+        sbx, _system, runtime = _make_sandbox()
+        result = sbx.commands.run("myserver &", detach=True)
+        self.assertEqual(runtime.exec_capture_output, [False])
+        # argv is wrapped so a &-backgrounded child releases the exec pipe.
+        self.assertEqual(
+            runtime.exec_calls[0],
+            ["/bin/sh", "-c", "exec 1>/dev/null 2>&1; myserver &"],
+        )
+        self.assertIsInstance(result, ActionResult)
+
+    def test_detach_wraps_direct_argv(self) -> None:
+        sbx, _system, runtime = _make_sandbox()
+        sbx.commands.run(argv=["myserver", "--port", "80"], detach=True)
+        self.assertEqual(
+            runtime.exec_calls[0],
+            ["/bin/sh", "-c", "exec 1>/dev/null 2>&1; myserver --port 80"],
+        )
+
+    def test_detach_on_batch_path_plumbs_capture_output(self) -> None:
+        # With an enrichment requested the SDK routes through batch_action;
+        # detach must still carry capture_output=False into the exec spec.
+        sbx, _system, runtime = _make_batch_sandbox()
+        sbx.commands.run("myserver &", detach=True, observe=True)
+        self.assertEqual(len(runtime.batch_calls), 1)
+        self.assertFalse(runtime.batch_calls[0]["capture_output"])
+        self.assertEqual(
+            runtime.batch_calls[0]["argv"],
+            ["/bin/sh", "-c", "exec 1>/dev/null 2>&1; myserver &"],
+        )
+
+    def test_batch_default_captures_output(self) -> None:
+        sbx, _system, runtime = _make_batch_sandbox()
+        sbx.commands.run("echo hi", observe=True)
+        self.assertEqual(len(runtime.batch_calls), 1)
+        self.assertTrue(runtime.batch_calls[0]["capture_output"])
+
+    def test_stream_detach_disables_capture(self) -> None:
+        sbx, _system, runtime = _make_sandbox()
+        stream = sbx.commands.stream("myserver &", detach=True)
+        list(stream)  # drain
+        self.assertFalse(runtime.stream_capture_output)
+
+    def test_stream_default_captures(self) -> None:
+        sbx, _system, runtime = _make_sandbox()
+        stream = sbx.commands.stream("echo hi")
+        list(stream)
+        self.assertTrue(runtime.stream_capture_output)
 
     def test_check_raises_on_nonzero(self) -> None:
         sbx, _system, runtime = _make_sandbox()
@@ -505,6 +565,7 @@ class _FakeRuntimeWithBatchAction(_FakeRuntime):
         env=None,
         user=None,
         timeout_s=None,
+        capture_output=True,
         checkpoint=False,
         checkpoint_id=None,
         changeset=False,
@@ -514,6 +575,7 @@ class _FakeRuntimeWithBatchAction(_FakeRuntime):
         self.batch_calls.append({
             "sandbox_id": sandbox_id,
             "argv": argv,
+            "capture_output": capture_output,
             "checkpoint": checkpoint,
             "checkpoint_id": checkpoint_id,
             "changeset": changeset,

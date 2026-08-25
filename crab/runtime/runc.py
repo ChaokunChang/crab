@@ -1159,11 +1159,17 @@ class RuncRuntime(Runtime):
         env: dict[str, object] | None = None,
         user: str | None = None,
         timeout_s: float | None = None,
+        capture_output: bool = True,
     ) -> Iterator[tuple[str, str]]:
         """Streaming exec: yields (channel, text) tuples as output arrives.
 
         channel is one of 'stdout', 'stderr', or 'exit'. The final yield
         is always ('exit', str(returncode)).
+
+        When ``capture_output`` is False (detach), stdout/stderr are wired
+        to ``/dev/null`` so a ``&``-backgrounded child cannot hold the exec
+        pipe open; no output events are produced and only the final
+        ('exit', rc) tuple is yielded once the foreground process exits.
         """
         command = [self._runtime_bin, "--root", str(self._paths.state_root), "exec"]
         if cwd:
@@ -1176,6 +1182,36 @@ class RuncRuntime(Runtime):
         command.extend(argv)
 
         deadline = (time.monotonic() + timeout_s) if timeout_s else None
+        if not capture_output:
+            proc = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            with self._active_execs_lock:
+                self._active_execs.setdefault(sandbox_id, set()).add(proc)
+            try:
+                timeout_remaining = (deadline - time.monotonic()) if deadline else None
+                try:
+                    proc.wait(timeout=timeout_remaining)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                    yield ("exit", "-1")
+                    return
+                yield ("exit", str(proc.returncode))
+                return
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+                with self._active_execs_lock:
+                    bucket = self._active_execs.get(sandbox_id)
+                    if bucket is not None:
+                        bucket.discard(proc)
+                        if not bucket:
+                            self._active_execs.pop(sandbox_id, None)
         proc = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,

@@ -427,10 +427,12 @@ class _Routes:
         cwd = body.get("cwd")
         user = body.get("user")
         timeout_s = body.get("timeout_s")
+        capture_output = bool(body.get("capture_output", True))
         rc = -1
         try:
             for channel, text in eng.runtime.stream_exec(
-                sid, list(argv), cwd=cwd, env=env, user=user, timeout_s=timeout_s
+                sid, list(argv), cwd=cwd, env=env, user=user, timeout_s=timeout_s,
+                capture_output=capture_output,
             ):
                 if channel == "exit":
                     rc = int(text)
@@ -1023,9 +1025,10 @@ class _Routes:
         cwd = exec_spec.get("cwd")
         user = exec_spec.get("user")
         timeout_s = exec_spec.get("timeout_s")
+        capture_output = bool(exec_spec.get("capture_output", True))
         exec_result = eng.runtime.exec(
             sid, argv, cwd=cwd, env=env, user=user, timeout_s=timeout_s,
-            capture_output=True,
+            capture_output=capture_output,
         )
         response: dict[str, Any] = {
             "ok": True,

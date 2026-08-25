@@ -283,14 +283,27 @@ def main() -> None:
             sandboxes_to_kill.append(auto_sb)
             step_ok(f"auto_checkpoint 沙箱创建成功: {auto_sb.sandbox_id}")
             t0 = time.time()
-            # auto_sb.commands.run("echo step1 > /tmp/s1")
-            # auto_sb.commands.run("dd if=/dev/zero of=/tmp/s1 bs=1M count=512")
-            auto_sb.commands.run("mkdir -p /tmp/smallfiles")
-            auto_sb.commands.run('seq 1 10240 | xargs -P 8 -I {} fallocate -l 1K "smallfiles/file_{}.dat"')
+            auto_sb.commands.run("echo step1 > /tmp/s1")
+            # 后台进程演示：detach=True 让 SDK 把命令 stdio 重定向到
+            # /dev/null（等价于前置 `exec 1>/dev/null 2>&1;`），从而解除
+            # `runc exec` 的管道继承阻塞——否则光加 `&` 会一直阻塞到进程退出。
+            # detach 只解除“管道继承阻塞”，不改变进程生命周期：命令自身
+            # 仍须用 `&` 后台化，run 才会立即返回；detach 模式不返回输出。
+            # 这个占用 512m 内存、sleep 10 的后台进程会被本次 auto_checkpoint 捕获。
+            auto_sb.commands.run(
+                "bash -c 'x=$(head -c 512m /dev/zero); sleep 10' &", detach=True
+            )
             step_ok(f"自动 checkpoint: {auto_sb.last_checkpoint_id} ⏱ {time.time()-t0:.3f}s")
             t0 = time.time()
-            auto_sb.commands.run("echo step2 > /tmp/s2")
-            step_ok(f"第二次自动 checkpoint: {auto_sb.last_checkpoint_id} ⏱ {time.time()-t0:.3f}s")
+            tmp2 = auto_sb.commands.run("echo step2 > /tmp/s2")
+            step_ok(f"第二次自动 checkpoint（含背压）: {auto_sb.last_checkpoint_id} ⏱ {time.time()-t0:.3f}s")
+            try:
+                tmp2.checkpoint.wait(timeout=120.0)
+            except Exception as exc:
+                step_fail(f"等待 step 2 checkpoint 失败: {exc}")
+            t0 = time.time()
+            auto_sb.commands.run("echo step3 > /tmp/s3")
+            step_ok(f"第三次自动 checkpoint（无背压）: {auto_sb.last_checkpoint_id} ⏱ {time.time()-t0:.3f}s")
         else:
             step_fail("auto_checkpoint 沙箱不可用，跳过后续演示")
 

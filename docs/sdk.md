@@ -80,6 +80,78 @@ sandbox.kill()
 helpers are intended for text-sized files; use sandbox commands for binary or
 streaming transfers.
 
+### Running background processes
+
+Starting a long-lived background process is the one case where the obvious
+call hangs. This **blocks until the process exits** even though you added `&`:
+
+```python
+sandbox.commands.run("myserver &")     # ← hangs for the life of myserver
+```
+
+**Why.** `commands.run` executes via `runc exec` (no `-d`), which relays the
+command's stdout/stderr through an internal pipe and only returns once that
+pipe reaches EOF. The foreground shell exits immediately after `&`, but the
+backgrounded child *inherits the same pipe* and holds it open for its whole
+lifetime, so the daemon keeps reading and `run` keeps waiting. This is the
+classic "`docker exec cmd &` hangs" behaviour. Note it is a **pipe-inheritance**
+block, not a process-lifecycle one: what pins `run` is the open pipe fd, not
+the child being alive.
+
+There are three correct ways to launch a background process:
+
+```python
+# 1. Redirect the child's stdio away from the exec pipe, then background it.
+sandbox.commands.run("myserver >/dev/null 2>&1 &")
+
+# 2. Same, but keep the logs in a file inside the sandbox.
+sandbox.commands.run("myserver >>/tmp/myserver.log 2>&1 &")
+
+# 3. Use detach=True and just add & — the SDK does the redirect for you.
+sandbox.commands.run("myserver &", detach=True)
+```
+
+**`detach=True`** does two things: it sets `capture_output=False`, and it
+redirects the command's stdout/stderr to `/dev/null` *inside* the container
+(equivalent to prefixing `exec 1>/dev/null 2>&1;`). The in-container redirect
+is the part that matters — merely discarding output on the host side does
+**not** release the block, because `runc`'s relay pipe still exists. With the
+redirect in place, `run` returns as soon as the foreground shell exits.
+
+What `detach` does *not* do is change process lifecycle. `runc exec` still
+waits for the foreground process, so a command that does not background itself
+still blocks:
+
+```python
+sandbox.commands.run("sleep 3", detach=True)     # still blocks ~3s (no &)
+sandbox.commands.run("sleep 3 &", detach=True)   # returns immediately
+```
+
+Measured on a VM (Ubuntu 22.04 sandbox): `run("sleep 3 &", detach=True)`
+returns in ~0.02s while the `sleep` keeps running in the sandbox; the same
+command without `detach` (or with `detach` but no `&`) blocks ~3s.
+
+Because detach sends output to `/dev/null`, the returned `ActionResult` has
+empty `stdout`/`stderr`. If you need the process's output, use option 2 (log
+to a file) and read the file afterwards. Enrichments still compose with
+detach: `run("myserver &", detach=True, checkpoint=True)` launches the process
+and checkpoints the sandbox with the process alive.
+
+### Capturing a background process in a checkpoint
+
+`auto_checkpoint=True` (or a per-call `checkpoint=True`) takes a **full**
+checkpoint by default: a CRIU dump of every live process in the sandbox plus a
+ZFS snapshot of the filesystem. "Full" is the granularity — the checkpoint
+captures the complete set of processes that are alive *at the moment the
+checkpoint runs*, together with their memory, open files, and the filesystem.
+
+The practical consequence for background processes: a process launched with
+`detach=True` (or any of the redirect recipes above) is captured only if it is
+still running when the checkpoint is taken. A short-lived command that has
+already exited leaves nothing for CRIU to dump — only its filesystem side
+effects survive in the ZFS snapshot. Restoring or forking such a checkpoint
+brings the still-live background processes back and they resume running.
+
 ### Host work directories are not rolled back
 
 `Sandbox(work_dir="./repo")` bind-mounts that host directory at `/work`.
