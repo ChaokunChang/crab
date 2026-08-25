@@ -370,19 +370,26 @@ class _CommandsNamespace:
         cs_handle: AsyncChangeset | list[dict] | None = None
         if changeset:
             raw_cs = response.get("changeset")
-            if isinstance(raw_cs, list):
-                if changeset_sync:
-                    cs_handle = raw_cs
-                else:
-                    # Wrap in an already-resolved AsyncChangeset
-                    done_thread = threading.Thread(target=lambda: None)
-                    done_thread.start()
-                    done_thread.join()
-                    handle = AsyncChangeset(done_thread)
-                    handle._result = raw_cs
-                    cs_handle = handle
+            # Daemon returns ChangesetResult.to_json() which is a dict
+            # with an "entries" key; normalise to a plain list of dicts.
+            if isinstance(raw_cs, dict):
+                entries_list: list[dict] = raw_cs.get("entries") or []
+            elif isinstance(raw_cs, list):
+                entries_list = raw_cs
             else:
-                cs_handle = None
+                entries_list = []
+
+            if changeset_sync:
+                cs_handle = entries_list
+            else:
+                # Wrap in an already-resolved AsyncChangeset so callers
+                # can uniformly call .wait() regardless of batch/local mode.
+                done_thread = threading.Thread(target=lambda: None)
+                done_thread.start()
+                done_thread.join()
+                handle = AsyncChangeset(done_thread)
+                handle._result = entries_list
+                cs_handle = handle
 
         # Observer flags
         fs_changed = response.get("filesystem_changed")

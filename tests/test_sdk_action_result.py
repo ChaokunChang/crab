@@ -526,7 +526,13 @@ class _FakeRuntimeWithBatchAction(_FakeRuntime):
         if checkpoint and checkpoint_id:
             response["checkpoint_id"] = checkpoint_id
         if changeset:
-            response["changeset"] = [{"path": "/tmp/x", "change": "added"}]
+            # Mirror real daemon format: ChangesetResult.to_json() dict
+            response["changeset"] = {
+                "sandbox_id": str(sandbox_id),
+                "base_checkpoint_id": changeset_since or "ckpt-forkpoint",
+                "entries": [{"path": "/tmp/x", "change": "added"}],
+                "skipped_by_gate": False,
+            }
         return response
 
 
