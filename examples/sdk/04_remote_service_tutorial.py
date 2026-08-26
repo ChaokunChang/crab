@@ -319,7 +319,7 @@ def main() -> None:
             # 只要后台进程还活着 process_changed 就稳定为 True；本命令没写磁盘，
             # 因此 filesystem_changed=False（VM 实测：proc=True / fs=False）。
             tmp1 = auto_sb.commands.run(
-                "bash -c 'x=$(head -c 512m /dev/zero); sleep 30' &", detach=True, observe=True
+                "bash -c 'x=$(head -c 512m /dev/zero); sleep 30' & sleep 5", detach=True, observe=True
             )
             step_ok(f"自动 checkpoint: {auto_sb.last_checkpoint_id} ⏱ {time.time()-t0:.3f}s")
             print(f"  filesystem_changed: {tmp1.filesystem_changed}")
@@ -333,9 +333,12 @@ def main() -> None:
                 tmp2.checkpoint.wait(timeout=120.0)
             except Exception as exc:
                 step_fail(f"等待 step 2 checkpoint 失败: {exc}")
+            time.sleep(5)
             t0 = time.time()
-            auto_sb.commands.run("echo step3 > /tmp/s3")
+            tmp3 = auto_sb.commands.run("echo step3 > /tmp/s3", observe=True)
             step_ok(f"第三次自动 checkpoint（无背压）: {auto_sb.last_checkpoint_id} ⏱ {time.time()-t0:.3f}s")
+            print(f"  filesystem_changed: {tmp3.filesystem_changed}")
+            print(f"  process_changed: {tmp3.process_changed}")
         else:
             step_fail("auto_checkpoint 沙箱不可用，跳过后续演示")
 
