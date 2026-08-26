@@ -596,7 +596,14 @@ class HostInspectorDaemon:
             all_current_pids = list_cgroup_pids(resolved.cgroup_path)
             tracked_pids, ignored_pids, fs_ignored_pids = self._split_pids(all_current_pids, existing.ignore_process_rules)
             soft_dirty_start = time.monotonic()
-            baseline_pids = reset_soft_dirty_for_pids(tracked_pids)
+            # When this reset follows a full process checkpoint, CRIU dumped
+            # the tasks with --leave-running; its parasite/resume writes can
+            # leave a few residual soft-dirty pages that land around this
+            # clear. Stabilize (re-clear until clean or attempts exhausted) so
+            # an otherwise idle checkpointed sandbox does not latch a false
+            # process_changed=True. Genuinely busy processes keep re-dirtying
+            # and are still reported by the next status() poll.
+            baseline_pids = reset_soft_dirty_for_pids(tracked_pids, stabilize=captures_process)
             soft_dirty_ms = (time.monotonic() - soft_dirty_start) * 1000.0
 
             # When this reset follows a full process checkpoint, snapshot

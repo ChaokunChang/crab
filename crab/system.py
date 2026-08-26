@@ -411,12 +411,6 @@ class CrabSystem:
                     ),
                     is_incremental_process=job.is_incremental_process,
                 )
-                self.inspector.mark_checkpoint_complete(
-                    sandbox_id,
-                    process=job.checkpoint_process,
-                    filesystem=job.checkpoint_filesystem,
-                    at=result.finished_at,
-                )
                 self._journal_lifecycle(
                     sandbox_id,
                     "checkpoint",
@@ -429,6 +423,26 @@ class CrabSystem:
         finally:
             if paused and self._should_resume_after_checkpoint(job, result):
                 self._resume_sandbox(sandbox_id)
+            # Re-baseline the inspector AFTER the sandbox is resumed. CRIU dumps
+            # the tasks with --leave-running while the container is paused; the
+            # parasite teardown on resume dirties 1-3 residual soft-dirty pages
+            # *after* the clear. Running the reset before resume (the old
+            # ordering) latched those residual pages as a false
+            # process_changed=True on an otherwise idle sandbox. Doing it here,
+            # once the tasks are running again, clears the residue; a genuinely
+            # busy process keeps re-dirtying and is still reported by the next
+            # status() poll, so real activity is never masked.
+            if (
+                job is not None
+                and result is not None
+                and result.status.value == "succeeded"
+            ):
+                self.inspector.mark_checkpoint_complete(
+                    sandbox_id,
+                    process=job.checkpoint_process,
+                    filesystem=job.checkpoint_filesystem,
+                    at=result.finished_at,
+                )
             self._release_response_gate(sandbox_id, pending_request)
             self._refresh_interceptor_pending_state(sandbox_id)
         finish_attrs: dict[str, object] = {}
@@ -4020,12 +4034,6 @@ class CrabSystem:
                     ),
                     is_incremental_process=job.is_incremental_process,
                 )
-                self.inspector.mark_checkpoint_complete(
-                    sandbox_id,
-                    process=job.checkpoint_process,
-                    filesystem=job.checkpoint_filesystem,
-                    at=result.finished_at,
-                )
                 self._journal_lifecycle(
                     sandbox_id,
                     "checkpoint",
@@ -4067,6 +4075,23 @@ class CrabSystem:
                 )
             if self._should_resume_after_checkpoint(job, result):
                 self._resume_sandbox(sandbox_id)
+            # Re-baseline the inspector AFTER resume so CRIU's --leave-running
+            # parasite-teardown residual pages (written on thaw, after the
+            # clear) do not latch a false process_changed=True. See
+            # checkpoint_once for the full rationale. mark_checkpoint_complete
+            # swallows its own errors, so this cannot break the symmetric
+            # telemetry finish above.
+            if (
+                job is not None
+                and result is not None
+                and result.status.value == "succeeded"
+            ):
+                self.inspector.mark_checkpoint_complete(
+                    sandbox_id,
+                    process=job.checkpoint_process,
+                    filesystem=job.checkpoint_filesystem,
+                    at=result.finished_at,
+                )
 
     def _latest_checkpoint_id(self, sandbox_id: SandboxId):
         checkpoints = self.storage.list_checkpoints(sandbox_id)
