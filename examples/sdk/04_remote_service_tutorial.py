@@ -435,6 +435,45 @@ def main() -> None:
             step_fail("Fork 不可用 (可能缺少 CRIU 或 ZFS)")
 
         # ----------------------------------------------------------
+        # 11b. 从历史 checkpoint fork
+        # ----------------------------------------------------------
+        # 默认的 fork（上面 step 11）从沙箱的 *当前活状态* 分叉。传入
+        # checkpoint_id 则从一个 *已存在的 checkpoint* 分叉：不再新打
+        # checkpoint，父沙箱也不会被 restore —— 父沙箱继续在原处运行，
+        # 只有 fork 回到那个历史点。用 step 10 的 checkpoint 作时间锚点：
+        #   1) 先在父沙箱写一个 "checkpoint 之后才存在" 的标记文件
+        #   2) 从 step 10 的 checkpoint fork —— 该文件不应出现在 fork 里
+        #   3) 父沙箱仍然持有该文件（证明父沙箱没有被回滚）
+        banner("11b. 从历史 checkpoint fork")
+        if ckpt_id:
+            sandbox.commands.run("echo 'after ckpt' > /tmp/after_ckpt.txt")
+            t0 = time.time()
+            past_forks = safe_run(
+                "从历史 checkpoint fork", sandbox.fork, 1, checkpoint_id=ckpt_id
+            )
+            if past_forks:
+                past_fork = past_forks[0]
+                step_ok(
+                    f"Fork 成功, fork id = {past_fork.sandbox_id} "
+                    f"(fork 点 = {ckpt_id}) ⏱ {time.time()-t0:.3f}s"
+                )
+                in_fork = past_fork.commands.run("cat /tmp/after_ckpt.txt 2>&1 || true")
+                step_ok(f"fork 内检查 (应找不到该文件): {in_fork.stdout.rstrip()}")
+                in_parent = sandbox.commands.run("cat /tmp/after_ckpt.txt 2>&1 || true")
+                step_ok(f"父沙箱检查 (文件应仍在): {in_parent.stdout.rstrip()}")
+                # 立刻回收：每个沙箱都占 tenant 配额，后面的步骤还要用。
+                try:
+                    past_fork.kill()
+                    step_ok(f"已回收历史 fork: {past_fork.sandbox_id}")
+                except Exception as exc:
+                    step_fail(f"回收历史 fork 失败: {exc}")
+                    sandboxes_to_kill.append(past_fork)
+            else:
+                step_fail("从历史 checkpoint fork 不可用 (可能缺少 CRIU 或 ZFS)")
+        else:
+            step_fail("跳过：step 10 未能创建 checkpoint，没有可用的 fork 点")
+
+        # ----------------------------------------------------------
         # 12. Transaction
         # ----------------------------------------------------------
         banner("12. Transaction (begin / exec / commit|abort)")

@@ -1646,12 +1646,23 @@ class Sandbox:
         self._mark_inspector_running()
 
     def fork(
-        self, count: int = 1, *, lazy: bool = False, effects: str | None = None
+        self,
+        count: int = 1,
+        *,
+        lazy: bool = False,
+        effects: str | None = None,
+        checkpoint_id: str | CheckpointId | None = None,
     ) -> list["Sandbox"]:
         """Clone this sandbox via checkpoint+restore. Each fork is an
         independent, running sandbox sharing initial state with the parent
-        (fresh checkpoint at call time; incremental chain sharing applies
-        when the runtime supports it).
+        (by default a fresh checkpoint at call time; incremental chain
+        sharing applies when the runtime supports it).
+
+        ``checkpoint_id`` forks from an *existing* checkpoint of this
+        sandbox instead of its live state: no new checkpoint is taken, the
+        parent is left untouched (it is not restored), and every fork in
+        the batch branches from that same point. The checkpoint must belong
+        to this sandbox.
 
         With ``lazy=True`` the process restore uses CRIU lazy-pages: the
         call returns as soon as metadata and the eager page set are in
@@ -1687,7 +1698,11 @@ class Sandbox:
         if count < 1:
             raise ValueError("fork count must be >= 1")
         fork_ids = self._engine.fork_sandbox(
-            self.sandbox_id, count=count, lazy=lazy, effects=effects
+            self.sandbox_id,
+            count=count,
+            lazy=lazy,
+            effects=effects,
+            checkpoint_id=None if checkpoint_id is None else CheckpointId(str(checkpoint_id)),
         )
         forks: list[Sandbox] = []
         for fork_id in fork_ids:

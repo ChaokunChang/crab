@@ -942,7 +942,7 @@ class ForkArmOrderingTests(unittest.TestCase):
             def _release_effect_session(_self, sandbox_id):
                 events.append("release")
 
-            def fork_once(_self, source, target, *, target_rootfs_path):
+            def fork_once(_self, source, target, *, checkpoint_id=None, target_rootfs_path):
                 events.append("fork_once")
                 return SimpleNamespace(checkpoint_id=CheckpointId("ckpt-1"))
 

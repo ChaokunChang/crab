@@ -193,6 +193,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "in place and stream memory on demand.",
     )
     p_fork.add_argument(
+        "--checkpoint",
+        dest="fork_checkpoint_id",
+        metavar="CHECKPOINT_ID",
+        default=None,
+        help="Fork from an existing checkpoint of the sandbox instead of its "
+        "live state: no new checkpoint is taken and the source is not "
+        "restored, so every fork branches from that past point.",
+    )
+    p_fork.add_argument(
         "--effects",
         choices=["allow", "reject"],
         default=None,
@@ -748,6 +757,8 @@ def _cmd_sandbox_fork(args: argparse.Namespace) -> int:
     payload: dict = {"count": int(args.count), "lazy": bool(args.lazy)}
     if getattr(args, "effects", None) is not None:
         payload["effects"] = str(args.effects)
+    if getattr(args, "fork_checkpoint_id", None) is not None:
+        payload["checkpoint_id"] = str(args.fork_checkpoint_id)
     response = client.post_json(
         f"/sandboxes/{args.sandbox_id}/fork",
         payload,

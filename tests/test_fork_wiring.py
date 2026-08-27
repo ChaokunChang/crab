@@ -280,6 +280,61 @@ class ForkOnceTests(unittest.TestCase):
             system.release_fork(fork_id)  # safe no-op
             system.prepare_source_destroy(source)  # safe no-op
 
+    def test_fork_once_clones_an_explicit_past_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="crab_fork_point_") as tmp:
+            root = Path(tmp)
+            system, runtime, executor, inspector = self._build(root)
+            self.addCleanup(executor.shutdown)
+            source = SandboxId("sbx-src")
+            bundle_dir = root / "bundles" / str(source)
+            bundle_dir.mkdir(parents=True)
+            (bundle_dir / "config.json").write_text(
+                json.dumps({"process": {"cwd": "/work"}}), encoding="utf-8"
+            )
+            runtime.launch("runc", {"sandbox_id": str(source), "bundle_path": str(bundle_dir)})
+
+            def signal_change() -> None:
+                inspector.upsert_snapshot(
+                    SandboxSnapshot(
+                        sandbox_id=source,
+                        runtime_name="runc",
+                        is_running=True,
+                        process_changed=True,
+                        filesystem_changed=True,
+                        observed_at=utc_now(),
+                    )
+                )
+
+            signal_change()
+            first = system.checkpoint_once(source, leave_running=True).checkpoint_id
+            signal_change()
+            second = system.checkpoint_once(source, leave_running=True).checkpoint_id
+            self.assertNotEqual(first, second)
+
+            fork_id = SandboxId("sbx-src-fork-past")
+            fork_bundle = root / "bundles" / str(fork_id)
+            fork_bundle.mkdir(parents=True)
+            result = system.fork_once(
+                source,
+                fork_id,
+                checkpoint_id=first,
+                target_rootfs_path=fork_bundle / "rootfs",
+            )
+
+            self.assertEqual(result.checkpoint_id, first)
+            self.assertEqual(result.filesystem_checkpoint_id, first)
+            # The past checkpoint was cloned as-is: no third checkpoint of
+            # the live source was taken.
+            self.assertEqual(set(system.storage.list_checkpoints(source)), {first, second})
+            # And the provider clone came off the fork point's snapshot,
+            # not the latest one.
+            runner = runtime._runner  # test-owned fake
+            self.assertIn(
+                ("zfs", "clone", "-o", f"mountpoint={fork_bundle / 'rootfs'}",
+                 f"pool/crab/{source}@{first}", f"pool/crab/{fork_id}"),
+                runner.commands,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -345,3 +400,81 @@ class ForkNetworkNamespaceRetargetTests(unittest.TestCase):
         self.assertFalse(
             forking.retarget_bundle_network_namespace(self.bundle, "/var/run/netns/ts-fork")
         )
+
+
+class EngineForkPointTests(unittest.TestCase):
+    """`Engine.fork_sandbox(checkpoint_id=...)` branches from a stored
+    checkpoint instead of the sandbox's live state."""
+
+    def _engine(self, *, checkpoints: list[CheckpointId]):
+        from crab.engine import Engine
+
+        calls: dict = {}
+
+        class _Storage:
+            def list_checkpoints(_self, sandbox_id):
+                return list(checkpoints)
+
+        class _System:
+            storage = _Storage()
+
+            def validate_standalone_fork_policy(_self, effects):
+                return None
+
+            def fork_once(_self, source, target, *, checkpoint_id=None, target_rootfs_path):
+                calls["fork_point"] = checkpoint_id
+                return type(
+                    "Result", (), {"checkpoint_id": checkpoint_id or CheckpointId("fresh")}
+                )()
+
+            def restore_once(_self, sandbox_id, checkpoint_id, *, restore_metadata=None):
+                calls["restored_from"] = checkpoint_id
+                return type(
+                    "Result", (), {"status": type("S", (), {"value": "succeeded"})()}
+                )()
+
+        class _Runtime:
+            name = "runc"
+            paths = type("P", (), {"bundle_root": Path("/tmp/crab-fake-bundles")})()
+
+            def bundle_path_for(_self, sandbox_id):
+                return Path("/tmp/crab-fake-bundles") / str(sandbox_id)
+
+        engine = Engine.__new__(Engine)  # bypass full construction
+        engine._system = _System()
+        engine._runtime = _Runtime()
+        engine._network_manager = None
+        engine.repair_network_lease = lambda sandbox_id: None
+        return engine, calls
+
+    def _fork(self, engine, **kwargs):
+        from unittest import mock
+
+        with mock.patch.object(forking, "replicate_bundle_config"), mock.patch(
+            "shutil.copy2"
+        ), mock.patch("pathlib.Path.mkdir"), mock.patch(
+            "pathlib.Path.is_file", return_value=False
+        ):
+            return engine.fork_sandbox(SandboxId("src"), **kwargs)
+
+    def test_an_explicit_checkpoint_is_the_fork_point(self) -> None:
+        engine, calls = self._engine(checkpoints=[CheckpointId("ckpt-1")])
+        fork_ids = self._fork(engine, count=1, checkpoint_id=CheckpointId("ckpt-1"))
+        self.assertEqual(len(fork_ids), 1)
+        # No fresh checkpoint of the source: the stored one is cloned, and
+        # the fork restores from exactly that point.
+        self.assertEqual(calls["fork_point"], CheckpointId("ckpt-1"))
+        self.assertEqual(calls["restored_from"], CheckpointId("ckpt-1"))
+
+    def test_omitting_it_keeps_the_live_state_behaviour(self) -> None:
+        engine, calls = self._engine(checkpoints=[CheckpointId("ckpt-1")])
+        self._fork(engine, count=1)
+        # None means "checkpoint the live state now", CrabSystem's default.
+        self.assertIsNone(calls["fork_point"])
+
+    def test_an_unknown_checkpoint_is_refused_before_any_fork_exists(self) -> None:
+        engine, calls = self._engine(checkpoints=[CheckpointId("ckpt-1")])
+        with self.assertRaises(ValueError):
+            self._fork(engine, count=2, checkpoint_id=CheckpointId("ckpt-missing"))
+        # Nothing was cloned, so no bundle or lease was left behind.
+        self.assertEqual(calls, {})
