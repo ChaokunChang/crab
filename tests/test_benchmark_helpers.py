@@ -1379,6 +1379,35 @@ class BenchmarkHelperTests(unittest.TestCase):
             self.assertTrue(work_dir_host_path.is_dir())
             self.assertEqual(payload["process"]["cwd"], "/work")
 
+    def test_write_bundle_config_sets_hostname_to_sandbox_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = Path(tmp)
+            config_path = bundle_dir / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "hostname": "runc",
+                        "linux": {"namespaces": [], "seccomp": {"defaultAction": "SCMP_ACT_ERRNO"}},
+                        "mounts": [],
+                        "process": {"terminal": True, "cwd": "/", "args": [], "env": []},
+                        "root": {"path": "rootfs", "readonly": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            sandbox_bundle.write_bundle_config(
+                bundle_dir=bundle_dir,
+                llm_base_url="http://127.0.0.1:9000/v1",
+                provider="openai",
+                sandbox_name="sbx-abc123",
+                status_port=9001,
+                cgroup_path="crab/test/sbx-abc123",
+            )
+
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["hostname"], "sbx-abc123")
+
     def test_write_bundle_config_inherits_image_env_workdir_and_user(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bundle_dir = Path(tmp) / "bundle"

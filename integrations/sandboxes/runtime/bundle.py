@@ -369,4 +369,7 @@ def write_bundle_config(
         )
     cfg["root"]["path"] = "rootfs"
     cfg["root"]["readonly"] = False
+    # The default `runc spec` leaves hostname as "runc"; use the sandbox id so
+    # each sandbox is individually identifiable from inside (e.g. `hostname`).
+    cfg["hostname"] = sandbox_name
     config_path.write_text(json.dumps(cfg, indent=2))

@@ -231,7 +231,8 @@ class _SystemShim:
             timeout_seconds=300.0,
         )
         status = JobStatus(str(response.get("status") or JobStatus.SUCCEEDED.value))
-        return SimpleNamespace(status=status, message="")
+        message = str(response.get("message") or "")
+        return SimpleNamespace(status=status, message=message)
 
     # ----- transactions (see crab/txn.py) ------------------------------
     # Proxies mirror CrabSystem's txn surface so Sandbox.begin() stays

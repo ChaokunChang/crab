@@ -633,6 +633,7 @@ class _Routes:
             "sandbox_id": sandbox_id,
             "checkpoint_id": checkpoint_id,
             "status": getattr(result, "status", "succeeded"),
+            "message": getattr(result, "message", None) or "",
         }
 
     def fork_sandbox(self, body: dict[str, Any], *, sandbox_id: str) -> dict[str, Any]:
