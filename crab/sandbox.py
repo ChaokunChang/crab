@@ -1577,6 +1577,26 @@ class Sandbox:
     def resume(self) -> None:
         self._engine.runtime.resume(self.sandbox_id)
 
+    def stop(self) -> None:
+        """Gracefully stop the sandbox (SIGTERM) while keeping its filesystem
+        and bundle, so it can later be brought back with ``start()``. In-sandbox
+        process state is not preserved — take a checkpoint first if you need to
+        resume the exact process tree. Distinct from ``kill()``, which destroys
+        the sandbox entirely."""
+        self._engine.runtime.stop(self.sandbox_id)
+
+    def start(self) -> None:
+        """Re-launch a previously stopped sandbox from its existing filesystem.
+        The container boots with the same files but a fresh process tree (like
+        ``docker start``). Use ``restore()`` instead to resume a checkpointed
+        process state."""
+        self._engine.runtime.start(self.sandbox_id)
+
+    def restart(self) -> None:
+        """Stop then start the sandbox (equivalent to ``stop()`` followed by
+        ``start()``)."""
+        self._engine.runtime.restart(self.sandbox_id)
+
     def kill(self) -> None:
         if self._closed:
             return

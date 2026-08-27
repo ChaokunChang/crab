@@ -386,6 +386,8 @@ _PASSTHROUGH_SANDBOX_ROUTES: list[tuple[str, str, float]] = [
     ("POST", "/stop", _FAST_TIMEOUT_S),
     ("POST", "/pause", _FAST_TIMEOUT_S),
     ("POST", "/resume", _FAST_TIMEOUT_S),
+    ("POST", "/start", _FAST_TIMEOUT_S),
+    ("POST", "/restart", _FAST_TIMEOUT_S),
     ("GET", "/checkpoints", _FAST_TIMEOUT_S),
     ("POST", "/checkpoints", _SLOW_TIMEOUT_S),
     ("DELETE", "/checkpoints/{checkpoint_id}", _FAST_TIMEOUT_S),

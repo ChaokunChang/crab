@@ -547,6 +547,18 @@ class _Routes:
         eng.runtime.resume(SandboxId(sandbox_id))
         return {"ok": True, "sandbox_id": sandbox_id}
 
+    def start_sandbox(self, body: dict[str, Any], *, sandbox_id: str) -> dict[str, Any]:
+        """Re-launch a stopped sandbox from its existing bundle/filesystem
+        (fresh process tree, same rootfs)."""
+        eng = self._daemon.require_engine()
+        eng.runtime.start(SandboxId(sandbox_id))
+        return {"ok": True, "sandbox_id": sandbox_id}
+
+    def restart_sandbox(self, body: dict[str, Any], *, sandbox_id: str) -> dict[str, Any]:
+        eng = self._daemon.require_engine()
+        eng.runtime.restart(SandboxId(sandbox_id))
+        return {"ok": True, "sandbox_id": sandbox_id}
+
     # ----- checkpoints ----------------------------------------------------
 
     def list_checkpoints(self, body: dict[str, Any], *, sandbox_id: str) -> dict[str, Any]:
@@ -1289,6 +1301,8 @@ def _build_handler(daemon: "DaemonServer"):
         ("POST", "/sandboxes/{sandbox_id}/stop", "", routes.stop_sandbox),
         ("POST", "/sandboxes/{sandbox_id}/pause", "", routes.pause_sandbox),
         ("POST", "/sandboxes/{sandbox_id}/resume", "", routes.resume_sandbox),
+        ("POST", "/sandboxes/{sandbox_id}/start", "", routes.start_sandbox),
+        ("POST", "/sandboxes/{sandbox_id}/restart", "", routes.restart_sandbox),
         # Checkpoints (keyed by sandbox; checkpoint ids are unique per-sandbox)
         ("GET", "/sandboxes/{sandbox_id}/checkpoints", "", routes.list_checkpoints),
         ("POST", "/sandboxes/{sandbox_id}/checkpoints", "", routes.create_checkpoint),

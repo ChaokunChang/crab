@@ -60,6 +60,14 @@ class Runtime(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def start(self, sandbox_id: SandboxId) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def restart(self, sandbox_id: SandboxId) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
     def sync_runtime_state(self, sandbox_id: SandboxId, *, is_running: bool) -> None:
         raise NotImplementedError
 

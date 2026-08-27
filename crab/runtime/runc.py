@@ -756,6 +756,58 @@ class RuncRuntime(Runtime):
             raise
         self._update_description(replace(description, status="running"))
 
+    def start(self, sandbox_id: SandboxId) -> None:
+        """Re-launch a stopped sandbox from its existing bundle/rootfs.
+
+        The bundle (config.json) and ZFS filesystem dataset persist across
+        ``stop``; this clears the stale runc container state and re-runs
+        ``runc create`` + ``runc start`` against the same bundle. The sandbox
+        boots with the same filesystem but a fresh process tree (analogous to
+        ``docker start`` on a stopped container). Process state from before the
+        stop is gone — use checkpoint/restore to preserve it."""
+        description = self.describe(sandbox_id)
+        bundle_path = self.bundle_path_for(sandbox_id)
+        self.delete_runtime(sandbox_id, force=True, ignore_missing=True)
+        self._run_command(
+            [self._runtime_bin, "--root", str(self._paths.state_root), "create", "--bundle", str(bundle_path), str(sandbox_id)],
+            operation="sandbox.runtime_create",
+            sandbox_id=sandbox_id,
+            metadata={"bundle_path": str(bundle_path)},
+        )
+        try:
+            self._run_command(
+                [self._runtime_bin, "--root", str(self._paths.state_root), "start", str(sandbox_id)],
+                operation="sandbox.runtime_start",
+                sandbox_id=sandbox_id,
+            )
+        except Exception:
+            try:
+                self.delete_runtime(sandbox_id, force=True, ignore_missing=True)
+            except Exception:
+                logger.exception("Failed to clean up sandbox %s after start failure", sandbox_id)
+            raise
+        started = replace(description, status="running")
+        with self._lock:
+            self._items[sandbox_id] = started
+        self._persist(started)
+        self._register_with_host_inspector(started)
+        self._record_lifecycle_action(
+            sandbox_id,
+            "start",
+            metadata={"bundle_path": str(bundle_path)},
+        )
+
+    def restart(self, sandbox_id: SandboxId) -> None:
+        """Stop then start the sandbox. Thaws a paused sandbox first so the
+        stop signal can be delivered; the stop is tolerated when the sandbox is
+        already stopped (start's forced delete_runtime clears any remainder)."""
+        self.resume(sandbox_id)
+        try:
+            self.stop(sandbox_id)
+        except RuntimeError:
+            logger.debug("restart: stop raised (likely already stopped); proceeding to start sandbox=%s", sandbox_id)
+        self.start(sandbox_id)
+
     _DEFENSIVE_RESUME_RETRY_DELAYS_S = (0.0, 5.0)
     _DEFENSIVE_RESUME_BENIGN_ERRORS = (
         "container not paused",

@@ -544,20 +544,22 @@ class RuntimeProxy(Runtime):
         return SandboxId(str(result["sandbox_id"]))
 
     def stop(self, sandbox_id: SandboxId) -> None:  # type: ignore[override]
-        # `stop` and `delete` are folded into the daemon's `DELETE /sandboxes/{id}`
-        # endpoint, which calls runtime.stop + runtime.delete + lease/upstream
-        # cleanup. The SDK's `Sandbox.kill()` already calls `delete` directly,
-        # so this entry point is rarely hit; expose it to keep the contract
-        # complete.
-        self._client.delete(f"/sandboxes/{sandbox_id}")
+        # Graceful stop that keeps the bundle/filesystem so the sandbox can be
+        # started again. Distinct from delete(), which `Sandbox.kill()` uses to
+        # destroy the sandbox via DELETE /sandboxes/{id}.
+        self._client.post_json(f"/sandboxes/{sandbox_id}/stop", {}, timeout_seconds=60.0)
 
     def pause(self, sandbox_id: SandboxId) -> None:  # type: ignore[override]
-        # Pause/resume aren't routed in v1 — the daemon's scheduler drives
-        # them internally. Explicit SDK pause is rare; raise if used.
-        raise NotImplementedError("Sandbox.pause from the SDK is not exposed in daemon mode v1")
+        self._client.post_json(f"/sandboxes/{sandbox_id}/pause", {}, timeout_seconds=60.0)
 
     def resume(self, sandbox_id: SandboxId) -> None:  # type: ignore[override]
-        raise NotImplementedError("Sandbox.resume from the SDK is not exposed in daemon mode v1")
+        self._client.post_json(f"/sandboxes/{sandbox_id}/resume", {}, timeout_seconds=60.0)
+
+    def start(self, sandbox_id: SandboxId) -> None:  # type: ignore[override]
+        self._client.post_json(f"/sandboxes/{sandbox_id}/start", {}, timeout_seconds=60.0)
+
+    def restart(self, sandbox_id: SandboxId) -> None:  # type: ignore[override]
+        self._client.post_json(f"/sandboxes/{sandbox_id}/restart", {}, timeout_seconds=60.0)
 
     def sync_runtime_state(self, sandbox_id, *, is_running: bool) -> None:  # type: ignore[override]
         return None  # daemon-side bookkeeping
