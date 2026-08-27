@@ -4,7 +4,7 @@ import unittest
 
 from crab.ids import CheckpointId, SandboxId
 from crab.models import JobStatus
-from crab.remote_engine import _SystemShim
+from crab.remote_engine import RuntimeProxy, _SystemShim
 
 
 class _FakeClient:
@@ -80,6 +80,54 @@ class RemoteCheckpointShimTests(unittest.TestCase):
         self.system.storage.delete_checkpoint(self.sandbox_id, checkpoint_ids[0], cascade=True)
         self.assertEqual(self.client.calls[-1][0], "DELETE")
         self.assertIn(b'"cascade": true', self.client.calls[-1][2])
+
+
+class _RecordingClient:
+    def __init__(self) -> None:
+        self.posts: list[str] = []
+        self.deletes: list[str] = []
+
+    def post_json(self, path: str, payload: object, *, timeout_seconds: float | None = None):
+        _ = payload
+        _ = timeout_seconds
+        self.posts.append(path)
+        return {"ok": True}
+
+    def delete(self, path: str, *, timeout_seconds: float | None = None):
+        _ = timeout_seconds
+        self.deletes.append(path)
+        return {"ok": True}
+
+
+class RemoteRuntimeLifecycleTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.client = _RecordingClient()
+        self.runtime = RuntimeProxy(self.client, name="runc")  # type: ignore[arg-type]
+        self.sandbox_id = SandboxId("sbx-one")
+
+    def test_lifecycle_ops_route_to_matching_endpoints(self) -> None:
+        self.runtime.stop(self.sandbox_id)
+        self.runtime.pause(self.sandbox_id)
+        self.runtime.resume(self.sandbox_id)
+        self.runtime.start(self.sandbox_id)
+        self.runtime.restart(self.sandbox_id)
+
+        self.assertEqual(
+            self.client.posts,
+            [
+                "/sandboxes/sbx-one/stop",
+                "/sandboxes/sbx-one/pause",
+                "/sandboxes/sbx-one/resume",
+                "/sandboxes/sbx-one/start",
+                "/sandboxes/sbx-one/restart",
+            ],
+        )
+
+    def test_stop_is_graceful_not_delete(self) -> None:
+        # stop keeps the sandbox (POST /stop); only kill->delete destroys it.
+        self.runtime.stop(self.sandbox_id)
+        self.assertEqual(self.client.deletes, [])
+        self.assertEqual(self.client.posts, ["/sandboxes/sbx-one/stop"])
 
 
 if __name__ == "__main__":
