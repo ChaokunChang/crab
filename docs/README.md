@@ -10,6 +10,10 @@
   and current operational limits.
 - [Configuration](configuration-reference.md): the supported daemon YAML
   surface and the difference between smoke-test and agent-oriented configs.
+- [Cloud deployment](deploy-cloud.md): one-click VM/cloud deployment and
+  post-deploy operations (Chinese).
+- [Multi-tenancy](multi-tenancy.md): tenant, API key, and quota management
+  through `crab-gateway` (Chinese).
 
 ## Build with Crab
 
