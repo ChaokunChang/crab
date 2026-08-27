@@ -50,6 +50,24 @@ class RemoteCheckpointShimTests(unittest.TestCase):
         restored = self.system.restore_once(self.sandbox_id, CheckpointId("ckpt-two"))
         self.assertEqual(restored.status, JobStatus.SUCCEEDED)
 
+    def test_restore_failure_surfaces_daemon_message(self) -> None:
+        zfs_error = (
+            "command failed (1): zfs rollback -r crab/sandboxes/sbx@ckpt"
+            "\nstdout: \nstderr: cannot rollback to 'crab/sandboxes/sbx@ckpt':"
+            " clones of previous snapshots exist"
+        )
+
+        class _FailingClient(_FakeClient):
+            def post_json(self, path: str, payload: object, *, timeout_seconds: float):
+                if path.endswith("/restore"):
+                    return {"status": "failed", "message": zfs_error}
+                return super().post_json(path, payload, timeout_seconds=timeout_seconds)
+
+        system = _SystemShim(_FailingClient())  # type: ignore[arg-type]
+        restored = system.restore_once(self.sandbox_id, CheckpointId("ckpt-two"))
+        self.assertEqual(restored.status, JobStatus.FAILED)
+        self.assertIn("clones of previous snapshots exist", restored.message)
+
     def test_checkpoint_storage_lists_metadata_and_deletes(self) -> None:
         checkpoint_ids = self.system.storage.list_checkpoints(self.sandbox_id)
         self.assertEqual([str(item) for item in checkpoint_ids], ["ckpt-one"])
