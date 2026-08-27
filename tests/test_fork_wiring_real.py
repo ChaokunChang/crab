@@ -69,6 +69,28 @@ class ForkWiringRealTests(unittest.TestCase):
         self._run(source, "echo source-v2 > /state.txt")
         self.assertEqual(self._run(forks[1], "cat /state.txt"), "v1")
 
+    def test_fork_from_a_past_checkpoint_rolls_back_only_the_fork(self) -> None:
+        source = Sandbox(image=self._IMAGE, engine=self.engine)
+        self.addCleanup(source.kill)
+        self._run(source, "echo v1 > /state.txt && cat /state.txt")
+
+        checkpoint_id = source.checkpoint()
+        # Mutate *after* the fork point, so the fork must not see this.
+        self._run(source, "echo v2 > /state.txt && echo after-ckpt > /only-in-source.txt")
+        self.assertEqual(self._run(source, "cat /state.txt"), "v2")
+
+        forks = source.fork(1, checkpoint_id=checkpoint_id)
+        fork = forks[0]
+        self.addCleanup(fork.kill)
+
+        # The fork is the sandbox as of the checkpoint: the later write is gone.
+        self.assertEqual(self._run(fork, "cat /state.txt"), "v1")
+        self.assertEqual(self._run(fork, "test -e /only-in-source.txt && echo yes || echo no"), "no")
+
+        # And the source was never restored — it keeps its newer state and runs on.
+        self.assertEqual(self._run(source, "cat /state.txt"), "v2")
+        self.assertEqual(self._run(source, "cat /only-in-source.txt"), "after-ckpt")
+
     def test_forks_survive_source_destruction(self) -> None:
         source = Sandbox(image=self._IMAGE, engine=self.engine)
         self._run(source, "echo keepsake > /state.txt")

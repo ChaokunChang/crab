@@ -315,11 +315,15 @@ Cloud-mode limitations:
 
 ## Current limitations
 
-- `Sandbox.fork(count, lazy=False, effects=None)` clones a running sandbox
-  via checkpoint+restore: each fork is an independent, running sandbox
-  sharing the parent's state at fork time (incremental chain sharing
-  applies when available). `lazy=True` restores with CRIU lazy-pages for a
-  faster return. Forks share the parent's `work_dir` host mount.
+- `Sandbox.fork(count, lazy=False, effects=None, checkpoint_id=None)` clones
+  a running sandbox via checkpoint+restore: each fork is an independent,
+  running sandbox sharing the parent's state at fork time (incremental
+  chain sharing applies when available). `lazy=True` restores with CRIU
+  lazy-pages for a faster return. `checkpoint_id` forks from one of the
+  parent's stored checkpoints instead of its live state: no new checkpoint
+  is taken and the parent is never restored, so the batch branches from
+  that past point while the parent keeps running where it is. Forks share
+  the parent's `work_dir` host mount.
   `effects` declares what the fork is *for*, which decides whether its
   outbound writes are gated — see
   [Fork intent and outbound writes](#fork-intent-and-outbound-writes).

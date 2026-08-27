@@ -642,6 +642,25 @@ class FacadeTests(GatewayLiveTestBase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["result"]["stdout"], "ran echo")
 
+    def test_fork_forwards_the_checkpoint_fork_point(self) -> None:
+        # The gateway only reads `count` (for quota); the rest of the fork
+        # body has to reach the daemon untouched.
+        _, payload = self.request("POST", "/v1/sandboxes", api_key=self.key, body={})
+        sandbox_id = payload["sandbox_id"]
+        status, _ = self.request(
+            "POST",
+            f"/v1/sandboxes/{sandbox_id}/fork",
+            api_key=self.key,
+            body={"count": 1, "checkpoint_id": "ckpt-7"},
+        )
+        self.assertEqual(status, 200)
+        forwarded = [
+            body
+            for method, path, body in self.state.requests
+            if (method, path) == ("POST", f"/sandboxes/{sandbox_id}/fork")
+        ]
+        self.assertEqual(forwarded, [{"count": 1, "checkpoint_id": "ckpt-7"}])
+
     def test_daemon_error_relayed_verbatim(self) -> None:
         _, payload = self.request("POST", "/v1/sandboxes", api_key=self.key, body={})
         sandbox_id = payload["sandbox_id"]

@@ -14,7 +14,7 @@ from unittest import mock
 
 from crab.daemon.server import _build_handler, _BadRequest, _Routes
 from crab.daemon.transport import DaemonClient, DaemonRequestError, serve_unix_socket
-from crab.ids import SandboxId
+from crab.ids import CheckpointId, SandboxId
 from crab.remote_engine import RemoteEngine
 from crab.sandbox import Sandbox
 
@@ -68,13 +68,16 @@ class _FakeEngine:
         self.fork_calls: list[dict] = []
         self.fork_error: Exception | None = None
 
-    def fork_sandbox(self, source_sandbox_id, *, count=1, lazy=False, effects=None):
+    def fork_sandbox(
+        self, source_sandbox_id, *, count=1, lazy=False, effects=None, checkpoint_id=None
+    ):
         self.fork_calls.append(
             {
                 "source": str(source_sandbox_id),
                 "count": count,
                 "lazy": lazy,
                 "effects": effects,
+                "checkpoint_id": None if checkpoint_id is None else str(checkpoint_id),
             }
         )
         if self.fork_error is not None:
@@ -123,7 +126,15 @@ class ForkRouteHandlerTests(unittest.TestCase):
         self.assertEqual(response["forks"], [{"sandbox_id": "src-fork-0"}])
         self.assertEqual(
             self.engine.fork_calls,
-            [{"source": "src", "count": 1, "lazy": False, "effects": None}],
+            [
+                {
+                    "source": "src",
+                    "count": 1,
+                    "lazy": False,
+                    "effects": None,
+                    "checkpoint_id": None,
+                }
+            ],
         )
 
     def test_fork_propagates_count_and_lazy_and_registers(self) -> None:
@@ -136,7 +147,15 @@ class ForkRouteHandlerTests(unittest.TestCase):
         )
         self.assertEqual(
             self.engine.fork_calls,
-            [{"source": "src", "count": 2, "lazy": True, "effects": None}],
+            [
+                {
+                    "source": "src",
+                    "count": 2,
+                    "lazy": True,
+                    "effects": None,
+                    "checkpoint_id": None,
+                }
+            ],
         )
         # Forks land in the daemon registry so /sandboxes lists them and
         # daemon shutdown tears them down.
@@ -152,8 +171,40 @@ class ForkRouteHandlerTests(unittest.TestCase):
         self.routes.fork_sandbox({"effects": "reject"}, sandbox_id="src")
         self.assertEqual(
             self.engine.fork_calls,
-            [{"source": "src", "count": 1, "lazy": False, "effects": "reject"}],
+            [
+                {
+                    "source": "src",
+                    "count": 1,
+                    "lazy": False,
+                    "effects": "reject",
+                    "checkpoint_id": None,
+                }
+            ],
         )
+
+    def test_fork_propagates_an_explicit_checkpoint_fork_point(self) -> None:
+        # Forking from a stored checkpoint instead of the live state: the id
+        # has to reach the daemon-side engine, which owns the clone.
+        self.routes.fork_sandbox(
+            {"count": 2, "checkpoint_id": "ckpt-7"}, sandbox_id="src"
+        )
+        self.assertEqual(
+            self.engine.fork_calls,
+            [
+                {
+                    "source": "src",
+                    "count": 2,
+                    "lazy": False,
+                    "effects": None,
+                    "checkpoint_id": "ckpt-7",
+                }
+            ],
+        )
+
+    def test_fork_rejects_a_non_string_checkpoint_id(self) -> None:
+        with self.assertRaises(_BadRequest):
+            self.routes.fork_sandbox({"checkpoint_id": 7}, sandbox_id="src")
+        self.assertEqual(self.engine.fork_calls, [])
 
     def test_fork_rejects_a_non_string_effect_policy(self) -> None:
         with self.assertRaises(_BadRequest):
@@ -222,6 +273,16 @@ class ForkRouteDispatchTests(unittest.TestCase):
         with self.assertRaises(DaemonRequestError) as ctx:
             self.client.post_json("/sandboxes/src/fork", {"count": 0})
         self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_sdk_fork_from_a_checkpoint_reaches_the_engine(self) -> None:
+        # The whole remote path in one go: Sandbox.fork -> RemoteEngine ->
+        # HTTP over the socket -> daemon route -> daemon-side engine.
+        engine = RemoteEngine(
+            self.client, info={"runtime": "runc", "default_image": "ubuntu:22.04"}
+        )
+        forks = Sandbox.connect("src", engine=engine).fork(1, checkpoint_id="ckpt-7")
+        self.assertEqual([str(fork.sandbox_id) for fork in forks], ["src-fork-0"])
+        self.assertEqual(self.engine.fork_calls[-1]["checkpoint_id"], "ckpt-7")
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +374,38 @@ class RemoteEngineForkTests(unittest.TestCase):
         self.assertEqual(str(forks[0].sandbox_id), "src-fork-a")
         self.assertEqual(client.requests[0]["path"], "/sandboxes/src/fork")
 
+    def test_fork_sandbox_sends_the_fork_point_only_when_given(self) -> None:
+        # Same compatibility rule as `effects`: omitting the fork point must
+        # not add the key, so a newer SDK keeps working against a daemon
+        # that predates it.
+        client = _FakeDaemonClient(
+            {"ok": True, "forks": [{"sandbox_id": "src-fork-a"}]}
+        )
+        engine = RemoteEngine(client, info=self._INFO)
+
+        engine.fork_sandbox(SandboxId("src"), count=1)
+        self.assertEqual(client.requests[-1]["payload"], {"count": 1, "lazy": False})
+
+        engine.fork_sandbox(
+            SandboxId("src"), count=1, checkpoint_id=CheckpointId("ckpt-7")
+        )
+        self.assertEqual(
+            client.requests[-1]["payload"],
+            {"count": 1, "lazy": False, "checkpoint_id": "ckpt-7"},
+        )
+
+    def test_sandbox_fork_from_a_checkpoint_reaches_the_wire(self) -> None:
+        client = _FakeDaemonClient(
+            {"ok": True, "forks": [{"sandbox_id": "src-fork-a"}]}
+        )
+        engine = RemoteEngine(client, info=self._INFO)
+        source = Sandbox.connect("src", engine=engine)
+        source.fork(2, checkpoint_id="ckpt-7")
+        self.assertEqual(
+            client.requests[-1]["payload"],
+            {"count": 2, "lazy": False, "checkpoint_id": "ckpt-7"},
+        )
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -364,6 +457,25 @@ class CliForkTests(unittest.TestCase):
         )
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(out), [{"sandbox_id": "sbx-1-fork-a"}])
+
+    def test_sandbox_fork_sends_the_checkpoint_fork_point(self) -> None:
+        rc, out, requests = self._run_cli(
+            ["sandbox", "fork", "sbx-1", "--checkpoint", "ckpt-7"],
+            {"ok": True, "forks": [{"sandbox_id": "sbx-1-fork-a"}]},
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.splitlines(), ["sbx-1-fork-a"])
+        self.assertEqual(
+            requests[-1]["payload"],
+            {"count": 1, "lazy": False, "checkpoint_id": "ckpt-7"},
+        )
+
+    def test_sandbox_fork_omits_the_fork_point_when_not_asked(self) -> None:
+        _, _, requests = self._run_cli(
+            ["sandbox", "fork", "sbx-1"],
+            {"ok": True, "forks": [{"sandbox_id": "sbx-1-fork-a"}]},
+        )
+        self.assertEqual(requests[-1]["payload"], {"count": 1, "lazy": False})
 
     def test_sandbox_fork_rejects_bad_count_without_daemon_call(self) -> None:
         stderr = io.StringIO()

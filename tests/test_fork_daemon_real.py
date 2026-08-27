@@ -112,6 +112,36 @@ class ForkDaemonRealTests(unittest.TestCase):
         self.addCleanup(fork.kill)
         self.assertEqual(self._run(fork, "cat /state.txt"), "cli-state")
 
+    def test_cli_fork_from_a_checkpoint_branches_from_the_past(self) -> None:
+        source = Sandbox(image=self._IMAGE, engine=self.engine)
+        self.addCleanup(source.kill)
+        self._run(source, "echo v1 > /state.txt")
+        checkpoint_id = source.checkpoint()
+        self._run(source, "echo v2 > /state.txt")
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc = cli_commands.main(
+                [
+                    "--socket",
+                    str(self.socket_path),
+                    "sandbox",
+                    "fork",
+                    str(source.sandbox_id),
+                    "--checkpoint",
+                    str(checkpoint_id),
+                ]
+            )
+        self.assertEqual(rc, 0)
+        fork_ids = stdout.getvalue().split()
+        self.assertEqual(len(fork_ids), 1)
+
+        fork = Sandbox.connect(fork_ids[0], engine=self.engine)
+        self.addCleanup(fork.kill)
+        self.assertEqual(self._run(fork, "cat /state.txt"), "v1")
+        # The source is not restored by a fork off one of its old checkpoints.
+        self.assertEqual(self._run(source, "cat /state.txt"), "v2")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -46,7 +46,7 @@ from typing import TYPE_CHECKING, Any, Mapping
 from .config import ExecutorConfig, SchedulerConfig, StorageConfig, TelemetryConfig
 from .contracts import Runtime
 from .executor import CRExecutor
-from .ids import SandboxId
+from .ids import CheckpointId, SandboxId
 from .inspector import EBPFSandboxInspector
 from .journal import ActionJournal
 from .interceptor import (
@@ -1891,6 +1891,7 @@ class Engine:
         lazy: bool = False,
         effects: str | None = None,
         gate_effects: bool = True,
+        checkpoint_id: CheckpointId | None = None,
     ) -> list[SandboxId]:
         """Fork a running sandbox `count` times via checkpoint+restore.
 
@@ -1899,6 +1900,11 @@ class Engine:
         is enabled, a checkpoint-state clone (CrabSystem.fork_once, with
         incremental chain sharing when available), and a process restore —
         lazily via CRIU lazy-pages when ``lazy=True``.
+
+        ``checkpoint_id`` names an existing checkpoint of the source as the
+        fork point instead of taking a fresh one; the whole batch then
+        branches from that single point, and the source is left as it is
+        (forking from a past checkpoint never restores it).
 
         ``effects`` is the bare-fork effect policy (F1); it is resolved and
         validated once, before any fork exists, so a bad value cannot leave
@@ -1924,6 +1930,14 @@ class Engine:
         paths = getattr(runtime, "paths", None)
         if paths is None:
             raise RuntimeError("fork is only supported on the runc runtime")
+        if checkpoint_id is not None and checkpoint_id not in system.storage.list_checkpoints(
+            source_sandbox_id
+        ):
+            # Same reason the effect policy is validated up front: a bad id
+            # must not leave a bundle and a network lease behind.
+            raise ValueError(
+                f"checkpoint {checkpoint_id} not found for sandbox {source_sandbox_id}"
+            )
 
         fork_ids: list[SandboxId] = []
         for _ in range(count):
@@ -1956,6 +1970,7 @@ class Engine:
             result = system.fork_once(
                 source_sandbox_id,
                 target_sandbox_id,
+                checkpoint_id=checkpoint_id,
                 target_rootfs_path=target_bundle / "rootfs",
             )
             # Arm the gate before the fork's processes are restored: once

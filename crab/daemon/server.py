@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..engine import Engine, EngineConfig
-from ..ids import SandboxId
+from ..ids import CheckpointId, SandboxId
 from ..merging import MergeError
 from ..process_merge import ProcessMergeConflict
 from ..models import SandboxSnapshot, utc_now
@@ -653,8 +653,18 @@ class _Routes:
         effects = body.get("effects")
         if effects is not None and not isinstance(effects, str):
             raise _BadRequest("fork effects must be a string")
+        checkpoint_raw = body.get("checkpoint_id")
+        if checkpoint_raw is not None and not isinstance(checkpoint_raw, str):
+            raise _BadRequest("fork checkpoint_id must be a string")
+        checkpoint_id = None if checkpoint_raw is None else CheckpointId(checkpoint_raw)
         try:
-            fork_ids = eng.fork_sandbox(sid, count=count, lazy=lazy, effects=effects)
+            fork_ids = eng.fork_sandbox(
+                sid,
+                count=count,
+                lazy=lazy,
+                effects=effects,
+                checkpoint_id=checkpoint_id,
+            )
         except (ValueError, RuntimeError) as exc:
             raise _BadRequest(f"fork failed: {exc}") from exc
         forks: list[dict[str, Any]] = []
