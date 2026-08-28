@@ -777,9 +777,35 @@ class _Routes:
         try:
             checkpoint_body = dict(body)
             checkpoint_body["leave_running"] = True
-            result = self._create_checkpoint_unlocked(
-                checkpoint_body, sandbox_id=sandbox_id
+            requested_id_raw = checkpoint_body.get("checkpoint_id")
+            requested_id = (
+                None
+                if requested_id_raw is None
+                else CheckpointId(str(requested_id_raw))
             )
+            result = None
+            storage = getattr(eng.system, "storage", None)
+            if requested_id is not None and storage is not None:
+                try:
+                    storage.get_manifest(SandboxId(sandbox_id), requested_id)
+                except (FileNotFoundError, KeyError):
+                    pass
+                else:
+                    # Idempotent retry after an uncertain gateway response:
+                    # the durable checkpoint already succeeded, so do not
+                    # create a second dump. Retry only the stop half.
+                    result = {
+                        "ok": True,
+                        "sandbox_id": sandbox_id,
+                        "checkpoint_id": str(requested_id),
+                        "status": "succeeded",
+                        "failure_code": None,
+                        "message": "",
+                    }
+            if result is None:
+                result = self._create_checkpoint_unlocked(
+                    checkpoint_body, sandbox_id=sandbox_id
+                )
             if (
                 not result.get("ok")
                 or result.get("status") != "succeeded"
@@ -832,6 +858,15 @@ class _Routes:
         }
 
     def fork_sandbox(self, body: dict[str, Any], *, sandbox_id: str) -> dict[str, Any]:
+        self._begin_lifecycle(sandbox_id, "fork")
+        try:
+            return self._fork_sandbox_unlocked(body, sandbox_id=sandbox_id)
+        finally:
+            _sandbox_activity.end_lifecycle(sandbox_id)
+
+    def _fork_sandbox_unlocked(
+        self, body: dict[str, Any], *, sandbox_id: str
+    ) -> dict[str, Any]:
         """Fork a running sandbox N times (checkpoint + per-fork restore).
 
         Runs the same local path the in-process Engine exposes; forks are

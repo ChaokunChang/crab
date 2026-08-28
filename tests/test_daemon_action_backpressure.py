@@ -13,10 +13,13 @@ from types import SimpleNamespace
 
 from crab.daemon import server as daemon_server
 from crab.daemon.server import _Routes
+from crab.ids import CheckpointId, SandboxId
 from crab.models import FailureCode, JobStatus
 
 
 class _FakeRuntime:
+    name = "fake"
+
     def __init__(self, log: list) -> None:
         self._log = log
 
@@ -50,9 +53,13 @@ class _FakeSystem:
 class _FakeDaemon:
     def __init__(self, engine) -> None:
         self.engine = engine
+        self.registered: list[SandboxId] = []
 
     def require_engine(self):
         return self.engine
+
+    def register_sandbox(self, sandbox_id: SandboxId) -> None:
+        self.registered.append(sandbox_id)
 
 
 class CheckpointBackpressureTests(unittest.TestCase):
@@ -228,6 +235,59 @@ class CheckpointBackpressureTests(unittest.TestCase):
         stopped = next(ts for kind, _, ts in self.log if kind == "stop")
         self.assertLess(checkpoint_done, stopped)
 
+    def test_fork_holds_lifecycle_gate_against_stop(self) -> None:
+        fork_started = threading.Event()
+        release_fork = threading.Event()
+        thread_errors: list[BaseException] = []
+
+        def fork_sandbox(source, **kwargs):
+            fork_started.set()
+            if not release_fork.wait(timeout=2.0):
+                raise TimeoutError("test did not release fork")
+            self.log.append(("fork_done", str(source), time.monotonic()))
+            return [SandboxId("sbx-child")]
+
+        inspector = SimpleNamespace(upsert_snapshot=lambda snapshot: None)
+        engine = SimpleNamespace(
+            runtime=_FakeRuntime(self.log),
+            system=SimpleNamespace(inspector=inspector),
+            fork_sandbox=fork_sandbox,
+        )
+        routes = _Routes(_FakeDaemon(engine))
+
+        def run(callable_):
+            try:
+                callable_()
+            except BaseException as exc:
+                thread_errors.append(exc)
+
+        fork_thread = threading.Thread(
+            target=run,
+            args=(lambda: routes.fork_sandbox({}, sandbox_id="sbx-source"),),
+        )
+        stop_thread = threading.Thread(
+            target=run,
+            args=(lambda: routes.stop_sandbox({}, sandbox_id="sbx-source"),),
+        )
+        try:
+            fork_thread.start()
+            self.assertTrue(fork_started.wait(timeout=1.0))
+            stop_thread.start()
+            time.sleep(0.1)
+            self.assertTrue(stop_thread.is_alive())
+            self.assertFalse(any(kind == "stop" for kind, _, _ in self.log))
+        finally:
+            release_fork.set()
+            fork_thread.join(timeout=2.0)
+            stop_thread.join(timeout=2.0)
+
+        self.assertFalse(fork_thread.is_alive())
+        self.assertFalse(stop_thread.is_alive())
+        self.assertEqual(thread_errors, [])
+        fork_done = next(ts for kind, _, ts in self.log if kind == "fork_done")
+        stopped = next(ts for kind, _, ts in self.log if kind == "stop")
+        self.assertLess(fork_done, stopped)
+
 
 class CheckpointStopTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -275,6 +335,40 @@ class CheckpointStopTests(unittest.TestCase):
         self.assertEqual(response["checkpoint_id"], "ckpt-requested")
         self.assertEqual(response["status"], "failed")
         self.assertFalse(any(kind == "stop" for kind, _, _ in self.log))
+
+    def test_existing_manifest_retries_only_stop(self) -> None:
+        checkpoint_calls: list[str] = []
+        manifest_reads: list[tuple[SandboxId, CheckpointId]] = []
+
+        class Storage:
+            def get_manifest(self, sandbox_id, checkpoint_id):
+                manifest_reads.append((sandbox_id, checkpoint_id))
+                return SimpleNamespace(checkpoint_id=checkpoint_id)
+
+        def checkpoint_once(*args, **kwargs):
+            checkpoint_calls.append("called")
+            raise AssertionError("existing checkpoint must not be recreated")
+
+        engine = SimpleNamespace(
+            runtime=_FakeRuntime(self.log),
+            system=SimpleNamespace(
+                storage=Storage(),
+                checkpoint_once=checkpoint_once,
+            ),
+        )
+        response = _Routes(_FakeDaemon(engine)).checkpoint_stop_sandbox(
+            {"checkpoint_id": "ckpt-durable"}, sandbox_id="sbx-retry"
+        )
+
+        self.assertTrue(response["ok"])
+        self.assertTrue(response["stopped"])
+        self.assertEqual(response["checkpoint_id"], "ckpt-durable")
+        self.assertEqual(checkpoint_calls, [])
+        self.assertEqual(
+            manifest_reads,
+            [(SandboxId("sbx-retry"), CheckpointId("ckpt-durable"))],
+        )
+        self.assertTrue(any(kind == "stop" for kind, _, _ in self.log))
 
 
 if __name__ == "__main__":

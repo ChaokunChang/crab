@@ -49,6 +49,7 @@ from ..daemon.transport import (
     DaemonRequestError,
     serve_unix_socket,
 )
+from ..ids import CheckpointId
 from ..resources import validate_claim
 from .ports import PortManager
 from .registry import GatewayRegistry, QuotaExceeded
@@ -110,6 +111,49 @@ def _parse_idle_timeout(raw: Any) -> float | None:
     except (TypeError, ValueError):
         raise _BadRequest(f"idle_timeout must be a number of seconds, got {raw!r}")
     return value if value > 0 else None
+
+
+def _parse_idle_action(raw: Any) -> str | None:
+    """Validate an optional idle action at every public entry point."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or raw not in IDLE_ACTIONS:
+        raise _BadRequest(
+            f"idle_action must be one of {', '.join(IDLE_ACTIONS)}; got {raw!r}"
+        )
+    return raw
+
+
+def _idle_reclaim_checkpoint_id(row: dict[str, Any], action: str) -> str | None:
+    """Return the durable checkpoint id for one idle reclaim episode.
+
+    A gateway crash or an uncertain daemon response must not mint a second
+    checkpoint on the retry. Reuse the prior id while no newer activity has
+    started a fresh idle episode; otherwise allocate a new one.
+    """
+    if action != "checkpoint_stop":
+        return None
+    prior_id = row.get("last_idle_checkpoint_id")
+    if (
+        prior_id
+        and row.get("last_idle_action") == action
+        and row.get("last_idle_status") in {"in_progress", "failed"}
+    ):
+        last_activity = row.get("last_activity")
+        last_reclaim = row.get("last_idle_reclaim_at")
+        activity_after_reclaim = False
+        if last_activity and last_reclaim:
+            try:
+                activity_after_reclaim = datetime.fromisoformat(
+                    str(last_activity)
+                ) > datetime.fromisoformat(str(last_reclaim))
+            except (TypeError, ValueError):
+                # Malformed legacy timestamps should favor idempotency: keep
+                # the durable id instead of risking a duplicate checkpoint.
+                activity_after_reclaim = False
+        if not activity_after_reclaim:
+            return str(prior_id)
+    return str(CheckpointId.new())
 
 
 def default_data_dir() -> Path:
@@ -244,9 +288,7 @@ class _GatewayRoutes:
         except ValueError as exc:
             raise _BadRequest(f"invalid resources: {exc}") from exc
         idle_timeout = _parse_idle_timeout(metadata.get("idle_timeout"))
-        idle_action = metadata.get("idle_action")
-        if idle_action is not None and idle_action not in IDLE_ACTIONS:
-            idle_action = DEFAULT_IDLE_ACTION
+        idle_action = _parse_idle_action(metadata.get("idle_action"))
         # Phase one: durable intent + quota gate (409 on exhaustion),
         # including the per-tenant aggregate resource caps.
         intent_id = self._gateway.registry.begin_create(tenant_id, name=name, resources=claim)
@@ -299,11 +341,7 @@ class _GatewayRoutes:
         assert tenant_id is not None
         self._gateway.require_owned(tenant_id, sandbox_id)
         idle_timeout = _parse_idle_timeout((body or {}).get("idle_timeout"))
-        idle_action = (body or {}).get("idle_action")
-        if idle_action is not None and idle_action not in IDLE_ACTIONS:
-            raise _BadRequest(
-                f"idle_action must be one of {', '.join(IDLE_ACTIONS)}; got {idle_action!r}"
-            )
+        idle_action = _parse_idle_action((body or {}).get("idle_action"))
         self._gateway.registry.set_idle_policy(sandbox_id, idle_timeout, idle_action)
         return self._idle_response(sandbox_id)
 
@@ -342,6 +380,10 @@ class _GatewayRoutes:
     ) -> dict[str, Any]:
         assert tenant_id is not None
         source_row = self._gateway.require_owned(tenant_id, sandbox_id)
+        # Fork is source activity. Touch before the long daemon call so a
+        # concurrent reaper sees it, and again afterwards so a long fork gets
+        # a full idle window rather than being reclaimed immediately.
+        self._gateway.registry.touch(sandbox_id)
         try:
             count = int(body.get("count", 1))
         except (TypeError, ValueError):
@@ -357,9 +399,12 @@ class _GatewayRoutes:
         self._gateway.registry.ensure_capacity(
             tenant_id, additional=max(count, 0), resources=claim
         )
-        result = self._gateway.proxy(
-            "POST", f"/sandboxes/{sandbox_id}/fork", body, _SLOW_TIMEOUT_S
-        )
+        try:
+            result = self._gateway.proxy(
+                "POST", f"/sandboxes/{sandbox_id}/fork", body, _SLOW_TIMEOUT_S
+            )
+        finally:
+            self._gateway.registry.touch(sandbox_id)
         for fork in result.get("forks") or []:
             fork_id = fork.get("sandbox_id")
             if fork_id:
@@ -1112,14 +1157,24 @@ class GatewayServer:
             if now_ts - baseline_ts < float(timeout):
                 continue
             action = row.get("idle_action") or DEFAULT_IDLE_ACTION
+            checkpoint_id = _idle_reclaim_checkpoint_id(row, action)
             self.registry.record_idle_reclaim(
-                sid, action=action, status="in_progress"
+                sid,
+                action=action,
+                status="in_progress",
+                checkpoint_id=checkpoint_id,
             )
             try:
-                result = self._apply_idle_action(sid, action)
+                result = self._apply_idle_action(
+                    sid, action, checkpoint_id=checkpoint_id
+                )
             except Exception as exc:
                 self.registry.record_idle_reclaim(
-                    sid, action=action, status="failed", error=str(exc)
+                    sid,
+                    action=action,
+                    status="failed",
+                    checkpoint_id=checkpoint_id,
+                    error=str(exc),
                 )
                 # Leave the row active so a later pass retries.
                 logger.warning(
@@ -1130,10 +1185,15 @@ class GatewayServer:
                 )
                 continue
 
-            checkpoint_id_raw = result.get("checkpoint_id")
-            checkpoint_id = (
-                None if checkpoint_id_raw is None else str(checkpoint_id_raw)
-            )
+            # checkpoint_stop always keeps the id allocated and persisted
+            # before the RPC. Never replace it with an unexpected daemon id.
+            if checkpoint_id is None:
+                checkpoint_id_raw = result.get("checkpoint_id")
+                checkpoint_id = (
+                    None
+                    if checkpoint_id_raw is None
+                    else str(checkpoint_id_raw)
+                )
             status = "succeeded" if result.get("ok") else "failed"
             error = None if status == "succeeded" else str(
                 result.get("message") or result.get("error") or "idle action failed"
@@ -1153,7 +1213,13 @@ class GatewayServer:
                     error,
                 )
 
-    def _apply_idle_action(self, sandbox_id: str, action: str) -> dict[str, Any]:
+    def _apply_idle_action(
+        self,
+        sandbox_id: str,
+        action: str,
+        *,
+        checkpoint_id: str | None = None,
+    ) -> dict[str, Any]:
         result: dict[str, Any]
         if action == "pause":
             result = self.proxy(
@@ -1172,16 +1238,19 @@ class GatewayServer:
             )
             logger.info("idle reclaim: stopped %s", sandbox_id)
         elif action == "checkpoint_stop":
+            if checkpoint_id is None:
+                raise ValueError("checkpoint_stop requires a preallocated checkpoint id")
             result = self.proxy(
                 "POST",
                 f"/sandboxes/{sandbox_id}/checkpoint-stop",
-                {},
+                {"checkpoint_id": checkpoint_id},
                 _RECLAIM_TIMEOUT_S,
             )
             if (
                 not result.get("ok")
                 or result.get("status") != "succeeded"
                 or not result.get("checkpoint_id")
+                or str(result.get("checkpoint_id")) != checkpoint_id
                 or not result.get("stopped")
             ):
                 return {**result, "ok": False}

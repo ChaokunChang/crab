@@ -654,6 +654,24 @@ class FacadeTests(GatewayLiveTestBase):
         self.assertEqual(row["status"], "active")
         self.assertEqual(self.gateway.registry.pending_rows(), [])
 
+    def test_create_rejects_invalid_idle_action_without_calling_daemon(self) -> None:
+        status, payload = self.request(
+            "POST",
+            "/v1/sandboxes",
+            api_key=self.key,
+            body={
+                "metadata": {
+                    "idle_timeout": 60,
+                    "idle_action": "archive",
+                }
+            },
+        )
+
+        self.assertEqual(status, 400)
+        self.assertIn("idle_action", payload["error"])
+        self.assertEqual(self.state.create_bodies(), [])
+        self.assertEqual(self.gateway.registry.pending_rows(), [])
+
     def test_exec_passthrough_result(self) -> None:
         _, payload = self.request("POST", "/v1/sandboxes", api_key=self.key, body={})
         sandbox_id = payload["sandbox_id"]
