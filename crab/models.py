@@ -40,6 +40,61 @@ class JobStatus(str, Enum):
     FAILED = "failed"
 
 
+class SandboxState(str, Enum):
+    """High-level sandbox lifecycle state surfaced to SDK users.
+
+    ``PAUSED`` and ``STOPPED`` are deliberately distinct:
+
+    - ``PAUSED`` — the container's cgroup is frozen (``runc pause``). The
+      process state is still in memory; ``resume()`` continues it almost
+      instantly.
+    - ``STOPPED`` — the container's processes have been terminated
+      (``runc stop``). The filesystem is preserved, but the process tree is
+      gone; bring it back with ``start()`` (fresh processes) or ``restore()``
+      (from a checkpoint).
+    """
+
+    RUNNING = "running"
+    PAUSED = "paused"
+    STOPPED = "stopped"
+    CREATED = "created"
+    KILLED = "killed"
+    LOST = "lost"
+    UNKNOWN = "unknown"
+
+
+def sandbox_state_from_status(status: str | None) -> SandboxState:
+    """Map a runtime/descriptor status string to a :class:`SandboxState`."""
+    s = (status or "").strip().lower()
+    if s == "running":
+        return SandboxState.RUNNING
+    if s == "paused":
+        return SandboxState.PAUSED
+    if s in ("stopped", "exited"):
+        return SandboxState.STOPPED
+    if s == "created":
+        return SandboxState.CREATED
+    if s == "killed":
+        return SandboxState.KILLED
+    if s == "lost":
+        return SandboxState.LOST
+    if s == "missing":
+        return SandboxState.KILLED
+    return SandboxState.UNKNOWN
+
+
+@dataclass(frozen=True)
+class SandboxInfo:
+    """Snapshot of a sandbox's lifecycle state returned by ``Sandbox.describe()``."""
+
+    sandbox_id: str
+    state: SandboxState
+    status: str | None = None
+    runtime_status: str | None = None
+    pid: int | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
 class ArtifactKind(str, Enum):
     PROCESS = "process"
     FILESYSTEM = "filesystem"

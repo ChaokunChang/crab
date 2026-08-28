@@ -899,6 +899,14 @@ class RemoteEngine:
         response = self._client.get_json("/sandboxes")
         return list(response.get("sandboxes") or [])
 
+    def set_idle_timeout(self, sandbox_id: SandboxId, idle_timeout: float | None) -> None:
+        """Reset/extend the sandbox's idle-reclaim window (E2B-style
+        ``set_timeout``). ``None`` disables idle reclaim."""
+        self._client.post_json(
+            f"/sandboxes/{sandbox_id}/idle",
+            {"idle_timeout": idle_timeout},
+        )
+
     def register_upstream(self, sandbox_id: SandboxId, url: str) -> None:
         if not url:
             return

@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator
 
 from .ids import CheckpointId, SandboxId
-from .models import EgressLedger, ExecDone, ExecEvent, JobStatus, MergeReport, ObservationReport, PortAllocation, ProcessMergeReport, SandboxExecResult, SandboxSnapshot, utc_now
+from .models import EgressLedger, ExecDone, ExecEvent, JobStatus, MergeReport, ObservationReport, PortAllocation, ProcessMergeReport, SandboxExecResult, SandboxInfo, SandboxSnapshot, SandboxState, sandbox_state_from_status, utc_now
 from .templates import SandboxTemplate
 
 if TYPE_CHECKING:
@@ -815,10 +815,15 @@ class Sandbox:
         autostart: bool = True,
         network: bool | None = None,
         # `resources` is enforced (S3): normalized at construction and
-        # applied as cgroup limits on the runc launch path. `timeout` and
-        # `labels` remain advisory metadata exposed via `Sandbox.metadata`.
+        # applied as cgroup limits on the runc launch path. `timeout` is the
+        # idle-reclaim window (seconds of inactivity before `idle_action` is
+        # applied by the gateway; E2B-style). `idle_action` selects the
+        # outcome: "pause" | "stop" | "checkpoint_stop" | "kill". Both are
+        # ignored by local (non-gateway) engines. `labels` remain advisory
+        # metadata exposed via `Sandbox.metadata`.
         resources: dict[str, object] | None = None,
         timeout: float | None = None,
+        idle_action: str | None = None,
         labels: dict[str, str] | None = None,
         auto_checkpoint: bool = False,
     ) -> None:
@@ -837,6 +842,7 @@ class Sandbox:
         self._metadata = {
             "resources": dict(resources or {}),
             "timeout": timeout,
+            "idle_action": idle_action,
             "labels": dict(labels or {}),
         }
         # Host-inspector filters are layered from two internal sources:
@@ -905,6 +911,12 @@ class Sandbox:
             # The normalized claim rides the launch metadata so the gateway
             # (cloud mode) can meter per-tenant aggregate quotas (§4 S3).
             launch_metadata = {**launch_metadata, "resources": dict(self._resource_claim)}
+        idle_timeout = self._metadata.get("timeout")
+        if idle_timeout is not None:
+            launch_metadata = {**launch_metadata, "idle_timeout": idle_timeout}
+            idle_action = self._metadata.get("idle_action")
+            if idle_action is not None:
+                launch_metadata = {**launch_metadata, "idle_action": idle_action}
         sandbox_id = runtime.launch(runtime_name, launch_metadata)
         self._sandbox_id = sandbox_id
         self._mark_inspector_running()
@@ -1596,6 +1608,113 @@ class Sandbox:
         """Stop then start the sandbox (equivalent to ``stop()`` followed by
         ``start()``)."""
         self._engine.runtime.restart(self.sandbox_id)
+
+    @staticmethod
+    def _state_exceptions() -> tuple[tuple[type, ...], tuple[type, ...]]:
+        """Return (lost_exceptions, not_found_exceptions). Remote engines raise
+        typed cloud errors (410/404); local engines raise ``KeyError``. The
+        import is lazy to avoid a top-level cycle with ``cloud_client``."""
+        try:
+            from .cloud_client import SandboxLost, SandboxNotFound
+
+            return (SandboxLost,), (SandboxNotFound, KeyError)
+        except Exception:
+            return (), (KeyError,)
+
+    @property
+    def state(self) -> SandboxState:
+        """The sandbox's current lifecycle state.
+
+        Distinguishes ``PAUSED`` (cgroup-frozen, ``resume()`` to continue) from
+        ``STOPPED`` (processes terminated, ``start()``/``restore()`` to bring
+        back). Returns ``KILLED`` after ``kill()`` or when the sandbox no longer
+        exists, and ``LOST`` when the gateway has lost track of it (e.g. a daemon
+        restart)."""
+        if self._closed:
+            return SandboxState.KILLED
+        sid = self._sandbox_id
+        if sid is None:
+            return SandboxState.UNKNOWN
+        lost_exc, notfound_exc = self._state_exceptions()
+        try:
+            runtime_state = self._engine.runtime.inspect_runtime(sid)
+            return sandbox_state_from_status(runtime_state.status)
+        except lost_exc:
+            return SandboxState.LOST
+        except notfound_exc:
+            return SandboxState.KILLED
+        except Exception:
+            try:
+                description = self._engine.runtime.describe(sid)
+                return sandbox_state_from_status(description.status)
+            except lost_exc:
+                return SandboxState.LOST
+            except notfound_exc:
+                return SandboxState.KILLED
+            except Exception:
+                return SandboxState.UNKNOWN
+
+    def describe(self) -> SandboxInfo:
+        """Return a :class:`SandboxInfo` snapshot with both the bookkeeping
+        status and the live runc runtime status (plus pid/metadata)."""
+        sid = self._sandbox_id
+        if sid is None:
+            return SandboxInfo(sandbox_id="", state=SandboxState.UNKNOWN)
+        if self._closed:
+            return SandboxInfo(sandbox_id=str(sid), state=SandboxState.KILLED)
+        lost_exc, notfound_exc = self._state_exceptions()
+        status: str | None = None
+        runtime_status: str | None = None
+        pid: int | None = None
+        metadata: dict[str, Any] = {}
+        lost = notfound = False
+        try:
+            description = self._engine.runtime.describe(sid)
+            status = description.status
+            metadata = dict(description.metadata or {})
+        except lost_exc:
+            lost = True
+        except notfound_exc:
+            notfound = True
+        except Exception:
+            pass
+        try:
+            runtime_state = self._engine.runtime.inspect_runtime(sid)
+            runtime_status = runtime_state.status
+            pid = runtime_state.pid
+        except lost_exc:
+            lost = True
+        except notfound_exc:
+            notfound = True
+        except Exception:
+            pass
+        if lost:
+            resolved = SandboxState.LOST
+        elif notfound:
+            resolved = SandboxState.KILLED
+        else:
+            resolved = sandbox_state_from_status(
+                runtime_status if runtime_status is not None else status
+            )
+        return SandboxInfo(
+            sandbox_id=str(sid),
+            state=resolved,
+            status=status,
+            runtime_status=runtime_status,
+            pid=pid,
+            metadata=metadata,
+        )
+
+    def set_timeout(self, seconds: float | None) -> None:
+        """Reset/extend the idle-reclaim window (E2B-style ``setTimeout`` /
+        Daytona keep-alive). ``seconds`` of further inactivity before the
+        configured ``idle_action`` fires; ``None`` disables idle reclaim.
+        Only enforced by gateway (remote) engines — local engines have no idle
+        sweeper, so the value is recorded but not acted on."""
+        setter = getattr(self._engine, "set_idle_timeout", None)
+        if callable(setter):
+            setter(self.sandbox_id, seconds)
+        self._metadata["timeout"] = seconds
 
     def kill(self) -> None:
         if self._closed:
