@@ -815,10 +815,15 @@ class Sandbox:
         autostart: bool = True,
         network: bool | None = None,
         # `resources` is enforced (S3): normalized at construction and
-        # applied as cgroup limits on the runc launch path. `timeout` and
-        # `labels` remain advisory metadata exposed via `Sandbox.metadata`.
+        # applied as cgroup limits on the runc launch path. `timeout` is the
+        # idle-reclaim window (seconds of inactivity before `idle_action` is
+        # applied by the gateway; E2B-style). `idle_action` selects the
+        # outcome: "pause" | "stop" | "checkpoint_stop" | "kill". Both are
+        # ignored by local (non-gateway) engines. `labels` remain advisory
+        # metadata exposed via `Sandbox.metadata`.
         resources: dict[str, object] | None = None,
         timeout: float | None = None,
+        idle_action: str | None = None,
         labels: dict[str, str] | None = None,
         auto_checkpoint: bool = False,
     ) -> None:
@@ -837,6 +842,7 @@ class Sandbox:
         self._metadata = {
             "resources": dict(resources or {}),
             "timeout": timeout,
+            "idle_action": idle_action,
             "labels": dict(labels or {}),
         }
         # Host-inspector filters are layered from two internal sources:
@@ -905,6 +911,12 @@ class Sandbox:
             # The normalized claim rides the launch metadata so the gateway
             # (cloud mode) can meter per-tenant aggregate quotas (§4 S3).
             launch_metadata = {**launch_metadata, "resources": dict(self._resource_claim)}
+        idle_timeout = self._metadata.get("timeout")
+        if idle_timeout is not None:
+            launch_metadata = {**launch_metadata, "idle_timeout": idle_timeout}
+            idle_action = self._metadata.get("idle_action")
+            if idle_action is not None:
+                launch_metadata = {**launch_metadata, "idle_action": idle_action}
         sandbox_id = runtime.launch(runtime_name, launch_metadata)
         self._sandbox_id = sandbox_id
         self._mark_inspector_running()
@@ -1692,6 +1704,17 @@ class Sandbox:
             pid=pid,
             metadata=metadata,
         )
+
+    def set_timeout(self, seconds: float | None) -> None:
+        """Reset/extend the idle-reclaim window (E2B-style ``setTimeout`` /
+        Daytona keep-alive). ``seconds`` of further inactivity before the
+        configured ``idle_action`` fires; ``None`` disables idle reclaim.
+        Only enforced by gateway (remote) engines — local engines have no idle
+        sweeper, so the value is recorded but not acted on."""
+        setter = getattr(self._engine, "set_idle_timeout", None)
+        if callable(setter):
+            setter(self.sandbox_id, seconds)
+        self._metadata["timeout"] = seconds
 
     def kill(self) -> None:
         if self._closed:

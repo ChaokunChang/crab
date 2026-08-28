@@ -38,6 +38,7 @@ import os
 import signal
 import threading
 import time
+from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -76,6 +77,35 @@ _SLOW_TIMEOUT_S = 600.0
 """Budget for daemon calls that legitimately block: CRIU dump/restore
 (checkpoint, fork, txn begin/commit/abort), merges, exec with long task
 timeouts, create (first image fetch), kill (chain materialization)."""
+
+# Idle auto-reclaim. A sandbox that carries an idle_timeout and sees no
+# activity on an _ACTIVITY_SUBPATH for that many seconds has idle_action
+# applied. PAUSED vs STOPPED are distinct outcomes (see SandboxState):
+# `pause` freezes the cgroup (resume() continues); `stop` terminates the
+# processes (start()/restore() to bring back); `checkpoint_stop` snapshots
+# process state first; `kill` destroys the sandbox.
+IDLE_ACTIONS = ("pause", "stop", "checkpoint_stop", "kill")
+DEFAULT_IDLE_ACTION = "stop"
+_ACTIVITY_SUBPATHS = {
+    "/exec",
+    "/action",
+    "/checkpoints",
+    "/checkpoints/{checkpoint_id}/restore",
+    "/start",
+    "/resume",
+}
+
+
+def _parse_idle_timeout(raw: Any) -> float | None:
+    """Parse an idle timeout (seconds). Returns None to disable idle reclaim
+    for absent or non-positive values; malformed non-numeric input is a 400."""
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise _BadRequest(f"idle_timeout must be a number of seconds, got {raw!r}")
+    return value if value > 0 else None
 
 
 def default_data_dir() -> Path:
@@ -209,6 +239,10 @@ class _GatewayRoutes:
             claim = validate_claim(metadata.get("resources"))
         except ValueError as exc:
             raise _BadRequest(f"invalid resources: {exc}") from exc
+        idle_timeout = _parse_idle_timeout(metadata.get("idle_timeout"))
+        idle_action = metadata.get("idle_action")
+        if idle_action is not None and idle_action not in IDLE_ACTIONS:
+            idle_action = DEFAULT_IDLE_ACTION
         # Phase one: durable intent + quota gate (409 on exhaustion),
         # including the per-tenant aggregate resource caps.
         intent_id = self._gateway.registry.begin_create(tenant_id, name=name, resources=claim)
@@ -232,6 +266,10 @@ class _GatewayRoutes:
             raise _BadRequest("daemon create returned no sandbox_id")
         # Phase two: flip pending -> active under the daemon-assigned id.
         self._gateway.registry.complete_create(intent_id, sandbox_id)
+        if idle_timeout is not None:
+            self._gateway.registry.set_idle_policy(
+                sandbox_id, idle_timeout, idle_action or DEFAULT_IDLE_ACTION
+            )
         return result
 
     def kill_sandbox(
@@ -248,6 +286,27 @@ class _GatewayRoutes:
         )
         self._gateway.registry.set_status(sandbox_id, "killed")
         return result
+
+    def set_idle(
+        self, tenant_id: str | None, body: dict[str, Any], *, sandbox_id: str, **_: Any
+    ) -> dict[str, Any]:
+        """Set/replace a sandbox's idle-reclaim policy and reset its activity
+        clock (E2B-style ``set_timeout`` / Daytona keep-alive)."""
+        assert tenant_id is not None
+        self._gateway.require_owned(tenant_id, sandbox_id)
+        idle_timeout = _parse_idle_timeout((body or {}).get("idle_timeout"))
+        idle_action = (body or {}).get("idle_action")
+        if idle_action is not None and idle_action not in IDLE_ACTIONS:
+            raise _BadRequest(
+                f"idle_action must be one of {', '.join(IDLE_ACTIONS)}; got {idle_action!r}"
+            )
+        self._gateway.registry.set_idle_policy(sandbox_id, idle_timeout, idle_action)
+        return {
+            "ok": True,
+            "sandbox_id": sandbox_id,
+            "idle_timeout": idle_timeout,
+            "idle_action": idle_action,
+        }
 
     def fork_sandbox(
         self, tenant_id: str | None, body: dict[str, Any], *, sandbox_id: str, **_: Any
@@ -348,9 +407,11 @@ class _GatewayRoutes:
         return {"ok": True, "released_host_port": host_port}
 
 
-def _make_passthrough(gateway: "GatewayServer", method: str, timeout: float):
+def _make_passthrough(gateway: "GatewayServer", method: str, timeout: float, subpath: str = ""):
     """Ownership-checked 1:1 proxy: the daemon path is the request path
-    minus the `/v1` prefix, the body rides verbatim."""
+    minus the `/v1` prefix, the body rides verbatim. Activity-bearing POST
+    routes additionally reset the sandbox's idle timer on success."""
+    activity = method == "POST" and subpath in _ACTIVITY_SUBPATHS
 
     def handler(
         tenant_id: str | None, body: dict[str, Any], *, path: str, sandbox_id: str, **_: Any
@@ -360,7 +421,10 @@ def _make_passthrough(gateway: "GatewayServer", method: str, timeout: float):
         # POST and DELETE both forward their body verbatim (the daemon's
         # checkpoint DELETE accepts a `{"cascade": true}` body).
         payload = body if method in ("POST", "DELETE") else None
-        return gateway.proxy(method, path[len(API_PREFIX):], payload, timeout)
+        result = gateway.proxy(method, path[len(API_PREFIX):], payload, timeout)
+        if activity:
+            gateway.registry.touch(sandbox_id)
+        return result
 
     return handler
 
@@ -502,6 +566,7 @@ def _build_handler(gateway: "GatewayServer"):
         ("POST", f"{API_PREFIX}/sandboxes", True, routes.launch_sandbox),
         ("DELETE", f"{API_PREFIX}/sandboxes/{{sandbox_id}}", True, routes.kill_sandbox),
         ("POST", f"{API_PREFIX}/sandboxes/{{sandbox_id}}/fork", True, routes.fork_sandbox),
+        ("POST", f"{API_PREFIX}/sandboxes/{{sandbox_id}}/idle", True, routes.set_idle),
         # S4: port exposure routes
         ("POST", f"{API_PREFIX}/sandboxes/{{sandbox_id}}/ports", True, routes.expose_port),
         ("GET", f"{API_PREFIX}/sandboxes/{{sandbox_id}}/ports", True, routes.list_ports),
@@ -512,7 +577,7 @@ def _build_handler(gateway: "GatewayServer"):
     ]
     for method, subpath, timeout in _PASSTHROUGH_SANDBOX_ROUTES:
         pattern = f"{API_PREFIX}/sandboxes/{{sandbox_id}}{subpath}"
-        table.append((method, pattern, True, _make_passthrough(gateway, method, timeout)))
+        table.append((method, pattern, True, _make_passthrough(gateway, method, timeout, subpath)))
 
     def _match(method: str, path: str):
         for route_method, pattern, requires_auth, fn in table:
@@ -964,10 +1029,12 @@ class GatewayServer:
             logger.warning("periodic reconcile failed: %s", exc)
             return
         present: set[str] = set()
+        daemon_status: dict[str, str] = {}
         for row in listing.get("sandboxes") or []:
             sid = str(row.get("sandbox_id") or "")
             if sid:
                 present.add(sid)
+                daemon_status[sid] = str(row.get("status") or "")
         lost_ids = self.registry.mark_missing_lost(present)
         if lost_ids:
             for sid in lost_ids:
@@ -980,6 +1047,56 @@ class GatewayServer:
             logger.info(
                 "periodic reconcile: %d daemon orphans (not in registry)", len(orphans)
             )
+        self._reap_idle_sandboxes(daemon_status)
+
+    def _reap_idle_sandboxes(self, daemon_status: dict[str, str]) -> None:
+        """Apply ``idle_action`` to active sandboxes past their ``idle_timeout``.
+
+        Only sandboxes the daemon reports as running are eligible — one that
+        is already paused/stopped has already been reclaimed and is left alone
+        until the user resumes/starts it (which resets its activity clock)."""
+        now_ts = time.time()
+        for row in self.registry.list_active_with_idle():
+            sid = str(row["sandbox_id"])
+            if daemon_status.get(sid, "").lower() != "running":
+                continue
+            timeout = row.get("idle_timeout")
+            if timeout is None:
+                continue
+            baseline = row.get("last_activity") or row.get("created_at")
+            try:
+                baseline_ts = datetime.fromisoformat(str(baseline)).timestamp()
+            except (ValueError, TypeError):
+                continue
+            if now_ts - baseline_ts < float(timeout):
+                continue
+            action = row.get("idle_action") or DEFAULT_IDLE_ACTION
+            self._apply_idle_action(sid, action)
+
+    def _apply_idle_action(self, sandbox_id: str, action: str) -> None:
+        try:
+            if action == "pause":
+                self.proxy("POST", f"/sandboxes/{sandbox_id}/pause", None, _FAST_TIMEOUT_S)
+                logger.info("idle reclaim: paused %s", sandbox_id)
+            elif action == "stop":
+                self.proxy("POST", f"/sandboxes/{sandbox_id}/stop", None, _FAST_TIMEOUT_S)
+                logger.info("idle reclaim: stopped %s", sandbox_id)
+            elif action == "checkpoint_stop":
+                self.proxy("POST", f"/sandboxes/{sandbox_id}/checkpoints", {}, _SLOW_TIMEOUT_S)
+                self.proxy("POST", f"/sandboxes/{sandbox_id}/stop", None, _FAST_TIMEOUT_S)
+                logger.info("idle reclaim: checkpoint + stopped %s", sandbox_id)
+            elif action == "kill":
+                host_ports = self.registry.release_all_ports(sandbox_id)
+                if host_ports:
+                    self._port_manager.release_all(sandbox_id, host_ports)
+                self.proxy("DELETE", f"/sandboxes/{sandbox_id}", None, _SLOW_TIMEOUT_S)
+                self.registry.set_status(sandbox_id, "killed")
+                logger.info("idle reclaim: killed %s", sandbox_id)
+            else:
+                logger.warning("idle reclaim: unknown action %r for %s", action, sandbox_id)
+        except Exception as exc:
+            # Leave the row as-is so a later pass retries; don't crash the loop.
+            logger.warning("idle reclaim failed for %s (action=%s): %s", sandbox_id, action, exc)
 
     def _rehydrate_ports(self) -> None:
         """Restart forwarders for persisted port allocations (S5).

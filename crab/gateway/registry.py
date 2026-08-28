@@ -61,7 +61,10 @@ CREATE TABLE IF NOT EXISTS sandboxes (
     name TEXT,
     created_at TEXT NOT NULL,
     status TEXT NOT NULL,
-    resources_json TEXT NOT NULL DEFAULT '{}'
+    resources_json TEXT NOT NULL DEFAULT '{}',
+    idle_timeout REAL,
+    idle_action TEXT,
+    last_activity TEXT
 );
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -128,6 +131,14 @@ class GatewayRegistry:
             self._conn.execute(
                 "ALTER TABLE sandboxes ADD COLUMN resources_json TEXT NOT NULL DEFAULT '{}'"
             )
+        # Idle auto-reclaim columns. NULL idle_timeout means idle reclaim is
+        # disabled for that sandbox.
+        if "idle_timeout" not in columns:
+            self._conn.execute("ALTER TABLE sandboxes ADD COLUMN idle_timeout REAL")
+        if "idle_action" not in columns:
+            self._conn.execute("ALTER TABLE sandboxes ADD COLUMN idle_action TEXT")
+        if "last_activity" not in columns:
+            self._conn.execute("ALTER TABLE sandboxes ADD COLUMN last_activity TEXT")
 
     @property
     def path(self) -> Path:
@@ -461,6 +472,53 @@ class GatewayRegistry:
                 "UPDATE sandboxes SET status = ? WHERE sandbox_id = ?",
                 (status, sandbox_id),
             )
+
+    # ----- idle auto-reclaim -------------------------------------------
+
+    def set_idle_policy(
+        self,
+        sandbox_id: str,
+        idle_timeout: float | None,
+        idle_action: str | None = None,
+    ) -> None:
+        """Set/replace a sandbox's idle-reclaim policy and reset its activity
+        clock. ``idle_timeout`` is seconds of inactivity before the action
+        fires; ``None`` disables idle reclaim for the sandbox. When
+        ``idle_action`` is ``None`` the sandbox's existing action is preserved
+        (so callers can extend the timer without changing the action)."""
+        with self._lock:
+            if idle_action is None:
+                self._conn.execute(
+                    "UPDATE sandboxes SET idle_timeout = ?, last_activity = ?"
+                    " WHERE sandbox_id = ?",
+                    (idle_timeout, _utc_now(), sandbox_id),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE sandboxes SET idle_timeout = ?, idle_action = ?, last_activity = ?"
+                    " WHERE sandbox_id = ?",
+                    (idle_timeout, idle_action, _utc_now(), sandbox_id),
+                )
+
+    def touch(self, sandbox_id: str) -> None:
+        """Record activity now, but only for sandboxes with an idle policy
+        (avoids writing rows that idle reclaim will never consult)."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE sandboxes SET last_activity = ?"
+                " WHERE sandbox_id = ? AND idle_timeout IS NOT NULL",
+                (_utc_now(), sandbox_id),
+            )
+
+    def list_active_with_idle(self) -> list[dict[str, Any]]:
+        """Active sandboxes that carry an idle policy, for the sweeper."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT sandbox_id, tenant_id, status, created_at, last_activity,"
+                " idle_timeout, idle_action FROM sandboxes"
+                " WHERE status = 'active' AND idle_timeout IS NOT NULL"
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def list_sandboxes(
         self, tenant_id: str, statuses: Iterable[str] | None = None
