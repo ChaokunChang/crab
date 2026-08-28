@@ -675,6 +675,15 @@ class RuncRuntime(Runtime):
         )
         return sandbox_id
 
+    # Graceful-stop escalation: `stop` sends SIGTERM, then escalates to SIGKILL
+    # if the container is still running after the grace window. The sandbox init
+    # runs as PID 1 (e.g. `sleep infinity`); in a PID namespace the kernel drops
+    # default-action signals delivered to PID 1 unless the process installed a
+    # handler, so SIGTERM alone never stops these containers (docker-stop uses
+    # the same TERM-then-KILL pattern).
+    _STOP_GRACE_S = 2.0
+    _STOP_POLL_INTERVAL_S = 0.1
+
     def stop(self, sandbox_id: SandboxId) -> None:
         description = self.describe(sandbox_id)
         self._run_command(
@@ -682,7 +691,26 @@ class RuncRuntime(Runtime):
             operation="sandbox.runtime_kill",
             sandbox_id=sandbox_id,
         )
+        if not self._wait_for_stopped(sandbox_id, self._STOP_GRACE_S):
+            self._run_command(
+                [self._runtime_bin, "--root", str(self._paths.state_root), "kill", str(sandbox_id), "KILL"],
+                operation="sandbox.runtime_kill_force",
+                sandbox_id=sandbox_id,
+                check=False,
+            )
         self._update_description(replace(description, status="stopped"))
+
+    def _wait_for_stopped(self, sandbox_id: SandboxId, timeout_s: float) -> bool:
+        """Poll until the container reports a terminal state, or the grace
+        window elapses. Returns True when the container is stopped/exited."""
+        deadline = time.monotonic() + max(float(timeout_s), 0.0)
+        while True:
+            state = self.inspect_runtime(sandbox_id)
+            if state.status.lower() in ("stopped", "exited", "missing"):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(self._STOP_POLL_INTERVAL_S)
 
     def pause(self, sandbox_id: SandboxId) -> None:
         description = self.describe(sandbox_id)

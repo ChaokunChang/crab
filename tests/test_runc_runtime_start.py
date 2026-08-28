@@ -51,6 +51,9 @@ class RuncRuntimeStartTests(unittest.TestCase):
             "runc",
             {"sandbox_id": "sbx-test", "bundle_path": str(root / "bundles" / "sbx-test")},
         )
+        # Zero the stop grace window so stop's TERM->KILL escalation does not
+        # sleep during unit tests.
+        runtime._STOP_GRACE_S = 0.0
         return runtime
 
     def _cmds(self, root: Path) -> dict[str, tuple[str, ...]]:
@@ -61,6 +64,8 @@ class RuncRuntimeStartTests(unittest.TestCase):
             "start": ("runc", "--root", state, "start", "sbx-test"),
             "delete": ("runc", "--root", state, "delete", "-f", "sbx-test"),
             "stop": ("runc", "--root", state, "kill", "sbx-test", "TERM"),
+            "kill": ("runc", "--root", state, "kill", "sbx-test", "KILL"),
+            "state": ("runc", "--root", state, "state", "sbx-test"),
             "resume": ("runc", "--root", state, "resume", "sbx-test"),
         }
 
@@ -135,6 +140,62 @@ class RuncRuntimeStartTests(unittest.TestCase):
             self.assertIn(c["create"], runner.commands)
             self.assertIn(c["start"], runner.commands)
             self.assertEqual(runtime.describe(SandboxId("sbx-test")).status, "running")
+
+    def test_stop_escalates_to_sigkill_when_term_ignored(self) -> None:
+        """The sandbox init runs as PID 1 (sleep infinity) which never handles
+        SIGTERM, so the container keeps running after the graceful signal. stop
+        must then escalate to SIGKILL so the sandbox actually stops."""
+        with tempfile.TemporaryDirectory(prefix="crab_runc_start_") as tmp:
+            root = Path(tmp)
+            c = self._cmds(root)
+            runner = _RecordingRunner(
+                results_by_key={
+                    c["state"]: [
+                        CommandResult(
+                            command=c["state"],
+                            returncode=0,
+                            stdout='{"status": "running", "pid": 1}',
+                            stderr="",
+                        )
+                    ]
+                },
+            )
+            runtime = self._make_runtime(runner, root)
+            runner.commands.clear()
+
+            runtime.stop(SandboxId("sbx-test"))
+
+            self.assertIn(c["stop"], runner.commands)
+            self.assertIn(c["kill"], runner.commands)
+            self.assertLess(runner.commands.index(c["stop"]), runner.commands.index(c["kill"]))
+            self.assertEqual(runtime.describe(SandboxId("sbx-test")).status, "stopped")
+
+    def test_stop_skips_sigkill_when_container_exits_on_term(self) -> None:
+        """When the container does exit promptly on SIGTERM, stop must not send
+        the SIGKILL escalation."""
+        with tempfile.TemporaryDirectory(prefix="crab_runc_start_") as tmp:
+            root = Path(tmp)
+            c = self._cmds(root)
+            runner = _RecordingRunner(
+                results_by_key={
+                    c["state"]: [
+                        CommandResult(
+                            command=c["state"],
+                            returncode=0,
+                            stdout='{"status": "stopped", "pid": 0}',
+                            stderr="",
+                        )
+                    ]
+                },
+            )
+            runtime = self._make_runtime(runner, root)
+            runner.commands.clear()
+
+            runtime.stop(SandboxId("sbx-test"))
+
+            self.assertIn(c["stop"], runner.commands)
+            self.assertNotIn(c["kill"], runner.commands)
+            self.assertEqual(runtime.describe(SandboxId("sbx-test")).status, "stopped")
 
 
 if __name__ == "__main__":

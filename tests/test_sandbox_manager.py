@@ -18,6 +18,9 @@ class FakeCommandRunner(CommandRunner):
         self.commands: list[tuple[str, ...]] = []
         self.datasets: set[str] = set()
         self.snapshots: set[str] = set()
+        # Tracked runc container status so `runc state` returns something the
+        # stop TERM->KILL grace poll can resolve against.
+        self._container_status = "created"
 
     def run(self, command: list[str], *, cwd: Path | None = None, timeout_seconds: float | None = None):
         _ = cwd
@@ -50,6 +53,20 @@ class FakeCommandRunner(CommandRunner):
                 stderr = "dataset does not exist"
             self.datasets.difference_update(datasets)
             self.snapshots.difference_update(snapshots)
+        elif command[-2:] == ["state", "sbx-test"]:
+            stdout = json.dumps({"status": self._container_status, "pid": 123})
+        elif command[-2:] == ["start", "sbx-test"]:
+            self._container_status = "running"
+        elif command[-2:] == ["pause", "sbx-test"]:
+            self._container_status = "paused"
+        elif command[-2:] == ["resume", "sbx-test"]:
+            self._container_status = "running"
+        elif command[-3:-1] == ["kill", "sbx-test"]:
+            # Simulate a container that honors the signal (the SIGTERM-ignored
+            # escalation is covered separately in test_runc_runtime_start).
+            self._container_status = "stopped"
+        elif "create" in command and command[-1] == "sbx-test":
+            self._container_status = "created"
         return type(
             "Result",
             (),
@@ -407,6 +424,7 @@ class SandboxManagerTests(unittest.TestCase):
                     ("runc", "--root", str(root / "state"), "pause", "sbx-test"),
                     ("runc", "--root", str(root / "state"), "resume", "sbx-test"),
                     ("runc", "--root", str(root / "state"), "kill", "sbx-test", "TERM"),
+                    ("runc", "--root", str(root / "state"), "state", "sbx-test"),
                     ("runc", "--root", str(root / "state"), "delete", "-f", "sbx-test"),
                     ("zfs", "destroy", "-r", "pool/crab/sbx-test"),
                 ],
