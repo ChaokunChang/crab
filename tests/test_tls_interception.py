@@ -1,16 +1,20 @@
-"""Unit tests for crab.tls_ca — CA store and leaf certificate minting.
+"""TLS certificate and egress interception tests.
 
 Covers: CA generation idempotency, key file permissions, leaf SAN correctness,
 per-host caching, cache expiry, EKU, clock-skew backdate, capacity eviction,
-host validation, and CA→leaf chain verification.
+host validation, CA→leaf chain verification, and rejected HTTPS responses.
 """
 
 from __future__ import annotations
 
 import datetime
+import http.client
 import ipaddress
 import os
+import socket
+import ssl
 import stat
+from unittest import mock
 
 import pytest
 
@@ -21,7 +25,12 @@ from cryptography import x509  # noqa: E402
 from cryptography.hazmat.primitives import hashes, serialization  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric import padding, rsa  # noqa: E402
 
+from crab.egress import EgressProxyServer  # noqa: E402
+from crab.effects import EffectGate  # noqa: E402
+from crab.ids import SandboxId  # noqa: E402
+from crab.journal import ActionJournal  # noqa: E402
 from crab.tls_ca import CAStore, LeafMinter, _LEAF_CACHE_MAX  # noqa: E402
+from crab.tls_interceptor import TLSInterceptor, _ALPN_PROTOCOLS  # noqa: E402
 
 
 class TestCAStore:
@@ -256,3 +265,64 @@ class TestLeafMinter:
         """Non-IP host containing ':' (port) raises ValueError."""
         with pytest.raises(ValueError, match="port separator"):
             minter.get_or_mint("example.com:443")
+
+
+class TestTLSEffectRejectLoopback:
+    """A rejected HTTPS write must receive its 503 before TLS closes."""
+
+    def test_nonempty_post_receives_503(self, tmp_path):
+        interceptor = TLSInterceptor(tmp_path / "tls")
+        sni = "reject.example.com"
+        sandbox_id = SandboxId("sbx-tls-reject")
+        gate = EffectGate()
+        gate.begin(sandbox_id, policy="reject")
+        proxy = EgressProxyServer(
+            journal=ActionJournal(tmp_path / "journal"),
+            sandbox_id_resolver=lambda _peer: sandbox_id,
+            host="127.0.0.1",
+            port=0,
+            head_timeout_seconds=1.0,
+            effect_gate=gate,
+            tls_interceptor=interceptor,
+        )
+
+        client_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        client_ctx.load_verify_locations(
+            cadata=interceptor.ca_store.cert_pem().decode()
+        )
+        client_ctx.set_alpn_protocols(_ALPN_PROTOCOLS)
+        request_head = (
+            b"POST /write HTTP/1.1\r\n"
+            b"Host: reject.example.com\r\n"
+            b"Content-Length: 7\r\n\r\n"
+        )
+
+        with mock.patch(
+            "crab.egress.original_destination",
+            return_value=("127.0.0.1", 443),
+        ):
+            proxy.start()
+            try:
+                with socket.create_connection(
+                    ("127.0.0.1", proxy.port), timeout=5.0
+                ) as raw_client:
+                    with client_ctx.wrap_socket(
+                        raw_client, server_hostname=sni
+                    ) as tls_client:
+                        # Separate writes become separate TLS records. The
+                        # proxy's first recv sees the head while the payload
+                        # remains unread, matching urllib's real-host flow.
+                        tls_client.sendall(request_head)
+                        tls_client.sendall(b"payload")
+
+                        response = http.client.HTTPResponse(tls_client)
+                        response.begin()
+                        assert response.status == 503
+                        assert response.getheader("X-Crab-Effect") == "rejected"
+                        assert response.read() == (
+                            b"crab: mutating egress refused by txn policy\n"
+                        )
+            finally:
+                proxy.stop()
+
+        assert gate.counters(sandbox_id)[1] == 1

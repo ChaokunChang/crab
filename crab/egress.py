@@ -550,6 +550,56 @@ class CassetteReplayer:
         return entry
 
 
+def _send_rejected_response(
+    client: socket.socket,
+    request_head: bytes,
+    *,
+    drain_timeout_seconds: float,
+) -> None:
+    """Return the synthetic 503 without resetting a TLS connection.
+
+    HTTP clients commonly write headers and a body as separate TLS records.
+    The proxy only needs the first record to reject the request, but closing
+    the socket while the body remains unread can make Linux send a TCP RST and
+    discard the 503 that was just written. Send the response promptly, then
+    best-effort drain the declared body before the handler closes the socket.
+    An absolute deadline keeps a slow or malicious peer from holding the
+    handler thread indefinitely.
+    """
+    client.sendall(REJECTED_RESPONSE)
+
+    parsed = parse_head(request_head)
+    if parsed is None:
+        return
+    content_length = parsed.content_length()
+    if content_length is None:
+        return
+    remaining = max(0, content_length - len(parsed.rest))
+    if remaining == 0:
+        return
+
+    deadline = time.monotonic() + max(0.0, drain_timeout_seconds)
+    previous_timeout = client.gettimeout()
+    try:
+        while remaining > 0:
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                break
+            client.settimeout(timeout)
+            try:
+                chunk = client.recv(min(_SPLICE_CHUNK, remaining))
+            except (socket.timeout, OSError):
+                break
+            if not chunk:
+                break
+            remaining -= len(chunk)
+    finally:
+        try:
+            client.settimeout(previous_timeout)
+        except OSError:
+            pass
+
+
 class _EgressHandler(socketserver.BaseRequestHandler):
     def handle(self) -> None:  # noqa: C901 - straight-line proxy flow
         server: "EgressProxyServer" = self.server  # type: ignore[assignment]
@@ -769,7 +819,11 @@ class _EgressHandler(socketserver.BaseRequestHandler):
                         # Unparsable head, unframed/chunked body, or a body
                         # past the cap: refuse rather than queue a request
                         # that would flush corrupted at commit.
-                        client.sendall(REJECTED_RESPONSE)
+                        _send_rejected_response(
+                            client,
+                            head,
+                            drain_timeout_seconds=server.head_timeout_seconds,
+                        )
                         bytes_in = len(REJECTED_RESPONSE)
                         record_meta = {"effect": "rejected", "effect_reason": "unqueueable"}
                         return
@@ -790,7 +844,11 @@ class _EgressHandler(socketserver.BaseRequestHandler):
                         # decision and the enqueue (commit/abort raced us).
                         # Either way the write was NOT queued, so answering
                         # 202 would be a lie — refuse instead.
-                        client.sendall(REJECTED_RESPONSE)
+                        _send_rejected_response(
+                            client,
+                            head,
+                            drain_timeout_seconds=server.head_timeout_seconds,
+                        )
                         bytes_in = len(REJECTED_RESPONSE)
                         record_meta = {
                             "effect": "rejected",
@@ -806,7 +864,11 @@ class _EgressHandler(socketserver.BaseRequestHandler):
                     }
                     return  # finally still writes the journal row
                 if decision == DECISION_REJECT:
-                    client.sendall(REJECTED_RESPONSE)
+                    _send_rejected_response(
+                        client,
+                        head,
+                        drain_timeout_seconds=server.head_timeout_seconds,
+                    )
                     bytes_in = len(REJECTED_RESPONSE)
                     record_meta = {"effect": "rejected"}
                     return
