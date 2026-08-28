@@ -600,7 +600,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 runner.commands,
             )
             self.assertEqual(
-                runner.commands[-3:],
+                runner.commands[-4:],
                 [
                     (
                         "runc",
@@ -610,6 +610,7 @@ class SystemIntegrationTests(unittest.TestCase):
                         "sbx-int",
                         "TERM",
                     ),
+                    ("runc", "--root", str(root / "runtime-state"), "state", "sbx-int"),
                     ("runc", "--root", str(root / "runtime-state"), "delete", "-f", "sbx-int"),
                     ("zfs", "destroy", "-r", "pool/crab/sbx-int"),
                 ],
