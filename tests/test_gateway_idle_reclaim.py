@@ -16,6 +16,7 @@ from crab.gateway.server import (
     GatewayServer,
     _BadRequest,
     _GatewayRoutes,
+    _parse_idle_action,
     _parse_idle_timeout,
 )
 
@@ -106,6 +107,11 @@ class RegistryIdleTests(unittest.TestCase):
         self.assertEqual(row["last_idle_status"], "succeeded")
         self.assertEqual(row["last_idle_checkpoint_id"], "ckpt-idle-1")
         self.assertIsNotNone(row["last_idle_reclaim_at"])
+        sweeper_row = self.registry.list_active_with_idle()[0]
+        self.assertEqual(sweeper_row["last_idle_action"], "checkpoint_stop")
+        self.assertEqual(sweeper_row["last_idle_status"], "succeeded")
+        self.assertEqual(sweeper_row["last_idle_checkpoint_id"], "ckpt-idle-1")
+        self.assertIsNotNone(sweeper_row["last_idle_reclaim_at"])
 
 
 class ParseIdleTimeoutTests(unittest.TestCase):
@@ -124,6 +130,18 @@ class ParseIdleTimeoutTests(unittest.TestCase):
     def test_malformed_is_bad_request(self) -> None:
         with self.assertRaises(_BadRequest):
             _parse_idle_timeout("not-a-number")
+
+
+class ParseIdleActionTests(unittest.TestCase):
+    def test_known_actions_and_none(self) -> None:
+        self.assertIsNone(_parse_idle_action(None))
+        for action in IDLE_ACTIONS:
+            self.assertEqual(_parse_idle_action(action), action)
+
+    def test_unknown_or_non_string_action_is_bad_request(self) -> None:
+        for value in ("archive", 1, True):
+            with self.subTest(value=value), self.assertRaises(_BadRequest):
+                _parse_idle_action(value)
 
 
 class IdleRouteTests(unittest.TestCase):
@@ -176,6 +194,38 @@ class IdleRouteTests(unittest.TestCase):
         self.assertEqual(child["idle_action"], "pause")
         self.assertGreaterEqual(child["last_activity"], source_activity)
 
+    def test_fork_refreshes_source_activity_before_and_after_daemon_call(self) -> None:
+        old_activity = "2020-01-01T00:00:00+00:00"
+        self.registry._conn.execute(
+            "UPDATE sandboxes SET last_activity = ? WHERE sandbox_id = ?",
+            (old_activity, "source"),
+        )
+        activity_during_proxy: list[str] = []
+
+        def proxy(*args):
+            activity_during_proxy.append(
+                self.registry.get_idle_policy("source")["last_activity"]
+            )
+            return {"ok": True, "forks": [{"sandbox_id": "child"}]}
+
+        gateway = types.SimpleNamespace(
+            registry=self.registry,
+            require_owned=lambda tenant_id, sandbox_id: self.registry.get_sandbox(
+                sandbox_id
+            ),
+            proxy=proxy,
+        )
+        _GatewayRoutes(gateway).fork_sandbox(
+            self.tenant, {"count": 1}, sandbox_id="source"
+        )
+
+        self.assertEqual(len(activity_during_proxy), 1)
+        self.assertGreater(activity_during_proxy[0], old_activity)
+        self.assertGreaterEqual(
+            self.registry.get_idle_policy("source")["last_activity"],
+            activity_during_proxy[0],
+        )
+
 
 class _FakeRegistry:
     def __init__(self, rows) -> None:
@@ -201,18 +251,32 @@ class _FakePortManager:
         pass
 
 
-def _make_fake_gateway(rows, *, checkpoint_result=None):
+def _make_fake_gateway(
+    rows, *, checkpoint_result=None, checkpoint_exception: Exception | None = None
+):
     gw = types.SimpleNamespace()
     gw.registry = _FakeRegistry(rows)
     gw.proxy_calls = []
+    gw.proxy_bodies = []
+    gw.reclaims_at_proxy = []
 
     def proxy(method, path, body, timeout):
         gw.proxy_calls.append((method, path))
+        gw.proxy_bodies.append((method, path, body))
+        gw.reclaims_at_proxy.append(
+            [dict(entry) for entry in gw.registry.reclaims]
+        )
         if path.endswith("/checkpoint-stop"):
-            return checkpoint_result or {
+            if checkpoint_exception is not None:
+                raise checkpoint_exception
+            if checkpoint_result is not None:
+                result = dict(checkpoint_result)
+                result.setdefault("checkpoint_id", body["checkpoint_id"])
+                return result
+            return {
                 "ok": True,
                 "status": "succeeded",
-                "checkpoint_id": "ckpt-idle-1",
+                "checkpoint_id": body["checkpoint_id"],
                 "stopped": True,
             }
         return {"ok": True}
@@ -232,6 +296,10 @@ def _row(sid, timeout, action, last_activity):
         "last_activity": last_activity,
         "idle_timeout": timeout,
         "idle_action": action,
+        "last_idle_action": None,
+        "last_idle_status": None,
+        "last_idle_checkpoint_id": None,
+        "last_idle_reclaim_at": None,
     }
 
 
@@ -280,10 +348,30 @@ class IdleSweeperTests(unittest.TestCase):
             gw.proxy_calls,
             [("POST", "/sandboxes/sb-1/checkpoint-stop")],
         )
-        self.assertEqual(gw.registry.reclaims[-1]["status"], "succeeded")
+        allocated_id = gw.registry.reclaims[0]["checkpoint_id"]
+        self.assertEqual(gw.registry.reclaims[0]["status"], "in_progress")
+        self.assertTrue(allocated_id.startswith("ckpt-"))
         self.assertEqual(
-            gw.registry.reclaims[-1]["checkpoint_id"], "ckpt-idle-1"
+            gw.reclaims_at_proxy[0][-1],
+            {
+                "sandbox_id": "sb-1",
+                "action": "checkpoint_stop",
+                "status": "in_progress",
+                "checkpoint_id": allocated_id,
+            },
         )
+        self.assertEqual(
+            gw.proxy_bodies,
+            [
+                (
+                    "POST",
+                    "/sandboxes/sb-1/checkpoint-stop",
+                    {"checkpoint_id": allocated_id},
+                )
+            ],
+        )
+        self.assertEqual(gw.registry.reclaims[-1]["status"], "succeeded")
+        self.assertEqual(gw.registry.reclaims[-1]["checkpoint_id"], allocated_id)
 
     def test_failed_checkpoint_stop_is_recorded_and_not_followed_by_stop(self) -> None:
         gw = _make_fake_gateway(
@@ -291,7 +379,6 @@ class IdleSweeperTests(unittest.TestCase):
             checkpoint_result={
                 "ok": False,
                 "status": "failed",
-                "checkpoint_id": "ckpt-failed-1",
                 "stopped": False,
                 "message": "checkpoint rejected",
             },
@@ -303,11 +390,81 @@ class IdleSweeperTests(unittest.TestCase):
         )
         self.assertEqual(gw.registry.reclaims[-1]["status"], "failed")
         self.assertEqual(
-            gw.registry.reclaims[-1]["checkpoint_id"], "ckpt-failed-1"
+            gw.registry.reclaims[-1]["checkpoint_id"],
+            gw.registry.reclaims[0]["checkpoint_id"],
         )
         self.assertEqual(
             gw.registry.reclaims[-1]["error"], "checkpoint rejected"
         )
+
+    def test_checkpoint_stop_transport_failure_preserves_preallocated_id(self) -> None:
+        gw = _make_fake_gateway(
+            [_row("sb-1", 60.0, "checkpoint_stop", _iso(3600))],
+            checkpoint_exception=TimeoutError("response lost"),
+        )
+        GatewayServer._reap_idle_sandboxes(gw, {"sb-1": "running"})
+
+        self.assertEqual(
+            [entry["status"] for entry in gw.registry.reclaims],
+            ["in_progress", "failed"],
+        )
+        allocated_id = gw.registry.reclaims[0]["checkpoint_id"]
+        self.assertEqual(gw.registry.reclaims[1]["checkpoint_id"], allocated_id)
+        self.assertEqual(
+            gw.proxy_bodies[-1][2], {"checkpoint_id": allocated_id}
+        )
+
+    def test_checkpoint_stop_rejects_unexpected_daemon_id(self) -> None:
+        gw = _make_fake_gateway(
+            [_row("sb-1", 60.0, "checkpoint_stop", _iso(3600))],
+            checkpoint_result={
+                "ok": True,
+                "status": "succeeded",
+                "checkpoint_id": "ckpt-unexpected",
+                "stopped": True,
+            },
+        )
+        GatewayServer._reap_idle_sandboxes(gw, {"sb-1": "running"})
+
+        allocated_id = gw.registry.reclaims[0]["checkpoint_id"]
+        self.assertEqual(gw.registry.reclaims[-1]["status"], "failed")
+        self.assertEqual(gw.registry.reclaims[-1]["checkpoint_id"], allocated_id)
+
+    def test_checkpoint_stop_retry_reuses_durable_id_without_new_activity(self) -> None:
+        row = _row("sb-1", 60.0, "checkpoint_stop", _iso(3600))
+        row.update(
+            last_idle_action="checkpoint_stop",
+            last_idle_status="failed",
+            last_idle_checkpoint_id="ckpt-durable",
+            last_idle_reclaim_at=_iso(120),
+        )
+        gw = _make_fake_gateway([row])
+        GatewayServer._reap_idle_sandboxes(gw, {"sb-1": "running"})
+
+        self.assertEqual(
+            gw.proxy_bodies[-1][2], {"checkpoint_id": "ckpt-durable"}
+        )
+        self.assertTrue(
+            all(
+                entry["checkpoint_id"] == "ckpt-durable"
+                for entry in gw.registry.reclaims
+            )
+        )
+
+    def test_checkpoint_stop_after_new_activity_allocates_a_new_id(self) -> None:
+        row = _row("sb-1", 60.0, "checkpoint_stop", _iso(3600))
+        row.update(
+            last_idle_action="checkpoint_stop",
+            last_idle_status="failed",
+            last_idle_checkpoint_id="ckpt-prior-episode",
+            last_idle_reclaim_at=_iso(7200),
+        )
+        gw = _make_fake_gateway([row])
+        GatewayServer._reap_idle_sandboxes(gw, {"sb-1": "running"})
+
+        allocated_id = gw.registry.reclaims[0]["checkpoint_id"]
+        self.assertNotEqual(allocated_id, "ckpt-prior-episode")
+        self.assertEqual(gw.proxy_bodies[-1][2], {"checkpoint_id": allocated_id})
 
     def test_idle_actions_constant(self) -> None:
         self.assertEqual(

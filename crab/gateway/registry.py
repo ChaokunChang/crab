@@ -551,7 +551,8 @@ class GatewayRegistry:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT sandbox_id, tenant_id, status, created_at, last_activity,"
-                " idle_timeout, idle_action FROM sandboxes"
+                " idle_timeout, idle_action, last_idle_action, last_idle_status,"
+                " last_idle_checkpoint_id, last_idle_reclaim_at FROM sandboxes"
                 " WHERE status = 'active' AND idle_timeout IS NOT NULL"
             ).fetchall()
         return [dict(row) for row in rows]
