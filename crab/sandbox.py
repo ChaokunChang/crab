@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator
 
 from .ids import CheckpointId, SandboxId
-from .models import EgressLedger, ExecDone, ExecEvent, JobStatus, MergeReport, ObservationReport, PortAllocation, ProcessMergeReport, SandboxExecResult, SandboxSnapshot, utc_now
+from .models import EgressLedger, ExecDone, ExecEvent, JobStatus, MergeReport, ObservationReport, PortAllocation, ProcessMergeReport, SandboxExecResult, SandboxInfo, SandboxSnapshot, SandboxState, sandbox_state_from_status, utc_now
 from .templates import SandboxTemplate
 
 if TYPE_CHECKING:
@@ -1596,6 +1596,102 @@ class Sandbox:
         """Stop then start the sandbox (equivalent to ``stop()`` followed by
         ``start()``)."""
         self._engine.runtime.restart(self.sandbox_id)
+
+    @staticmethod
+    def _state_exceptions() -> tuple[tuple[type, ...], tuple[type, ...]]:
+        """Return (lost_exceptions, not_found_exceptions). Remote engines raise
+        typed cloud errors (410/404); local engines raise ``KeyError``. The
+        import is lazy to avoid a top-level cycle with ``cloud_client``."""
+        try:
+            from .cloud_client import SandboxLost, SandboxNotFound
+
+            return (SandboxLost,), (SandboxNotFound, KeyError)
+        except Exception:
+            return (), (KeyError,)
+
+    @property
+    def state(self) -> SandboxState:
+        """The sandbox's current lifecycle state.
+
+        Distinguishes ``PAUSED`` (cgroup-frozen, ``resume()`` to continue) from
+        ``STOPPED`` (processes terminated, ``start()``/``restore()`` to bring
+        back). Returns ``KILLED`` after ``kill()`` or when the sandbox no longer
+        exists, and ``LOST`` when the gateway has lost track of it (e.g. a daemon
+        restart)."""
+        if self._closed:
+            return SandboxState.KILLED
+        sid = self._sandbox_id
+        if sid is None:
+            return SandboxState.UNKNOWN
+        lost_exc, notfound_exc = self._state_exceptions()
+        try:
+            runtime_state = self._engine.runtime.inspect_runtime(sid)
+            return sandbox_state_from_status(runtime_state.status)
+        except lost_exc:
+            return SandboxState.LOST
+        except notfound_exc:
+            return SandboxState.KILLED
+        except Exception:
+            try:
+                description = self._engine.runtime.describe(sid)
+                return sandbox_state_from_status(description.status)
+            except lost_exc:
+                return SandboxState.LOST
+            except notfound_exc:
+                return SandboxState.KILLED
+            except Exception:
+                return SandboxState.UNKNOWN
+
+    def describe(self) -> SandboxInfo:
+        """Return a :class:`SandboxInfo` snapshot with both the bookkeeping
+        status and the live runc runtime status (plus pid/metadata)."""
+        sid = self._sandbox_id
+        if sid is None:
+            return SandboxInfo(sandbox_id="", state=SandboxState.UNKNOWN)
+        if self._closed:
+            return SandboxInfo(sandbox_id=str(sid), state=SandboxState.KILLED)
+        lost_exc, notfound_exc = self._state_exceptions()
+        status: str | None = None
+        runtime_status: str | None = None
+        pid: int | None = None
+        metadata: dict[str, Any] = {}
+        lost = notfound = False
+        try:
+            description = self._engine.runtime.describe(sid)
+            status = description.status
+            metadata = dict(description.metadata or {})
+        except lost_exc:
+            lost = True
+        except notfound_exc:
+            notfound = True
+        except Exception:
+            pass
+        try:
+            runtime_state = self._engine.runtime.inspect_runtime(sid)
+            runtime_status = runtime_state.status
+            pid = runtime_state.pid
+        except lost_exc:
+            lost = True
+        except notfound_exc:
+            notfound = True
+        except Exception:
+            pass
+        if lost:
+            resolved = SandboxState.LOST
+        elif notfound:
+            resolved = SandboxState.KILLED
+        else:
+            resolved = sandbox_state_from_status(
+                runtime_status if runtime_status is not None else status
+            )
+        return SandboxInfo(
+            sandbox_id=str(sid),
+            state=resolved,
+            status=status,
+            runtime_status=runtime_status,
+            pid=pid,
+            metadata=metadata,
+        )
 
     def kill(self) -> None:
         if self._closed:
