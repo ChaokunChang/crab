@@ -68,6 +68,25 @@ class RemoteCheckpointShimTests(unittest.TestCase):
         self.assertEqual(restored.status, JobStatus.FAILED)
         self.assertIn("clones of previous snapshots exist", restored.message)
 
+    def test_checkpoint_failure_keeps_id_without_success_manifest(self) -> None:
+        class _FailingClient(_FakeClient):
+            def post_json(self, path: str, payload: object, *, timeout_seconds: float):
+                if path.endswith("/checkpoints"):
+                    return {
+                        "ok": False,
+                        "checkpoint_id": "ckpt-failed",
+                        "status": "failed",
+                        "message": "dump failed",
+                    }
+                return super().post_json(path, payload, timeout_seconds=timeout_seconds)
+
+        system = _SystemShim(_FailingClient())  # type: ignore[arg-type]
+        created = system.checkpoint_once(self.sandbox_id)
+        self.assertEqual(created.status, JobStatus.FAILED)
+        self.assertEqual(str(created.checkpoint_id), "ckpt-failed")
+        self.assertIsNone(created.manifest)
+        self.assertEqual(created.message, "dump failed")
+
     def test_checkpoint_storage_lists_metadata_and_deletes(self) -> None:
         checkpoint_ids = self.system.storage.list_checkpoints(self.sandbox_id)
         self.assertEqual([str(item) for item in checkpoint_ids], ["ckpt-one"])
