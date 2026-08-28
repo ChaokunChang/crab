@@ -64,7 +64,12 @@ CREATE TABLE IF NOT EXISTS sandboxes (
     resources_json TEXT NOT NULL DEFAULT '{}',
     idle_timeout REAL,
     idle_action TEXT,
-    last_activity TEXT
+    last_activity TEXT,
+    last_idle_action TEXT,
+    last_idle_status TEXT,
+    last_idle_checkpoint_id TEXT,
+    last_idle_reclaim_at TEXT,
+    last_idle_error TEXT
 );
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -139,6 +144,20 @@ class GatewayRegistry:
             self._conn.execute("ALTER TABLE sandboxes ADD COLUMN idle_action TEXT")
         if "last_activity" not in columns:
             self._conn.execute("ALTER TABLE sandboxes ADD COLUMN last_activity TEXT")
+        if "last_idle_action" not in columns:
+            self._conn.execute("ALTER TABLE sandboxes ADD COLUMN last_idle_action TEXT")
+        if "last_idle_status" not in columns:
+            self._conn.execute("ALTER TABLE sandboxes ADD COLUMN last_idle_status TEXT")
+        if "last_idle_checkpoint_id" not in columns:
+            self._conn.execute(
+                "ALTER TABLE sandboxes ADD COLUMN last_idle_checkpoint_id TEXT"
+            )
+        if "last_idle_reclaim_at" not in columns:
+            self._conn.execute(
+                "ALTER TABLE sandboxes ADD COLUMN last_idle_reclaim_at TEXT"
+            )
+        if "last_idle_error" not in columns:
+            self._conn.execute("ALTER TABLE sandboxes ADD COLUMN last_idle_error TEXT")
 
     @property
     def path(self) -> Path:
@@ -418,13 +437,27 @@ class GatewayRegistry:
         name: str | None = None,
         status: str = "active",
         resources: dict[str, Any] | None = None,
+        idle_timeout: float | None = None,
+        idle_action: str | None = None,
     ) -> None:
+        last_activity = _utc_now() if idle_timeout is not None else None
         with self._lock:
             self._conn.execute(
                 "INSERT INTO sandboxes"
-                " (sandbox_id, tenant_id, name, created_at, status, resources_json)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
-                (sandbox_id, tenant_id, name, _utc_now(), status, json.dumps(dict(resources or {}))),
+                " (sandbox_id, tenant_id, name, created_at, status, resources_json,"
+                " idle_timeout, idle_action, last_activity)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    sandbox_id,
+                    tenant_id,
+                    name,
+                    _utc_now(),
+                    status,
+                    json.dumps(dict(resources or {})),
+                    idle_timeout,
+                    idle_action,
+                    last_activity,
+                ),
             )
 
     def adopt_sandbox(
@@ -460,7 +493,10 @@ class GatewayRegistry:
     def get_sandbox(self, sandbox_id: str) -> dict[str, Any] | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT sandbox_id, tenant_id, name, created_at, status, resources_json"
+                "SELECT sandbox_id, tenant_id, name, created_at, status, resources_json,"
+                " idle_timeout, idle_action, last_activity, last_idle_action,"
+                " last_idle_status, last_idle_checkpoint_id, last_idle_reclaim_at,"
+                " last_idle_error"
                 " FROM sandboxes WHERE sandbox_id = ?",
                 (sandbox_id,),
             ).fetchone()
@@ -519,6 +555,42 @@ class GatewayRegistry:
                 " WHERE status = 'active' AND idle_timeout IS NOT NULL"
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def record_idle_reclaim(
+        self,
+        sandbox_id: str,
+        *,
+        action: str,
+        status: str,
+        checkpoint_id: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        """Persist the latest automatic reclaim outcome for API reads."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE sandboxes SET last_idle_action = ?, last_idle_status = ?,"
+                " last_idle_checkpoint_id = ?, last_idle_reclaim_at = ?,"
+                " last_idle_error = ? WHERE sandbox_id = ?",
+                (
+                    action,
+                    status,
+                    checkpoint_id,
+                    _utc_now(),
+                    error,
+                    sandbox_id,
+                ),
+            )
+
+    def get_idle_policy(self, sandbox_id: str) -> dict[str, Any] | None:
+        """Return policy, activity clock, and latest reclaim result."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT idle_timeout, idle_action, last_activity, last_idle_action,"
+                " last_idle_status, last_idle_checkpoint_id, last_idle_reclaim_at,"
+                " last_idle_error FROM sandboxes WHERE sandbox_id = ?",
+                (sandbox_id,),
+            ).fetchone()
+        return None if row is None else dict(row)
 
     def list_sandboxes(
         self, tenant_id: str, statuses: Iterable[str] | None = None

@@ -173,6 +173,30 @@ def _build_stub_daemon_handler(state: _StubDaemonState):
                         "stderr": "",
                     },
                 }
+            if method == "POST" and sub == ["action"]:
+                exec_spec = body.get("exec") or {}
+                argv = list(exec_spec.get("argv") or [])
+                if not argv:
+                    return HTTPStatus.BAD_REQUEST, {
+                        "ok": False,
+                        "error": "action exec requires non-empty argv",
+                    }
+                payload: dict[str, Any] = {
+                    "ok": True,
+                    "exec": {
+                        "returncode": 0,
+                        "stdout": f"ran {argv[0]}",
+                        "stderr": "",
+                    },
+                }
+                if body.get("checkpoint"):
+                    payload["checkpoint_id"] = (
+                        body.get("checkpoint_id") or "ckpt-action"
+                    )
+                if body.get("observe"):
+                    payload["filesystem_changed"] = True
+                    payload["process_changed"] = False
+                return HTTPStatus.OK, payload
             if method == "POST" and sub == ["stop"]:
                 # Optionally outlast the gateway's per-call timeout (the
                 # 504 regression test dials the route timeout down).

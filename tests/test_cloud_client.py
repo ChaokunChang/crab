@@ -199,15 +199,14 @@ class CloudLifecycleTests(CloudLiveTestBase):
         returned = result.checkpoint.wait(timeout=5.0)
         self.assertTrue(returned.startswith("ckpt-"))
         # Daemon saw the checkpoint_id in the body.
-        seen = self.daemon_requests(f"/sandboxes/{sandbox_id}/checkpoints")
+        seen = self.daemon_requests(f"/sandboxes/{sandbox_id}/action")
         post_calls = [(m, p, b) for m, p, b in seen if m == "POST"]
         self.assertEqual(len(post_calls), 1)
         self.assertEqual(post_calls[0][2].get("checkpoint_id"), returned)
-        # Observe: inspector peek populated flags without resetting.
+        self.assertTrue(post_calls[0][2].get("observe"))
+        # Observe flags came back in the same batch response.
         self.assertTrue(result.filesystem_changed)
         self.assertFalse(result.process_changed)
-        peek = self.daemon_requests(f"/sandboxes/{sandbox_id}/inspector")
-        self.assertEqual(peek, [("GET", f"/sandboxes/{sandbox_id}/inspector", {})])
 
 
 # ---------------------------------------------------------------------------

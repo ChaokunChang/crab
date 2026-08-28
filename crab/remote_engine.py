@@ -216,12 +216,16 @@ class _SystemShim:
         checkpoint_id_raw = response.get("checkpoint_id")
         checkpoint_id = CheckpointId(str(checkpoint_id_raw)) if checkpoint_id_raw else None
         status = JobStatus(str(response.get("status") or JobStatus.SUCCEEDED.value))
-        manifest = None if checkpoint_id is None else SimpleNamespace(checkpoint_id=checkpoint_id)
+        manifest = (
+            None
+            if checkpoint_id is None or status != JobStatus.SUCCEEDED
+            else SimpleNamespace(checkpoint_id=checkpoint_id)
+        )
         return SimpleNamespace(
             checkpoint_id=checkpoint_id,
             manifest=manifest,
             status=status,
-            message="",
+            message=str(response.get("message") or ""),
         )
 
     def restore_once(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId):
@@ -547,10 +551,10 @@ class RuntimeProxy(Runtime):
         # Graceful stop that keeps the bundle/filesystem so the sandbox can be
         # started again. Distinct from delete(), which `Sandbox.kill()` uses to
         # destroy the sandbox via DELETE /sandboxes/{id}.
-        self._client.post_json(f"/sandboxes/{sandbox_id}/stop", {}, timeout_seconds=60.0)
+        self._client.post_json(f"/sandboxes/{sandbox_id}/stop", {}, timeout_seconds=600.0)
 
     def pause(self, sandbox_id: SandboxId) -> None:  # type: ignore[override]
-        self._client.post_json(f"/sandboxes/{sandbox_id}/pause", {}, timeout_seconds=60.0)
+        self._client.post_json(f"/sandboxes/{sandbox_id}/pause", {}, timeout_seconds=600.0)
 
     def resume(self, sandbox_id: SandboxId) -> None:  # type: ignore[override]
         self._client.post_json(f"/sandboxes/{sandbox_id}/resume", {}, timeout_seconds=60.0)

@@ -104,6 +104,7 @@ _job_store = _JobStore()
 # ---------------------------------------------------------------------------
 
 _BACKPRESSURE_TIMEOUT_SECONDS: float = 600.0
+_QUIESCE_TIMEOUT_SECONDS: float = 540.0
 
 
 class _CheckpointBackpressure:
@@ -152,6 +153,104 @@ class _CheckpointBackpressure:
 _ckpt_backpressure = _CheckpointBackpressure()
 
 
+class _SandboxActivityGate:
+    """Per-sandbox coordination between commands, background work and
+    lifecycle transitions.
+
+    Commands may run concurrently, but they wait while a lifecycle transition
+    is active or an asynchronous checkpoint/changeset is still running. A
+    lifecycle transition claims the sandbox first (blocking new commands), then
+    waits for existing commands and background work to drain. If the bounded
+    wait expires, the caller must *not* pause/stop the sandbox.
+
+    ``begin_background`` is intentionally allowed after a lifecycle waiter has
+    claimed the sandbox: ``action_sandbox`` reserves its background work while
+    it still owns an active command slot, so the lifecycle waiter will observe
+    both counts and cannot slip between exec completion and checkpoint start.
+    """
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._states: dict[str, dict[str, int | bool]] = {}
+
+    def _state_locked(self, sandbox_id: str) -> dict[str, int | bool]:
+        state = self._states.get(sandbox_id)
+        if state is None:
+            state = {"commands": 0, "background": 0, "lifecycle": False}
+            self._states[sandbox_id] = state
+        return state
+
+    @staticmethod
+    def _remaining(deadline: float) -> float:
+        return max(0.0, deadline - _time.monotonic())
+
+    def begin_command(self, sandbox_id: str, *, timeout: float) -> bool:
+        deadline = _time.monotonic() + max(0.0, float(timeout))
+        with self._condition:
+            state = self._state_locked(sandbox_id)
+            while bool(state["lifecycle"]) or int(state["background"]) > 0:
+                remaining = self._remaining(deadline)
+                if remaining <= 0:
+                    return False
+                self._condition.wait(timeout=remaining)
+            state["commands"] = int(state["commands"]) + 1
+            return True
+
+    def end_command(self, sandbox_id: str) -> None:
+        with self._condition:
+            state = self._state_locked(sandbox_id)
+            state["commands"] = max(0, int(state["commands"]) - 1)
+            self._condition.notify_all()
+
+    def begin_background(self, sandbox_id: str) -> None:
+        with self._condition:
+            state = self._state_locked(sandbox_id)
+            state["background"] = int(state["background"]) + 1
+            self._condition.notify_all()
+
+    def end_background(self, sandbox_id: str) -> None:
+        with self._condition:
+            state = self._state_locked(sandbox_id)
+            state["background"] = max(0, int(state["background"]) - 1)
+            self._condition.notify_all()
+
+    def begin_lifecycle(self, sandbox_id: str, *, timeout: float) -> bool:
+        deadline = _time.monotonic() + max(0.0, float(timeout))
+        with self._condition:
+            state = self._state_locked(sandbox_id)
+            while bool(state["lifecycle"]):
+                remaining = self._remaining(deadline)
+                if remaining <= 0:
+                    return False
+                self._condition.wait(timeout=remaining)
+
+            # Claim first so no new command can enter while existing work
+            # drains. This closes the check-then-stop race.
+            state["lifecycle"] = True
+            while int(state["commands"]) > 0 or int(state["background"]) > 0:
+                remaining = self._remaining(deadline)
+                if remaining <= 0:
+                    state["lifecycle"] = False
+                    self._condition.notify_all()
+                    return False
+                self._condition.wait(timeout=remaining)
+            return True
+
+    def end_lifecycle(self, sandbox_id: str) -> None:
+        with self._condition:
+            state = self._state_locked(sandbox_id)
+            state["lifecycle"] = False
+            self._condition.notify_all()
+
+    def snapshot(self, sandbox_id: str) -> dict[str, int | bool]:
+        """Testing/diagnostic snapshot of the current counters."""
+        with self._condition:
+            return dict(self._state_locked(sandbox_id))
+
+
+_sandbox_activity = _SandboxActivityGate()
+
+
 # ---------------------------------------------------------------------------
 # Route table — each handler runs in a worker thread and is given the
 # parsed request body + path variables. Keeping routes small and explicit
@@ -165,6 +264,25 @@ class _Routes:
 
     def __init__(self, daemon: "DaemonServer") -> None:
         self._daemon = daemon
+
+    @staticmethod
+    def _begin_command(sandbox_id: str) -> None:
+        if not _sandbox_activity.begin_command(
+            sandbox_id, timeout=_BACKPRESSURE_TIMEOUT_SECONDS
+        ):
+            raise _BadRequest(
+                f"sandbox {sandbox_id} stayed busy during a lifecycle transition"
+            )
+
+    @staticmethod
+    def _begin_lifecycle(sandbox_id: str, operation: str) -> None:
+        if not _sandbox_activity.begin_lifecycle(
+            sandbox_id, timeout=_QUIESCE_TIMEOUT_SECONDS
+        ):
+            raise _BadRequest(
+                f"{operation} deferred: sandbox {sandbox_id} still has active "
+                "commands or background checkpoint work"
+            )
 
     def healthz(self, body: dict[str, Any], **_: str) -> dict[str, Any]:
         return {"ok": True, "started": self._daemon.engine is not None}
@@ -396,15 +514,19 @@ class _Routes:
         user = body.get("user")
         timeout_s = body.get("timeout_s")
         capture_output = bool(body.get("capture_output", True))
-        result = eng.runtime.exec(
-            sid,
-            list(argv),
-            cwd=cwd,
-            env=env,
-            user=user,
-            timeout_s=timeout_s,
-            capture_output=capture_output,
-        )
+        self._begin_command(sandbox_id)
+        try:
+            result = eng.runtime.exec(
+                sid,
+                list(argv),
+                cwd=cwd,
+                env=env,
+                user=user,
+                timeout_s=timeout_s,
+                capture_output=capture_output,
+            )
+        finally:
+            _sandbox_activity.end_command(sandbox_id)
         return {
             "ok": True,
             "result": {
@@ -429,6 +551,7 @@ class _Routes:
         timeout_s = body.get("timeout_s")
         capture_output = bool(body.get("capture_output", True))
         rc = -1
+        self._begin_command(sandbox_id)
         try:
             for channel, text in eng.runtime.stream_exec(
                 sid, list(argv), cwd=cwd, env=env, user=user, timeout_s=timeout_s,
@@ -444,6 +567,7 @@ class _Routes:
         except BrokenPipeError:
             return
         finally:
+            _sandbox_activity.end_command(sandbox_id)
             try:
                 wfile.write(b"0\r\n\r\n")
                 wfile.flush()
@@ -451,6 +575,15 @@ class _Routes:
                 pass
 
     def kill_sandbox(self, body: dict[str, Any], *, sandbox_id: str) -> dict[str, Any]:
+        self._begin_lifecycle(sandbox_id, "kill")
+        try:
+            return self._kill_sandbox_unlocked(body, sandbox_id=sandbox_id)
+        finally:
+            _sandbox_activity.end_lifecycle(sandbox_id)
+
+    def _kill_sandbox_unlocked(
+        self, body: dict[str, Any], *, sandbox_id: str
+    ) -> dict[str, Any]:
         eng = self._daemon.require_engine()
         sid = SandboxId(sandbox_id)
         # Fork/txn bookkeeping mirrors Sandbox.kill(): release an open txn
@@ -534,13 +667,21 @@ class _Routes:
         bundle/ZFS state in place so the sandbox can be restarted via
         restore or destroyed later with DELETE /sandboxes/{id}."""
         eng = self._daemon.require_engine()
-        eng.runtime.stop(SandboxId(sandbox_id))
-        return {"ok": True, "sandbox_id": sandbox_id}
+        self._begin_lifecycle(sandbox_id, "stop")
+        try:
+            eng.runtime.stop(SandboxId(sandbox_id))
+            return {"ok": True, "sandbox_id": sandbox_id}
+        finally:
+            _sandbox_activity.end_lifecycle(sandbox_id)
 
     def pause_sandbox(self, body: dict[str, Any], *, sandbox_id: str) -> dict[str, Any]:
         eng = self._daemon.require_engine()
-        eng.runtime.pause(SandboxId(sandbox_id))
-        return {"ok": True, "sandbox_id": sandbox_id}
+        self._begin_lifecycle(sandbox_id, "pause")
+        try:
+            eng.runtime.pause(SandboxId(sandbox_id))
+            return {"ok": True, "sandbox_id": sandbox_id}
+        finally:
+            _sandbox_activity.end_lifecycle(sandbox_id)
 
     def resume_sandbox(self, body: dict[str, Any], *, sandbox_id: str) -> dict[str, Any]:
         eng = self._daemon.require_engine()
@@ -589,7 +730,9 @@ class _Routes:
             out.append(entry)
         return {"ok": True, "checkpoints": out}
 
-    def create_checkpoint(self, body: dict[str, Any], *, sandbox_id: str) -> dict[str, Any]:
+    def _create_checkpoint_unlocked(
+        self, body: dict[str, Any], *, sandbox_id: str
+    ) -> dict[str, Any]:
         eng = self._daemon.require_engine()
         sid = SandboxId(sandbox_id)
         leave_running = bool(body.get("leave_running", True))
@@ -601,12 +744,52 @@ class _Routes:
             )
         except Exception as exc:
             raise _BadRequest(f"checkpoint failed: {exc}") from exc
+        status = getattr(result.status, "value", str(result.status))
+        failure_code_raw = getattr(result, "failure_code", None)
+        failure_code = getattr(failure_code_raw, "value", failure_code_raw)
         return {
-            "ok": True,
+            "ok": status == "succeeded",
             "sandbox_id": sandbox_id,
             "checkpoint_id": str(result.checkpoint_id) if result.checkpoint_id else None,
-            "status": result.status,
+            "status": status,
+            "failure_code": failure_code,
+            "message": getattr(result, "message", None) or "",
         }
+
+    def create_checkpoint(self, body: dict[str, Any], *, sandbox_id: str) -> dict[str, Any]:
+        self._begin_lifecycle(sandbox_id, "checkpoint")
+        try:
+            return self._create_checkpoint_unlocked(body, sandbox_id=sandbox_id)
+        finally:
+            _sandbox_activity.end_lifecycle(sandbox_id)
+
+    def checkpoint_stop_sandbox(
+        self, body: dict[str, Any], *, sandbox_id: str
+    ) -> dict[str, Any]:
+        """Atomically checkpoint a quiescent sandbox and stop it.
+
+        The lifecycle claim blocks new commands across both operations. A
+        failed checkpoint is returned to the caller, including its allocated
+        id, but the runtime is left running.
+        """
+        eng = self._daemon.require_engine()
+        self._begin_lifecycle(sandbox_id, "checkpoint_stop")
+        try:
+            checkpoint_body = dict(body)
+            checkpoint_body["leave_running"] = True
+            result = self._create_checkpoint_unlocked(
+                checkpoint_body, sandbox_id=sandbox_id
+            )
+            if (
+                not result.get("ok")
+                or result.get("status") != "succeeded"
+                or not result.get("checkpoint_id")
+            ):
+                return {**result, "stopped": False}
+            eng.runtime.stop(SandboxId(sandbox_id))
+            return {**result, "ok": True, "stopped": True}
+        finally:
+            _sandbox_activity.end_lifecycle(sandbox_id)
 
     def delete_checkpoint(
         self, body: dict[str, Any], *, sandbox_id: str, checkpoint_id: str
@@ -1029,11 +1212,12 @@ class _Routes:
         # (but never drops) the request; a slow checkpoint just makes the
         # next run a little slower. Bounded so a stuck checkpoint can't wedge
         # the sandbox forever.
-        if not _ckpt_backpressure.wait_idle(sandbox_id, timeout=_BACKPRESSURE_TIMEOUT_SECONDS):
-            logger.warning(
-                "checkpoint backpressure timed out after %.0fs for sandbox %s; "
-                "proceeding with exec anyway",
-                _BACKPRESSURE_TIMEOUT_SECONDS, sandbox_id,
+        if not _ckpt_backpressure.wait_idle(
+            sandbox_id, timeout=_BACKPRESSURE_TIMEOUT_SECONDS
+        ):
+            raise _BadRequest(
+                f"sandbox {sandbox_id} background checkpoint did not finish "
+                f"within {_BACKPRESSURE_TIMEOUT_SECONDS:.0f}s"
             )
 
         # --- 1. exec (required) ---
@@ -1049,108 +1233,143 @@ class _Routes:
         user = exec_spec.get("user")
         timeout_s = exec_spec.get("timeout_s")
         capture_output = bool(exec_spec.get("capture_output", True))
-        exec_result = eng.runtime.exec(
-            sid, argv, cwd=cwd, env=env, user=user, timeout_s=timeout_s,
-            capture_output=capture_output,
-        )
-        response: dict[str, Any] = {
-            "ok": True,
-            "exec": {
-                "returncode": int(exec_result.returncode),
-                "stdout": exec_result.stdout,
-                "stderr": exec_result.stderr,
-            },
-        }
+        do_checkpoint = bool(body.get("checkpoint"))
+        do_changeset = bool(body.get("changeset"))
 
-        # --- 2. observe (before checkpoint to avoid reset race) ---
-        if body.get("observe"):
-            try:
-                snapshot = eng.system.inspector.inspect(sid)
-                response["filesystem_changed"] = bool(snapshot.filesystem_changed)
-                response["process_changed"] = bool(snapshot.process_changed)
-            except KeyError:
-                _seed_inspector_running(eng, sid)
+        # Hold a command slot until any requested background work has been
+        # reserved. A lifecycle waiter claims the sandbox before waiting, so
+        # it cannot slip between exec completion and async checkpoint start.
+        self._begin_command(sandbox_id)
+        try:
+            exec_result = eng.runtime.exec(
+                sid,
+                argv,
+                cwd=cwd,
+                env=env,
+                user=user,
+                timeout_s=timeout_s,
+                capture_output=capture_output,
+            )
+            response: dict[str, Any] = {
+                "ok": True,
+                "exec": {
+                    "returncode": int(exec_result.returncode),
+                    "stdout": exec_result.stdout,
+                    "stderr": exec_result.stderr,
+                },
+            }
+
+            # --- 2. observe (before checkpoint to avoid reset race) ---
+            if body.get("observe"):
                 try:
                     snapshot = eng.system.inspector.inspect(sid)
                     response["filesystem_changed"] = bool(snapshot.filesystem_changed)
                     response["process_changed"] = bool(snapshot.process_changed)
                 except KeyError:
-                    response["filesystem_changed"] = None
-                    response["process_changed"] = None
+                    _seed_inspector_running(eng, sid)
+                    try:
+                        snapshot = eng.system.inspector.inspect(sid)
+                        response["filesystem_changed"] = bool(
+                            snapshot.filesystem_changed
+                        )
+                        response["process_changed"] = bool(snapshot.process_changed)
+                    except KeyError:
+                        response["filesystem_changed"] = None
+                        response["process_changed"] = None
 
-        # --- 3. checkpoint + changeset (async background) ---
-        do_checkpoint = bool(body.get("checkpoint"))
-        do_changeset = bool(body.get("changeset"))
+            # --- 3. checkpoint + changeset (async background) ---
+            if do_checkpoint or do_changeset:
+                # Determine the job_id: use client-supplied checkpoint_id or
+                # generate one.
+                client_ckpt_id = body.get("checkpoint_id")
+                job_id = (
+                    str(client_ckpt_id)
+                    if client_ckpt_id
+                    else f"job-{threading.current_thread().ident}"
+                )
+                if do_checkpoint:
+                    job_id = (
+                        str(client_ckpt_id)
+                        if client_ckpt_id
+                        else f"ckpt-daemon-{id(eng)}-{_time.time_ns()}"
+                    )
 
-        if do_checkpoint or do_changeset:
-            # Determine the job_id: use client-supplied checkpoint_id or generate one.
-            client_ckpt_id = body.get("checkpoint_id")
-            job_id = str(client_ckpt_id) if client_ckpt_id else f"job-{threading.current_thread().ident}"
-            if do_checkpoint:
-                job_id = str(client_ckpt_id) if client_ckpt_id else f"ckpt-daemon-{id(eng)}-{_time.time_ns()}"
+                _job_store.register(job_id)
+                response["job_id"] = job_id
 
-            _job_store.register(job_id)
-            response["job_id"] = job_id
+                if do_checkpoint:
+                    response["checkpoint_status"] = "pending"
+                    response["checkpoint_id"] = job_id  # provisional
+                if do_changeset:
+                    response["changeset_status"] = "pending"
 
-            if do_checkpoint:
-                response["checkpoint_status"] = "pending"
-                response["checkpoint_id"] = job_id  # provisional
-            if do_changeset:
-                response["changeset_status"] = "pending"
+                # Capture closure vars for the background thread.
+                changeset_since_raw = body.get("changeset_since")
 
-            # Capture closure vars for the background thread.
-            changeset_since_raw = body.get("changeset_since")
+                # Reserve both gates before releasing the active command slot.
+                ckpt_event = _ckpt_backpressure.begin(sandbox_id)
+                _sandbox_activity.begin_background(sandbox_id)
 
-            # Mark this sandbox busy *before* starting the thread so a
-            # closely-following request observes the backpressure.
-            ckpt_event = _ckpt_backpressure.begin(sandbox_id)
+                def _background() -> None:
+                    result: dict[str, Any] = {}
+                    try:
+                        # 3a. checkpoint
+                        if do_checkpoint:
+                            ckpt_result = eng.system.checkpoint_once(
+                                sid,
+                                leave_running=True,
+                                checkpoint_id=client_ckpt_id,
+                            )
+                            resolved_id = (
+                                str(ckpt_result.checkpoint_id)
+                                if ckpt_result.checkpoint_id
+                                else job_id
+                            )
+                            result["checkpoint_id"] = resolved_id
 
-            def _background() -> None:
-                result: dict[str, Any] = {}
+                        # 3b. changeset
+                        if do_changeset:
+                            from ..ids import CheckpointId
+
+                            try:
+                                if changeset_since_raw:
+                                    cs_result = eng.system.changeset_since(
+                                        sid,
+                                        CheckpointId(str(changeset_since_raw)),
+                                        use_inspector_gate=False,
+                                    )
+                                else:
+                                    cs_result = eng.system.fork_changeset(
+                                        sid, force=True
+                                    )
+                                result["changeset"] = cs_result.to_json()
+                            except Exception as cs_exc:
+                                result["changeset"] = None
+                                result["changeset_error"] = str(cs_exc)
+
+                        _job_store.complete(job_id, result)
+                    except Exception as exc:
+                        _job_store.fail(job_id, str(exc))
+                    finally:
+                        # Release both gates even if checkpoint/changeset fails.
+                        ckpt_event.set()
+                        _sandbox_activity.end_background(sandbox_id)
+
+                t = threading.Thread(
+                    target=_background,
+                    daemon=True,
+                    name=f"action-bg-{job_id}",
+                )
                 try:
-                    # 3a. checkpoint
-                    if do_checkpoint:
-                        ckpt_result = eng.system.checkpoint_once(
-                            sid, leave_running=True, checkpoint_id=client_ckpt_id,
-                        )
-                        resolved_id = (
-                            str(ckpt_result.checkpoint_id)
-                            if ckpt_result.checkpoint_id else job_id
-                        )
-                        result["checkpoint_id"] = resolved_id
-
-                    # 3b. changeset
-                    if do_changeset:
-                        from ..ids import CheckpointId
-                        try:
-                            if changeset_since_raw:
-                                cs_result = eng.system.changeset_since(
-                                    sid, CheckpointId(str(changeset_since_raw)),
-                                    use_inspector_gate=False,
-                                )
-                            else:
-                                cs_result = eng.system.fork_changeset(sid, force=True)
-                            result["changeset"] = cs_result.to_json()
-                        except Exception as cs_exc:
-                            result["changeset"] = None
-                            result["changeset_error"] = str(cs_exc)
-
-                    _job_store.complete(job_id, result)
-                except Exception as exc:
-                    _job_store.fail(job_id, str(exc))
-                finally:
-                    # Release backpressure so the next /action can proceed,
-                    # even if the checkpoint/changeset failed.
+                    t.start()
+                except BaseException:
                     ckpt_event.set()
+                    _sandbox_activity.end_background(sandbox_id)
+                    raise
 
-            t = threading.Thread(target=_background, daemon=True,
-                                 name=f"action-bg-{job_id}")
-            t.start()
-        else:
-            # No async work needed.
-            pass
-
-        return response
+            return response
+        finally:
+            _sandbox_activity.end_command(sandbox_id)
 
     def get_job(self, body: dict[str, Any], *, sandbox_id: str, job_id: str) -> dict[str, Any]:
         """Poll a background job's status (checkpoint + changeset)."""
@@ -1306,6 +1525,12 @@ def _build_handler(daemon: "DaemonServer"):
         # Checkpoints (keyed by sandbox; checkpoint ids are unique per-sandbox)
         ("GET", "/sandboxes/{sandbox_id}/checkpoints", "", routes.list_checkpoints),
         ("POST", "/sandboxes/{sandbox_id}/checkpoints", "", routes.create_checkpoint),
+        (
+            "POST",
+            "/sandboxes/{sandbox_id}/checkpoint-stop",
+            "",
+            routes.checkpoint_stop_sandbox,
+        ),
         (
             "DELETE",
             "/sandboxes/{sandbox_id}/checkpoints/{checkpoint_id}",

@@ -660,6 +660,18 @@ class CrabSystem:
                 target_sandbox_id,
                 target_rootfs_path=target_rootfs_path,
             )
+            inherited_idle_metadata: dict[str, object] = {}
+            try:
+                source_description = self.runtime.describe(source_sandbox_id)
+                for key in ("idle_timeout", "idle_action"):
+                    if key in source_description.metadata:
+                        inherited_idle_metadata[key] = source_description.metadata[key]
+            except Exception:
+                logger.debug(
+                    "Unable to read source idle metadata while forking %s",
+                    source_sandbox_id,
+                    exc_info=True,
+                )
             # Restore flows (prepare_for_restore/mark_restored) require a
             # runtime description; forks were never launched, so adopt one.
             self.runtime.adopt_sandbox_description(
@@ -667,6 +679,7 @@ class CrabSystem:
                 runtime_name=self.runtime.name,
                 status="stopped",
                 metadata={
+                    **inherited_idle_metadata,
                     "sandbox_id": str(target_sandbox_id),
                     "bundle_path": str(bundle_root / str(target_sandbox_id)),
                     "rootfs_path": str(target_rootfs_path),

@@ -6,12 +6,14 @@ checkpoint delays — but never drops — the next request.
 """
 from __future__ import annotations
 
+import threading
 import time
 import unittest
 from types import SimpleNamespace
 
 from crab.daemon import server as daemon_server
 from crab.daemon.server import _Routes
+from crab.models import FailureCode, JobStatus
 
 
 class _FakeRuntime:
@@ -22,6 +24,9 @@ class _FakeRuntime:
              timeout_s=None, capture_output=True):
         self._log.append(("exec", list(argv), time.monotonic()))
         return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def stop(self, sid):
+        self._log.append(("stop", str(sid), time.monotonic()))
 
 
 class _FakeSystem:
@@ -54,6 +59,7 @@ class CheckpointBackpressureTests(unittest.TestCase):
     def setUp(self) -> None:
         # Reset module-level singletons so tests don't contaminate each other.
         daemon_server._ckpt_backpressure = daemon_server._CheckpointBackpressure()
+        daemon_server._sandbox_activity = daemon_server._SandboxActivityGate()
         daemon_server._job_store = daemon_server._JobStore()
         self.log: list = []
 
@@ -174,6 +180,101 @@ class CheckpointBackpressureTests(unittest.TestCase):
                         "backpressure must be per-sandbox, not global")
         self._wait_for_jobs_idle("sbx-A")
         self._wait_for_jobs_idle("sbx-B")
+
+    def test_stop_waits_for_running_command(self) -> None:
+        routes = self._make_routes(ckpt_delay=0.0)
+        sbx = "sbx-active-command"
+        self.assertTrue(
+            daemon_server._sandbox_activity.begin_command(sbx, timeout=1.0)
+        )
+        thread = threading.Thread(
+            target=lambda: routes.stop_sandbox({}, sandbox_id=sbx)
+        )
+        thread.start()
+        time.sleep(0.1)
+        self.assertTrue(thread.is_alive())
+        self.assertFalse(any(kind == "stop" for kind, _, _ in self.log))
+
+        daemon_server._sandbox_activity.end_command(sbx)
+        thread.join(timeout=2.0)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(any(kind == "stop" for kind, _, _ in self.log))
+
+    def test_stop_waits_for_async_checkpoint(self) -> None:
+        routes = self._make_routes(ckpt_delay=0.4)
+        sbx = "sbx-active-checkpoint"
+        self._action(
+            routes,
+            sbx,
+            ["echo", "checkpoint"],
+            checkpoint=True,
+            checkpoint_id="ckpt-active",
+        )
+        thread = threading.Thread(
+            target=lambda: routes.stop_sandbox({}, sandbox_id=sbx)
+        )
+        thread.start()
+        time.sleep(0.1)
+        self.assertTrue(thread.is_alive())
+        self.assertFalse(any(kind == "stop" for kind, _, _ in self.log))
+
+        self._wait_for_jobs_idle(sbx)
+        thread.join(timeout=2.0)
+        self.assertFalse(thread.is_alive())
+        checkpoint_done = next(
+            ts for kind, value, ts in self.log
+            if kind == "ckpt_done" and value == "ckpt-active"
+        )
+        stopped = next(ts for kind, _, ts in self.log if kind == "stop")
+        self.assertLess(checkpoint_done, stopped)
+
+
+class CheckpointStopTests(unittest.TestCase):
+    def setUp(self) -> None:
+        daemon_server._sandbox_activity = daemon_server._SandboxActivityGate()
+        self.log: list = []
+
+    def _routes(self, status: JobStatus) -> _Routes:
+        runtime = _FakeRuntime(self.log)
+
+        def checkpoint_once(sid, *, leave_running=True, checkpoint_id=None):
+            self.assertTrue(leave_running)
+            return SimpleNamespace(
+                checkpoint_id=checkpoint_id or "ckpt-generated",
+                status=status,
+                failure_code=(
+                    FailureCode.NONE
+                    if status == JobStatus.SUCCEEDED
+                    else FailureCode.RUNTIME_ERROR
+                ),
+                message=None if status == JobStatus.SUCCEEDED else "dump failed",
+            )
+
+        engine = SimpleNamespace(
+            runtime=runtime,
+            system=SimpleNamespace(checkpoint_once=checkpoint_once),
+        )
+        return _Routes(_FakeDaemon(engine))
+
+    def test_success_returns_checkpoint_id_then_stops(self) -> None:
+        response = self._routes(JobStatus.SUCCEEDED).checkpoint_stop_sandbox(
+            {}, sandbox_id="sbx-checkpoint-stop"
+        )
+        self.assertTrue(response["ok"])
+        self.assertTrue(response["stopped"])
+        self.assertEqual(response["checkpoint_id"], "ckpt-generated")
+        self.assertTrue(any(kind == "stop" for kind, _, _ in self.log))
+
+    def test_failed_checkpoint_returns_id_without_stopping(self) -> None:
+        response = self._routes(JobStatus.FAILED).checkpoint_stop_sandbox(
+            {"checkpoint_id": "ckpt-requested"},
+            sandbox_id="sbx-checkpoint-stop-failed",
+        )
+        self.assertFalse(response["ok"])
+        self.assertFalse(response["stopped"])
+        self.assertEqual(response["checkpoint_id"], "ckpt-requested")
+        self.assertEqual(response["status"], "failed")
+        self.assertFalse(any(kind == "stop" for kind, _, _ in self.log))
 
 
 if __name__ == "__main__":
