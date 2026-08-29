@@ -4,6 +4,7 @@ routing). Host-runnable — no daemon, no root."""
 from __future__ import annotations
 
 import tempfile
+import threading
 import types
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -15,6 +16,7 @@ from crab.gateway.server import (
     IDLE_ACTIONS,
     GatewayServer,
     _BadRequest,
+    _GatewayActivityGate,
     _GatewayRoutes,
     _parse_idle_action,
     _parse_idle_timeout,
@@ -144,6 +146,38 @@ class ParseIdleActionTests(unittest.TestCase):
                 _parse_idle_action(value)
 
 
+class GatewayActivityGateTests(unittest.TestCase):
+    def test_activity_leases_are_shared(self) -> None:
+        gate = _GatewayActivityGate()
+        first_entered = threading.Event()
+        second_entered = threading.Event()
+        release_first = threading.Event()
+
+        def first_activity():
+            with gate.activity("sb-1"):
+                first_entered.set()
+                release_first.wait(timeout=2.0)
+
+        def second_activity():
+            with gate.activity("sb-1"):
+                second_entered.set()
+
+        first_thread = threading.Thread(target=first_activity)
+        second_thread = threading.Thread(target=second_activity)
+        try:
+            first_thread.start()
+            self.assertTrue(first_entered.wait(timeout=1.0))
+            second_thread.start()
+            self.assertTrue(second_entered.wait(timeout=1.0))
+        finally:
+            release_first.set()
+            first_thread.join(timeout=2.0)
+            second_thread.join(timeout=2.0)
+
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+
+
 class IdleRouteTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -156,6 +190,7 @@ class IdleRouteTests(unittest.TestCase):
 
     def _gateway(self, *, forks=None):
         return types.SimpleNamespace(
+            _activity_gate=_GatewayActivityGate(),
             registry=self.registry,
             require_owned=lambda tenant_id, sandbox_id: self.registry.get_sandbox(
                 sandbox_id
@@ -209,6 +244,7 @@ class IdleRouteTests(unittest.TestCase):
             return {"ok": True, "forks": [{"sandbox_id": "child"}]}
 
         gateway = types.SimpleNamespace(
+            _activity_gate=_GatewayActivityGate(),
             registry=self.registry,
             require_owned=lambda tenant_id, sandbox_id: self.registry.get_sandbox(
                 sandbox_id
@@ -226,21 +262,98 @@ class IdleRouteTests(unittest.TestCase):
             activity_during_proxy[0],
         )
 
+    def test_reaper_does_not_queue_stop_behind_fork_from_stale_snapshot(self) -> None:
+        old_activity = "2020-01-01T00:00:00+00:00"
+        self.registry._conn.execute(
+            "UPDATE sandboxes SET last_activity = ? WHERE sandbox_id = ?",
+            (old_activity, "source"),
+        )
+        stale_rows = self.registry.list_active_with_idle()
+        fork_started = threading.Event()
+        release_fork = threading.Event()
+        proxy_calls: list[tuple[str, str]] = []
+        thread_errors: list[BaseException] = []
+
+        class SnapshotRegistry:
+            def list_active_with_idle(inner_self):
+                return [dict(row) for row in stale_rows]
+
+            def __getattr__(inner_self, name):
+                return getattr(self.registry, name)
+
+        gateway = types.SimpleNamespace(
+            _activity_gate=_GatewayActivityGate(),
+            registry=SnapshotRegistry(),
+            require_owned=lambda tenant_id, sandbox_id: self.registry.get_sandbox(
+                sandbox_id
+            ),
+            _port_manager=_FakePortManager(),
+        )
+
+        def proxy(method, path, body, timeout):
+            proxy_calls.append((method, path))
+            if path.endswith("/fork"):
+                fork_started.set()
+                if not release_fork.wait(timeout=2.0):
+                    raise TimeoutError("test did not release fork")
+                return {"ok": True, "forks": []}
+            return {"ok": True}
+
+        gateway.proxy = proxy
+        gateway._apply_idle_action = GatewayServer._apply_idle_action.__get__(
+            gateway, GatewayServer
+        )
+
+        def run_fork():
+            try:
+                _GatewayRoutes(gateway).fork_sandbox(
+                    self.tenant, {"count": 1}, sandbox_id="source"
+                )
+            except BaseException as exc:
+                thread_errors.append(exc)
+
+        fork_thread = threading.Thread(target=run_fork)
+        try:
+            fork_thread.start()
+            self.assertTrue(fork_started.wait(timeout=1.0))
+            GatewayServer._reap_idle_sandboxes(
+                gateway, {"source": "running"}
+            )
+        finally:
+            release_fork.set()
+            fork_thread.join(timeout=2.0)
+
+        self.assertFalse(fork_thread.is_alive())
+        self.assertEqual(thread_errors, [])
+        self.assertNotIn(("POST", "/sandboxes/source/stop"), proxy_calls)
+
 
 class _FakeRegistry:
     def __init__(self, rows) -> None:
         self._rows = rows
+        self._current = {str(row["sandbox_id"]): dict(row) for row in rows}
         self.statuses: dict[str, str] = {}
         self.reclaims: list[dict] = []
 
     def list_active_with_idle(self):
         return self._rows
 
+    def get_sandbox(self, sandbox_id):
+        row = self._current.get(sandbox_id)
+        return None if row is None else dict(row)
+
+    def touch(self, sandbox_id):
+        row = self._current.get(sandbox_id)
+        if row is not None and row.get("idle_timeout") is not None:
+            row["last_activity"] = _iso(0)
+
     def release_all_ports(self, sandbox_id):
         return []
 
     def set_status(self, sandbox_id, status):
         self.statuses[sandbox_id] = status
+        if sandbox_id in self._current:
+            self._current[sandbox_id]["status"] = status
 
     def record_idle_reclaim(self, sandbox_id, **result):
         self.reclaims.append({"sandbox_id": sandbox_id, **result})
@@ -255,6 +368,7 @@ def _make_fake_gateway(
     rows, *, checkpoint_result=None, checkpoint_exception: Exception | None = None
 ):
     gw = types.SimpleNamespace()
+    gw._activity_gate = _GatewayActivityGate()
     gw.registry = _FakeRegistry(rows)
     gw.proxy_calls = []
     gw.proxy_bodies = []
@@ -313,6 +427,24 @@ class IdleSweeperTests(unittest.TestCase):
         gw = _make_fake_gateway([_row("sb-1", 3600.0, "stop", _iso(10))])
         GatewayServer._reap_idle_sandboxes(gw, {"sb-1": "running"})
         self.assertEqual(gw.proxy_calls, [])
+
+    def test_revalidates_stale_idle_snapshot_before_reclaim(self) -> None:
+        gw = _make_fake_gateway([_row("sb-1", 60.0, "stop", _iso(3600))])
+        gw.registry.touch("sb-1")
+
+        GatewayServer._reap_idle_sandboxes(gw, {"sb-1": "running"})
+
+        self.assertEqual(gw.proxy_calls, [])
+        self.assertEqual(gw.registry.reclaims, [])
+
+    def test_busy_activity_is_skipped_without_blocking_reaper(self) -> None:
+        gw = _make_fake_gateway([_row("sb-1", 60.0, "stop", _iso(3600))])
+
+        with gw._activity_gate.activity("sb-1"):
+            GatewayServer._reap_idle_sandboxes(gw, {"sb-1": "running"})
+
+        self.assertEqual(gw.proxy_calls, [])
+        self.assertEqual(gw.registry.reclaims, [])
 
     def test_skips_sandbox_not_running(self) -> None:
         # Already paused/stopped -> not re-reaped.

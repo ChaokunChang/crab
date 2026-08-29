@@ -38,11 +38,12 @@ import os
 import signal
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from ..daemon.transport import (
     DaemonClient,
@@ -99,6 +100,77 @@ _ACTIVITY_SUBPATHS = {
     "/start",
     "/resume",
 }
+
+
+class _GatewayActivityGate:
+    """Coordinate tenant activity with automatic idle reclaim.
+
+    Activity-bearing requests may overlap one another, but an idle reclaim is
+    exclusive. The reaper never waits for activity: a busy sandbox is skipped
+    until the next pass. Once reclaim owns the gate, new activity waits for
+    the lifecycle transition to finish, matching the daemon's lifecycle gate.
+
+    This gate is intentionally process-local. ``GatewayServer`` is a single
+    process with threaded listeners; the SQLite registry remains the durable
+    source of activity timestamps across restarts.
+    """
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._states: dict[str, dict[str, int | bool]] = {}
+
+    def _state_locked(self, sandbox_id: str) -> dict[str, int | bool]:
+        state = self._states.get(sandbox_id)
+        if state is None:
+            state = {"activities": 0, "reclaim": False}
+            self._states[sandbox_id] = state
+        return state
+
+    @contextmanager
+    def activity(self, sandbox_id: str) -> Iterator[None]:
+        with self._condition:
+            state = self._state_locked(sandbox_id)
+            while bool(state["reclaim"]):
+                self._condition.wait()
+            state["activities"] = int(state["activities"]) + 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                state = self._state_locked(sandbox_id)
+                state["activities"] = max(0, int(state["activities"]) - 1)
+                self._condition.notify_all()
+
+    @contextmanager
+    def reclaim_if_available(self, sandbox_id: str) -> Iterator[bool]:
+        """Try to claim reclaim ownership without waiting for activity."""
+        acquired = False
+        with self._condition:
+            state = self._state_locked(sandbox_id)
+            if not bool(state["reclaim"]) and int(state["activities"]) == 0:
+                state["reclaim"] = True
+                acquired = True
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                with self._condition:
+                    state = self._state_locked(sandbox_id)
+                    state["reclaim"] = False
+                    self._condition.notify_all()
+
+
+def _idle_timeout_expired(row: dict[str, Any], now_ts: float) -> bool:
+    timeout = row.get("idle_timeout")
+    if timeout is None:
+        return False
+    baseline = row.get("last_activity") or row.get("created_at")
+    try:
+        baseline_ts = datetime.fromisoformat(str(baseline)).timestamp()
+        timeout_s = float(timeout)
+    except (ValueError, TypeError):
+        return False
+    return now_ts - baseline_ts >= timeout_s
 
 
 def _parse_idle_timeout(raw: Any) -> float | None:
@@ -340,10 +412,11 @@ class _GatewayRoutes:
         clock (E2B-style ``set_timeout`` / Daytona keep-alive)."""
         assert tenant_id is not None
         self._gateway.require_owned(tenant_id, sandbox_id)
-        idle_timeout = _parse_idle_timeout((body or {}).get("idle_timeout"))
-        idle_action = _parse_idle_action((body or {}).get("idle_action"))
-        self._gateway.registry.set_idle_policy(sandbox_id, idle_timeout, idle_action)
-        return self._idle_response(sandbox_id)
+        with self._gateway._activity_gate.activity(sandbox_id):
+            idle_timeout = _parse_idle_timeout((body or {}).get("idle_timeout"))
+            idle_action = _parse_idle_action((body or {}).get("idle_action"))
+            self._gateway.registry.set_idle_policy(sandbox_id, idle_timeout, idle_action)
+            return self._idle_response(sandbox_id)
 
     def get_idle(
         self, tenant_id: str | None, body: dict[str, Any], *, sandbox_id: str, **_: Any
@@ -380,41 +453,42 @@ class _GatewayRoutes:
     ) -> dict[str, Any]:
         assert tenant_id is not None
         source_row = self._gateway.require_owned(tenant_id, sandbox_id)
-        # Fork is source activity. Touch before the long daemon call so a
-        # concurrent reaper sees it, and again afterwards so a long fork gets
-        # a full idle window rather than being reclaimed immediately.
-        self._gateway.registry.touch(sandbox_id)
-        try:
-            count = int(body.get("count", 1))
-        except (TypeError, ValueError):
-            count = 1  # malformed counts are the daemon's 400 to give
-        # Forks create sandboxes, so they hit the same quota gate as
-        # create. Children inherit the source's resource claim (§4 S3 —
-        # forks copy the source's limits), so each child counts it against
-        # the aggregate caps. Children are registered post-hoc (their ids
-        # are daemon-assigned), not two-phase — see the design doc.
-        claim = dict(source_row.get("resources") or {})
-        idle_timeout = source_row.get("idle_timeout")
-        idle_action = source_row.get("idle_action")
-        self._gateway.registry.ensure_capacity(
-            tenant_id, additional=max(count, 0), resources=claim
-        )
-        try:
-            result = self._gateway.proxy(
-                "POST", f"/sandboxes/{sandbox_id}/fork", body, _SLOW_TIMEOUT_S
-            )
-        finally:
+        with self._gateway._activity_gate.activity(sandbox_id):
+            # Fork is source activity. Touch before the long daemon call so a
+            # concurrent reaper sees it, and again before releasing the
+            # activity gate so a long fork gets a full idle window.
             self._gateway.registry.touch(sandbox_id)
-        for fork in result.get("forks") or []:
-            fork_id = fork.get("sandbox_id")
-            if fork_id:
-                self._gateway.registry.register_sandbox(
-                    tenant_id,
-                    str(fork_id),
-                    resources=claim,
-                    idle_timeout=idle_timeout,
-                    idle_action=idle_action,
+            try:
+                count = int(body.get("count", 1))
+            except (TypeError, ValueError):
+                count = 1  # malformed counts are the daemon's 400 to give
+            # Forks create sandboxes, so they hit the same quota gate as
+            # create. Children inherit the source's resource claim (§4 S3 —
+            # forks copy the source's limits), so each child counts it against
+            # the aggregate caps. Children are registered post-hoc (their ids
+            # are daemon-assigned), not two-phase — see the design doc.
+            claim = dict(source_row.get("resources") or {})
+            idle_timeout = source_row.get("idle_timeout")
+            idle_action = source_row.get("idle_action")
+            self._gateway.registry.ensure_capacity(
+                tenant_id, additional=max(count, 0), resources=claim
+            )
+            try:
+                result = self._gateway.proxy(
+                    "POST", f"/sandboxes/{sandbox_id}/fork", body, _SLOW_TIMEOUT_S
                 )
+            finally:
+                self._gateway.registry.touch(sandbox_id)
+            for fork in result.get("forks") or []:
+                fork_id = fork.get("sandbox_id")
+                if fork_id:
+                    self._gateway.registry.register_sandbox(
+                        tenant_id,
+                        str(fork_id),
+                        resources=claim,
+                        idle_timeout=idle_timeout,
+                        idle_action=idle_action,
+                    )
         return result
 
     # ----- port exposure (S4) -----------------------------------------------
@@ -502,11 +576,14 @@ def _make_passthrough(gateway: "GatewayServer", method: str, timeout: float, sub
         # checkpoint DELETE accepts a `{"cascade": true}` body).
         payload = body if method in ("POST", "DELETE") else None
         if activity:
-            # Mark activity before the potentially long daemon call so the
-            # periodic reaper does not classify an in-flight command as idle.
-            gateway.registry.touch(sandbox_id)
-        result = gateway.proxy(method, path[len(API_PREFIX):], payload, timeout)
-        return result
+            with gateway._activity_gate.activity(sandbox_id):
+                # Mark activity before the potentially long daemon call so the
+                # periodic reaper does not classify an in-flight command as idle.
+                gateway.registry.touch(sandbox_id)
+                return gateway.proxy(
+                    method, path[len(API_PREFIX):], payload, timeout
+                )
+        return gateway.proxy(method, path[len(API_PREFIX):], payload, timeout)
 
     return handler
 
@@ -766,46 +843,47 @@ def _build_handler(gateway: "GatewayServer"):
                     {"ok": False, "error": str(exc)},
                 )
                 return
-            gateway.registry.touch(sandbox_id)
-            # Open streaming connection to daemon
-            daemon_path = f"/sandboxes/{sandbox_id}/exec?stream=1"
-            try:
-                stream = gateway._client.stream_post(daemon_path, body)
-            except FileNotFoundError as exc:
-                self._send_json(
-                    HTTPStatus.BAD_GATEWAY,
-                    {"ok": False, "error": str(exc), "error_type": "daemon_unreachable"},
-                )
-                return
-            except Exception as exc:
-                self._send_json(
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                    {"ok": False, "error": f"{type(exc).__name__}: {exc}"},
-                )
-                return
-            # Send chunked response headers
-            self.send_response(200)
-            self.send_header("Transfer-Encoding", "chunked")
-            self.send_header("Content-Type", "application/x-ndjson")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            try:
-                for event in stream:
-                    line = (json.dumps(event) + "\n").encode("utf-8")
-                    self.wfile.write(f"{len(line):x}\r\n".encode("ascii"))
-                    self.wfile.write(line)
-                    self.wfile.write(b"\r\n")
-                    self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            finally:
-                stream.close()
+            with gateway._activity_gate.activity(sandbox_id):
                 gateway.registry.touch(sandbox_id)
+                # Open streaming connection to daemon
+                daemon_path = f"/sandboxes/{sandbox_id}/exec?stream=1"
                 try:
-                    self.wfile.write(b"0\r\n\r\n")
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, OSError):
+                    stream = gateway._client.stream_post(daemon_path, body)
+                except FileNotFoundError as exc:
+                    self._send_json(
+                        HTTPStatus.BAD_GATEWAY,
+                        {"ok": False, "error": str(exc), "error_type": "daemon_unreachable"},
+                    )
+                    return
+                except Exception as exc:
+                    self._send_json(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        {"ok": False, "error": f"{type(exc).__name__}: {exc}"},
+                    )
+                    return
+                # Send chunked response headers
+                self.send_response(200)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Content-Type", "application/x-ndjson")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                try:
+                    for event in stream:
+                        line = (json.dumps(event) + "\n").encode("utf-8")
+                        self.wfile.write(f"{len(line):x}\r\n".encode("ascii"))
+                        self.wfile.write(line)
+                        self.wfile.write(b"\r\n")
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
                     pass
+                finally:
+                    stream.close()
+                    gateway.registry.touch(sandbox_id)
+                    try:
+                        self.wfile.write(b"0\r\n\r\n")
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        pass
 
     return Handler
 
@@ -963,6 +1041,7 @@ class GatewayServer:
         self._admin_server = None
         self._threads: list[threading.Thread] = []
         self._stop_event = threading.Event()
+        self._activity_gate = _GatewayActivityGate()
         self._port_manager = PortManager()
         self._reconcile_interval: float = float(
             os.environ.get("CRAB_GATEWAY_RECONCILE_S", self._RECONCILE_INTERVAL_S)
@@ -1146,72 +1225,80 @@ class GatewayServer:
             sid = str(row["sandbox_id"])
             if daemon_status.get(sid, "").lower() != "running":
                 continue
-            timeout = row.get("idle_timeout")
-            if timeout is None:
+            if not _idle_timeout_expired(row, now_ts):
                 continue
-            baseline = row.get("last_activity") or row.get("created_at")
-            try:
-                baseline_ts = datetime.fromisoformat(str(baseline)).timestamp()
-            except (ValueError, TypeError):
-                continue
-            if now_ts - baseline_ts < float(timeout):
-                continue
-            action = row.get("idle_action") or DEFAULT_IDLE_ACTION
-            checkpoint_id = _idle_reclaim_checkpoint_id(row, action)
-            self.registry.record_idle_reclaim(
-                sid,
-                action=action,
-                status="in_progress",
-                checkpoint_id=checkpoint_id,
-            )
-            try:
-                result = self._apply_idle_action(
-                    sid, action, checkpoint_id=checkpoint_id
-                )
-            except Exception as exc:
+
+            # The listing above is only a candidate snapshot. Activity may
+            # have refreshed the row after it was read. Coordinate with all
+            # activity-bearing routes and re-read under exclusive reclaim
+            # ownership before making a lifecycle decision.
+            with self._activity_gate.reclaim_if_available(sid) as acquired:
+                if not acquired:
+                    continue
+                fresh_row = self.registry.get_sandbox(sid)
+                if (
+                    fresh_row is None
+                    or fresh_row.get("status") != "active"
+                    or not _idle_timeout_expired(fresh_row, time.time())
+                ):
+                    continue
+
+                action = fresh_row.get("idle_action") or DEFAULT_IDLE_ACTION
+                checkpoint_id = _idle_reclaim_checkpoint_id(fresh_row, action)
                 self.registry.record_idle_reclaim(
                     sid,
                     action=action,
-                    status="failed",
+                    status="in_progress",
                     checkpoint_id=checkpoint_id,
-                    error=str(exc),
                 )
-                # Leave the row active so a later pass retries.
-                logger.warning(
-                    "idle reclaim failed for %s (action=%s): %s",
-                    sid,
-                    action,
-                    exc,
-                )
-                continue
+                try:
+                    result = self._apply_idle_action(
+                        sid, action, checkpoint_id=checkpoint_id
+                    )
+                except Exception as exc:
+                    self.registry.record_idle_reclaim(
+                        sid,
+                        action=action,
+                        status="failed",
+                        checkpoint_id=checkpoint_id,
+                        error=str(exc),
+                    )
+                    # Leave the row active so a later pass retries.
+                    logger.warning(
+                        "idle reclaim failed for %s (action=%s): %s",
+                        sid,
+                        action,
+                        exc,
+                    )
+                    continue
 
-            # checkpoint_stop always keeps the id allocated and persisted
-            # before the RPC. Never replace it with an unexpected daemon id.
-            if checkpoint_id is None:
-                checkpoint_id_raw = result.get("checkpoint_id")
-                checkpoint_id = (
-                    None
-                    if checkpoint_id_raw is None
-                    else str(checkpoint_id_raw)
+                # checkpoint_stop always keeps the id allocated and persisted
+                # before the RPC. Never replace it with an unexpected daemon id.
+                if checkpoint_id is None:
+                    checkpoint_id_raw = result.get("checkpoint_id")
+                    checkpoint_id = (
+                        None
+                        if checkpoint_id_raw is None
+                        else str(checkpoint_id_raw)
+                    )
+                status = "succeeded" if result.get("ok") else "failed"
+                error = None if status == "succeeded" else str(
+                    result.get("message") or result.get("error") or "idle action failed"
                 )
-            status = "succeeded" if result.get("ok") else "failed"
-            error = None if status == "succeeded" else str(
-                result.get("message") or result.get("error") or "idle action failed"
-            )
-            self.registry.record_idle_reclaim(
-                sid,
-                action=action,
-                status=status,
-                checkpoint_id=checkpoint_id,
-                error=error,
-            )
-            if status != "succeeded":
-                logger.warning(
-                    "idle reclaim did not complete for %s (action=%s): %s",
+                self.registry.record_idle_reclaim(
                     sid,
-                    action,
-                    error,
+                    action=action,
+                    status=status,
+                    checkpoint_id=checkpoint_id,
+                    error=error,
                 )
+                if status != "succeeded":
+                    logger.warning(
+                        "idle reclaim did not complete for %s (action=%s): %s",
+                        sid,
+                        action,
+                        error,
+                    )
 
     def _apply_idle_action(
         self,
