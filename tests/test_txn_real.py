@@ -58,7 +58,10 @@ class TxnRealTests(unittest.TestCase):
         sandbox = Sandbox(image=self._IMAGE, engine=engine)
         self.addCleanup(sandbox.kill)
         self._run(sandbox, "mkdir -p /probe && echo base-1 > /probe/a && echo base-2 > /probe/b")
-        self._run(sandbox, "sh -c 'sleep 600 & echo $! > /probe/worker.pid'")
+        self._run(
+            sandbox,
+            "sh -c 'nohup sleep 600 >/dev/null 2>&1 & echo $! > /probe/worker.pid'",
+        )
         base_digest = self._run(sandbox, "cat /probe/a /probe/b | sha256sum")
 
         txn = sandbox.begin(label="abort-e2e")
