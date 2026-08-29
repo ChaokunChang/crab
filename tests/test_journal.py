@@ -31,6 +31,7 @@ from crab import (
     SandboxId,
     SandboxSnapshot,
     SchedulerConfig,
+    SandboxExecTimeout,
     StorageConfig,
 )
 from crab.engine import EngineConfig
@@ -69,6 +70,9 @@ class _FakeProc:
             self._timeout_first = False
             raise subprocess.TimeoutExpired(cmd="runc exec", timeout=timeout or 0.0)
         return self._stdout, self._stderr
+
+    def poll(self) -> int | None:
+        return self.returncode
 
     def kill(self) -> None:
         self.returncode = -9
@@ -189,7 +193,12 @@ class RuncExecJournalTests(unittest.TestCase):
         self.sid = SandboxId("sbx-exec")
 
     def _exec(self, proc: _FakeProc, **kwargs):
-        with mock.patch("crab.runtime.runc.subprocess.Popen", return_value=proc):
+        # Payload-tree cleanup has dedicated contract tests.  This journal
+        # unit uses no real process/PID file, so make termination a no-op and
+        # exercise only recording plus the stable timeout type here.
+        with mock.patch(
+            "crab.runtime.runc.subprocess.Popen", return_value=proc
+        ), mock.patch.object(self.runtime, "_terminate_exec_payload"):
             return self.runtime.exec(self.sid, ["echo", "hi"], **kwargs)
 
     def test_exec_records_success(self) -> None:
@@ -211,7 +220,7 @@ class RuncExecJournalTests(unittest.TestCase):
         self.assertEqual(payload["returncode"], 3)
 
     def test_exec_timeout_records_attempt_and_reraises(self) -> None:
-        with self.assertRaises(subprocess.TimeoutExpired):
+        with self.assertRaises(SandboxExecTimeout):
             self._exec(_FakeProc(timeout_first=True), timeout_s=0.01)
         records = self.journal.entries(self.sid, kind="exec")
         self.assertEqual(len(records), 1)

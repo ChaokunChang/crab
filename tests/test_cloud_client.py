@@ -142,6 +142,25 @@ class ConnectDispatchTests(CloudLiveTestBase):
 
 
 class CloudLifecycleTests(CloudLiveTestBase):
+    def test_create_preserves_network_tristate_on_the_wire(self) -> None:
+        engine = self.connect(self.key)
+        explicit_host = Sandbox(image="ubuntu:22.04", network=False, engine=engine)
+        automatic = Sandbox(image="ubuntu:22.04", network=None, engine=engine)
+        try:
+            create_bodies = self.state.create_bodies()
+            self.assertIs(create_bodies[-2]["metadata"]["network"], False)
+            self.assertNotIn("network", create_bodies[-1]["metadata"])
+        finally:
+            explicit_host.kill()
+            automatic.kill()
+
+    def test_create_rejects_non_boolean_network_before_wire_call(self) -> None:
+        engine = self.connect(self.key)
+        before = len(self.state.create_bodies())
+        with self.assertRaisesRegex(ValueError, "true, false, or null"):
+            Sandbox(image="ubuntu:22.04", network="false", engine=engine)  # type: ignore[arg-type]
+        self.assertEqual(len(self.state.create_bodies()), before)
+
     def test_full_lifecycle_over_gateway(self) -> None:
         engine = self.connect(self.key)
         sbx = Sandbox(image="ubuntu:22.04", engine=engine)

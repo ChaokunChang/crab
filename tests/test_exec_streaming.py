@@ -434,6 +434,53 @@ class RemoteEngineStreamTests(StreamingTestBase):
         self.assertEqual(result.returncode, 0)
 
 
+class RemoteEngineTimeoutStreamTests(StreamingTestBase):
+    def _start_stub_daemon(self) -> None:
+        events = [
+            {"ch": "stdout", "t": "started\n"},
+            {
+                "done": True,
+                "rc": None,
+                "error": "command timed out",
+                "error_type": "exec_timeout",
+                "timeout_s": 1.0,
+                "stdout": "started\n",
+                "stderr": "",
+                "cleanup_completed": True,
+            },
+        ]
+        handler = _build_streaming_stub_handler(events=events)
+        self.daemon_server = serve_unix_socket(self.daemon_socket, handler)
+        thread = threading.Thread(
+            target=self.daemon_server.serve_forever, daemon=True
+        )
+        thread.start()
+        self.addCleanup(self._stop_daemon)
+
+    def test_stream_timeout_rehydrates_stable_type(self) -> None:
+        from crab.cloud_client import CloudClient
+        from crab.errors import SandboxExecTimeout
+        from crab.ids import SandboxId
+        from crab.remote_engine import RuntimeProxy
+
+        proxy = RuntimeProxy(
+            CloudClient(
+                f"http://127.0.0.1:{self.gateway.port}",
+                api_key=self.api_key,
+                timeout_seconds=10,
+            ),
+            name="runc",
+        )
+        stream = proxy.stream_exec(
+            SandboxId("sbx-1"), ["sh", "-c", "sleep 30 & wait"], timeout_s=1.0
+        )
+        first = next(stream)
+        self.assertIsInstance(first, ExecEvent)
+        with self.assertRaises(SandboxExecTimeout) as caught:
+            list(stream)
+        self.assertEqual(caught.exception.stdout, "started\n")
+
+
 # ---------------------------------------------------------------------------
 # StreamIterator unit tests
 # ---------------------------------------------------------------------------

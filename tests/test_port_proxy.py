@@ -206,8 +206,15 @@ def _build_port_test_handler(state: dict[str, Any]):
                 sid = path.split("/")[2]
                 self._json(200, {
                     "ok": True,
-                    "sandbox_id": sid,
-                    "metadata": {"guest_ip": state.get("guest_ip", "127.0.0.1")},
+                    "description": {
+                        "sandbox_id": sid,
+                        "runtime_name": "fake",
+                        "status": "running",
+                        "metadata": {
+                            "guest_ip": state.get("guest_ip", "127.0.0.1")
+                        },
+                    },
+                    "runtime_state": None,
                 })
             else:
                 self._json(404, {"ok": False, "error": "not found"})
@@ -310,6 +317,35 @@ class GatewayPortTestBase(unittest.TestCase):
 
 
 class GatewayPortRouteTests(GatewayPortTestBase):
+    def test_expose_port_uses_guest_ip_from_daemon_description(self) -> None:
+        self.state["guest_ip"] = "10.250.99.7"
+        captured: dict[str, object] = {}
+        original_allocate = self.gateway.port_manager.allocate
+
+        def capture_allocate(
+            sandbox_id: str, guest_ip: str, guest_port: int, **_: Any
+        ) -> int:
+            captured.update(
+                sandbox_id=sandbox_id,
+                guest_ip=guest_ip,
+                guest_port=guest_port,
+            )
+            return _find_free_port()
+
+        self.gateway.port_manager.allocate = capture_allocate
+        self.addCleanup(
+            setattr, self.gateway.port_manager, "allocate", original_allocate
+        )
+
+        status, _ = self.request(
+            "POST", "/v1/sandboxes/sbx-1/ports", {"port": 8080}
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(captured["sandbox_id"], "sbx-1")
+        self.assertEqual(captured["guest_ip"], "10.250.99.7")
+        self.assertEqual(captured["guest_port"], 8080)
+
     def test_expose_port(self) -> None:
         guest_port = self._start_echo_for_guest()
         status, body = self.request("POST", "/v1/sandboxes/sbx-1/ports", {"port": guest_port})

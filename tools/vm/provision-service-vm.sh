@@ -29,6 +29,13 @@ SERVICE_VM_SSH_PORT=${SERVICE_VM_SSH_PORT:-2223}       # host-side SSH port
 SERVICE_VM_GATEWAY_PORT=${SERVICE_VM_GATEWAY_PORT:-8900}  # host-side, bound 0.0.0.0
 SERVICE_VM_CPUS=${SERVICE_VM_CPUS:-4}
 SERVICE_VM_MEM=${SERVICE_VM_MEM:-8G}
+# `user` keeps the zero-setup QEMU SLIRP path used by development. `tap`
+# attaches the guest to an operator-created tap/bridge and gives production
+# deployments a host-equivalent egress path.
+SERVICE_VM_NET_MODE=${SERVICE_VM_NET_MODE:-user}
+SERVICE_VM_TAP_IFACE=${SERVICE_VM_TAP_IFACE:-}
+SERVICE_VM_TAP_SSH_HOST=${SERVICE_VM_TAP_SSH_HOST:-}
+SERVICE_VM_TAP_SSH_PORT=${SERVICE_VM_TAP_SSH_PORT:-22}
 
 TENANT_NAME=${TENANT_NAME:-default}
 MAX_SANDBOXES=${MAX_SANDBOXES:-20}
@@ -65,17 +72,42 @@ SVC_PIDFILE="$SERVICE_VM_DIR/crab-service.pid"
 SVC_MONITOR="$SERVICE_VM_DIR/crab-service.monitor"
 SVC_CONSOLE="$SERVICE_VM_DIR/crab-service-console.log"
 
-# SSH config for service VM (reuses the same key baked into the dev VM image)
-SVC_SSH_DEST=root@127.0.0.1
-SVC_SSH_OPTS=(-i "$SSH_KEY" -p "$SERVICE_VM_SSH_PORT" -o StrictHostKeyChecking=no
-              -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5)
-
 # =============================================================================
 # Helpers
 # =============================================================================
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
+
+# SSH and host reachability differ between the forwarded SLIRP path and a
+# bridge-attached guest. The tap interface, bridge membership, DHCP/static
+# address, firewall, and host routing are intentionally operator-owned.
+case "$SERVICE_VM_NET_MODE" in
+    user)
+        SVC_SSH_DEST=root@127.0.0.1
+        SVC_SSH_PORT=$SERVICE_VM_SSH_PORT
+        SVC_GATEWAY_CHECK_HOST=127.0.0.1
+        SVC_GATEWAY_PUBLIC_HOST=""
+        QEMU_NETDEV="user,id=net0,hostfwd=tcp:127.0.0.1:${SERVICE_VM_SSH_PORT}-:22,hostfwd=tcp:0.0.0.0:${SERVICE_VM_GATEWAY_PORT}-:${VM_GATEWAY_PORT}"
+        ;;
+    tap)
+        [ -n "$SERVICE_VM_TAP_IFACE" ] \
+            || die "SERVICE_VM_TAP_IFACE is required when SERVICE_VM_NET_MODE=tap"
+        [ -n "$SERVICE_VM_TAP_SSH_HOST" ] \
+            || die "SERVICE_VM_TAP_SSH_HOST is required when SERVICE_VM_NET_MODE=tap"
+        SVC_SSH_DEST="root@${SERVICE_VM_TAP_SSH_HOST}"
+        SVC_SSH_PORT=$SERVICE_VM_TAP_SSH_PORT
+        SVC_GATEWAY_CHECK_HOST=$SERVICE_VM_TAP_SSH_HOST
+        SVC_GATEWAY_PUBLIC_HOST=$SERVICE_VM_TAP_SSH_HOST
+        QEMU_NETDEV="tap,id=net0,ifname=${SERVICE_VM_TAP_IFACE},script=no,downscript=no"
+        ;;
+    *)
+        die "unsupported SERVICE_VM_NET_MODE=$SERVICE_VM_NET_MODE (expected user or tap)"
+        ;;
+esac
+
+SVC_SSH_OPTS=(-i "$SSH_KEY" -p "$SVC_SSH_PORT" -o StrictHostKeyChecking=no
+              -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5)
 
 svc_vm_running() {
     [ -f "$SVC_PIDFILE" ] && kill -0 "$(cat "$SVC_PIDFILE")" 2>/dev/null
@@ -160,8 +192,13 @@ if [ "${1:-}" = "--status" ]; then
     if svc_vm_running; then
         local_pid=$(cat "$SVC_PIDFILE")
         echo "Service VM: RUNNING (PID $local_pid)"
-        echo "  SSH:     ssh -p $SERVICE_VM_SSH_PORT root@127.0.0.1"
-        echo "  Gateway: http://$(get_host_ip):$SERVICE_VM_GATEWAY_PORT"
+        echo "  Network: $SERVICE_VM_NET_MODE"
+        echo "  SSH:     ssh -p $SVC_SSH_PORT $SVC_SSH_DEST"
+        if [ "$SERVICE_VM_NET_MODE" = tap ]; then
+            echo "  Gateway: http://${SVC_GATEWAY_PUBLIC_HOST}:${VM_GATEWAY_PORT}"
+        else
+            echo "  Gateway: http://$(get_host_ip):$SERVICE_VM_GATEWAY_PORT"
+        fi
         # Try to check gateway health
         if svc_vm_ssh "curl -sf http://localhost:$VM_GATEWAY_PORT/healthz" >/dev/null 2>&1; then
             echo "  Gateway health: OK"
@@ -287,17 +324,23 @@ for t in data.get('tenants', []):
     API_KEY=$(echo "$API_KEY_OUTPUT" | grep -oP 'crab_sk_\w+' | head -1 || echo "")
     [ -n "$API_KEY" ] || API_KEY="(check gateway output: $API_KEY_OUTPUT)"
 
-    HOST_IP=$(get_host_ip)
+    if [ "$SERVICE_VM_NET_MODE" = tap ]; then
+        HOST_IP=$SVC_GATEWAY_PUBLIC_HOST
+        RESET_GATEWAY_PORT=$VM_GATEWAY_PORT
+    else
+        HOST_IP=$(get_host_ip)
+        RESET_GATEWAY_PORT=$SERVICE_VM_GATEWAY_PORT
+    fi
     cat <<EOF
 
 ====== Crab Service VM RESET complete ======
-Gateway: http://${HOST_IP}:${SERVICE_VM_GATEWAY_PORT}
+Gateway: http://${HOST_IP}:${RESET_GATEWAY_PORT}
 Tenant:  ${TENANT_NAME} (id: ${TENANT_ID})
 API Key: ${API_KEY}
 
 All previous tenants, API keys, and sandboxes were wiped; image caches kept.
 Export the new credentials to use the tutorial:
-  export CRAB_GATEWAY_URL=http://${HOST_IP}:${SERVICE_VM_GATEWAY_PORT}
+  export CRAB_GATEWAY_URL=http://${HOST_IP}:${RESET_GATEWAY_PORT}
   export CRAB_API_KEY=${API_KEY}
 =============================================
 EOF
@@ -313,7 +356,7 @@ fi
 [ -x "$QEMU_BIN" ] || die "QEMU binary not found: $QEMU_BIN"
 
 # Check port conflicts (only when VM is NOT already running)
-if ! svc_vm_running; then
+if ! svc_vm_running && [ "$SERVICE_VM_NET_MODE" = user ]; then
     if port_in_use "$SERVICE_VM_SSH_PORT"; then
         die "Port $SERVICE_VM_SSH_PORT is already in use (needed for service VM SSH). Choose another SERVICE_VM_SSH_PORT."
     fi
@@ -369,7 +412,7 @@ else
         -machine q35,accel=kvm -cpu host \
         -smp "$SERVICE_VM_CPUS" -m "$MEMORY_ARG" \
         -drive "file=$SVC_DISK,if=virtio,format=qcow2" \
-        -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${SERVICE_VM_SSH_PORT}-:22,hostfwd=tcp:0.0.0.0:${SERVICE_VM_GATEWAY_PORT}-:${VM_GATEWAY_PORT}" \
+        -netdev "$QEMU_NETDEV" \
         -device "virtio-net-pci,netdev=net0" \
         -display none \
         -serial "file:$SVC_CONSOLE" \
@@ -384,7 +427,7 @@ fi
 # Step 3: Wait for SSH
 # =============================================================================
 
-log "Waiting for SSH on port $SERVICE_VM_SSH_PORT..."
+log "Waiting for SSH at $SVC_SSH_DEST port $SVC_SSH_PORT..."
 svc_vm_wait_ssh 60 || die "SSH to service VM timed out after 60s"
 log "SSH is up"
 
@@ -482,14 +525,19 @@ fi
 # =============================================================================
 
 log "Verifying gateway reachable from host..."
+if [ "$SERVICE_VM_NET_MODE" = tap ]; then
+    HOST_GATEWAY_PORT=$VM_GATEWAY_PORT
+else
+    HOST_GATEWAY_PORT=$SERVICE_VM_GATEWAY_PORT
+fi
 for _ in $(seq 1 10); do
-    if curl -sf "http://127.0.0.1:$SERVICE_VM_GATEWAY_PORT/healthz" >/dev/null 2>&1; then
+    if curl -sf "http://${SVC_GATEWAY_CHECK_HOST}:${HOST_GATEWAY_PORT}/healthz" >/dev/null 2>&1; then
         break
     fi
     sleep 2
 done
-curl -sf "http://127.0.0.1:$SERVICE_VM_GATEWAY_PORT/healthz" >/dev/null 2>&1 \
-    || die "Gateway not reachable on host port $SERVICE_VM_GATEWAY_PORT"
+curl -sf "http://${SVC_GATEWAY_CHECK_HOST}:${HOST_GATEWAY_PORT}/healthz" >/dev/null 2>&1 \
+    || die "Gateway not reachable at ${SVC_GATEWAY_CHECK_HOST}:${HOST_GATEWAY_PORT}"
 log "Gateway reachable on host"
 
 # =============================================================================
@@ -596,24 +644,31 @@ fi
 # Summary
 # =============================================================================
 
-HOST_IP=$(get_host_ip)
+if [ "$SERVICE_VM_NET_MODE" = tap ]; then
+    HOST_IP=$SVC_GATEWAY_PUBLIC_HOST
+    PUBLIC_GATEWAY_PORT=$VM_GATEWAY_PORT
+else
+    HOST_IP=$(get_host_ip)
+    PUBLIC_GATEWAY_PORT=$SERVICE_VM_GATEWAY_PORT
+fi
 
 cat <<EOF
 
 ====== Crab Service VM Ready ======
-SSH:     ssh -i $SSH_KEY -p $SERVICE_VM_SSH_PORT root@127.0.0.1
-Gateway: http://${HOST_IP}:${SERVICE_VM_GATEWAY_PORT}
+Network: ${SERVICE_VM_NET_MODE}
+SSH:     ssh -i $SSH_KEY -p $SVC_SSH_PORT $SVC_SSH_DEST
+Gateway: http://${HOST_IP}:${PUBLIC_GATEWAY_PORT}
 API Key: ${API_KEY}
 Tenant:  ${TENANT_NAME} (id: ${TENANT_ID})
 Example sandbox: ${SANDBOX_ID}
 
 From other servers:
-  engine = Engine.connect(url="http://${HOST_IP}:${SERVICE_VM_GATEWAY_PORT}", api_key="${API_KEY}")
+  engine = Engine.connect(url="http://${HOST_IP}:${PUBLIC_GATEWAY_PORT}", api_key="${API_KEY}")
   sandbox = Sandbox.connect("${SANDBOX_ID}", engine=engine)
 
 Manage:
   Stop:   bash tools/vm/provision-service-vm.sh --stop
   Status: bash tools/vm/provision-service-vm.sh --status
-  Logs:   ssh -i $SSH_KEY -p $SERVICE_VM_SSH_PORT root@127.0.0.1 'tail -f /var/log/crab-gateway.log'
+  Logs:   ssh -i $SSH_KEY -p $SVC_SSH_PORT $SVC_SSH_DEST 'tail -f /var/log/crab-gateway.log'
 ===================================
 EOF

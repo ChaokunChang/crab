@@ -57,6 +57,10 @@ storage_planes:
   for one.
 - `image_cache_root`: exported container-image rootfs cache.
 
+Image pull policy, limits, cache retention, and prewarming are configured in
+the `images` block. See [Sandbox runtime baseline](sandbox-runtime-baseline.md#cache-and-pull-policy)
+for the complete example and compatible-image contract.
+
 `Sandbox(work_dir=...)` and `crab sandbox run --work-dir` create host bind
 mounts. Their contents are outside ZFS rollback.
 
@@ -94,6 +98,11 @@ clearly when the sandbox has no network namespace. Use an agent-oriented
 config, such as
 [`examples/sdk/configs/iflow_replay_engine.runc.yaml`](../examples/sdk/configs/iflow_replay_engine.runc.yaml),
 instead of silently weakening isolation or bypassing interception.
+
+`Sandbox(network=...)` is tri-state: `true` requires an isolated namespace,
+`false` explicitly uses host networking, and omitted/`null` follows the daemon
+default. The default becomes isolated only when sandbox networking is enabled
+and interception needs it. See [Network selection](sandbox-runtime-baseline.md#network-selection).
 
 ## Host inspector
 

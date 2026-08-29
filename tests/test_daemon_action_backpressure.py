@@ -173,6 +173,65 @@ class CheckpointBackpressureTests(unittest.TestCase):
         self.assertLess(time.monotonic() - t1, 0.5)
         self._wait_for_jobs_idle(sbx)
 
+    def test_nonzero_action_skips_checkpoint(self) -> None:
+        checkpoint_calls: list[str] = []
+
+        class NonzeroRuntime(_FakeRuntime):
+            def exec(self, *args, **kwargs):
+                _ = (args, kwargs)
+                return SimpleNamespace(returncode=7, stdout="", stderr="failed")
+
+        system = _FakeSystem(self.log, 0.0)
+        system.checkpoint_once = lambda *args, **kwargs: checkpoint_calls.append(
+            "called"
+        )
+        routes = _Routes(
+            _FakeDaemon(
+                SimpleNamespace(runtime=NonzeroRuntime(self.log), system=system)
+            )
+        )
+
+        response = routes.action_sandbox(
+            {
+                "exec": {"argv": ["false"]},
+                "checkpoint": True,
+                "checkpoint_id": "ckpt-should-not-exist",
+            },
+            sandbox_id="sbx-nonzero",
+        )
+
+        self.assertEqual(response["exec"]["returncode"], 7)
+        self.assertEqual(response["checkpoint_status"], "skipped")
+        self.assertNotIn("checkpoint_id", response)
+        self.assertEqual(checkpoint_calls, [])
+
+    def test_timed_out_action_never_starts_checkpoint(self) -> None:
+        from crab.errors import SandboxExecTimeout
+
+        checkpoint_calls: list[str] = []
+
+        class TimeoutRuntime(_FakeRuntime):
+            def exec(self, *args, **kwargs):
+                _ = (args, kwargs)
+                raise SandboxExecTimeout(["sleep", "30"], 1.0)
+
+        system = _FakeSystem(self.log, 0.0)
+        system.checkpoint_once = lambda *args, **kwargs: checkpoint_calls.append(
+            "called"
+        )
+        routes = _Routes(
+            _FakeDaemon(
+                SimpleNamespace(runtime=TimeoutRuntime(self.log), system=system)
+            )
+        )
+
+        with self.assertRaises(SandboxExecTimeout):
+            routes.action_sandbox(
+                {"exec": {"argv": ["sleep", "30"]}, "checkpoint": True},
+                sandbox_id="sbx-timeout",
+            )
+        self.assertEqual(checkpoint_calls, [])
+
     def test_distinct_sandboxes_do_not_block_each_other(self) -> None:
         routes = self._make_routes(ckpt_delay=1.0)
 

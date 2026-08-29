@@ -49,10 +49,14 @@ class PortForwarder:
     def start(self) -> None:
         """Bind and begin accepting connections."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(("0.0.0.0", self.host_port))
-        sock.listen(5)
-        sock.settimeout(1.0)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("0.0.0.0", self.host_port))
+            sock.listen(5)
+            sock.settimeout(1.0)
+        except Exception:
+            sock.close()
+            raise
         self._listener = sock
         self._accept_thread = threading.Thread(
             target=self._accept_loop, daemon=True, name=f"port-fwd-{self.host_port}"
@@ -87,6 +91,7 @@ class PortForwarder:
             except OSError:
                 break
             # Connect to guest
+            guest_sock: socket.socket | None = None
             try:
                 guest_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 guest_sock.settimeout(10.0)
@@ -94,7 +99,10 @@ class PortForwarder:
                 guest_sock.settimeout(None)
             except OSError:
                 client_sock.close()
+                if guest_sock is not None:
+                    guest_sock.close()
                 continue
+            assert guest_sock is not None
             conn = _Connection(client_sock, guest_sock, self.idle_timeout, self._stop_event)
             with self._lock:
                 # Prune dead connections

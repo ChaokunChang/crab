@@ -12,6 +12,23 @@ from .contracts import (
     TelemetrySink,
 )
 from .executor import CRExecutor
+from .errors import (
+    ImageAuthenticationError,
+    ImageCompatibilityError,
+    ImageInsufficientDiskError,
+    ImageNotFoundError,
+    ImagePlatformError,
+    ImagePolicyError,
+    ImagePullError,
+    ImagePullTimeoutError,
+    ImageRateLimitError,
+    ImageReferenceError,
+    ImageTooLargeError,
+    SandboxCreateCleanupError,
+    SandboxExecCleanupError,
+    SandboxExecTimeout,
+    SandboxImageError,
+)
 from .ids import CheckpointId, JobId, SandboxId
 from .inspector import EBPFSandboxInspector, InMemoryEBPFEventCollector, InMemorySandboxInspector
 from .interceptor import (
@@ -131,6 +148,21 @@ __all__ = [
     "Engine",
     "EngineConfig",
     "Sandbox",
+    "SandboxCreateCleanupError",
+    "SandboxExecCleanupError",
+    "SandboxExecTimeout",
+    "SandboxImageError",
+    "ImageAuthenticationError",
+    "ImageCompatibilityError",
+    "ImageInsufficientDiskError",
+    "ImageNotFoundError",
+    "ImagePlatformError",
+    "ImagePolicyError",
+    "ImagePullError",
+    "ImagePullTimeoutError",
+    "ImageRateLimitError",
+    "ImageReferenceError",
+    "ImageTooLargeError",
     "Transaction",
     "TxnAbortError",
     "TxnActiveError",

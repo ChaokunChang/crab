@@ -80,6 +80,9 @@ _SLOW_TIMEOUT_S = 600.0
 (checkpoint, fork, txn begin/commit/abort), merges, exec with long task
 timeouts, create (first image fetch), kill (chain materialization)."""
 
+_CREATE_TIMEOUT_S = 1200.0
+"""Cold-image create includes a bounded 600s pull plus export/rootfs setup."""
+
 _RECLAIM_TIMEOUT_S = 1200.0
 """Budget for an idle lifecycle transition: it may first wait for a long
 command/background checkpoint and then take another checkpoint itself."""
@@ -329,6 +332,7 @@ class _GatewayRoutes:
             "version": raw.get("version"),
             "runtime": raw.get("runtime"),
             "default_image": raw.get("default_image"),
+            "sandbox_network_default": raw.get("sandbox_network_default"),
             "sandbox_count": self._gateway.registry.live_count(tenant_id),
         }
 
@@ -368,7 +372,9 @@ class _GatewayRoutes:
         metadata[GATEWAY_INTENT_METADATA_KEY] = intent_id
         daemon_body["metadata"] = metadata
         try:
-            result = self._gateway.proxy("POST", "/sandboxes", daemon_body, _SLOW_TIMEOUT_S)
+            result = self._gateway.proxy(
+                "POST", "/sandboxes", daemon_body, _CREATE_TIMEOUT_S
+            )
         except (_DaemonError, _DaemonUnreachable):
             # The daemon answered with an error or was never reached —
             # no sandbox exists, so the intent row can be reaped now.
@@ -520,7 +526,14 @@ class _GatewayRoutes:
         raw = self._gateway.proxy(
             "GET", f"/sandboxes/{sandbox_id}", None, _FAST_TIMEOUT_S
         )
-        metadata = raw.get("metadata") or {}
+        description = raw.get("description")
+        if isinstance(description, dict):
+            metadata = description.get("metadata") or {}
+        else:
+            # Compatibility with pre-description daemon responses.
+            metadata = raw.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
         guest_ip = metadata.get("guest_ip") or "127.0.0.1"
         # Allocate host port and start forwarder
         host_port = self._gateway.port_manager.allocate(
