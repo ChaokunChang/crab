@@ -33,6 +33,22 @@ from typing import TYPE_CHECKING, Any, Iterator, Mapping
 
 from .contracts import Runtime
 from .daemon import DaemonClient, DaemonRequestError
+from .errors import (
+    ImageAuthenticationError,
+    ImageCompatibilityError,
+    ImageInsufficientDiskError,
+    ImageNotFoundError,
+    ImagePlatformError,
+    ImagePolicyError,
+    ImagePullError,
+    ImagePullTimeoutError,
+    ImageRateLimitError,
+    ImageReferenceError,
+    ImageTooLargeError,
+    SandboxCreateCleanupError,
+    SandboxExecCleanupError,
+    SandboxExecTimeout,
+)
 from .ids import CheckpointId, SandboxId
 from .models import ChangesetResult, EgressLedger, EgressReplayReport, ExecDone, ExecEvent, JobStatus, MergeReport, ObservationReport, ProcessMergeReport, SandboxDescription, SandboxExecResult, SandboxRuntimeState, SandboxSnapshot, utc_now
 from .journal import ActionRecord
@@ -506,8 +522,12 @@ class _ConfigShim:
     def __init__(self, info: Mapping[str, Any]) -> None:
         self.default_image = info.get("default_image") or "ubuntu:22.04"
         self.runtime = str(info.get("runtime") or "runc")
-        self.enable_sandbox_network = info.get("network_bridge_ip") is not None
+        self.enable_sandbox_network = bool(
+            info.get("sandbox_network_default")
+            or info.get("network_bridge_ip") is not None
+        )
         self.enable_interceptor = bool(info.get("interceptor_base_url"))
+        self.enable_egress_proxy = False
 
 
 class RuntimeProxy(Runtime):
@@ -544,7 +564,15 @@ class RuntimeProxy(Runtime):
         payload: dict[str, Any] = {"runtime_name": runtime_name}
         if metadata is not None:
             payload["metadata"] = _make_jsonable(metadata)
-        result = self._client.post_json("/sandboxes", payload)
+        try:
+            result = self._client.post_json(
+                "/sandboxes", payload, timeout_seconds=1200.0
+            )
+        except DaemonRequestError as exc:
+            mapped = _map_create_error(exc)
+            if mapped is exc:
+                raise
+            raise mapped from exc
         return SandboxId(str(result["sandbox_id"]))
 
     def stop(self, sandbox_id: SandboxId) -> None:  # type: ignore[override]
@@ -630,11 +658,17 @@ class RuntimeProxy(Runtime):
             http_timeout = float(timeout_s) + 60.0
         else:
             http_timeout = None  # use client default
-        response = self._client.post_json(
-            f"/sandboxes/{sandbox_id}/exec",
-            payload,
-            timeout_seconds=http_timeout,
-        )
+        try:
+            response = self._client.post_json(
+                f"/sandboxes/{sandbox_id}/exec",
+                payload,
+                timeout_seconds=http_timeout,
+            )
+        except DaemonRequestError as exc:
+            mapped = _map_exec_error(exc, cmd=argv, timeout_s=timeout_s)
+            if mapped is exc:
+                raise
+            raise mapped from exc
         raw = response["result"]
         return SandboxExecResult(
             args=tuple(raw.get("args") or []),
@@ -676,6 +710,24 @@ class RuntimeProxy(Runtime):
         try:
             for event in stream:
                 if event.get("done"):
+                    error_type = event.get("error_type")
+                    if error_type == SandboxExecTimeout.error_type:
+                        raise SandboxExecTimeout(
+                            argv,
+                            float(event.get("timeout_s") or timeout_s or 0.0),
+                            stdout=str(event.get("stdout") or ""),
+                            stderr=str(event.get("stderr") or ""),
+                        )
+                    if error_type == SandboxExecCleanupError.error_type:
+                        raise SandboxExecCleanupError(
+                            str(event.get("error") or "sandbox exec cleanup failed"),
+                            cmd=argv,
+                            timeout=event.get("timeout_s", timeout_s),
+                            stdout=str(event.get("stdout") or ""),
+                            stderr=str(event.get("stderr") or ""),
+                            payload_pid=event.get("payload_pid"),
+                            cgroup_path=event.get("cgroup_path"),
+                        )
                     yield ExecDone(returncode=int(event.get("rc", -1)))
                     return
                 ch = event.get("ch", "stdout")
@@ -734,11 +786,17 @@ class RuntimeProxy(Runtime):
 
         # Timeout: exec may block for the full task timeout; add headroom.
         http_timeout = (float(timeout_s) + 120.0) if timeout_s else 600.0
-        return self._client.post_json(
-            f"/sandboxes/{sandbox_id}/action",
-            payload,
-            timeout_seconds=http_timeout,
-        )
+        try:
+            return self._client.post_json(
+                f"/sandboxes/{sandbox_id}/action",
+                payload,
+                timeout_seconds=http_timeout,
+            )
+        except DaemonRequestError as exc:
+            mapped = _map_exec_error(exc, cmd=argv, timeout_s=timeout_s)
+            if mapped is exc:
+                raise
+            raise mapped from exc
 
     def poll_job(self, sandbox_id: SandboxId, job_id: str) -> dict[str, Any]:
         """Poll a daemon background job (checkpoint/changeset) status.
@@ -1084,6 +1142,90 @@ def _map_txn_error(exc: DaemonRequestError) -> Exception:
         return TxnCommitConflict(message)
     if error_type == "txn_abort_failed":
         return TxnAbortError(message)
+    return exc
+
+
+def _map_exec_error(
+    exc: DaemonRequestError,
+    *,
+    cmd: list[str],
+    timeout_s: float | None,
+) -> Exception:
+    """Rehydrate daemon/gateway exec failures into stable SDK types."""
+
+    try:
+        payload = json.loads(exc.body.decode("utf-8", errors="replace"))
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        return exc
+    error_type = payload.get("error_type")
+    if error_type == SandboxExecTimeout.error_type:
+        return SandboxExecTimeout(
+            cmd,
+            float(payload.get("timeout_s") or timeout_s or 0.0),
+            stdout=str(payload.get("stdout") or ""),
+            stderr=str(payload.get("stderr") or ""),
+        )
+    if error_type == SandboxExecCleanupError.error_type:
+        return SandboxExecCleanupError(
+            str(payload.get("error") or "sandbox exec cleanup failed"),
+            cmd=cmd,
+            timeout=payload.get("timeout_s", timeout_s),
+            stdout=str(payload.get("stdout") or ""),
+            stderr=str(payload.get("stderr") or ""),
+            payload_pid=payload.get("payload_pid"),
+            cgroup_path=payload.get("cgroup_path"),
+        )
+    return exc
+
+
+def _map_create_error(exc: DaemonRequestError) -> Exception:
+    """Rehydrate typed image/rollback failures across daemon and gateway."""
+
+    try:
+        payload = json.loads(exc.body.decode("utf-8", errors="replace"))
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        return exc
+    error_type = payload.get("error_type")
+    message = str(payload.get("error") or exc)
+    reference = str(payload.get("image") or "")
+    image_types = {
+        ImageNotFoundError.error_type: ImageNotFoundError,
+        ImageAuthenticationError.error_type: ImageAuthenticationError,
+        ImageRateLimitError.error_type: ImageRateLimitError,
+        ImagePullTimeoutError.error_type: ImagePullTimeoutError,
+        ImagePlatformError.error_type: ImagePlatformError,
+        ImageCompatibilityError.error_type: ImageCompatibilityError,
+        ImageReferenceError.error_type: ImageReferenceError,
+        ImagePolicyError.error_type: ImagePolicyError,
+        ImageInsufficientDiskError.error_type: ImageInsufficientDiskError,
+        ImageTooLargeError.error_type: ImageTooLargeError,
+        ImagePullError.error_type: ImagePullError,
+    }
+    image_error_type = image_types.get(error_type)
+    if image_error_type is not None:
+        return image_error_type(reference, message)
+    if error_type == SandboxCreateCleanupError.error_type:
+        sandbox_id = str(payload.get("sandbox_id") or "unknown")
+        cleanup_errors = payload.get("cleanup_errors")
+        resources = payload.get("leaked_resources")
+        return SandboxCreateCleanupError(
+            sandbox_id,
+            RuntimeError(message),
+            (
+                [str(item) for item in cleanup_errors]
+                if isinstance(cleanup_errors, list)
+                else [message]
+            ),
+            resources=(
+                [str(item) for item in resources]
+                if isinstance(resources, list)
+                else ()
+            ),
+        )
     return exc
 
 

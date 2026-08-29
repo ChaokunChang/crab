@@ -180,6 +180,178 @@ class FlakyHostInspectorClient(FakeHostInspectorClient):
 
 
 class SandboxManagerTests(unittest.TestCase):
+    def test_failed_runc_create_or_start_rolls_back_all_launch_resources(self) -> None:
+        for failed_action in ("create", "start"):
+            with self.subTest(failed_action=failed_action):
+                with tempfile.TemporaryDirectory(
+                    prefix="crab_sandbox_launch_rollback_"
+                ) as tmp:
+                    root = Path(tmp)
+
+                    class FailingRunner(FakeCommandRunner):
+                        def run(self, command, **kwargs):
+                            if len(command) > 3 and command[3] == failed_action:
+                                self.commands.append(tuple(command))
+                                return type(
+                                    "Result",
+                                    (),
+                                    {
+                                        "command": tuple(command),
+                                        "returncode": 42,
+                                        "stdout": "",
+                                        "stderr": f"injected {failed_action} failure",
+                                    },
+                                )()
+                            return super().run(command, **kwargs)
+
+                    runner = FailingRunner()
+                    manager = RuncSandboxManager(
+                        command_runner=runner,
+                        paths=RuncSandboxManagerPaths(
+                            state_root=root / "state",
+                            bundle_root=root / "bundles",
+                            metadata_root=root / "metadata",
+                            zfs_dataset_prefix="pool/crab",
+                        ),
+                    )
+                    bundle = root / "bundles" / "sbx-test"
+
+                    with self.assertRaisesRegex(RuntimeError, "injected"):
+                        manager.launch(
+                            "runc",
+                            {
+                                "sandbox_id": "sbx-test",
+                                "bundle_path": str(bundle),
+                            },
+                        )
+
+                    self.assertFalse(bundle.exists())
+                    self.assertEqual(runner.datasets, set())
+                    self.assertFalse(
+                        (root / "metadata" / "sbx-test.json").exists()
+                    )
+                    with self.assertRaises(KeyError):
+                        manager.describe(SandboxId("sbx-test"))
+
+    def test_post_start_metadata_failure_stops_and_removes_sandbox(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="crab_sandbox_metadata_rollback_"
+        ) as tmp:
+            root = Path(tmp)
+            runner = FakeCommandRunner()
+            manager = RuncSandboxManager(
+                command_runner=runner,
+                paths=RuncSandboxManagerPaths(
+                    state_root=root / "state",
+                    bundle_root=root / "bundles",
+                    metadata_root=root / "metadata",
+                    zfs_dataset_prefix="pool/crab",
+                ),
+            )
+            bundle = root / "bundles" / "sbx-test"
+            original_persist = manager._persist
+            persist_calls = 0
+
+            def fail_first_persist(description):
+                nonlocal persist_calls
+                persist_calls += 1
+                if persist_calls == 1:
+                    raise OSError("injected metadata failure")
+                return original_persist(description)
+
+            with patch.object(
+                manager,
+                "_persist",
+                side_effect=fail_first_persist,
+            ):
+                with self.assertRaisesRegex(OSError, "metadata failure"):
+                    manager.launch(
+                        "runc",
+                        {
+                            "sandbox_id": "sbx-test",
+                            "bundle_path": str(bundle),
+                        },
+                    )
+
+            self.assertFalse(bundle.exists())
+            self.assertEqual(runner.datasets, set())
+            self.assertIn(
+                (
+                    "runc",
+                    "--root",
+                    str(root / "state"),
+                    "delete",
+                    "-f",
+                    "sbx-test",
+                ),
+                runner.commands,
+            )
+            with self.assertRaises(KeyError):
+                manager.describe(SandboxId("sbx-test"))
+
+    def test_post_clone_dns_does_not_mutate_shared_base(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="crab_sandbox_dns_") as tmp:
+            root = Path(tmp)
+            runner = FakeCommandRunner()
+            manager = RuncSandboxManager(
+                command_runner=runner,
+                paths=RuncSandboxManagerPaths(
+                    state_root=root / "state",
+                    bundle_root=root / "bundles",
+                    metadata_root=root / "metadata",
+                    zfs_dataset_prefix="pool/crab-dns",
+                ),
+            )
+            image_root = root / "image"
+            (image_root / "etc").mkdir(parents=True)
+            (image_root / "etc" / "image-marker").write_text(
+                "base\n", encoding="utf-8"
+            )
+            resolver_a = root / "resolver-a"
+            resolver_b = root / "resolver-b"
+            resolver_a.write_text("nameserver 192.0.2.1\n", encoding="utf-8")
+            resolver_b.write_text("nameserver 192.0.2.2\n", encoding="utf-8")
+            shared_key = f"dns-base-{root.name}"
+
+            for sandbox_id, resolver in (
+                ("sbx-dns-a", resolver_a),
+                ("sbx-dns-b", resolver_b),
+            ):
+                manager.prepare_launch(
+                    "runc",
+                    {
+                        "sandbox_id": sandbox_id,
+                        "bundle_path": str(root / "bundles" / sandbox_id),
+                        "rootfs_copy_paths": [
+                            {"source": str(image_root), "destination": "/"}
+                        ],
+                        "rootfs_post_clone_copy_paths": [
+                            {
+                                "source": str(resolver),
+                                "destination": "/etc/resolv.conf",
+                                "replace": True,
+                            }
+                        ],
+                        "shared_rootfs_key": shared_key,
+                        "shared_rootfs_persist": False,
+                    },
+                )
+
+            rootfs_a = root / "bundles" / "sbx-dns-a" / "rootfs"
+            rootfs_b = root / "bundles" / "sbx-dns-b" / "rootfs"
+            self.assertEqual(
+                (rootfs_a / "etc" / "resolv.conf").read_text(encoding="utf-8"),
+                "nameserver 192.0.2.1\n",
+            )
+            self.assertEqual(
+                (rootfs_b / "etc" / "resolv.conf").read_text(encoding="utf-8"),
+                "nameserver 192.0.2.2\n",
+            )
+            shared_base = Path(
+                f"/tmp/crab-rootfs-cache/pool_crab-dns/run/v2-{shared_key}"
+            )
+            self.assertFalse((shared_base / "etc" / "resolv.conf").exists())
+
     def test_runc_prepare_launch_moves_rootfs_materialization_out_of_launch(self) -> None:
         with tempfile.TemporaryDirectory(prefix="crab_sandbox_mgr_") as tmp:
             root = Path(tmp)
@@ -295,11 +467,11 @@ class SandboxManagerTests(unittest.TestCase):
             manager.prepare_launch("runc", metadata)
 
             self.assertIn(
-                ("zfs", "create", "-o", "mountpoint=/tmp/crab-rootfs-cache/pool_crab/persistent/compose-cache-key", "pool/crab-cache-compose-cache-key"),
+                ("zfs", "create", "-o", "mountpoint=/tmp/crab-rootfs-cache/pool_crab/persistent/v2-compose-cache-key", "pool/crab-cache-v2-compose-cache-key"),
                 runner.commands,
             )
             self.assertIn(
-                ("zfs", "clone", "-o", f"mountpoint={root / 'bundles' / 'sbx-shared-a' / 'rootfs'}", "pool/crab-cache-compose-cache-key@base", "pool/crab/sbx-shared-a"),
+                ("zfs", "clone", "-o", f"mountpoint={root / 'bundles' / 'sbx-shared-a' / 'rootfs'}", "pool/crab-cache-v2-compose-cache-key@base", "pool/crab/sbx-shared-a"),
                 runner.commands,
             )
             self.assertEqual(
@@ -320,15 +492,15 @@ class SandboxManagerTests(unittest.TestCase):
             manager.prepare_launch("runc", metadata_b)
 
             self.assertIn(
-                ("zfs", "list", "-H", "-o", "name", "pool/crab-cache-compose-cache-key"),
+                ("zfs", "list", "-H", "-o", "name", "pool/crab-cache-v2-compose-cache-key"),
                 runner.commands,
             )
             self.assertIn(
-                ("zfs", "list", "-H", "-o", "name", "pool/crab-cache-compose-cache-key@base"),
+                ("zfs", "list", "-H", "-o", "name", "pool/crab-cache-v2-compose-cache-key@base"),
                 runner.commands,
             )
             self.assertNotIn(
-                ("zfs", "create", "-o", "mountpoint=/tmp/crab-rootfs-cache/pool_crab/persistent/compose-cache-key", "pool/crab-cache-compose-cache-key"),
+                ("zfs", "create", "-o", "mountpoint=/tmp/crab-rootfs-cache/pool_crab/persistent/v2-compose-cache-key", "pool/crab-cache-v2-compose-cache-key"),
                 runner.commands,
             )
             self.assertEqual(

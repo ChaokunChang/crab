@@ -47,7 +47,7 @@ sandbox = Sandbox(
     image="ubuntu:22.04",
     name="my-sandbox",       # optional; generated when omitted
     env={"MODE": "test"},   # environment inherited by sandbox commands
-    network=False,           # request a network namespace explicitly
+    network=False,          # host mode; True requires netns; None uses daemon default
     engine=engine,
 )
 ```

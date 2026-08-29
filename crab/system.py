@@ -660,12 +660,22 @@ class CrabSystem:
                 target_sandbox_id,
                 target_rootfs_path=target_rootfs_path,
             )
-            inherited_idle_metadata: dict[str, object] = {}
+            inherited_launch_metadata: dict[str, object] = {}
             try:
                 source_description = self.runtime.describe(source_sandbox_id)
-                for key in ("idle_timeout", "idle_action"):
+                for key in (
+                    "idle_timeout",
+                    "idle_action",
+                    "sdk_image",
+                    "image_reference",
+                    "image_id",
+                    "image_digest",
+                    "network_mode",
+                    "network_requested",
+                    "rootfs_preparation_schema",
+                ):
                     if key in source_description.metadata:
-                        inherited_idle_metadata[key] = source_description.metadata[key]
+                        inherited_launch_metadata[key] = source_description.metadata[key]
             except Exception:
                 logger.debug(
                     "Unable to read source idle metadata while forking %s",
@@ -679,7 +689,7 @@ class CrabSystem:
                 runtime_name=self.runtime.name,
                 status="stopped",
                 metadata={
-                    **inherited_idle_metadata,
+                    **inherited_launch_metadata,
                     "sandbox_id": str(target_sandbox_id),
                     "bundle_path": str(bundle_root / str(target_sandbox_id)),
                     "rootfs_path": str(target_rootfs_path),

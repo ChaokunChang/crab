@@ -36,7 +36,24 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any, Callable
 
-from ..engine import Engine, EngineConfig
+from ..engine import Engine, EngineConfig, resolve_sandbox_network_mode
+from ..errors import (
+    ImageAuthenticationError,
+    ImageCompatibilityError,
+    ImageInsufficientDiskError,
+    ImageNotFoundError,
+    ImagePlatformError,
+    ImagePolicyError,
+    ImagePullError,
+    ImagePullTimeoutError,
+    ImageRateLimitError,
+    ImageReferenceError,
+    ImageTooLargeError,
+    SandboxCreateCleanupError,
+    SandboxExecCleanupError,
+    SandboxExecTimeout,
+    SandboxImageError,
+)
 from ..ids import CheckpointId, SandboxId
 from ..merging import MergeError
 from ..process_merge import ProcessMergeConflict
@@ -304,6 +321,11 @@ class _Routes:
             "interceptor_base_url": eng.interceptor_base_url,
             "forwarder_base_url": eng.forwarder_base_url,
             "network_bridge_ip": eng.network_bridge_ip,
+            "sandbox_network_default": resolve_sandbox_network_mode(
+                cfg,
+                runtime_name=eng.runtime.name,
+                requested=None,
+            ),
             "sandbox_count": len(self._daemon.sandbox_ids()),
         }
 
@@ -347,12 +369,62 @@ class _Routes:
         eng = self._daemon.require_engine()
         runtime_name = str(body.get("runtime_name") or eng.runtime.name)
         metadata = dict(body.get("metadata") or {})
+        sandbox_id = SandboxId(str(metadata.get("sandbox_id") or SandboxId.new()))
+        metadata["sandbox_id"] = str(sandbox_id)
         # S5 full-access: if metadata carries 'image' without 'bundle_path',
         # the client is in remote mode and the daemon must do server-side
         # bundle preparation (docker export + runc spec + config).
-        if "image" in metadata and "bundle_path" not in metadata:
-            metadata = self._prepare_image_launch(eng, metadata)
-        sandbox_id = eng.runtime.launch(runtime_name, metadata)
+        try:
+            if "image" in metadata and "bundle_path" not in metadata:
+                metadata = self._prepare_image_launch(eng, metadata)
+            sandbox_id = eng.runtime.launch(runtime_name, metadata)
+        except Exception as exc:
+            cleanup_errors: list[str] = []
+            cleanup = getattr(eng.runtime, "cleanup_failed_launch", None)
+            if callable(cleanup):
+                try:
+                    cleanup_errors.extend(
+                        cleanup(
+                            sandbox_id,
+                            bundle_path=(
+                                None
+                                if metadata.get("bundle_path") is None
+                                else Path(str(metadata["bundle_path"]))
+                            ),
+                            dataset=(
+                                None
+                                if metadata.get("zfs_dataset") is None
+                                else str(metadata["zfs_dataset"])
+                            ),
+                        )
+                    )
+                except Exception as cleanup_exc:
+                    cleanup_errors.append(f"runtime cleanup: {cleanup_exc}")
+            try:
+                eng.release_network_lease(sandbox_id, strict=True)
+            except Exception as cleanup_exc:
+                cleanup_errors.append(f"network lease: {cleanup_exc}")
+            self._daemon.unregister_sandbox(sandbox_id)
+            if cleanup_errors:
+                resources = (
+                    str(metadata.get("bundle_path") or "bundle"),
+                    str(metadata.get("zfs_dataset") or "dataset"),
+                    "network lease",
+                )
+                if isinstance(exc, SandboxCreateCleanupError):
+                    raise SandboxCreateCleanupError(
+                        exc.sandbox_id,
+                        exc.cause,
+                        (*exc.cleanup_errors, *cleanup_errors),
+                        resources=(*exc.resources, *resources),
+                    ) from exc
+                raise SandboxCreateCleanupError(
+                    str(sandbox_id),
+                    exc,
+                    cleanup_errors,
+                    resources=resources,
+                ) from exc
+            raise
         # Track in the daemon-side registry so /sandboxes lists it and
         # /shutdown can tear it down. The SDK Sandbox is the lifecycle
         # owner; this registry is a cheap mirror.
@@ -375,8 +447,12 @@ class _Routes:
         config.json is never disturbed by ZFS mount operations."""
         from integrations.sandboxes.runtime import bundle as sandbox_bundle
         from integrations.sandboxes.runtime import image as sandbox_image
+        from integrations.sandboxes.runtime.baseline import (
+            SANDBOX_ROOTFS_PREPARATION_SCHEMA,
+            add_dns_materialization,
+        )
 
-        image_tag = str(metadata["image"])
+        requested_image = str(metadata["image"])
         sandbox_id_str = str(metadata.get("sandbox_id") or str(SandboxId.new()))
 
         # Resolve paths from engine's runtime
@@ -388,14 +464,36 @@ class _Routes:
         bundle_dir.mkdir(parents=True, exist_ok=True)
 
         # 1. Image export (creates cached rootfs tarball → directory)
-        image_id = sandbox_image.inspect_image_id(tag=image_tag)
+        resolved_image = sandbox_image.resolve_image(
+            reference=requested_image,
+            cache_root=eng.image_cache_root,
+            pull_policy=eng.config.image_pull_policy,
+            allowed_registries=eng.config.image_allowed_registries,
+            allowed_references=eng.config.image_allowed_references,
+            pull_timeout_seconds=eng.config.image_pull_timeout_seconds,
+            max_image_bytes=eng.config.image_max_bytes,
+            min_free_bytes=eng.config.image_min_free_bytes,
+            telemetry=eng.system.telemetry,
+        )
+        image_tag = resolved_image.normalized_reference
+        image_id = resolved_image.image_id
         image_defaults = sandbox_image.inspect_image_runtime_defaults(
-            tag=image_tag, cache_root=eng.image_cache_root
+            tag=image_tag,
+            cache_root=eng.image_cache_root,
+            telemetry=eng.system.telemetry,
+            image_id=image_id,
         )
         exported_rootfs = sandbox_image.export_image_rootfs(
             tag=image_tag,
             output_dir=eng.image_cache_root / image_id,
             cache_root=eng.image_cache_root,
+            telemetry=eng.system.telemetry,
+            image_id=image_id,
+            image_size_bytes=resolved_image.size_bytes,
+            max_image_bytes=eng.config.image_max_bytes,
+            cache_max_bytes=eng.config.image_cache_max_bytes,
+            min_free_bytes=eng.config.image_min_free_bytes,
+            cache_retention_seconds=eng.config.image_cache_retention_seconds,
         )
 
         # 2. Resource limits
@@ -408,16 +506,26 @@ class _Routes:
                 pids_limit=resources.get("pids"),
             )
 
-        # 3. Network lease (optional)
+        # 3. Network lease (tri-state: explicit true/false, omitted=daemon
+        #    auto default). An explicit/selected isolated mode is required,
+        #    never silently downgraded when allocation fails.
         network_namespace_path = None
-        if metadata.get("network"):
-            try:
-                lease = eng.allocate_network_lease(SandboxId(sandbox_id_str))
-                if lease:
-                    network_namespace_path = lease.namespace_path
-                    metadata["guest_ip"] = str(lease.guest_ip)
-            except Exception:
-                logger.debug("network lease allocation skipped", exc_info=True)
+        network_raw = metadata.get("network") if "network" in metadata else None
+        if network_raw is not None and not isinstance(network_raw, bool):
+            raise _BadRequest("network must be true, false, or null")
+        effective_network = resolve_sandbox_network_mode(
+            eng.config,
+            runtime_name=eng.runtime.name,
+            requested=network_raw,
+        )
+        if effective_network:
+            lease = eng.allocate_network_lease(SandboxId(sandbox_id_str))
+            network_namespace_path = lease.namespace_path
+            metadata["guest_ip"] = str(lease.guest_ip)
+            metadata["bridge_ip"] = eng.network_bridge_ip
+            metadata["network_namespace_path"] = str(lease.namespace_path)
+        metadata["network_mode"] = "isolated" if effective_network else "host"
+        metadata["network_requested"] = network_raw
 
         # 4. Build launch metadata with rootfs directives
         rootfs_copy_paths = [{"source": str(exported_rootfs), "destination": "/"}]
@@ -430,9 +538,18 @@ class _Routes:
             "rootfs_copy_paths": rootfs_copy_paths,
             "shared_rootfs_key": shared_rootfs_key,
             "shared_rootfs_persist": True,
-            "sdk_image": image_tag,
+            "sdk_image": requested_image,
+            "image_reference": image_tag,
+            "image_id": image_id,
+            "image_digest": resolved_image.digest,
             "sdk_process_cwd": "/work",
+            "rootfs_preparation_schema": SANDBOX_ROOTFS_PREPARATION_SCHEMA,
         })
+        add_dns_materialization(
+            metadata,
+            bundle_dir=bundle_dir,
+            isolated=effective_network,
+        )
 
         # 5. Let the runtime handle ZFS dataset creation + rootfs
         #    materialization (shared-clone or fresh copy).  This runs
@@ -443,19 +560,25 @@ class _Routes:
         #    _crab_runtime_prepared=True, so the second call inside
         #    runtime.launch() will be a no-op).
         rt.write_bundle_spec(bundle_dir)
-        sandbox_bundle.write_bundle_config(
-            bundle_dir=bundle_dir,
-            llm_base_url="",
-            provider="openai",
-            sandbox_name=sandbox_id_str,
-            status_port=0,
-            cgroup_path=f"crab-sdk/{sandbox_id_str}",
-            work_dir_host_path=None,
-            network_namespace_path=network_namespace_path,
-            image_defaults=image_defaults,
-            image_rootfs_dir=exported_rootfs,
-            resource_limits=resource_limits,
-        )
+        try:
+            sandbox_bundle.write_bundle_config(
+                bundle_dir=bundle_dir,
+                llm_base_url="",
+                provider="openai",
+                sandbox_name=sandbox_id_str,
+                status_port=0,
+                cgroup_path=f"crab-sdk/{sandbox_id_str}",
+                work_dir_host_path=None,
+                network_namespace_path=network_namespace_path,
+                image_defaults=image_defaults,
+                image_rootfs_dir=exported_rootfs,
+                resource_limits=resource_limits,
+            )
+        except ValueError as exc:
+            raise ImageCompatibilityError(
+                requested_image,
+                f"image {requested_image!r} has unsupported runtime metadata: {exc}",
+            ) from exc
 
         # 7. Write process section (sleep infinity idle init)
         self._write_daemon_bundle_process(
@@ -552,11 +675,13 @@ class _Routes:
         capture_output = bool(body.get("capture_output", True))
         rc = -1
         self._begin_command(sandbox_id)
+        stream = None
         try:
-            for channel, text in eng.runtime.stream_exec(
+            stream = eng.runtime.stream_exec(
                 sid, list(argv), cwd=cwd, env=env, user=user, timeout_s=timeout_s,
                 capture_output=capture_output,
-            ):
+            )
+            for channel, text in stream:
                 if channel == "exit":
                     rc = int(text)
                 else:
@@ -567,12 +692,10 @@ class _Routes:
         except BrokenPipeError:
             return
         finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
             _sandbox_activity.end_command(sandbox_id)
-            try:
-                wfile.write(b"0\r\n\r\n")
-                wfile.flush()
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                pass
 
     def kill_sandbox(self, body: dict[str, Any], *, sandbox_id: str) -> dict[str, Any]:
         self._begin_lifecycle(sandbox_id, "kill")
@@ -896,6 +1019,8 @@ class _Routes:
                 effects=effects,
                 checkpoint_id=checkpoint_id,
             )
+        except SandboxCreateCleanupError:
+            raise
         except (ValueError, RuntimeError) as exc:
             raise _BadRequest(f"fork failed: {exc}") from exc
         forks: list[dict[str, Any]] = []
@@ -1293,6 +1418,19 @@ class _Routes:
                     "stderr": exec_result.stderr,
                 },
             }
+            if int(exec_result.returncode) != 0:
+                # A non-zero action is complete as an exec result, but it is
+                # not a successful state transition to checkpoint.  In
+                # particular, never hand back a receipt that looks like a
+                # successful post-action checkpoint.
+                if do_checkpoint:
+                    response["checkpoint_status"] = "skipped"
+                    response["checkpoint_error"] = (
+                        f"exec returned {int(exec_result.returncode)}"
+                    )
+                if do_changeset:
+                    response["changeset_status"] = "skipped"
+                return response
 
             # --- 2. observe (before checkpoint to avoid reset race) ---
             if body.get("observe"):
@@ -1667,6 +1805,79 @@ def _build_handler(daemon: "DaemonServer"):
                 self._send_json(HTTPStatus.OK, result)
             except _BadRequest as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+            except SandboxExecTimeout as exc:
+                self._send_json(
+                    HTTPStatus.REQUEST_TIMEOUT,
+                    {
+                        "ok": False,
+                        "error": str(exc),
+                        "error_type": SandboxExecTimeout.error_type,
+                        "timeout_s": float(exc.timeout),
+                        "stdout": exc.stdout or "",
+                        "stderr": exc.stderr or "",
+                        "cleanup_completed": True,
+                    },
+                )
+            except SandboxExecCleanupError as exc:
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": str(exc),
+                        "error_type": SandboxExecCleanupError.error_type,
+                        "timeout_s": exc.timeout,
+                        "stdout": exc.stdout,
+                        "stderr": exc.stderr,
+                        "payload_pid": exc.payload_pid,
+                        "cgroup_path": exc.cgroup_path,
+                        "cleanup_completed": False,
+                    },
+                )
+            except SandboxCreateCleanupError as exc:
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": str(exc),
+                        "error_type": SandboxCreateCleanupError.error_type,
+                        "sandbox_id": exc.sandbox_id,
+                        "cleanup_errors": list(exc.cleanup_errors),
+                        "leaked_resources": list(exc.resources),
+                    },
+                )
+            except SandboxImageError as exc:
+                if isinstance(exc, ImageNotFoundError):
+                    status = HTTPStatus.NOT_FOUND
+                elif isinstance(exc, ImageRateLimitError):
+                    status = HTTPStatus.TOO_MANY_REQUESTS
+                elif isinstance(exc, ImagePullTimeoutError):
+                    status = HTTPStatus.GATEWAY_TIMEOUT
+                elif isinstance(exc, ImageInsufficientDiskError):
+                    status = HTTPStatus.INSUFFICIENT_STORAGE
+                elif isinstance(exc, (ImageAuthenticationError, ImagePullError)):
+                    status = HTTPStatus.BAD_GATEWAY
+                elif isinstance(
+                    exc,
+                    (
+                        ImageCompatibilityError,
+                        ImagePlatformError,
+                        ImagePolicyError,
+                        ImageReferenceError,
+                        ImageTooLargeError,
+                    ),
+                ):
+                    status = HTTPStatus.UNPROCESSABLE_ENTITY
+                else:
+                    status = HTTPStatus.BAD_REQUEST
+                self._send_json(
+                    status,
+                    {
+                        "ok": False,
+                        "error": str(exc),
+                        "error_type": exc.error_type,
+                        "image": exc.reference,
+                    },
+                )
             except _TxnConflict as exc:
                 self._send_json(
                     HTTPStatus.CONFLICT,
@@ -1747,8 +1958,42 @@ def _build_handler(daemon: "DaemonServer"):
                 err_line = json.dumps({"error": str(exc), "done": True, "rc": -1}) + "\n"
                 try:
                     _write_chunk(self.wfile, err_line.encode("utf-8"))
-                    self.wfile.write(b"0\r\n\r\n")
-                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+            except SandboxExecTimeout as exc:
+                err_line = json.dumps(
+                    {
+                        "error": str(exc),
+                        "error_type": SandboxExecTimeout.error_type,
+                        "timeout_s": float(exc.timeout),
+                        "stdout": exc.stdout or "",
+                        "stderr": exc.stderr or "",
+                        "cleanup_completed": True,
+                        "done": True,
+                        "rc": None,
+                    }
+                ) + "\n"
+                try:
+                    _write_chunk(self.wfile, err_line.encode("utf-8"))
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+            except SandboxExecCleanupError as exc:
+                err_line = json.dumps(
+                    {
+                        "error": str(exc),
+                        "error_type": SandboxExecCleanupError.error_type,
+                        "timeout_s": exc.timeout,
+                        "stdout": exc.stdout,
+                        "stderr": exc.stderr,
+                        "payload_pid": exc.payload_pid,
+                        "cgroup_path": exc.cgroup_path,
+                        "cleanup_completed": False,
+                        "done": True,
+                        "rc": None,
+                    }
+                ) + "\n"
+                try:
+                    _write_chunk(self.wfile, err_line.encode("utf-8"))
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     pass
             except (BrokenPipeError, ConnectionResetError):
@@ -1758,6 +2003,10 @@ def _build_handler(daemon: "DaemonServer"):
                 err_line = json.dumps({"error": f"{type(exc).__name__}: {exc}", "done": True, "rc": -1}) + "\n"
                 try:
                     _write_chunk(self.wfile, err_line.encode("utf-8"))
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+            finally:
+                try:
                     self.wfile.write(b"0\r\n\r\n")
                     self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError, OSError):

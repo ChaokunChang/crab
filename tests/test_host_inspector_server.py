@@ -99,6 +99,65 @@ def _event(
     )
 
 class HostInspectorServerTests(unittest.TestCase):
+    def test_conservative_filesystem_marker_survives_status_until_reset(self) -> None:
+        daemon = HostInspectorDaemon(
+            resolver=FakeResolver(),
+            fs_monitor=FakeFilesystemMonitor(),
+            process_poll_interval_s=60.0,
+        )
+        server = HostInspectorServer(host="127.0.0.1", port=0, daemon=daemon)
+        server.start()
+        client = HostInspectorServiceClient(
+            f"http://127.0.0.1:{server.port}", timeout_s=1.0
+        )
+        try:
+            with patch(
+                "crab.host_inspector.server.list_cgroup_pids",
+                return_value={111},
+            ), patch(
+                "crab.host_inspector.server.reset_soft_dirty_for_pids",
+                return_value={111},
+            ), patch(
+                "crab.host_inspector.server.dirty_pids", return_value=set()
+            ), patch(
+                "crab.host_inspector.server.all_deleted_mmap_paths",
+                return_value=frozenset(),
+            ):
+                client.register_sandbox(
+                    SandboxId("sbx-dirty"), "docker", "container-1"
+                )
+                client.reset_sandbox(SandboxId("sbx-dirty"), None)
+                client.mark_filesystem_changed(
+                    SandboxId("sbx-dirty"), reason="isolated exec"
+                )
+
+                dirty = client.get_proc_and_fs_status(
+                    SandboxId("sbx-dirty")
+                )["status"]
+                self.assertTrue(dirty["filesystem_changed"])
+                self.assertEqual(
+                    dirty["metadata"]["unreconciled_fs_events"][-1]["reason"],
+                    "isolated exec",
+                )
+
+                client.reset_sandbox(SandboxId("sbx-dirty"), None)
+                clean = client.get_proc_and_fs_status(
+                    SandboxId("sbx-dirty")
+                )["status"]
+                self.assertFalse(clean["filesystem_changed"])
+
+                first_unregister = client.unregister_sandbox(
+                    SandboxId("sbx-dirty")
+                )
+                second_unregister = client.unregister_sandbox(
+                    SandboxId("sbx-dirty")
+                )
+                self.assertTrue(first_unregister["unregistered"])
+                self.assertTrue(second_unregister["already_absent"])
+        finally:
+            client.close()
+            server.stop()
+
     def test_server_closes_idle_connections_so_one_client_does_not_pin_only_worker(self) -> None:
         daemon = HostInspectorDaemon(resolver=FakeResolver(), fs_monitor=FakeFilesystemMonitor(), process_poll_interval_s=60.0)
         server = HostInspectorServer(host="127.0.0.1", port=0, daemon=daemon, max_workers=1)

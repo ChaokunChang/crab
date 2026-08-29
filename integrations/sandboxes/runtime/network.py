@@ -9,8 +9,10 @@ from pathlib import Path
 import subprocess
 import threading
 import uuid
+from typing import TYPE_CHECKING
 
-from crab import SandboxId
+if TYPE_CHECKING:
+    from crab.ids import SandboxId
 
 logger = logging.getLogger(__name__)
 
@@ -308,39 +310,99 @@ class BenchmarkNetworkManager:
             # IFNAMSIZ-1 (15).
             host_veth_name = f"vh{suffix}"
             guest_veth_name = f"vg{suffix}"
-            subprocess.run(["ip", "netns", "add", namespace_name], check=True)
-            subprocess.run(
-                ["ip", "link", "add", host_veth_name, "type", "veth", "peer", "name", guest_veth_name],
-                check=True,
-            )
-            subprocess.run(["ip", "link", "set", host_veth_name, "master", self._bridge_name], check=True)
-            subprocess.run(["ip", "link", "set", host_veth_name, "up"], check=True)
-            subprocess.run(["ip", "link", "set", guest_veth_name, "netns", namespace_name], check=True)
-            subprocess.run(["ip", "netns", "exec", namespace_name, "ip", "link", "set", "lo", "up"], check=True)
-            subprocess.run(
-                ["ip", "netns", "exec", namespace_name, "ip", "link", "set", guest_veth_name, "name", "eth0"],
-                check=True,
-            )
-            subprocess.run(
-                [
-                    "ip",
-                    "netns",
-                    "exec",
-                    namespace_name,
-                    "ip",
-                    "addr",
-                    "add",
-                    f"{guest_ip}/{network.prefixlen}",
-                    "dev",
-                    "eth0",
-                ],
-                check=True,
-            )
-            subprocess.run(["ip", "netns", "exec", namespace_name, "ip", "link", "set", "eth0", "up"], check=True)
-            subprocess.run(
-                ["ip", "netns", "exec", namespace_name, "ip", "route", "replace", "default", "via", self._bridge_ip],
-                check=True,
-            )
+            namespace_created = False
+            veth_created = False
+            try:
+                subprocess.run(["ip", "netns", "add", namespace_name], check=True)
+                namespace_created = True
+                subprocess.run(
+                    ["ip", "link", "add", host_veth_name, "type", "veth", "peer", "name", guest_veth_name],
+                    check=True,
+                )
+                veth_created = True
+                subprocess.run(["ip", "link", "set", host_veth_name, "master", self._bridge_name], check=True)
+                subprocess.run(["ip", "link", "set", host_veth_name, "up"], check=True)
+                subprocess.run(["ip", "link", "set", guest_veth_name, "netns", namespace_name], check=True)
+                subprocess.run(["ip", "netns", "exec", namespace_name, "ip", "link", "set", "lo", "up"], check=True)
+                subprocess.run(
+                    ["ip", "netns", "exec", namespace_name, "ip", "link", "set", guest_veth_name, "name", "eth0"],
+                    check=True,
+                )
+                subprocess.run(
+                    [
+                        "ip",
+                        "netns",
+                        "exec",
+                        namespace_name,
+                        "ip",
+                        "addr",
+                        "add",
+                        f"{guest_ip}/{network.prefixlen}",
+                        "dev",
+                        "eth0",
+                    ],
+                    check=True,
+                )
+                subprocess.run(["ip", "netns", "exec", namespace_name, "ip", "link", "set", "eth0", "up"], check=True)
+                subprocess.run(
+                    ["ip", "netns", "exec", namespace_name, "ip", "route", "replace", "default", "via", self._bridge_ip],
+                    check=True,
+                )
+            except Exception as exc:
+                # The lease is published only after every setup command has
+                # succeeded, so outer cleanup cannot see a partial lease. Tear
+                # down only resources this attempt positively created: an
+                # `ip link add` collision must never delete another lease's
+                # interface.
+                cleanup_errors: list[str] = []
+                if veth_created:
+                    try:
+                        result = subprocess.run(
+                            ["ip", "link", "delete", host_veth_name],
+                            check=False,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                        if result.returncode != 0:
+                            cleanup_errors.append(
+                                f"delete host veth {host_veth_name}: exit {result.returncode}"
+                            )
+                    except Exception as cleanup_exc:
+                        cleanup_errors.append(
+                            f"delete host veth {host_veth_name}: {cleanup_exc}"
+                        )
+                if namespace_created:
+                    try:
+                        result = subprocess.run(
+                            ["ip", "netns", "del", namespace_name],
+                            check=False,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                        if result.returncode != 0:
+                            cleanup_errors.append(
+                                f"delete network namespace {namespace_name}: exit {result.returncode}"
+                            )
+                    except Exception as cleanup_exc:
+                        cleanup_errors.append(
+                            f"delete network namespace {namespace_name}: {cleanup_exc}"
+                        )
+                heapq.heappush(self._free_ip_indices, guest_index)
+                if cleanup_errors:
+                    from crab.errors import SandboxCreateCleanupError
+
+                    leaked_resources: list[str] = []
+                    if veth_created:
+                        leaked_resources.append(f"host-veth={host_veth_name}")
+                    if namespace_created:
+                        leaked_resources.append(f"netns={namespace_name}")
+                    raise SandboxCreateCleanupError(
+                        str(sandbox_id),
+                        exc,
+                        cleanup_errors,
+                        resources=tuple(leaked_resources),
+                    ) from exc
+                raise
             lease = BenchmarkNetworkLease(
                 sandbox_id=sandbox_id,
                 namespace_name=namespace_name,

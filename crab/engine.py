@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Any, Mapping
 
 from .config import ExecutorConfig, SchedulerConfig, StorageConfig, TelemetryConfig
 from .contracts import Runtime
+from .errors import SandboxCreateCleanupError
 from .executor import CRExecutor
 from .ids import CheckpointId, SandboxId
 from .inspector import EBPFSandboxInspector
@@ -138,6 +139,28 @@ def _as_float(value: object, *, default: float) -> float:
     if value is None:
         return default
     return float(value)
+
+
+def _as_string_tuple(
+    value: object,
+    *,
+    default: tuple[str, ...] = (),
+    label: str,
+) -> tuple[str, ...]:
+    if value is None:
+        return default
+    if isinstance(value, (str, bytes)) or isinstance(value, Mapping):
+        raise ValueError(f"{label} must be a list of strings")
+    try:
+        items = tuple(value)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise ValueError(f"{label} must be a list of strings") from exc
+    if not all(isinstance(item, str) for item in items):
+        raise ValueError(f"{label} must contain only strings")
+    normalized = tuple(item.strip() for item in items)
+    if any(not item for item in normalized):
+        raise ValueError(f"{label} must not contain empty strings")
+    return normalized
 
 
 def _find_free_port() -> int:
@@ -546,6 +569,16 @@ class EngineConfig:
     work_dir_host_root: Path | None = None
     agent_state_root: Path | None = None
     default_image: str = "ubuntu:22.04"
+    image_pull_policy: str = "if-not-present"
+    image_allowed_registries: tuple[str, ...] = ("docker.io",)
+    image_allowed_references: tuple[str, ...] = ()
+    image_pull_timeout_seconds: float = 600.0
+    image_max_bytes: int = 8 * 1024 * 1024 * 1024
+    image_cache_max_bytes: int = 20 * 1024 * 1024 * 1024
+    image_min_free_bytes: int = 2 * 1024 * 1024 * 1024
+    image_cache_retention_seconds: float = 30 * 24 * 60 * 60
+    image_prewarm: tuple[str, ...] = ()
+    image_prewarm_required: tuple[str, ...] = ()
 
     scheduler_config: SchedulerConfig | None = None
     executor_config: ExecutorConfig | None = None
@@ -608,6 +641,9 @@ class EngineConfig:
         )
         recording = _optional_mapping(egress.get("recording"), label="egress.recording")
         effects = _optional_mapping(data.get("effects"), label="effects")
+        images = _optional_mapping(
+            data.get("images", data.get("image_policy")), label="images"
+        )
 
         default_workers = _as_int(data.get("max_workers"), default=None)
         executor_data = _optional_mapping(data.get("executor"), label="executor")
@@ -806,6 +842,58 @@ class EngineConfig:
             work_dir_host_root=work_dir_host_root,
             agent_state_root=agent_state_root,
             default_image=str(data.get("default_image", "ubuntu:22.04")),
+            image_pull_policy=str(
+                images.get("pull_policy", data.get("image_pull_policy"))
+                or "if-not-present"
+            ).strip().lower(),
+            image_allowed_registries=_as_string_tuple(
+                images.get(
+                    "allowed_registries", data.get("image_allowed_registries")
+                ),
+                default=("docker.io",),
+                label="images.allowed_registries",
+            ),
+            image_allowed_references=_as_string_tuple(
+                images.get(
+                    "allowed_references", data.get("image_allowed_references")
+                ),
+                label="images.allowed_references",
+            ),
+            image_pull_timeout_seconds=_as_float(
+                images.get(
+                    "pull_timeout_seconds", data.get("image_pull_timeout_seconds")
+                ),
+                default=600.0,
+            ),
+            image_max_bytes=_as_int(
+                images.get("max_image_bytes", data.get("image_max_bytes")),
+                default=8 * 1024 * 1024 * 1024,
+            ),
+            image_cache_max_bytes=_as_int(
+                images.get("cache_max_bytes", data.get("image_cache_max_bytes")),
+                default=20 * 1024 * 1024 * 1024,
+            ),
+            image_min_free_bytes=_as_int(
+                images.get("min_free_bytes", data.get("image_min_free_bytes")),
+                default=2 * 1024 * 1024 * 1024,
+            ),
+            image_cache_retention_seconds=_as_float(
+                images.get(
+                    "cache_retention_seconds",
+                    data.get("image_cache_retention_seconds"),
+                ),
+                default=30 * 24 * 60 * 60,
+            ),
+            image_prewarm=_as_string_tuple(
+                images.get("prewarm", data.get("image_prewarm")),
+                label="images.prewarm",
+            ),
+            image_prewarm_required=_as_string_tuple(
+                images.get(
+                    "required_prewarm", data.get("image_prewarm_required")
+                ),
+                label="images.required_prewarm",
+            ),
             scheduler_config=scheduler_config,
             executor_config=executor_config,
             telemetry_config=telemetry_config,
@@ -830,6 +918,18 @@ class EngineConfig:
                     "forwarder",
                     "host_inspector",
                     "image_cache_root",
+                    "image_allowed_references",
+                    "image_allowed_registries",
+                    "image_cache_max_bytes",
+                    "image_cache_retention_seconds",
+                    "image_max_bytes",
+                    "image_min_free_bytes",
+                    "image_prewarm",
+                    "image_prewarm_required",
+                    "image_pull_policy",
+                    "image_pull_timeout_seconds",
+                    "image_policy",
+                    "images",
                     "interceptor",
                     "interceptor_host",
                     "interceptor_port",
@@ -854,6 +954,31 @@ class EngineConfig:
                 }
             },
         )
+
+
+def resolve_sandbox_network_mode(
+    config: EngineConfig,
+    *,
+    runtime_name: str,
+    requested: bool | None,
+) -> bool:
+    """Resolve the public tri-state sandbox ``network`` contract.
+
+    Explicit true/false always wins. Omission follows the engine's existing
+    auto policy: a runc bridge must be enabled and at least one feature that
+    requires per-sandbox network identity (LLM interception or egress proxy)
+    must be active.
+    """
+
+    if requested is not None:
+        if not isinstance(requested, bool):
+            raise ValueError("network must be true, false, or null")
+        return requested
+    return bool(
+        runtime_name == "runc"
+        and config.enable_sandbox_network
+        and (config.enable_interceptor or config.enable_egress_proxy)
+    )
 
 
 class Engine:
@@ -899,6 +1024,7 @@ class Engine:
         self._host_inspector_process_log_path: Path | None = None
         self._sandboxes: "dict[SandboxId, Sandbox]" = {}
         self._sandbox_lock = threading.Lock()
+        self._image_prewarm_thread: threading.Thread | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -994,6 +1120,22 @@ class Engine:
                 return
             cfg = self._config
             self._configure_logging(cfg)
+            if cfg.image_pull_policy not in {"if-not-present", "never"}:
+                raise ValueError(
+                    "images.pull_policy must be 'if-not-present' or 'never'"
+                )
+            for label, value in (
+                ("images.pull_timeout_seconds", cfg.image_pull_timeout_seconds),
+                ("images.max_image_bytes", cfg.image_max_bytes),
+                ("images.cache_max_bytes", cfg.image_cache_max_bytes),
+                ("images.min_free_bytes", cfg.image_min_free_bytes),
+                (
+                    "images.cache_retention_seconds",
+                    cfg.image_cache_retention_seconds,
+                ),
+            ):
+                if float(value) <= 0:
+                    raise ValueError(f"{label} must be positive, got {value}")
             storage_root = cfg.storage_root
             if storage_root is None:
                 self._tempdir = tempfile.TemporaryDirectory(prefix="crab-engine-")
@@ -1190,8 +1332,70 @@ class Engine:
                 self._egress_proxy = proxy
                 logger.info("Egress interception active: proxy_port=%d", proxy.port)
 
+            for reference in cfg.image_prewarm_required:
+                self._prewarm_image(reference)
             self._system.start()
             self._started = True
+            optional_prewarm = tuple(
+                reference
+                for reference in cfg.image_prewarm
+                if reference not in set(cfg.image_prewarm_required)
+            )
+            if optional_prewarm:
+                self._image_prewarm_thread = threading.Thread(
+                    target=self._prewarm_images_best_effort,
+                    args=(optional_prewarm,),
+                    daemon=True,
+                    name="crab-image-prewarm",
+                )
+                self._image_prewarm_thread.start()
+
+    def _prewarm_images_best_effort(self, references: tuple[str, ...]) -> None:
+        for reference in references:
+            try:
+                self._prewarm_image(reference)
+            except Exception:
+                logger.exception("Optional image prewarm failed: %s", reference)
+
+    def _prewarm_image(self, reference: str) -> None:
+        from integrations.sandboxes.runtime import image as sandbox_image
+
+        cfg = self.config
+        resolved = sandbox_image.resolve_image(
+            reference=reference,
+            cache_root=self.image_cache_root,
+            pull_policy=cfg.image_pull_policy,
+            allowed_registries=cfg.image_allowed_registries,
+            allowed_references=cfg.image_allowed_references,
+            pull_timeout_seconds=cfg.image_pull_timeout_seconds,
+            max_image_bytes=cfg.image_max_bytes,
+            min_free_bytes=cfg.image_min_free_bytes,
+            telemetry=self.system.telemetry,
+        )
+        sandbox_image.inspect_image_runtime_defaults(
+            tag=resolved.normalized_reference,
+            cache_root=self.image_cache_root,
+            telemetry=self.system.telemetry,
+            image_id=resolved.image_id,
+        )
+        sandbox_image.export_image_rootfs(
+            tag=resolved.normalized_reference,
+            output_dir=self.image_cache_root / resolved.image_id,
+            cache_root=self.image_cache_root,
+            telemetry=self.system.telemetry,
+            image_id=resolved.image_id,
+            image_size_bytes=resolved.size_bytes,
+            max_image_bytes=cfg.image_max_bytes,
+            cache_max_bytes=cfg.image_cache_max_bytes,
+            min_free_bytes=cfg.image_min_free_bytes,
+            cache_retention_seconds=cfg.image_cache_retention_seconds,
+        )
+        logger.info(
+            "Image prewarm ready: reference=%s digest=%s image_id=%s",
+            resolved.normalized_reference,
+            resolved.digest,
+            resolved.image_id,
+        )
 
     def _configure_logging(self, cfg: EngineConfig) -> None:
         if cfg.log_file is None and not cfg.log_level:
@@ -1799,7 +2003,9 @@ class Engine:
         manager.register_guest_ip(lease.guest_ip, sandbox_id)
         return lease
 
-    def release_network_lease(self, sandbox_id: SandboxId) -> None:
+    def release_network_lease(
+        self, sandbox_id: SandboxId, *, strict: bool = False
+    ) -> None:
         manager = self._network_manager
         if manager is None:
             return
@@ -1807,6 +2013,8 @@ class Engine:
             manager.release_lease(sandbox_id)
         except Exception:
             logger.exception("Failed to release sandbox network lease: %s", sandbox_id)
+            if strict:
+                raise
 
     def repair_network_lease(self, sandbox_id: SandboxId) -> bool:
         manager = self._network_manager
@@ -1927,6 +2135,7 @@ class Engine:
             )
         runtime = self.runtime
         source_bundle = runtime.bundle_path_for(source_sandbox_id)
+        source_config_path = source_bundle / "config.json"
         paths = getattr(runtime, "paths", None)
         if paths is None:
             raise RuntimeError("fork is only supported on the runc runtime")
@@ -1939,45 +2148,90 @@ class Engine:
                 f"checkpoint {checkpoint_id} not found for sandbox {source_sandbox_id}"
             )
 
+        try:
+            source_description = runtime.describe(source_sandbox_id)
+            source_network_metadata = dict(source_description.metadata or {})
+        except (AttributeError, KeyError):
+            # Older/in-memory Runtime test doubles have no persistent
+            # description. They are necessarily host-networked because they
+            # also have no concrete network namespace to inherit.
+            source_network_metadata = {}
+        source_network_mode = str(
+            source_network_metadata.get("network_mode") or ""
+        ).strip().lower()
+        source_has_isolated_network = source_network_mode == "isolated" or bool(
+            source_network_metadata.get("network_namespace_path")
+        )
+        if not source_has_isolated_network:
+            # Metadata added before this release may not carry network_mode.
+            # The copied OCI config remains authoritative for a live legacy
+            # sandbox, so do not accidentally turn its fork into host mode.
+            try:
+                source_config = json.loads(
+                    source_config_path.read_text(encoding="utf-8")
+                )
+                namespaces = (source_config.get("linux") or {}).get(
+                    "namespaces", []
+                )
+                source_has_isolated_network = any(
+                    isinstance(item, dict) and item.get("type") == "network"
+                    for item in namespaces
+                )
+            except (FileNotFoundError, OSError, json.JSONDecodeError, AttributeError):
+                pass
+
         fork_ids: list[SandboxId] = []
         for _ in range(count):
             target_sandbox_id = SandboxId(f"{source_sandbox_id}-fork-{uuid.uuid4().hex[:8]}")
             target_bundle = paths.bundle_root / str(target_sandbox_id)
-            target_bundle.mkdir(parents=True, exist_ok=True)
-            source_cfg = source_bundle / "config.json"
-            if source_cfg.is_file():
-                shutil.copy2(source_cfg, target_bundle / "config.json")
-            forking.replicate_bundle_config(
-                source_bundle,
-                target_bundle,
-                source_sandbox_id,
-                target_sandbox_id,
-            )
-            if self._network_manager is not None:
-                try:
+            try:
+                target_bundle.mkdir(parents=True, exist_ok=True)
+                if source_config_path.is_file():
+                    shutil.copy2(source_config_path, target_bundle / "config.json")
+                forking.replicate_bundle_config(
+                    source_bundle,
+                    target_bundle,
+                    source_sandbox_id,
+                    target_sandbox_id,
+                )
+                lease = None
+                if source_has_isolated_network:
+                    if self._network_manager is None:
+                        raise RuntimeError(
+                            f"fork source {source_sandbox_id} uses an isolated network, "
+                            "but the network manager is unavailable"
+                        )
                     lease = self.allocate_network_lease(target_sandbox_id)
                     # The spec was copied from the source, so it still names
                     # the source's netns: without retargeting, the fork
                     # shares the source's network stack and its egress is
                     # attributed to the source.
-                    if lease is not None:
-                        forking.retarget_bundle_network_namespace(
-                            target_bundle, str(lease.namespace_path)
-                        )
-                except Exception:
-                    logger.exception("Failed to allocate network lease for fork %s", target_sandbox_id)
+                    forking.retarget_bundle_network_namespace(
+                        target_bundle, str(lease.namespace_path)
+                    )
 
-            result = system.fork_once(
-                source_sandbox_id,
-                target_sandbox_id,
-                checkpoint_id=checkpoint_id,
-                target_rootfs_path=target_bundle / "rootfs",
-            )
-            # Arm the gate before the fork's processes are restored: once
-            # they run, an ungated write could already be on the wire.
-            if fork_effect_policy is not None:
-                system.arm_fork_effect_session(target_sandbox_id, fork_effect_policy)
-            try:
+                result = system.fork_once(
+                    source_sandbox_id,
+                    target_sandbox_id,
+                    checkpoint_id=checkpoint_id,
+                    target_rootfs_path=target_bundle / "rootfs",
+                )
+                if lease is not None:
+                    update_network_metadata = getattr(
+                        runtime, "update_network_metadata", None
+                    )
+                    if callable(update_network_metadata):
+                        update_network_metadata(
+                            target_sandbox_id,
+                            guest_ip=str(lease.guest_ip),
+                            network_namespace_path=str(lease.namespace_path),
+                        )
+                # Arm the gate before the fork's processes are restored: once
+                # they run, an ungated write could already be on the wire.
+                if fork_effect_policy is not None:
+                    system.arm_fork_effect_session(
+                        target_sandbox_id, fork_effect_policy
+                    )
                 restore_result = system.restore_once(
                     target_sandbox_id,
                     result.checkpoint_id,
@@ -1987,15 +2241,69 @@ class Engine:
                     raise RuntimeError(
                         f"fork restore failed for {target_sandbox_id}: status={restore_result.status.value}"
                     )
-            except Exception:
-                # The session was armed a moment ago for a fork that never
-                # came up; leaving it behind would gate a dead id forever.
-                if fork_effect_policy is not None:
-                    system._release_effect_session(target_sandbox_id)
+                if lease is not None and not self.repair_network_lease(
+                    target_sandbox_id
+                ):
+                    raise RuntimeError(
+                        f"fork network lease repair failed for {target_sandbox_id}"
+                    )
+            except Exception as exc:
+                cleanup_errors: list[str] = []
+                for failed_id in reversed([*fork_ids, target_sandbox_id]):
+                    cleanup_errors.extend(self._cleanup_failed_fork(failed_id))
+                if cleanup_errors:
+                    raise SandboxCreateCleanupError(
+                        str(target_sandbox_id),
+                        exc,
+                        cleanup_errors,
+                        resources=tuple(str(item) for item in [*fork_ids, target_sandbox_id]),
+                    ) from exc
                 raise
-            self.repair_network_lease(target_sandbox_id)
             fork_ids.append(target_sandbox_id)
         return fork_ids
+
+    def _cleanup_failed_fork(self, sandbox_id: SandboxId) -> tuple[str, ...]:
+        errors: list[str] = []
+        # The effect gate is armed before restore.  Release it independently
+        # from fork bookkeeping so a missing/failed release_fork hook cannot
+        # leave a dead sandbox id gated forever.  The real EffectGate.end()
+        # path is idempotent, so release_fork may safely repeat this step.
+        release_effect_session = getattr(
+            self.system, "_release_effect_session", None
+        )
+        if callable(release_effect_session):
+            try:
+                release_effect_session(sandbox_id)
+            except Exception as exc:
+                errors.append(f"effect session {sandbox_id}: {exc}")
+        try:
+            self.system.release_fork(sandbox_id)
+        except Exception as exc:
+            errors.append(f"fork bookkeeping {sandbox_id}: {exc}")
+        try:
+            self.system.storage.delete_all_checkpoints(sandbox_id)
+        except Exception as exc:
+            errors.append(f"checkpoint storage {sandbox_id}: {exc}")
+        cleanup = getattr(self.runtime, "cleanup_failed_launch", None)
+        if callable(cleanup):
+            try:
+                errors.extend(cleanup(sandbox_id))
+            except Exception as exc:
+                errors.append(f"runtime cleanup {sandbox_id}: {exc}")
+        else:
+            try:
+                self.runtime.delete(sandbox_id)
+            except Exception as exc:
+                errors.append(f"runtime delete {sandbox_id}: {exc}")
+        try:
+            self.unregister_upstream(sandbox_id)
+        except Exception as exc:
+            errors.append(f"upstream {sandbox_id}: {exc}")
+        try:
+            self.release_network_lease(sandbox_id, strict=True)
+        except Exception as exc:
+            errors.append(f"network lease {sandbox_id}: {exc}")
+        return tuple(errors)
 
     def _fork_for_txn(self, source_sandbox_id: SandboxId) -> SandboxId:
         """Fork hook for fork-backed transactions (B3): one fork via the

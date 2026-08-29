@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator
 
+from .errors import ImageCompatibilityError, SandboxCreateCleanupError
 from .ids import CheckpointId, SandboxId
 from .models import EgressLedger, ExecDone, ExecEvent, JobStatus, MergeReport, ObservationReport, PortAllocation, ProcessMergeReport, SandboxExecResult, SandboxInfo, SandboxSnapshot, SandboxState, sandbox_state_from_status, utc_now
 from .templates import SandboxTemplate
@@ -289,7 +290,7 @@ class ExecStream:
             stdout="",
             stderr="",
             args=(),
-            do_checkpoint=self._do_checkpoint,
+            do_checkpoint=self._do_checkpoint and self._returncode == 0,
             do_changeset=self._do_changeset,
             changeset_sync=self._changeset_sync,
             do_observe=self._do_observe,
@@ -460,7 +461,7 @@ class _CommandsNamespace:
             stdout=result.stdout,
             stderr=result.stderr,
             args=result.args,
-            do_checkpoint=do_checkpoint,
+            do_checkpoint=do_checkpoint and result.returncode == 0,
             do_changeset=changeset,
             changeset_sync=changeset_sync,
             do_observe=observe,
@@ -500,26 +501,37 @@ class _CommandsNamespace:
         if changeset and prev_ckpt_id:
             changeset_since = prev_ckpt_id
 
-        response = runtime.batch_action(
-            sandbox.sandbox_id,
-            argv=argv,
-            cwd=cwd,
-            env=env,
-            user=user,
-            timeout_s=timeout,
-            capture_output=capture_output,
-            checkpoint=do_checkpoint,
-            checkpoint_id=ckpt_id,
-            changeset=changeset,
-            changeset_since=changeset_since,
-            observe=observe,
-        )
+        try:
+            response = runtime.batch_action(
+                sandbox.sandbox_id,
+                argv=argv,
+                cwd=cwd,
+                env=env,
+                user=user,
+                timeout_s=timeout,
+                capture_output=capture_output,
+                checkpoint=do_checkpoint,
+                checkpoint_id=ckpt_id,
+                changeset=changeset,
+                changeset_since=changeset_since,
+                observe=observe,
+            )
+        except BaseException:
+            # The daemon never reserved a checkpoint when exec failed or
+            # timed out. Do not expose the client-side provisional id as the
+            # sandbox's latest checkpoint.
+            if do_checkpoint:
+                sandbox._last_checkpoint_id = prev_ckpt_id
+            raise
 
         # Parse exec result
         exec_data = response.get("exec") or {}
         returncode = int(exec_data.get("returncode", -1))
         stdout = str(exec_data.get("stdout") or "")
         stderr = str(exec_data.get("stderr") or "")
+
+        if returncode != 0 and do_checkpoint:
+            sandbox._last_checkpoint_id = prev_ckpt_id
 
         if check and returncode != 0:
             raise RuntimeError(
@@ -546,7 +558,9 @@ class _CommandsNamespace:
             poll_fn = lambda: _rt.poll_job(_sid, _jid)  # noqa: E731
 
         if do_checkpoint and ckpt_id:
-            if ckpt_status == "pending" and poll_fn is not None:
+            if ckpt_status == "skipped":
+                sandbox._last_checkpoint_id = prev_ckpt_id
+            elif ckpt_status == "pending" and poll_fn is not None:
                 # Daemon is working in background — poll for result.
                 ckpt_handle = AsyncCheckpoint(ckpt_id, poll_fn=poll_fn)
             else:
@@ -869,6 +883,8 @@ class Sandbox:
         self._desired_image = image
         self._template = template
         self._work_dir_host = Path(work_dir).expanduser().resolve() if work_dir else None
+        if network is not None and not isinstance(network, bool):
+            raise ValueError("network must be true, false, or null")
         self._network_requested = network
         self._network_lease = None
         self._process_cwd = "/work"
@@ -900,24 +916,73 @@ class Sandbox:
         )
         self._launch_plan = plan
         self._sandbox_id = sandbox_id
-        if self._is_remote_runtime(runtime):
-            # S5 full-access: remote mode — daemon handles all bundle prep.
-            launch_metadata = self._build_remote_launch_metadata(plan, sandbox_id)
-        elif runtime_name == "runc":
-            launch_metadata = self._prepare_runc_launch(plan, sandbox_id)
-        else:
-            launch_metadata = {"sandbox_id": str(sandbox_id), **dict(plan.metadata)}
-        if self._resource_claim:
-            # The normalized claim rides the launch metadata so the gateway
-            # (cloud mode) can meter per-tenant aggregate quotas (§4 S3).
-            launch_metadata = {**launch_metadata, "resources": dict(self._resource_claim)}
-        idle_timeout = self._metadata.get("timeout")
-        if idle_timeout is not None:
-            launch_metadata = {**launch_metadata, "idle_timeout": idle_timeout}
-            idle_action = self._metadata.get("idle_action")
-            if idle_action is not None:
-                launch_metadata = {**launch_metadata, "idle_action": idle_action}
-        sandbox_id = runtime.launch(runtime_name, launch_metadata)
+        is_remote = self._is_remote_runtime(runtime)
+        try:
+            if is_remote:
+                # S5 full-access: remote mode — daemon handles all bundle prep.
+                launch_metadata = self._build_remote_launch_metadata(plan, sandbox_id)
+            elif runtime_name == "runc":
+                launch_metadata = self._prepare_runc_launch(plan, sandbox_id)
+            else:
+                launch_metadata = {"sandbox_id": str(sandbox_id), **dict(plan.metadata)}
+            if self._resource_claim:
+                # The normalized claim rides the launch metadata so the gateway
+                # (cloud mode) can meter per-tenant aggregate quotas (§4 S3).
+                launch_metadata = {**launch_metadata, "resources": dict(self._resource_claim)}
+            idle_timeout = self._metadata.get("timeout")
+            if idle_timeout is not None:
+                launch_metadata = {**launch_metadata, "idle_timeout": idle_timeout}
+                idle_action = self._metadata.get("idle_action")
+                if idle_action is not None:
+                    launch_metadata = {**launch_metadata, "idle_action": idle_action}
+            sandbox_id = runtime.launch(runtime_name, launch_metadata)
+        except Exception as exc:
+            # Remote create is a daemon-owned transaction (and a gateway
+            # timeout is intentionally reconciled server-side). Local runc
+            # preparation owns its lease/bundle/dataset here.
+            if not is_remote and runtime_name == "runc":
+                cleanup_errors: list[str] = []
+                cleanup = getattr(runtime, "cleanup_failed_launch", None)
+                if callable(cleanup):
+                    try:
+                        cleanup_errors.extend(
+                            cleanup(
+                                sandbox_id,
+                                bundle_path=plan.bundle_dir,
+                                dataset=(
+                                    None
+                                    if plan.metadata.get("zfs_dataset") is None
+                                    else str(plan.metadata["zfs_dataset"])
+                                ),
+                            )
+                        )
+                    except Exception as cleanup_exc:
+                        cleanup_errors.append(f"runtime cleanup: {cleanup_exc}")
+                try:
+                    self._engine.release_network_lease(sandbox_id, strict=True)
+                except Exception as cleanup_exc:
+                    cleanup_errors.append(f"network lease: {cleanup_exc}")
+                self._network_lease = None
+                if cleanup_errors:
+                    resources = (
+                        str(plan.bundle_dir or "bundle"),
+                        str(plan.metadata.get("zfs_dataset") or "dataset"),
+                        "network lease",
+                    )
+                    if isinstance(exc, SandboxCreateCleanupError):
+                        raise SandboxCreateCleanupError(
+                            exc.sandbox_id,
+                            exc.cause,
+                            (*exc.cleanup_errors, *cleanup_errors),
+                            resources=(*exc.resources, *resources),
+                        ) from exc
+                    raise SandboxCreateCleanupError(
+                        str(sandbox_id),
+                        exc,
+                        cleanup_errors,
+                        resources=resources,
+                    ) from exc
+            raise
         self._sandbox_id = sandbox_id
         self._mark_inspector_running()
         self._engine._register_sandbox(self)
@@ -944,8 +1009,8 @@ class Sandbox:
         }
         if self._user_env:
             md["env"] = dict(self._user_env)
-        if self._network_requested:
-            md["network"] = True
+        if self._network_requested is not None:
+            md["network"] = bool(self._network_requested)
         return md
 
     def _default_image(self) -> str | None:
@@ -1027,35 +1092,56 @@ class Sandbox:
             return dict(plan.metadata)
 
         image = plan.image or self._engine.config.default_image
-        image_tag = image
-        image_id = sandbox_image.inspect_image_id(
-            tag=image_tag,
+        resolved_image = sandbox_image.resolve_image(
+            reference=image,
+            cache_root=self._engine.image_cache_root,
+            pull_policy=self._engine.config.image_pull_policy,
+            allowed_registries=self._engine.config.image_allowed_registries,
+            allowed_references=self._engine.config.image_allowed_references,
+            pull_timeout_seconds=self._engine.config.image_pull_timeout_seconds,
+            max_image_bytes=self._engine.config.image_max_bytes,
+            min_free_bytes=self._engine.config.image_min_free_bytes,
             telemetry=self._engine.system.telemetry,
         )
+        image_tag = resolved_image.normalized_reference
+        image_id = resolved_image.image_id
         image_defaults = sandbox_image.inspect_image_runtime_defaults(
             tag=image_tag,
             cache_root=self._engine.image_cache_root,
             telemetry=self._engine.system.telemetry,
+            image_id=image_id,
         )
         exported_rootfs = sandbox_image.export_image_rootfs(
             tag=image_tag,
             output_dir=self._engine.image_cache_root / image_id,
             cache_root=self._engine.image_cache_root,
             telemetry=self._engine.system.telemetry,
+            image_id=image_id,
+            image_size_bytes=resolved_image.size_bytes,
+            max_image_bytes=self._engine.config.image_max_bytes,
+            cache_max_bytes=self._engine.config.image_cache_max_bytes,
+            min_free_bytes=self._engine.config.image_min_free_bytes,
+            cache_retention_seconds=self._engine.config.image_cache_retention_seconds,
         )
-        sandbox_bundle.write_bundle_config(
-            bundle_dir=bundle_dir,
-            llm_base_url="",
-            provider="openai",
-            sandbox_name=str(sandbox_id),
-            status_port=self._find_free_port(),
-            cgroup_path=f"crab-sdk/{sandbox_id}",
-            work_dir_host_path=work_dir_host_path,
-            network_namespace_path=network_namespace_path,
-            image_defaults=image_defaults,
-            image_rootfs_dir=exported_rootfs,
-            resource_limits=resource_limits,
-        )
+        try:
+            sandbox_bundle.write_bundle_config(
+                bundle_dir=bundle_dir,
+                llm_base_url="",
+                provider="openai",
+                sandbox_name=str(sandbox_id),
+                status_port=self._find_free_port(),
+                cgroup_path=f"crab-sdk/{sandbox_id}",
+                work_dir_host_path=work_dir_host_path,
+                network_namespace_path=network_namespace_path,
+                image_defaults=image_defaults,
+                image_rootfs_dir=exported_rootfs,
+                resource_limits=resource_limits,
+            )
+        except ValueError as exc:
+            raise ImageCompatibilityError(
+                image,
+                f"image {image!r} has unsupported runtime metadata: {exc}",
+            ) from exc
         self._write_sdk_bundle_process(bundle_dir, image_defaults)
         # TLS trust injection: add CA cert to rootfs copy paths.
         rootfs_copy_paths = [{"source": str(exported_rootfs), "destination": "/"}]
@@ -1073,21 +1159,36 @@ class Sandbox:
         # The SDK's bare-image path writes `sh -lc exec sleep infinity` as
         # the bundle init, so the canonical ignore rules are applicable.
         self._default_ignore_process_rules = self._derive_init_ignore_rules(bundle_dir)
-        plan.metadata.update(
-            {
-                "sandbox_id": str(sandbox_id),
-                "bundle_path": str(bundle_dir),
-                "work_dir_host_path": None if work_dir_host_path is None else str(work_dir_host_path),
-                "rootfs_init_dirs": self._rootfs_init_dirs(),
-                "rootfs_copy_paths": rootfs_copy_paths,
-                "shared_rootfs_key": self._shared_rootfs_key(image_id, ca_cert_path),
-                "shared_rootfs_persist": True,
-                "sdk_image": image_tag,
-                "sdk_process_cwd": plan.process_cwd,
-                **self._network_launch_metadata(network_lease),
-                **self._host_inspector_launch_metadata(),
-            }
+        launch_metadata: dict[str, object] = {
+            "sandbox_id": str(sandbox_id),
+            "bundle_path": str(bundle_dir),
+            "work_dir_host_path": None if work_dir_host_path is None else str(work_dir_host_path),
+            "rootfs_init_dirs": self._rootfs_init_dirs(),
+            "rootfs_copy_paths": rootfs_copy_paths,
+            "shared_rootfs_key": self._shared_rootfs_key(image_id, ca_cert_path),
+            "shared_rootfs_persist": True,
+            "sdk_image": image,
+            "image_reference": image_tag,
+            "image_id": image_id,
+            "image_digest": resolved_image.digest,
+            "sdk_process_cwd": plan.process_cwd,
+            **self._network_launch_metadata(network_lease),
+            **self._host_inspector_launch_metadata(),
+        }
+        from integrations.sandboxes.runtime.baseline import (
+            SANDBOX_ROOTFS_PREPARATION_SCHEMA,
+            add_dns_materialization,
         )
+
+        add_dns_materialization(
+            launch_metadata,
+            bundle_dir=bundle_dir,
+            isolated=network_lease is not None,
+        )
+        launch_metadata["rootfs_preparation_schema"] = (
+            SANDBOX_ROOTFS_PREPARATION_SCHEMA
+        )
+        plan.metadata.update(launch_metadata)
         return dict(plan.metadata)
 
     def _bundle_resource_limits(self) -> "object | None":
@@ -1137,24 +1238,24 @@ class Sandbox:
         return lease
 
     def _requires_network_namespace(self) -> bool:
-        if self._network_requested is not None:
-            return bool(self._network_requested)
-        config = self._engine.config
-        if self._engine.runtime.name != "runc" or not config.enable_sandbox_network:
-            return False
-        # The bridge netns is what makes both features possible: request
-        # attribution for the interceptor, and the REDIRECT hook point for
-        # egress interception (D1) — without it the sandbox shares the
-        # host's network and its egress bypasses the proxy entirely.
-        return bool(
-            config.enable_interceptor or getattr(config, "enable_egress_proxy", False)
+        from .engine import resolve_sandbox_network_mode
+
+        return resolve_sandbox_network_mode(
+            self._engine.config,
+            runtime_name=self._engine.runtime.name,
+            requested=self._network_requested,
         )
 
     def _network_launch_metadata(self, lease) -> dict[str, object]:
         if lease is None:
-            return {}
+            return {
+                "network_mode": "host",
+                "network_requested": self._network_requested,
+            }
         bridge_ip = self._engine.network_bridge_ip
         return {
+            "network_mode": "isolated",
+            "network_requested": self._network_requested,
             "network_namespace_path": str(lease.namespace_path),
             "guest_ip": str(lease.guest_ip),
             "bridge_ip": bridge_ip,

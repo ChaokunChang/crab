@@ -38,6 +38,21 @@ storage_planes:
   work_dir_host_root: /var/lib/crab/work
   image_cache_root: /var/lib/crab/images
 
+# Public Docker Hub images are pulled on first use, then exported into the
+# bounded immutable rootfs cache. Set pull_policy: never on sealed hosts.
+images:
+  pull_policy: if-not-present
+  allowed_registries:
+    - docker.io
+  allowed_references: []
+  pull_timeout_seconds: 600
+  max_image_bytes: 8589934592
+  cache_max_bytes: 21474836480
+  min_free_bytes: 2147483648
+  cache_retention_seconds: 2592000
+  prewarm: []
+  required_prewarm: []
+
 # The no-key smoke test does not require a sandbox network or LLM proxy.
 # Agent-specific examples can enable these in their own config.
 network:
