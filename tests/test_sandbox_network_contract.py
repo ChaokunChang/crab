@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from crab.engine import EngineConfig, resolve_sandbox_network_mode
@@ -28,15 +29,16 @@ class NetworkSelectionTests(unittest.TestCase):
             )
         )
 
-    def test_omitted_value_uses_feature_driven_daemon_default(self) -> None:
+    def test_omitted_value_defaults_to_isolated_when_networking_is_enabled(self) -> None:
         isolated = EngineConfig(
             runtime="runc",
             enable_sandbox_network=True,
-            enable_interceptor=True,
+            enable_interceptor=False,
+            enable_egress_proxy=False,
         )
         host = EngineConfig(
             runtime="runc",
-            enable_sandbox_network=True,
+            enable_sandbox_network=False,
             enable_interceptor=False,
             enable_egress_proxy=False,
         )
@@ -48,12 +50,28 @@ class NetworkSelectionTests(unittest.TestCase):
         self.assertFalse(
             resolve_sandbox_network_mode(host, runtime_name="runc", requested=None)
         )
+        self.assertFalse(
+            resolve_sandbox_network_mode(
+                isolated, runtime_name="docker", requested=None
+            )
+        )
 
     def test_non_boolean_value_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "true, false, or null"):
             resolve_sandbox_network_mode(
                 EngineConfig(), runtime_name="runc", requested="true"  # type: ignore[arg-type]
             )
+
+    def test_packaged_config_defaults_runc_sandboxes_to_isolated(self) -> None:
+        config_path = Path(__file__).resolve().parents[1] / "config" / "crab.yaml"
+        config = EngineConfig.from_file(config_path)
+
+        self.assertTrue(config.enable_sandbox_network)
+        self.assertTrue(
+            resolve_sandbox_network_mode(
+                config, runtime_name="runc", requested=None
+            )
+        )
 
 
 class NetworkLeaseRollbackTests(unittest.TestCase):

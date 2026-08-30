@@ -409,8 +409,11 @@ class EngineConfig:
     LLM tagging (e.g. bare-image experiments). Disables the forwarder too."""
 
     enable_sandbox_network: bool = True
-    """For runc, create a small bridge/veth network when in-sandbox agents
-    need deterministic LLM request attribution across multiple sandboxes."""
+    """For runc, make Crab-managed per-sandbox network namespaces available.
+
+    New sandboxes use them by default. Callers may still request host networking
+    explicitly with ``Sandbox(network=False)``.
+    """
 
     enable_action_journal: bool = True
     """Record every sandbox exec + lifecycle marker into the per-sandbox
@@ -964,10 +967,10 @@ def resolve_sandbox_network_mode(
 ) -> bool:
     """Resolve the public tri-state sandbox ``network`` contract.
 
-    Explicit true/false always wins. Omission follows the engine's existing
-    auto policy: a runc bridge must be enabled and at least one feature that
-    requires per-sandbox network identity (LLM interception or egress proxy)
-    must be active.
+    Explicit true/false always wins. Omission uses an isolated namespace for
+    runc whenever the daemon has sandbox networking enabled. This keeps host
+    networking an explicit opt-out instead of coupling the security boundary
+    to optional interception features.
     """
 
     if requested is not None:
@@ -977,7 +980,6 @@ def resolve_sandbox_network_mode(
     return bool(
         runtime_name == "runc"
         and config.enable_sandbox_network
-        and (config.enable_interceptor or config.enable_egress_proxy)
     )
 
 
@@ -1948,11 +1950,10 @@ class Engine:
                 if isinstance(value, str) and value == client_host:
                     return str(sandbox.sandbox_id)
 
-        # SDK runc sandboxes currently default to host networking unless the
-        # caller supplies a network namespace. That makes the HTTP peer
-        # 127.0.0.1 for all in-sandbox agents, so fall back to the single
-        # registered upstream case. Multi-sandbox LLM routing should use an
-        # explicit header or per-sandbox network identity.
+        # An explicit host-network opt-out makes the HTTP peer 127.0.0.1 for
+        # every such in-sandbox agent, so fall back to the single registered
+        # upstream case. Multi-sandbox LLM routing must keep the default
+        # per-sandbox network identity or use an explicit header.
         registered = [
             sandbox
             for sandbox in sandboxes

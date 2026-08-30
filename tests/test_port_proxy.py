@@ -211,7 +211,11 @@ def _build_port_test_handler(state: dict[str, Any]):
                         "runtime_name": "fake",
                         "status": "running",
                         "metadata": {
-                            "guest_ip": state.get("guest_ip", "127.0.0.1")
+                            "guest_ip": state.get("guest_ip", "10.250.0.2"),
+                            "network_mode": state.get("network_mode", "isolated"),
+                            "network_namespace_path": state.get(
+                                "network_namespace_path", "/var/run/netns/ts-test"
+                            ),
                         },
                     },
                     "runtime_state": None,
@@ -251,7 +255,18 @@ class GatewayPortTestBase(unittest.TestCase):
         self.state: dict[str, Any] = {
             "pid": 1000,
             "guest_ip": "127.0.0.1",
-            "sandboxes": [{"sandbox_id": "sbx-1", "metadata": {"guest_ip": "127.0.0.1"}}],
+            "network_mode": "isolated",
+            "network_namespace_path": "/var/run/netns/ts-test",
+            "sandboxes": [
+                {
+                    "sandbox_id": "sbx-1",
+                    "metadata": {
+                        "guest_ip": "127.0.0.1",
+                        "network_mode": "isolated",
+                        "network_namespace_path": "/var/run/netns/ts-test",
+                    },
+                }
+            ],
         }
         self._start_stub_daemon()
         self._start_gateway()
@@ -345,6 +360,42 @@ class GatewayPortRouteTests(GatewayPortTestBase):
         self.assertEqual(captured["sandbox_id"], "sbx-1")
         self.assertEqual(captured["guest_ip"], "10.250.99.7")
         self.assertEqual(captured["guest_port"], 8080)
+
+    def test_expose_port_rejects_host_network_without_allocating(self) -> None:
+        self.state["network_mode"] = "host"
+        self.state["network_namespace_path"] = None
+        original_allocate = self.gateway.port_manager.allocate
+        called = False
+
+        def capture_allocate(*args: Any, **kwargs: Any) -> int:
+            nonlocal called
+            called = True
+            return original_allocate(*args, **kwargs)
+
+        self.gateway.port_manager.allocate = capture_allocate
+        self.addCleanup(
+            setattr, self.gateway.port_manager, "allocate", original_allocate
+        )
+
+        status, body = self.request(
+            "POST", "/v1/sandboxes/sbx-1/ports", {"port": 8080}
+        )
+
+        self.assertEqual(status, 400)
+        self.assertIn("isolated network namespace", body["error"])
+        self.assertFalse(called)
+        self.assertEqual(self.gateway.registry.list_ports("sbx-1"), [])
+
+    def test_expose_port_rejects_isolated_metadata_without_guest_ip(self) -> None:
+        self.state["guest_ip"] = None
+
+        status, body = self.request(
+            "POST", "/v1/sandboxes/sbx-1/ports", {"port": 8080}
+        )
+
+        self.assertEqual(status, 400)
+        self.assertIn("has no guest_ip", body["error"])
+        self.assertEqual(self.gateway.registry.list_ports("sbx-1"), [])
 
     def test_expose_port(self) -> None:
         guest_port = self._start_echo_for_guest()
@@ -452,7 +503,18 @@ class PortRehydrationTests(unittest.TestCase):
         self.state: dict[str, Any] = {
             "pid": 1000,
             "guest_ip": "127.0.0.1",
-            "sandboxes": [{"sandbox_id": "sbx-1", "metadata": {"guest_ip": "127.0.0.1"}}],
+            "network_mode": "isolated",
+            "network_namespace_path": "/var/run/netns/ts-test",
+            "sandboxes": [
+                {
+                    "sandbox_id": "sbx-1",
+                    "metadata": {
+                        "guest_ip": "127.0.0.1",
+                        "network_mode": "isolated",
+                        "network_namespace_path": "/var/run/netns/ts-test",
+                    },
+                }
+            ],
         }
         self._start_stub_daemon()
         # Start echo server that persists across gateway restarts
@@ -556,6 +618,65 @@ class PortRehydrationTests(unittest.TestCase):
         with self.assertRaises(OSError):
             dead.connect(("127.0.0.1", host_port))
         dead.close()
+
+    def test_host_network_allocation_cleaned_not_rebuilt(self) -> None:
+        gw1 = self._make_gateway()
+        admin = DaemonClient(self.base / "admin.sock")
+        tenant = admin.post_json("/admin/tenants", {"name": "t1"})["tenant"]
+        gw1.registry.register_sandbox(tenant["id"], "sbx-1")
+        host_port = gw1.port_manager.allocate(
+            "sbx-1", "127.0.0.1", self.echo_port
+        )
+        gw1.registry.allocate_port(
+            "sbx-1",
+            tenant["id"],
+            self.echo_port,
+            host_port,
+            guest_ip="127.0.0.1",
+        )
+        gw1.stop()
+        self.state["network_mode"] = "host"
+        self.state["network_namespace_path"] = None
+        self.state["sandboxes"][0]["metadata"].update(
+            {"network_mode": "host", "network_namespace_path": None}
+        )
+
+        admin_sock_path = self.base / "admin.sock"
+        if admin_sock_path.exists():
+            admin_sock_path.unlink()
+        gw2 = self._make_gateway()
+        self.addCleanup(gw2.stop)
+
+        self.assertEqual(gw2.registry.list_ports("sbx-1"), [])
+        self.assertNotIn(host_port, gw2.port_manager._forwarders)
+
+    def test_rehydrate_refreshes_guest_ip_from_daemon(self) -> None:
+        gw1 = self._make_gateway()
+        admin = DaemonClient(self.base / "admin.sock")
+        tenant = admin.post_json("/admin/tenants", {"name": "t1"})["tenant"]
+        gw1.registry.register_sandbox(tenant["id"], "sbx-1")
+        host_port = _find_free_port()
+        gw1.registry.allocate_port(
+            "sbx-1",
+            tenant["id"],
+            self.echo_port,
+            host_port,
+            guest_ip="10.250.0.2",
+        )
+        gw1.stop()
+        self.state["sandboxes"][0]["metadata"]["guest_ip"] = "10.250.0.9"
+
+        admin_sock_path = self.base / "admin.sock"
+        if admin_sock_path.exists():
+            admin_sock_path.unlink()
+        gw2 = self._make_gateway()
+        self.addCleanup(gw2.stop)
+
+        self.assertEqual(
+            gw2.port_manager._forwarders[host_port].guest_ip, "10.250.0.9"
+        )
+        allocations = gw2.registry.list_all_port_allocations()
+        self.assertEqual(allocations[0]["guest_ip"], "10.250.0.9")
 
     def test_occupied_port_releases_db_row(self) -> None:
         # First gateway: allocate a port

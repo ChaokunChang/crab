@@ -66,11 +66,12 @@ mounts. Their contents are outside ZFS rollback.
 
 ## Network and LLM interception
 
-The safe default used by the no-key smoke test disables both:
+The packaged configuration enables per-sandbox networking by default while
+leaving LLM interception disabled:
 
 ```yaml
 network:
-  enable_sandbox_network: false
+  enable_sandbox_network: true
 
 interceptor:
   enabled: false
@@ -101,8 +102,9 @@ instead of silently weakening isolation or bypassing interception.
 
 `Sandbox(network=...)` is tri-state: `true` requires an isolated namespace,
 `false` explicitly uses host networking, and omitted/`null` follows the daemon
-default. The default becomes isolated only when sandbox networking is enabled
-and interception needs it. See [Network selection](sandbox-runtime-baseline.md#network-selection).
+default. For runc, the default is isolated whenever sandbox networking is
+enabled; interception is an independent feature. Port exposure is rejected for
+host-network sandboxes. See [Network selection](sandbox-runtime-baseline.md#network-selection).
 
 ## Host inspector
 

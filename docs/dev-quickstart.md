@@ -173,7 +173,8 @@ engine = Engine.connect(
 )
 
 # 创建沙箱。公共 Docker Hub image 缺失时会按 daemon policy 自动拉取；
-# network=None/省略使用 daemon 默认，False 使用 host 网络，True 要求独立 netns。
+# network=None/省略使用 daemon 默认（标准配置为独立 netns）；
+# False 显式使用 host 网络，True 要求独立 netns。
 sbx = Sandbox(image="python:3.12-slim", network=None, engine=engine)
 info = sbx.describe()
 print(sbx.sandbox_id, info.metadata["image_digest"], info.metadata["network_mode"])

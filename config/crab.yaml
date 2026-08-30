@@ -53,10 +53,11 @@ images:
   prewarm: []
   required_prewarm: []
 
-# The no-key smoke test does not require a sandbox network or LLM proxy.
-# Agent-specific examples can enable these in their own config.
+# Use a dedicated network namespace for new runc sandboxes by default. Set a
+# sandbox's public `network` option to false only for an explicit host-network
+# compatibility case. LLM interception remains independently disabled below.
 network:
-  enable_sandbox_network: false
+  enable_sandbox_network: true
 
 interceptor:
   enabled: false
