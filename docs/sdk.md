@@ -204,9 +204,9 @@ Crab exposes a small `Agent` contract and two built-in profiles:
 | `IFlowAgent` | OpenAI-compatible | Uses the packaged iFlow runtime inside the sandbox |
 
 Both built-ins require a sandbox network namespace and the LLM interceptor.
-The safe default config disables those features because the no-key rollback
-smoke test does not need them. Start an agent-oriented config instead, such as
-the iFlow replay config:
+The packaged config enables sandbox networking by default but leaves the LLM
+interceptor disabled. Start an agent-oriented config to enable interception,
+such as the iFlow replay config:
 
 ```bash
 sudo crab daemon start \

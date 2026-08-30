@@ -32,6 +32,7 @@ open.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -302,6 +303,41 @@ class _DaemonError(Exception):
         self.body = cause.body
 
 
+def _port_forward_guest_ip(
+    sandbox_id: str, metadata: dict[str, Any]
+) -> str:
+    """Return the daemon-owned guest address for a safe port-forward target.
+
+    A host-network sandbox has no address that identifies only that sandbox.
+    Falling back to 127.0.0.1 would target the gateway host and could expose a
+    service owned by another sandbox or the host itself.
+    """
+
+    network_mode = str(metadata.get("network_mode") or "").strip().lower()
+    namespace_path = metadata.get("network_namespace_path")
+    if (
+        network_mode != "isolated"
+        or not isinstance(namespace_path, str)
+        or not namespace_path
+    ):
+        raise _BadRequest(
+            f"port exposure requires an isolated network namespace; "
+            f"sandbox {sandbox_id} uses network_mode={network_mode or 'unknown'}"
+        )
+    raw_guest_ip = metadata.get("guest_ip")
+    if not isinstance(raw_guest_ip, str) or not raw_guest_ip.strip():
+        raise _BadRequest(
+            f"isolated sandbox {sandbox_id} has no guest_ip for port exposure"
+        )
+    try:
+        guest_ip = ipaddress.ip_address(raw_guest_ip.strip())
+    except ValueError as exc:
+        raise _BadRequest(
+            f"isolated sandbox {sandbox_id} has invalid guest_ip={raw_guest_ip!r}"
+        ) from exc
+    return str(guest_ip)
+
+
 # ---------------------------------------------------------------------------
 # Tenant-facing routes.
 # ---------------------------------------------------------------------------
@@ -515,14 +551,10 @@ class _GatewayRoutes:
             raise _BadRequest("'port' must be an integer")
         if not (1 <= guest_port <= 65535):
             raise _BadRequest("'port' must be between 1 and 65535")
-        # Quota check
-        count = self._gateway.registry.count_tenant_ports(tenant_id)
-        if count >= self._MAX_PORTS_PER_TENANT:
-            raise QuotaExceeded(
-                f"port quota exceeded for tenant {tenant_id}",
-                {"max_ports": self._MAX_PORTS_PER_TENANT, "current_ports": count},
-            )
-        # Get guest IP from daemon
+        # Resolve and validate the daemon-owned network identity before
+        # allocating any host resource. Host-network sandboxes share the
+        # gateway host's address space and therefore have no safe per-sandbox
+        # forwarding target.
         raw = self._gateway.proxy(
             "GET", f"/sandboxes/{sandbox_id}", None, _FAST_TIMEOUT_S
         )
@@ -534,7 +566,14 @@ class _GatewayRoutes:
             metadata = raw.get("metadata") or {}
         if not isinstance(metadata, dict):
             metadata = {}
-        guest_ip = metadata.get("guest_ip") or "127.0.0.1"
+        guest_ip = _port_forward_guest_ip(sandbox_id, metadata)
+        # Quota check
+        count = self._gateway.registry.count_tenant_ports(tenant_id)
+        if count >= self._MAX_PORTS_PER_TENANT:
+            raise QuotaExceeded(
+                f"port quota exceeded for tenant {tenant_id}",
+                {"max_ports": self._MAX_PORTS_PER_TENANT, "current_ports": count},
+            )
         # Allocate host port and start forwarder
         host_port = self._gateway.port_manager.allocate(
             sandbox_id, guest_ip, guest_port
@@ -1376,13 +1415,19 @@ class GatewayServer:
         """Restart forwarders for persisted port allocations (S5).
 
         Called once at startup after reconcile(). Skips allocations whose
-        sandbox is no longer active; removes DB rows for ports that cannot
-        be re-bound (occupied by another process)."""
+        sandbox is no longer active or no longer has a safe isolated-network
+        target; removes DB rows for ports that cannot be re-bound."""
         allocations = self.registry.list_all_port_allocations()
         if not allocations:
             return
         # Only rehydrate for sandboxes that are still active
         active_ids = self.registry.active_sandbox_ids()
+        listing = self.proxy("GET", "/sandboxes", None, _FAST_TIMEOUT_S)
+        daemon_metadata = {
+            str(row.get("sandbox_id")): row.get("metadata") or {}
+            for row in listing.get("sandboxes") or []
+            if row.get("sandbox_id")
+        }
         rebuilt = 0
         cleaned = 0
         for alloc in allocations:
@@ -1392,9 +1437,28 @@ class GatewayServer:
                 self.registry.release_port(sid, alloc["guest_port"])
                 cleaned += 1
                 continue
+            metadata = daemon_metadata.get(sid)
+            try:
+                guest_ip = _port_forward_guest_ip(
+                    sid, metadata if isinstance(metadata, dict) else {}
+                )
+            except _BadRequest as exc:
+                self.registry.release_port(sid, alloc["guest_port"])
+                cleaned += 1
+                logger.warning(
+                    "port rehydration: unsafe target for %s:%d — released: %s",
+                    sid,
+                    alloc["guest_port"],
+                    exc,
+                )
+                continue
+            if guest_ip != alloc["guest_ip"]:
+                self.registry.update_port_guest_ip(
+                    sid, alloc["guest_port"], guest_ip
+                )
             try:
                 self._port_manager.rehydrate(
-                    alloc["host_port"], alloc["guest_ip"], alloc["guest_port"]
+                    alloc["host_port"], guest_ip, alloc["guest_port"]
                 )
                 rebuilt += 1
             except OSError:

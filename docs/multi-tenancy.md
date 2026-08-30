@@ -3,6 +3,11 @@
 Crab Gateway 是部署在 daemon 前面的多租户服务入口，负责租户、API Key、
 配额和沙箱归属管理。本文介绍如何查看和管理租户。
 
+这里的租户边界属于控制面：Gateway 会隔离资源可见性和操作权限。默认的
+独立 network namespace 会隔离各 sandbox 的网络栈和端口空间，但所有
+isolated sandbox 目前仍连接同一个 Crab bridge，尚没有按 tenant 阻断东西向
+流量，因此不能把它当作不可信租户之间的网络分段。
+
 - 所有租户状态保存在 Gateway 的 SQLite 数据库中（见[数据存储](#数据存储)），
   没有独立的配置文件。
 - 所有管理命令只走本机 Unix socket（管理面永不暴露在 TCP 端口上），

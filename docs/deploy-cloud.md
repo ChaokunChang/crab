@@ -152,4 +152,4 @@ systemctl start crabd crab-gateway
 2. **端口暴露依赖安全组**：脚本不自动操作云防火墙，需手动放行。
 3. **单机部署**：当前版本不支持多节点集群，一台机器运行一个 daemon。
 4. **无自动升级**：更新代码后需手动 `git pull` + `pip install` + `systemctl restart`。
-5. **sandbox 网络默认关闭**：如需沙箱访问外网，修改 `/etc/crab/config.yaml` 中 `network.enable_sandbox_network: true` 并重启。
+5. **sandbox 网络默认隔离**：新建 runc sandbox 默认使用独立 netns；只有显式传入 `network=false` 才共享 host 网络。`ports.expose` 不支持 host 网络模式。

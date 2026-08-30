@@ -26,6 +26,7 @@ from crab import (
     Sandbox,
     SandboxExecTimeout,
 )
+from crab.cloud_client import CloudRequestError
 from crab.daemon import DaemonClient
 from crab.daemon.server import DaemonServer
 from crab.gateway.server import GatewayServer
@@ -188,7 +189,7 @@ class RemoteSandboxBaselineRealTests(unittest.TestCase):
             network=None,
             engine=self.daemon_engine,
         )
-        self.assertEqual(sandbox.describe().metadata["network_mode"], "host")
+        self.assertEqual(sandbox.describe().metadata["network_mode"], "isolated")
         result = sandbox.commands.run(
             ["python", "-c", "import socket; print(socket.gethostbyname('example.com'))"],
             timeout=60,
@@ -441,8 +442,13 @@ class RemoteSandboxBaselineRealTests(unittest.TestCase):
             )
         self.assertEqual(sandbox._last_checkpoint_id, previous)
 
-    def test_port_exposure_works_in_host_and_isolated_modes(self) -> None:
-        for network in (False, True):
+    def test_port_exposure_rejects_host_and_works_in_isolated_mode(self) -> None:
+        host = self._sandbox("python:3.12-slim", network=False)
+        with self.assertRaises(CloudRequestError) as caught:
+            host.ports.expose(8080)
+        self.assertEqual(caught.exception.status_code, 400)
+
+        for network in (None, True):
             with self.subTest(network=network):
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
                     probe.bind(("127.0.0.1", 0))

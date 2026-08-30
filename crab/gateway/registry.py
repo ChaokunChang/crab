@@ -726,8 +726,13 @@ class GatewayRegistry:
                 )
 
     def allocate_port(
-        self, sandbox_id: str, tenant_id: str, guest_port: int, host_port: int,
-        *, guest_ip: str = "127.0.0.1",
+        self,
+        sandbox_id: str,
+        tenant_id: str,
+        guest_port: int,
+        host_port: int,
+        *,
+        guest_ip: str,
     ) -> int:
         """Record a port allocation; returns the row id."""
         with self._lock:
@@ -756,6 +761,17 @@ class GatewayRegistry:
                 (sandbox_id, int(guest_port)),
             )
             return host_port
+
+    def update_port_guest_ip(
+        self, sandbox_id: str, guest_port: int, guest_ip: str
+    ) -> None:
+        """Refresh the daemon-owned forwarding target during rehydration."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE port_allocations SET guest_ip = ?"
+                " WHERE sandbox_id = ? AND guest_port = ?",
+                (guest_ip, sandbox_id, int(guest_port)),
+            )
 
     def release_all_ports(self, sandbox_id: str) -> list[int]:
         """Release all port allocations for a sandbox; returns freed host_ports."""

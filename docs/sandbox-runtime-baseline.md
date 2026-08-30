@@ -37,11 +37,23 @@ The Python and remote create APIs treat `network` as a tri-state value:
 | `false` | Share the daemon host's network namespace. |
 | omitted or `null` | Use the daemon policy. |
 
-The current automatic policy selects an isolated namespace only when runc
-sandbox networking is enabled and either LLM interception or egress
-interception needs per-sandbox identity. Otherwise its default is host mode.
+The default policy selects an isolated namespace whenever runc sandbox
+networking is enabled. The packaged daemon configuration enables it, so host
+networking is an explicit `network=false` compatibility opt-out. Disabling
+daemon sandbox networking changes the omitted/`null` default back to host mode;
+an explicit `true` request still fails rather than silently downgrading.
 `Sandbox.describe().metadata` reports `network_mode`, the original
 `network_requested` value, and the lease/netns identity when isolated.
+
+Port exposure requires an isolated namespace. Gateway rejects host-network
+sandboxes with HTTP 400 because they have no guest address that identifies only
+that sandbox; forwarding to host loopback could expose an unrelated host or
+sandbox service.
+
+The namespace boundary separates loopback, interfaces, routes, and port spaces.
+All isolated sandboxes currently attach to one Crab bridge, however, and Crab
+does not yet install an east-west deny policy between bridge ports. It must not
+be interpreted as tenant-aware network segmentation.
 
 Forks inherit the source's effective network mode. A fork of an isolated
 source receives a distinct lease and netns; a host-network source remains in

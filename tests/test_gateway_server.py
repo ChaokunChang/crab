@@ -1129,7 +1129,13 @@ class PeriodicReconciliationTests(GatewayTestBase):
         self.addCleanup(echo_sock.close)
 
         host_port = self.gateway.port_manager.allocate("sbx-gone", "127.0.0.1", echo_port)
-        self.gateway.registry.allocate_port("sbx-gone", tenant["id"], echo_port, host_port)
+        self.gateway.registry.allocate_port(
+            "sbx-gone",
+            tenant["id"],
+            echo_port,
+            host_port,
+            guest_ip="127.0.0.1",
+        )
 
         self.gateway._periodic_reconcile()
 
