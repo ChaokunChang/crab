@@ -165,19 +165,28 @@ crab-gateway tenants list
 
 ```python
 from crab import Engine, Sandbox
+from crab.errors import SandboxExecTimeout
 
 engine = Engine.connect(
     url="http://192.168.1.100:8080",   # gateway 地址
     api_key="crab_key_AbCdEf...",      # 上一步拿到的 key
 )
 
-# 创建沙箱
-sbx = Sandbox(image="ubuntu:22.04", engine=engine)
-print(sbx.sandbox_id)
+# 创建沙箱。公共 Docker Hub image 缺失时会按 daemon policy 自动拉取；
+# network=None/省略使用 daemon 默认，False 使用 host 网络，True 要求独立 netns。
+sbx = Sandbox(image="python:3.12-slim", network=None, engine=engine)
+info = sbx.describe()
+print(sbx.sandbox_id, info.metadata["image_digest"], info.metadata["network_mode"])
 
 # 执行命令
 result = sbx.commands.run("whoami")
 print(result.stdout)
+
+# timeout 由 daemon 强制执行，返回前已经回收命令及其 descendants
+try:
+    sbx.commands.run("sleep 30 & wait", timeout=1)
+except SandboxExecTimeout:
+    print("timed out and reaped")
 
 # fork
 forks = sbx.fork(2)
@@ -263,9 +272,10 @@ zfs create crab/sandboxes
 | 项目 | 状态 |
 |------|------|
 | 远程创建沙箱 | ✅ 正常工作（gateway 转发 create 到 daemon） |
-| exec 流式输出 | ❌ 当前是一次性返回全部 stdout/stderr（S4 将支持流式） |
-| 端口暴露 | ❌ 沙箱端口无法从外部访问（S4 将支持端口转发） |
-| `timeout` 参数 | ⚠️ 仅为 advisory 元数据，不会实际强制超时 |
+| exec 流式输出 | ✅ `commands.stream()` 通过 Gateway 流式转发 stdout/stderr |
+| 端口暴露 | ✅ isolated netns 下支持；service VM/NAT 仍需转发分配出的 host port |
+| `commands.run(timeout=...)` | ✅ daemon 强制硬超时并回收完整 payload tree |
+| `Sandbox(timeout=...)` | ✅ Gateway idle-reclaim 窗口；配合 `idle_action` 使用 |
 | `labels` 参数 | ⚠️ 仅为 advisory 元数据，不影响运行时行为 |
 | daemon 重启 | ⚠️ 会丢失所有运行中的沙箱，gateway 对它们返回 410 Gone |
 | PTY / 交互终端 | ❌ 不支持，远程只有 exec 一次性调用 |

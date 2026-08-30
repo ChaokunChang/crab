@@ -44,13 +44,23 @@ Create a sandbox from an image:
 
 ```python
 sandbox = Sandbox(
-    image="ubuntu:22.04",
+    image="python:3.12-slim",  # public Docker Hub image; pulled on cache miss
     name="my-sandbox",       # optional; generated when omitted
     env={"MODE": "test"},   # environment inherited by sandbox commands
-    network=False,          # host mode; True requires netns; None uses daemon default
+    network=None,            # False=host; True=isolated netns; None=daemon default
     engine=engine,
 )
+
+metadata = sandbox.describe().metadata
+print(metadata["image_digest"], metadata["network_mode"])
 ```
+
+New bare-image sandboxes receive the shared runtime baseline after rootfs
+cloning: a usable resolver configuration and an explicit non-privileged
+capability profile. Public Docker Hub references use the daemon's pull/cache
+policy and are reported with immutable `image_id`/`image_digest` metadata.
+See [Sandbox runtime baseline](sandbox-runtime-baseline.md) for the image
+compatibility, networking, timeout, cache, and lifecycle contracts.
 
 The main operations are:
 
@@ -78,7 +88,13 @@ sandbox.kill()
 
 `commands.run()` currently buffers output and does not allocate a PTY. File
 helpers are intended for text-sized files; use sandbox commands for binary or
-streaming transfers.
+streaming transfers. Use `commands.stream()` when stdout/stderr must be
+consumed incrementally.
+
+`commands.run(..., timeout=seconds)` is enforced by the daemon. On expiry it
+terminates and reaps the complete exec payload tree before raising
+`crab.errors.SandboxExecTimeout`; sandbox init and unrelated concurrent execs
+remain alive.
 
 ### Running background processes
 
@@ -594,7 +610,8 @@ that gap needs TLS interception, which is deliberately out of scope.
   so the abort reports rather than hides them (holding or rejecting
   such requests is D3).
 - Daemon restart rehydration is not implemented.
-- Exec output is buffered; streaming and PTY support are not implemented.
+- `commands.run()` buffers output; `commands.stream()` supports incremental
+  stdout/stderr through daemon and gateway. PTY support is not implemented.
 - `resources` is enforced (S3): `Sandbox(resources={"cpus": 2, "memory":
   "512M", "pids": 256})` lands in the runc spec's `linux.resources`
   (cpu quota/period, memory limit, pids limit) and forks inherit the
@@ -608,5 +625,7 @@ that gap needs TLS interception, which is deliberately out of scope.
   must declare the corresponding `resources` limit; undeclared requests
   are refused with 409 `QuotaExceeded` (`requested_*` is `null` in the
   quota payload).
-  `timeout` and `labels` remain advisory metadata, not lifecycle policies.
+  `Sandbox(timeout=...)` is a gateway-enforced idle-reclaim window and
+  `idle_action` selects pause/stop/checkpoint_stop/kill. `labels` remain
+  advisory metadata.
 - Only OpenAI-compatible and Anthropic LLM base-URL conventions are built in.
