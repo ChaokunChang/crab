@@ -1,9 +1,11 @@
 """Crab SDK 远程接口全功能教程
 
 本脚本演示如何从一台 *远程* 客户端机器连接 Crab Gateway（或 daemon），
-并覆盖 SDK 暴露的所有远程操作，包括最新引入的富返回值 `ActionResult`、
-异步 checkpoint / changeset、inspector 只读 peek、以及 Sandbox 级
-`auto_checkpoint` 模式。
+并覆盖 SDK 暴露的所有远程操作，包括公共镜像按需拉取、运行时 baseline、
+daemon 强制执行超时、网络 tri-state、富返回值 `ActionResult`、异步
+checkpoint / changeset、inspector 只读 peek，以及 Sandbox 级
+`auto_checkpoint` 模式。教程只清理本次运行创建的 sandbox，不会删除同一
+tenant 中已有的 workload。
 
 使用前准备:
   1. 确保目标机器已部署 crab-gateway（或 daemon）并在监听 HTTP 端口。
@@ -15,6 +17,11 @@
 运行:
     export CRAB_GATEWAY_URL=http://host:8900 CRAB_API_KEY=crab_sk_xxx
     python examples/sdk/04_remote_service_tutorial.py
+
+可选配置:
+    export CRAB_TUTORIAL_IMAGE=python:3.12-slim  # 未缓存时自动 pull
+    export CRAB_TUTORIAL_NETWORK=auto            # auto | host | isolated
+    export CRAB_TUTORIAL_RUN_APT=1               # 验证普通 apt 工作流
 """
 from __future__ import annotations
 
@@ -22,10 +29,14 @@ import os
 import sys
 import time
 import traceback
+import uuid
 from urllib.parse import urlparse
 
 from crab import Engine, Sandbox
+from crab.errors import SandboxExecTimeout
 from crab.models import ExecEvent, ExecDone
+
+FAILURES: list[str] = []
 
 # ============================================================
 # ★ 用户配置区 ★  —— 通过环境变量提供凭证（勿硬编码真实 key/URL）
@@ -35,9 +46,44 @@ from crab.models import ExecEvent, ExecDone
 GATEWAY_URL = os.environ.get("CRAB_GATEWAY_URL", "http://YOUR_GATEWAY_HOST:8900")
 API_KEY = os.environ.get("CRAB_API_KEY", "YOUR_API_KEY")
 
-# 创建沙箱时使用的镜像和资源配置（非敏感，可直接改）
-SANDBOX_IMAGE = "ubuntu:22.04"
-SANDBOX_RESOURCES = {"memory": "2G", "cpus": 2}
+
+def env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean (1/0, true/false, yes/no, on/off)")
+
+
+def network_setting() -> bool | None:
+    raw = os.environ.get("CRAB_TUTORIAL_NETWORK", "auto").strip().lower()
+    if raw in {"auto", "default", "null", "none"}:
+        return None
+    if raw in {"host", "false", "off", "0"}:
+        return False
+    if raw in {"isolated", "true", "on", "1"}:
+        return True
+    raise ValueError("CRAB_TUTORIAL_NETWORK must be auto, host, or isolated")
+
+
+# 非敏感配置。默认资源保持较小，避免教程挤占同 tenant 的真实 workload。
+SANDBOX_IMAGE = os.environ.get("CRAB_TUTORIAL_IMAGE", "ubuntu:22.04")
+SANDBOX_NETWORK = network_setting()
+SANDBOX_RESOURCES = {
+    "memory": os.environ.get("CRAB_TUTORIAL_MEMORY", "512M"),
+    "cpus": int(os.environ.get("CRAB_TUTORIAL_CPUS", "1")),
+}
+AUX_SANDBOX_MEMORY = os.environ.get("CRAB_TUTORIAL_AUX_MEMORY", "256M")
+RUN_APT_CHECK = env_flag("CRAB_TUTORIAL_RUN_APT", True)
+TUTORIAL_RUN_ID = os.environ.get("CRAB_TUTORIAL_RUN_ID", uuid.uuid4().hex[:8])
+
+
+def tutorial_name(role: str) -> str:
+    return f"crab-tutorial-{TUTORIAL_RUN_ID}-{role}"
 
 
 # ============================================================
@@ -56,7 +102,12 @@ def step_ok(msg: str) -> None:
 
 
 def step_fail(msg: str) -> None:
+    FAILURES.append(msg)
     print(f"  ✗ {msg}")
+
+
+def step_warn(msg: str) -> None:
+    print(f"  ! {msg}")
 
 
 def safe_run(description: str, func, *args, **kwargs):
@@ -82,8 +133,9 @@ def main() -> None:
         print("  export CRAB_API_KEY=crab_sk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
         sys.exit(1)
 
-    # 用于最终统一清理的沙箱列表
+    # 用于最终统一清理的 sandbox 列表。只向这里加入本次运行创建的对象。
     sandboxes_to_kill: list[Sandbox] = []
+    created_ids: set[str] = set()
 
     # ----------------------------------------------------------
     # 1. 连接 Gateway
@@ -97,27 +149,22 @@ def main() -> None:
     print(f"  Engine 类型: {type(engine).__name__}")
 
     # ----------------------------------------------------------
-    # 1.5 清理残留沙箱（确保从干净配额开始）
+    # 1.5 记录已有沙箱（绝不清理其他 workload）
     # ----------------------------------------------------------
-    # 上一次跑 tutorial 可能留下未清理的沙箱，占用 tenant 配额——例如
-    # 3 个残留沙箱 × 2G 就会占满 6G 配额，导致后面 step 11 的 fork
-    # 因配额不足而失败。这里在创建任何新沙箱 *之前*，先把当前 API key
-    # 可见的沙箱全部 kill 掉。友好容错：任一步失败都只打印告警、不中断。
-    banner("1.5 清理残留沙箱")
+    # 旧版教程会 kill 当前 API key 可见的全部 sandbox，这会误删同 tenant
+    # 的真实任务。现在只记录基线；finally 只回收 created_ids 中的对象。
+    banner("1.5 记录已有沙箱（保留现有 workload）")
     t0 = time.time()
-    existing = safe_run("列出残留沙箱", engine.list_sandboxes) or []
-    cleaned = 0
-    for s in existing:
-        sid = s.get("sandbox_id")
-        if not sid:
-            continue
-        try:
-            Sandbox.connect(sid, engine=engine).kill()
-            cleaned += 1
-            print(f"    已清理: {sid}")
-        except Exception as exc:
-            step_fail(f"清理 {sid} 失败（忽略）: {exc}")
-    step_ok(f"清理了 {cleaned}/{len(existing)} 个残留沙箱 ⏱ {time.time()-t0:.3f}s")
+    existing = safe_run("列出已有沙箱", engine.list_sandboxes) or []
+    preexisting_ids = {
+        str(row["sandbox_id"])
+        for row in existing
+        if row.get("sandbox_id")
+    }
+    step_ok(
+        f"发现并保留 {len(preexisting_ids)} 个已有沙箱 "
+        f"⏱ {time.time()-t0:.3f}s"
+    )
 
     try:
         # ----------------------------------------------------------
@@ -126,15 +173,123 @@ def main() -> None:
         banner("2. 远程创建沙箱")
         print(f"  镜像: {SANDBOX_IMAGE}")
         print(f"  资源: {SANDBOX_RESOURCES}")
+        print(f"  网络请求: {SANDBOX_NETWORK!r} (None 表示 daemon 默认)")
 
         t0 = time.time()
         sandbox = Sandbox(
             image=SANDBOX_IMAGE,
             resources=SANDBOX_RESOURCES,
+            network=SANDBOX_NETWORK,
+            name=tutorial_name("main"),
             engine=engine,
         )
         sandboxes_to_kill.append(sandbox)
+        created_ids.add(str(sandbox.sandbox_id))
         step_ok(f"沙箱创建成功, id = {sandbox.sandbox_id} ⏱ {time.time()-t0:.3f}s")
+
+        info = sandbox.describe()
+        metadata = info.metadata
+        print(f"  image_reference: {metadata.get('image_reference')}")
+        print(f"  image_digest: {metadata.get('image_digest')}")
+        print(f"  rootfs_preparation_schema: {metadata.get('rootfs_preparation_schema')}")
+        print(f"  effective network_mode: {metadata.get('network_mode')}")
+        required_metadata = (
+            "image_reference",
+            "image_id",
+            "image_digest",
+            "rootfs_preparation_schema",
+            "network_mode",
+        )
+        missing = [key for key in required_metadata if not metadata.get(key)]
+        if missing:
+            step_fail(f"创建结果缺少 baseline metadata: {', '.join(missing)}")
+            raise RuntimeError(
+                "Gateway/daemon 尚未运行支持 runtime baseline 的版本；"
+                "请先完成服务升级并重启后再运行本教程"
+            )
+        else:
+            step_ok("创建结果包含不可变镜像身份、baseline schema 和有效网络模式")
+
+        # ----------------------------------------------------------
+        # 2a. 新 sandbox runtime baseline
+        # ----------------------------------------------------------
+        banner("2a. Runtime baseline — DNS + 非特权 capability")
+        baseline = safe_run(
+            "验证 runtime baseline",
+            sandbox.commands.run,
+            """set -eu
+test -s /etc/resolv.conf
+dns_answer=$(getent hosts archive.ubuntu.com | head -n 1)
+cap_hex=$(awk '/^CapEff:/{print $2}' /proc/self/status)
+cap_dec=$(printf '%d' "0x${cap_hex}")
+test $((cap_dec & (1 << 6))) -ne 0
+test $((cap_dec & (1 << 7))) -ne 0
+test $((cap_dec & (1 << 21))) -eq 0
+printf 'dns=%s\nCapEff=%s\n' "$dns_answer" "$cap_hex"
+""",
+            timeout=60.0,
+            check=True,
+        )
+        if baseline is not None:
+            step_ok("DNS 可用；CAP_SETGID/CAP_SETUID 存在；CAP_SYS_ADMIN 不存在")
+            print(f"  {baseline.stdout.strip()}")
+
+        if RUN_APT_CHECK:
+            apt = safe_run(
+                "验证普通 APT 权限切换",
+                sandbox.commands.run,
+                "DEBIAN_FRONTEND=noninteractive apt-get update -qq && "
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl && "
+                "curl --version | head -n 1",
+                timeout=240.0,
+                check=True,
+            )
+            if apt is not None:
+                step_ok("apt-get 无需 APT::Sandbox::User=root 即可安装 curl")
+                print(f"  {apt.stdout.strip()}")
+        else:
+            step_warn("已通过 CRAB_TUTORIAL_RUN_APT=0 跳过 APT 验证")
+
+        # ----------------------------------------------------------
+        # 2b. daemon 强制硬超时
+        # ----------------------------------------------------------
+        banner("2b. Exec hard timeout — 完整回收 payload")
+        timed_out_cleanly = False
+        try:
+            sandbox.commands.run(
+                "echo $$ > /tmp/crab-tutorial-timeout-shell.pid; "
+                "sleep 30 & echo $! > /tmp/crab-tutorial-timeout-child.pid; wait",
+                timeout=1.0,
+            )
+            step_fail("超时命令意外正常返回")
+        except SandboxExecTimeout as exc:
+            timed_out_cleanly = True
+            step_ok(
+                "收到稳定的 SandboxExecTimeout；daemon 已完成 payload 清理后才返回 "
+                f"(timeout={exc.timeout}s)"
+            )
+        except Exception as exc:
+            step_fail(f"超时返回了非预期错误类型 {type(exc).__name__}: {exc}")
+
+        if timed_out_cleanly:
+            reaped = safe_run(
+                "确认超时 shell 与子进程均已消失",
+                sandbox.commands.run,
+                """set -eu
+for pid_file in /tmp/crab-tutorial-timeout-shell.pid /tmp/crab-tutorial-timeout-child.pid; do
+    pid=$(cat "$pid_file")
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "payload still alive: pid=$pid" >&2
+        exit 1
+    fi
+done
+echo reaped
+""",
+                timeout=10.0,
+                check=True,
+            )
+            if reaped is not None:
+                step_ok("超时 payload 及其 descendants 均已回收")
 
         # ----------------------------------------------------------
         # 3. 列出当前 tenant 的沙箱 (engine.list_sandboxes)
@@ -298,12 +453,15 @@ def main() -> None:
             "创建 auto_checkpoint 沙箱",
             Sandbox,
             image=SANDBOX_IMAGE,
-            resources={"memory": "1G"},
+            resources={"memory": AUX_SANDBOX_MEMORY},
+            network=SANDBOX_NETWORK,
+            name=tutorial_name("auto"),
             engine=engine,
             auto_checkpoint=True,
         )
         if auto_sb is not None:
             sandboxes_to_kill.append(auto_sb)
+            created_ids.add(str(auto_sb.sandbox_id))
             step_ok(f"auto_checkpoint 沙箱创建成功: {auto_sb.sandbox_id}")
             t0 = time.time()
             auto_sb.commands.run("echo step1 > /tmp/s1")
@@ -312,14 +470,14 @@ def main() -> None:
             # `runc exec` 的管道继承阻塞——否则光加 `&` 会一直阻塞到进程退出。
             # detach 只解除“管道继承阻塞”，不改变进程生命周期：命令自身
             # 仍须用 `&` 后台化，run 才会立即返回；detach 模式不返回输出。
-            # 这个占用 512m 内存、sleep 30 的后台进程会被本次 auto_checkpoint 捕获。
+            # 这个 sleep 30 后台进程会被本次 auto_checkpoint 捕获。
             # observe=True 在 exec 之后、checkpoint 之前做一次只读 inspector peek。
             # process_changed 由 host-inspector 对比“当前 cgroup 活进程集”与“上次
             # checkpoint 基线”得出（实时读 cgroup PID，不是靠消费 eBPF 事件），所以
             # 只要后台进程还活着 process_changed 就稳定为 True；本命令没写磁盘，
             # 因此 filesystem_changed=False（VM 实测：proc=True / fs=False）。
             tmp1 = auto_sb.commands.run(
-                "bash -c 'x=$(head -c 512m /dev/zero); sleep 30' & sleep 5", detach=True, observe=True
+                "sleep 30 & sleep 2", detach=True, observe=True
             )
             step_ok(f"自动 checkpoint: {auto_sb.last_checkpoint_id} ⏱ {time.time()-t0:.3f}s")
             print(f"  filesystem_changed: {tmp1.filesystem_changed}")
@@ -418,7 +576,23 @@ def main() -> None:
         if forks:
             fork_sbx = forks[0]
             sandboxes_to_kill.append(fork_sbx)
+            created_ids.add(str(fork_sbx.sandbox_id))
             step_ok(f"Fork 成功, fork id = {fork_sbx.sandbox_id} ⏱ {time.time()-t0:.3f}s")
+
+            fork_metadata = fork_sbx.describe().metadata
+            source_mode = sandbox.describe().metadata.get("network_mode")
+            fork_mode = fork_metadata.get("network_mode")
+            if fork_mode == source_mode:
+                step_ok(f"Fork 继承有效网络模式: {fork_mode}")
+            else:
+                step_fail(f"Fork 网络模式不一致: source={source_mode}, fork={fork_mode}")
+            if source_mode == "isolated":
+                source_netns = sandbox.describe().metadata.get("network_namespace_path")
+                fork_netns = fork_metadata.get("network_namespace_path")
+                if source_netns and fork_netns and source_netns != fork_netns:
+                    step_ok("隔离网络 fork 获得独立 network namespace")
+                else:
+                    step_fail("隔离网络 fork 未报告独立 network namespace")
 
             # 在 fork 里做一些修改
             fork_result = fork_sbx.commands.run(
@@ -453,6 +627,7 @@ def main() -> None:
             )
             if past_forks:
                 past_fork = past_forks[0]
+                created_ids.add(str(past_fork.sandbox_id))
                 step_ok(
                     f"Fork 成功, fork id = {past_fork.sandbox_id} "
                     f"(fork 点 = {ckpt_id}) ⏱ {time.time()-t0:.3f}s"
@@ -526,45 +701,53 @@ def main() -> None:
         banner("14. 端口暴露 (ports.expose)")
         print("  在沙箱内启动一个简单 HTTP server，然后暴露端口…")
 
-        try:
-            # 在沙箱内后台起一个 python HTTP server
-            sandbox.commands.run(
-                "python3 -m http.server 8080 --directory /tmp &",
-                timeout=3.0,
-            )
-            # 等待 server 启动
-            time.sleep(1)
-
-            # 暴露端口
-            t0 = time.time()
-            allocation = sandbox.ports.expose(8080)
-            step_ok(f"端口暴露成功 ⏱ {time.time()-t0:.3f}s:")
-            print(f"    guest_port: {allocation.guest_port}")
-            print(f"    host_port:  {allocation.host_port}")
-            print(f"    url:        {allocation.url}")
-
-            # 尝试从外部验证（使用 urllib，不依赖 requests）
-            # ports.expose 返回的 url 通常是 tcp:// 格式（L4 转发），
-            # 需要用 http:// 协议访问沙箱内的 HTTP server
-            print("  尝试从外部访问暴露的端口…")
+        if sandbox.describe().metadata.get("network_mode") != "isolated":
+            step_warn("当前为 host 网络模式；端口暴露仅适用于 isolated netns，跳过")
+        else:
             try:
-                import urllib.request
-                # 从 GATEWAY_URL 提取主机名，拼接 host_port 构造 HTTP URL
-                gw_parsed = urlparse(GATEWAY_URL)
-                gw_host = gw_parsed.hostname or "127.0.0.1"
-                http_url = f"http://{gw_host}:{allocation.host_port}/"
-                print(f"    构造 HTTP URL: {http_url}")
-                with urllib.request.urlopen(http_url, timeout=5) as resp:
-                    body = resp.read(200).decode("utf-8", errors="replace")
-                    step_ok(f"外部访问成功 (HTTP {resp.status}), 响应前 200 字节:")
-                    print(f"    {body[:200]}")
-            except Exception as fetch_exc:
-                step_fail(f"外部访问失败 (可能网络不通): {fetch_exc}")
-                print("    提示: 端口已暴露，但从当前网络可能无法直接访问 gateway 主机。")
+                # 在沙箱内后台起一个 python HTTP server
+                sandbox.commands.run(
+                    "python3 -m http.server 8080 --directory /tmp &",
+                    timeout=3.0,
+                )
+                # 等待 server 启动
+                time.sleep(1)
 
-        except Exception as port_exc:
-            step_fail(f"端口暴露不可用: {port_exc}")
-            print("    提示: 端口暴露需要沙箱具有网络命名空间 (netns) 支持。")
+                # 暴露端口
+                t0 = time.time()
+                allocation = sandbox.ports.expose(8080)
+                step_ok(f"端口暴露成功 ⏱ {time.time()-t0:.3f}s:")
+                print(f"    guest_port: {allocation.guest_port}")
+                print(f"    host_port:  {allocation.host_port}")
+                print(f"    url:        {allocation.url}")
+
+                # 尝试从外部验证（使用 urllib，不依赖 requests）
+                # ports.expose 返回的 url 通常是 tcp:// 格式（L4 转发），
+                # 需要用 http:// 协议访问沙箱内的 HTTP server
+                print("  尝试从外部访问暴露的端口…")
+                try:
+                    import urllib.request
+
+                    # 从 GATEWAY_URL 提取主机名，拼接 host_port 构造 HTTP URL
+                    gw_parsed = urlparse(GATEWAY_URL)
+                    gw_host = gw_parsed.hostname or "127.0.0.1"
+                    http_url = f"http://{gw_host}:{allocation.host_port}/"
+                    print(f"    构造 HTTP URL: {http_url}")
+                    with urllib.request.urlopen(http_url, timeout=5) as resp:
+                        body = resp.read(200).decode("utf-8", errors="replace")
+                        step_ok(
+                            f"外部访问成功 (HTTP {resp.status}), 响应前 200 字节:"
+                        )
+                        print(f"    {body[:200]}")
+                except Exception as fetch_exc:
+                    step_warn(f"外部访问失败 (可能网络不通): {fetch_exc}")
+                    print(
+                        "    提示: 端口已暴露，但从当前网络可能无法直接访问 "
+                        "gateway 主机。"
+                    )
+            except Exception as port_exc:
+                step_fail(f"端口暴露不可用: {port_exc}")
+                print("    提示: 端口暴露需要沙箱具有网络命名空间 (netns) 支持。")
 
     finally:
         # ----------------------------------------------------------
@@ -580,12 +763,38 @@ def main() -> None:
             except Exception as kill_exc:
                 step_fail(f"清理沙箱失败: {kill_exc}")
 
+        remaining = safe_run("清理后列出沙箱", engine.list_sandboxes)
+        if remaining is not None:
+            remaining_ids = {
+                str(row["sandbox_id"])
+                for row in remaining
+                if row.get("sandbox_id")
+            }
+            missing_preexisting = sorted(preexisting_ids - remaining_ids)
+            leaked_tutorial = sorted(created_ids & remaining_ids)
+            if missing_preexisting:
+                step_fail(
+                    "教程运行期间已有 sandbox 消失: "
+                    + ", ".join(missing_preexisting)
+                )
+            else:
+                step_ok(f"运行前的 {len(preexisting_ids)} 个 sandbox 全部保留")
+            if leaked_tutorial:
+                step_fail("以下 tutorial sandbox 未清理: " + ", ".join(leaked_tutorial))
+            else:
+                step_ok("本次 tutorial 创建的 sandbox 已全部清理")
+
     # ----------------------------------------------------------
     # 完成
     # ----------------------------------------------------------
     banner("全部测试完成")
-    print("  所有远程 SDK 接口已依次测试。")
-    print("  如有失败项，请检查 Gateway/Daemon 配置和网络连通性。\n")
+    if FAILURES:
+        print(f"  完成，但有 {len(FAILURES)} 个失败项:")
+        for failure in FAILURES:
+            print(f"    - {failure}")
+        print()
+        raise SystemExit(1)
+    print("  所有远程 SDK 接口已依次测试并通过。\n")
 
 
 if __name__ == "__main__":
