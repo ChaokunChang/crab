@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime
 import logging
+from pathlib import Path
 from threading import Lock
 from typing import Callable, Protocol
 
@@ -249,6 +250,25 @@ class InMemorySchedulerStateStore(SchedulerStateStore):
         with self._lock:
             return self._process_chain_length.get(sandbox_id, 0)
 
+    def set_process_checkpoint_base(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+        *,
+        chain_length: int,
+    ) -> None:
+        if chain_length < 0:
+            raise ValueError("chain_length must be >= 0")
+        with self._lock:
+            self._last_process_checkpoint[sandbox_id] = checkpoint_id
+            self._process_chain_length[sandbox_id] = chain_length
+        logger.debug(
+            "Set process checkpoint base sandbox=%s checkpoint=%s chain_length=%d",
+            sandbox_id,
+            checkpoint_id,
+            chain_length,
+        )
+
 
 class CheckpointingPolicy:
     """
@@ -446,6 +466,101 @@ class CRScheduler:
         with self._deactivated_lock:
             return sandbox_id in self._deactivated
 
+    def _resolve_incremental_decision(
+        self,
+        decision: SchedulerCheckpointDecision,
+        sandbox_id: SandboxId,
+        *,
+        baseline_available: bool = True,
+    ) -> SchedulerCheckpointDecision:
+        """Apply incremental policy only when the runtime can honor it.
+
+        Scheduler state can legitimately point at a standalone full process
+        checkpoint: manual checkpoints, restores of legacy manifests, and a
+        daemon that was upgraded from an incremental-disabled configuration
+        can all establish such a base.  Those checkpoints have no ``pre_dump``
+        directory and therefore cannot be used as CRIU incremental parents.
+        Treat them as a request for a fresh chain anchor instead of handing an
+        invalid parent to runc.
+
+        ``baseline_available=False`` deliberately ignores any stale in-memory
+        parent.  The resulting first requested checkpoint is still passed
+        through the incremental resolver so it produces the pre-dump anchor
+        needed by the next process-changing turn.
+        """
+        if (
+            not self._config.incremental_process_enabled
+            or not decision.should_checkpoint
+            or not decision.checkpoint_process
+        ):
+            return decision
+        try:
+            supports_incremental = bool(
+                self._runtime.capabilities().supports_incremental_process
+            )
+        except Exception:
+            logger.warning(
+                "Unable to read runtime incremental capability for sandbox=%s; "
+                "using a standalone full checkpoint",
+                sandbox_id,
+                exc_info=True,
+            )
+            return decision
+        if not supports_incremental:
+            return decision
+
+        parent_checkpoint_id = (
+            self._state.get_last_process_checkpoint(sandbox_id)
+            if baseline_available
+            else None
+        )
+        process_chain_length = (
+            self._state.get_process_chain_length(sandbox_id)
+            if baseline_available
+            else 0
+        )
+        reset_parent_id: CheckpointId | None = None
+        if parent_checkpoint_id is not None:
+            try:
+                parent_path_raw = self._runtime.pre_dump_location(
+                    sandbox_id, parent_checkpoint_id
+                )
+                parent_available = bool(
+                    parent_path_raw and Path(parent_path_raw).is_dir()
+                )
+            except Exception:
+                parent_available = False
+                logger.warning(
+                    "Unable to inspect incremental parent sandbox=%s checkpoint=%s; "
+                    "forcing a fresh chain anchor",
+                    sandbox_id,
+                    parent_checkpoint_id,
+                    exc_info=True,
+                )
+            if not parent_available:
+                reset_parent_id = parent_checkpoint_id
+                parent_checkpoint_id = None
+                process_chain_length = 0
+                logger.info(
+                    "Incremental parent has no usable pre-dump; forcing a fresh "
+                    "chain anchor sandbox=%s checkpoint=%s",
+                    sandbox_id,
+                    reset_parent_id,
+                )
+
+        resolved = _resolve_incremental_process(
+            decision,
+            config=self._config,
+            last_process_checkpoint_id=parent_checkpoint_id,
+            process_chain_length=process_chain_length,
+        )
+        if reset_parent_id is not None:
+            metadata = dict(resolved.metadata)
+            metadata["incremental_parent_reset_reason"] = "missing_pre_dump"
+            metadata["incremental_parent_candidate"] = str(reset_parent_id)
+            resolved = replace(resolved, metadata=metadata)
+        return resolved
+
     def evaluate(self, sandbox: SandboxSnapshot) -> SchedulerCheckpointDecision:
         operation = start_operation(
             self._telemetry,
@@ -467,11 +582,9 @@ class CRScheduler:
                     last.isoformat(),
                 )
         decision = self._policy.evaluate(hydrated)
-        decision = _resolve_incremental_process(
+        decision = self._resolve_incremental_decision(
             decision,
-            config=self._config,
-            last_process_checkpoint_id=self._state.get_last_process_checkpoint(hydrated.sandbox_id),
-            process_chain_length=self._state.get_process_chain_length(hydrated.sandbox_id),
+            hydrated.sandbox_id,
         )
         log_fn = logger.info if decision.should_checkpoint else logger.debug
         log_fn(
@@ -583,17 +696,11 @@ class CRScheduler:
                 },
             )
 
-        if baseline_available:
-            decision = _resolve_incremental_process(
-                decision,
-                config=self._config,
-                last_process_checkpoint_id=self._state.get_last_process_checkpoint(
-                    hydrated.sandbox_id
-                ),
-                process_chain_length=self._state.get_process_chain_length(
-                    hydrated.sandbox_id
-                ),
-            )
+        decision = self._resolve_incremental_decision(
+            decision,
+            hydrated.sandbox_id,
+            baseline_available=baseline_available,
+        )
         log_fn = logger.info if decision.should_checkpoint else logger.debug
         log_fn(
             "Scheduler evaluated requested checkpoint sandbox=%s "
@@ -817,21 +924,31 @@ class CRScheduler:
         *,
         process_checkpoint_id: CheckpointId | None = None,
         is_incremental_process: bool = False,
+        process_chain_length: int | None = None,
     ) -> None:
         ts = at or utc_now()
         self._state.set_last_checkpoint(sandbox_id, ts)
         if process_checkpoint_id is not None:
-            self._state.record_process_checkpoint(
-                sandbox_id,
-                process_checkpoint_id,
-                is_incremental=is_incremental_process,
-            )
+            if process_chain_length is None:
+                self._state.record_process_checkpoint(
+                    sandbox_id,
+                    process_checkpoint_id,
+                    is_incremental=is_incremental_process,
+                )
+            else:
+                self._state.set_process_checkpoint_base(
+                    sandbox_id,
+                    process_checkpoint_id,
+                    chain_length=process_chain_length,
+                )
         logger.info(
-            "Marked checkpoint complete for sandbox %s at %s process=%s incremental=%s",
+            "Marked checkpoint complete for sandbox %s at %s process=%s "
+            "incremental=%s chain_length=%s",
             sandbox_id,
             ts.isoformat(),
             process_checkpoint_id,
             is_incremental_process,
+            process_chain_length,
         )
         self._telemetry.emit_event(
             "scheduler.checkpoint_complete",
@@ -840,5 +957,6 @@ class CRScheduler:
                 "at": ts.isoformat(),
                 "process_checkpoint_id": (None if process_checkpoint_id is None else str(process_checkpoint_id)),
                 "is_incremental_process": is_incremental_process,
+                "process_chain_length": process_chain_length,
             },
         )

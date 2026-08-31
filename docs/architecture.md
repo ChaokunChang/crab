@@ -155,7 +155,7 @@ The benchmark YAML `scheduler:` block can override that flag, but the repository
 
 ## Incremental Process Checkpoint Chains
 
-Opt-in via `SchedulerConfig.incremental_process_enabled=True`. Default off. When enabled, the scheduler's decision passes a `produce_pre_dump=True` flag down to the worker for every chain participant — anchors and chain nodes alike. The flag travels on `SchedulerCheckpointDecision` and `CheckpointJob`, separate from `is_incremental_process` (which discriminates "this checkpoint chains off a parent's pre-dump" from "this is a chain root").
+Enabled by default via `SchedulerConfig.incremental_process_enabled=True` for runtimes that advertise incremental-process support. Operators can disable it for high-dirty-memory workloads. When enabled, the scheduler's decision passes a `produce_pre_dump=True` flag down to the worker for every chain participant — anchors and chain nodes alike. The flag travels on `SchedulerCheckpointDecision` and `CheckpointJob`, separate from `is_incremental_process` (which discriminates "this checkpoint chains off a parent's pre-dump" from "this is a chain root").
 
 `AdapterProcessCWorker.checkpoint(...)` runs a two-phase CRIU dance whenever `produce_pre_dump=True` and the runtime advertises `supports_incremental_process=True`:
 
@@ -171,6 +171,15 @@ The scheduler's `InMemorySchedulerStateStore` tracks `last_process_checkpoint_id
 - otherwise → emit a chain node (`is_incremental_process=True`, `parent_process_checkpoint_id=last_id`)
 
 `mark_checkpoint_complete(...)` records each successful process checkpoint. The chain length resets to 0 on anchors and increments on nodes.
+
+Before selecting a chain node, the scheduler verifies that the runtime supports
+incremental process checkpoints and that the candidate parent's `pre_dump/`
+directory still exists. The system rechecks both the stored parent manifest
+and runtime directory at the execution boundary. A manual/legacy standalone
+full checkpoint or a removed parent therefore starts a fresh anchor instead
+of producing a dangling incremental manifest. Restoring an incremental point
+reconstructs its persisted chain depth so the configured interval and maximum
+remain accurate after historical restores.
 
 ### Restore-time chain validation
 

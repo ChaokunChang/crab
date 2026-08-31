@@ -38,6 +38,7 @@ from .models import (
     RestoreResult,
     SandboxId,
     SandboxSnapshot,
+    SchedulerCheckpointDecision,
     utc_now,
 )
 from . import forking
@@ -659,13 +660,21 @@ class CrabSystem:
                     )
                     # A restore changes which historical process image the
                     # live sandbox descends from. Reset the incremental
-                    # scheduler base to that exact source; retaining a newer
-                    # pre-restore parent can create a divergent CRIU chain.
+                    # scheduler base to that exact source and its persisted
+                    # depth; retaining a newer pre-restore parent creates a
+                    # divergent CRIU chain, while resetting the depth to zero
+                    # can exceed the configured maximum after a historical
+                    # incremental restore.
+                    process_chain_length = self._stored_process_chain_length(
+                        sandbox_id,
+                        process_source_id,
+                    )
                     self.scheduler.mark_checkpoint_complete(
                         sandbox_id,
                         restored_at,
                         process_checkpoint_id=process_source_id,
-                        is_incremental_process=False,
+                        is_incremental_process=process_chain_length > 0,
+                        process_chain_length=process_chain_length,
                     )
                 self.inspector.mark_checkpoint_complete(
                     sandbox_id,
@@ -4299,6 +4308,96 @@ class CrabSystem:
             )
         return None
 
+    def _ensure_incremental_parent_available(
+        self,
+        sandbox_id: SandboxId,
+        decision: SchedulerCheckpointDecision,
+    ) -> SchedulerCheckpointDecision:
+        """Downgrade an unusable incremental parent to a fresh anchor.
+
+        The scheduler checks the runtime pre-dump before returning its
+        decision.  Re-check here at the execution boundary and also require a
+        stored process manifest: retention may have removed a restored source,
+        or external cleanup may race the scheduler check.  Creating an anchor
+        preserves the requested recovery point without emitting a manifest
+        whose parent chain can never be restored.
+        """
+        if not decision.is_incremental_process:
+            return decision
+        parent_id = decision.parent_process_checkpoint_id
+        reset_reason: str | None = None
+        if parent_id is None:
+            reset_reason = "missing_parent_id"
+        else:
+            try:
+                parent_manifest = self.storage.get_manifest(
+                    sandbox_id, parent_id
+                )
+            except Exception:
+                reset_reason = "missing_parent_manifest"
+            else:
+                if not parent_manifest.process_artifacts:
+                    reset_reason = "missing_parent_process_artifacts"
+            if reset_reason is None:
+                try:
+                    parent_path_raw = self.runtime.pre_dump_location(
+                        sandbox_id, parent_id
+                    )
+                    if not parent_path_raw or not Path(parent_path_raw).is_dir():
+                        reset_reason = "missing_pre_dump"
+                except Exception:
+                    reset_reason = "missing_pre_dump"
+
+        if reset_reason is None:
+            return decision
+        metadata = dict(decision.metadata)
+        metadata.pop("incremental_process", None)
+        metadata["incremental_chain_role"] = "anchor"
+        metadata["process_chain_length_after"] = 0
+        metadata["incremental_parent_reset_reason"] = reset_reason
+        if parent_id is not None:
+            metadata["incremental_parent_candidate"] = str(parent_id)
+        logger.warning(
+            "Incremental parent is unusable at checkpoint execution; forcing "
+            "a fresh anchor sandbox=%s checkpoint=%s reason=%s",
+            sandbox_id,
+            parent_id,
+            reset_reason,
+        )
+        return replace(
+            decision,
+            is_incremental_process=False,
+            parent_process_checkpoint_id=None,
+            produce_pre_dump=True,
+            metadata=metadata,
+        )
+
+    def _stored_process_chain_length(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> int:
+        """Return the persisted incremental depth of a physical process source."""
+        length = 0
+        cursor = checkpoint_id
+        visited: set[CheckpointId] = set()
+        while True:
+            if cursor in visited:
+                raise ValueError(
+                    f"cycle in process checkpoint chain at {cursor}"
+                )
+            visited.add(cursor)
+            manifest = self.storage.get_manifest(sandbox_id, cursor)
+            if manifest.process_kind != "incremental":
+                return length
+            parent_id = manifest.parent_checkpoint_id
+            if parent_id is None:
+                raise ValueError(
+                    f"incremental process checkpoint {cursor} has no parent"
+                )
+            length += 1
+            cursor = parent_id
+
     def _execute_requested_checkpoint_flow(
         self,
         sandbox_id: SandboxId,
@@ -4356,6 +4455,9 @@ class CrabSystem:
                 sandbox_id,
                 baseline_available=restore_sources is not None,
                 leave_running=leave_running,
+            )
+            decision = self._ensure_incremental_parent_available(
+                sandbox_id, decision
             )
             checkpoint_metadata = self._build_checkpoint_metadata(
                 sandbox_id, pending_request=pending_request
@@ -4609,6 +4711,9 @@ class CrabSystem:
         )
         prior_restore_sources = self._latest_restore_sources(sandbox_id)
         decision = self.scheduler.query_checkpoint(sandbox_id)
+        decision = self._ensure_incremental_parent_available(
+            sandbox_id, decision
+        )
         if not decision.should_checkpoint:
             operation.finish(status="skipped", attributes={"reason": decision.reason})
             return None

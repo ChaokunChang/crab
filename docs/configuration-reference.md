@@ -131,7 +131,7 @@ scheduler:
   prefer_checkpoint_during_llm_request: true
   require_llm_request_for_checkpoint: false
   inspect_without_pause: false
-  incremental_process_enabled: false
+  incremental_process_enabled: true
 ```
 
 Important settings:
@@ -144,8 +144,12 @@ Important settings:
   active intercepted request window.
 - `inspect_without_pause`: live inspection is opt-in; the safer default pauses
   before inspection.
-- `incremental_process_enabled`: opt in to CRIU pre-dump chains. Keep it off
-  until the workload and retention policy have been validated together.
+- `incremental_process_enabled`: use CRIU pre-dump chains when the runtime
+  supports them. This is on by default for runc; runtimes without the
+  capability continue to create standalone full checkpoints. Set it to
+  `false` for workloads that dirty most memory between every checkpoint, or
+  when operating against a custom retention policy that has not been
+  validated with incremental ancestors.
 
 Manual `crab checkpoint create` and `Sandbox.checkpoint()` force a checkpoint;
 they do not wait for the automatic scheduler to become due.

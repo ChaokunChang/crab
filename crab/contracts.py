@@ -642,3 +642,23 @@ class SchedulerStateStore(ABC):
         """
         _ = sandbox_id
         return 0
+
+    def set_process_checkpoint_base(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+        *,
+        chain_length: int,
+    ) -> None:
+        """Set an exact process-chain cursor after restoring history.
+
+        Stores predating exact chain tracking retain safe behavior by treating
+        the restored point as a full base. Implementations that track chain
+        length should override this method.
+        """
+        _ = chain_length
+        self.record_process_checkpoint(
+            sandbox_id,
+            checkpoint_id,
+            is_incremental=False,
+        )
