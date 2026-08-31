@@ -725,10 +725,13 @@ echo reaped
             step_warn("当前为 host 网络模式；端口暴露仅适用于 isolated netns，跳过")
         else:
             try:
-                # 在沙箱内后台起一个 python HTTP server
+                # 完整脱离 stdio；否则 runc exec 会一直等待继承了管道的
+                # 后台进程，并在 timeout 后按契约回收它。
                 sandbox.commands.run(
-                    "python3 -m http.server 8080 --directory /tmp &",
+                    "nohup python3 -m http.server 8080 --directory /tmp "
+                    ">/tmp/crab-tutorial-http.log 2>&1 </dev/null &",
                     timeout=3.0,
+                    check=True,
                 )
                 # 等待 server 启动
                 time.sleep(1)
