@@ -86,7 +86,7 @@ scheduler:
   prefer_checkpoint_during_llm_request: true
   require_llm_request_for_checkpoint: false
   inspect_without_pause: false
-  incremental_process_enabled: false
+  incremental_process_enabled: true
 
 runc:
   command_timeout_seconds: 120.0

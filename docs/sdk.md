@@ -164,9 +164,9 @@ the inspector to choose the physical work needed for that recovery point:
   to the previous physical restore sources;
 - a filesystem-only change creates only a filesystem checkpoint and reuses the
   previous process image;
-- a process change captures process + filesystem state; when incremental
-  process checkpoints are enabled, the existing incremental policy still
-  chooses the process representation.
+- a process change captures process + filesystem state; runc uses incremental
+  process checkpoints by default and periodically creates a fresh chain
+  anchor. Operators can disable this for high-dirty-memory workloads.
 
 Requested recovery points are not dropped by the automatic scheduler's time
 window. If state changed, Crab materializes it even when the normal minimum

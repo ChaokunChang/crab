@@ -18,7 +18,7 @@ class SchedulerConfig:
     prefer_checkpoint_during_llm_request: bool = True
     require_llm_request_for_checkpoint: bool = False
     inspect_without_pause: bool = False
-    incremental_process_enabled: bool = False
+    incremental_process_enabled: bool = True
     full_process_checkpoint_interval: int = 8
     max_process_chain_length: int = 16
 
