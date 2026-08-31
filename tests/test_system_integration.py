@@ -316,6 +316,188 @@ class SystemIntegrationTests(unittest.TestCase):
         )
         return system, executor
 
+    def test_requested_logical_checkpoints_reuse_or_partially_materialize(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="crab_logical_ckpt_") as tmp:
+            root = Path(tmp)
+            runner = FakeCommandRunner()
+            telemetry = InMemoryTelemetrySink()
+            inspector = EBPFSandboxInspector(InMemoryEBPFEventCollector())
+            system, executor = self._build_runc_system(
+                root=root,
+                runner=runner,
+                telemetry=telemetry,
+                inspector=inspector,
+            )
+            sandbox_id = system.sandbox_manager.launch(
+                "runc",
+                {
+                    "sandbox_id": "sbx-logical",
+                    "bundle_path": str(root / "bundles" / "sbx-logical"),
+                },
+            )
+
+            try:
+                inspector.upsert_snapshot(
+                    SandboxSnapshot(
+                        sandbox_id=sandbox_id,
+                        runtime_name="runc",
+                        is_running=True,
+                        process_changed=False,
+                        filesystem_changed=False,
+                        observed_at=utc_now(),
+                    )
+                )
+                baseline = system.checkpoint_requested(
+                    sandbox_id,
+                    checkpoint_id="ckpt-logical-1",
+                )
+                self.assertEqual(baseline.status, JobStatus.SUCCEEDED)
+                assert baseline.manifest is not None
+                self.assertTrue(baseline.manifest.process_artifacts)
+                self.assertTrue(baseline.manifest.filesystem_artifacts)
+                self.assertEqual(
+                    baseline.manifest.metadata["checkpoint_materialization"],
+                    "full",
+                )
+
+                physical_commands_before_reuse = [
+                    command
+                    for command in runner.commands
+                    if (command and command[0] == "runc" and "checkpoint" in command)
+                    or command[:2] == ("zfs", "snapshot")
+                ]
+                inspector.upsert_snapshot(
+                    SandboxSnapshot(
+                        sandbox_id=sandbox_id,
+                        runtime_name="runc",
+                        is_running=True,
+                        process_changed=False,
+                        filesystem_changed=False,
+                        observed_at=utc_now(),
+                        last_checkpoint_at=baseline.finished_at,
+                    )
+                )
+                reused = system.checkpoint_requested(
+                    sandbox_id,
+                    checkpoint_id="ckpt-logical-2",
+                )
+                self.assertEqual(reused.status, JobStatus.SUCCEEDED)
+                assert reused.manifest is not None
+                self.assertEqual(reused.checkpoint_id, CheckpointId("ckpt-logical-2"))
+                self.assertEqual(reused.manifest.process_artifacts, [])
+                self.assertEqual(reused.manifest.filesystem_artifacts, [])
+                self.assertEqual(
+                    reused.manifest.metadata["checkpoint_materialization"],
+                    "reused",
+                )
+                self.assertEqual(
+                    reused.manifest.metadata["process_restore_checkpoint_id"],
+                    "ckpt-logical-1",
+                )
+                self.assertEqual(
+                    reused.manifest.metadata["filesystem_restore_checkpoint_id"],
+                    "ckpt-logical-1",
+                )
+                physical_commands_after_reuse = [
+                    command
+                    for command in runner.commands
+                    if (command and command[0] == "runc" and "checkpoint" in command)
+                    or command[:2] == ("zfs", "snapshot")
+                ]
+                self.assertEqual(
+                    physical_commands_after_reuse,
+                    physical_commands_before_reuse,
+                )
+                resolved_reuse = system._resolve_restore_manifest(
+                    sandbox_id, reused.checkpoint_id
+                )
+                self.assertTrue(resolved_reuse.process_artifacts)
+                self.assertTrue(resolved_reuse.filesystem_artifacts)
+
+                inspector.upsert_snapshot(
+                    SandboxSnapshot(
+                        sandbox_id=sandbox_id,
+                        runtime_name="runc",
+                        is_running=True,
+                        process_changed=False,
+                        filesystem_changed=True,
+                        observed_at=utc_now(),
+                        last_checkpoint_at=baseline.finished_at,
+                    )
+                )
+                partial = system.checkpoint_requested(
+                    sandbox_id,
+                    checkpoint_id="ckpt-logical-3",
+                )
+                self.assertEqual(partial.status, JobStatus.SUCCEEDED)
+                assert partial.manifest is not None
+                self.assertEqual(partial.manifest.process_artifacts, [])
+                self.assertTrue(partial.manifest.filesystem_artifacts)
+                self.assertEqual(
+                    partial.manifest.metadata["checkpoint_materialization"],
+                    "filesystem_only",
+                )
+                self.assertEqual(
+                    partial.manifest.metadata["process_restore_checkpoint_id"],
+                    "ckpt-logical-1",
+                )
+                self.assertEqual(
+                    partial.manifest.metadata["filesystem_restore_checkpoint_id"],
+                    "ckpt-logical-3",
+                )
+
+                system.changeset_since(
+                    sandbox_id,
+                    reused.checkpoint_id,
+                    use_inspector_gate=False,
+                )
+                self.assertIn(
+                    (
+                        "zfs",
+                        "diff",
+                        "-FH",
+                        f"pool/crab/{sandbox_id}@ckpt-logical-1",
+                        f"pool/crab/{sandbox_id}",
+                    ),
+                    runner.commands,
+                )
+
+                # Restoring an older logical point must also move Crab's
+                # adaptive-reuse cursor backwards. The newer filesystem-only
+                # point remains stored, but a clean post-restore logical id
+                # must map to the state that is actually running (baseline),
+                # not to the newest manifest on disk (partial).
+                restored = system.restore_once(
+                    sandbox_id, baseline.checkpoint_id
+                )
+                self.assertEqual(restored.status, JobStatus.SUCCEEDED)
+                after_restore = system.checkpoint_requested(
+                    sandbox_id,
+                    checkpoint_id="ckpt-logical-4",
+                )
+                self.assertEqual(after_restore.status, JobStatus.SUCCEEDED)
+                assert after_restore.manifest is not None
+                self.assertEqual(
+                    after_restore.manifest.metadata[
+                        "checkpoint_materialization"
+                    ],
+                    "reused",
+                )
+                self.assertEqual(
+                    after_restore.manifest.metadata[
+                        "process_restore_checkpoint_id"
+                    ],
+                    "ckpt-logical-1",
+                )
+                self.assertEqual(
+                    after_restore.manifest.metadata[
+                        "filesystem_restore_checkpoint_id"
+                    ],
+                    "ckpt-logical-1",
+                )
+            finally:
+                executor.shutdown()
+
     def test_recovery_workers_match_restore_workers_and_run_different_sandboxes_in_parallel(self) -> None:
         class BlockingRecoverySystem(CrabSystem):
             def __post_init__(self) -> None:

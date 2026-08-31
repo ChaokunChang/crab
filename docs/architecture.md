@@ -109,6 +109,41 @@ Two invariants matter here:
 
 `checkpoint_if_due(...)` shares the same execution path after the scheduler decision, but does not force a checkpoint if the policy declines.
 
+## Requested Logical Checkpoint Flow
+
+`commands.run(checkpoint=True)` and sandbox-level `auto_checkpoint` use
+`checkpoint_requested(...)`, not the force-full manual path:
+
+1. The SDK preallocates a logical `checkpoint_id` and returns it in an
+   `AsyncCheckpoint` handle as soon as exec/observe completes.
+2. The daemon serializes the background request with later actions and asks
+   `CRScheduler.query_requested_checkpoint(...)` for an inspector-driven
+   materialization decision.
+3. With no previous restorable state, Crab creates a full baseline. With
+   filesystem-only changes it creates a partial filesystem checkpoint. With a
+   process change it captures process + filesystem state (and may use the
+   configured incremental process representation). A clean turn creates no
+   physical data.
+4. Every successful turn persists a manifest under the logical id. A clean
+   turn's manifest has no artifacts and explicitly records
+   `process_restore_checkpoint_id` and `filesystem_restore_checkpoint_id` for
+   the physical sources it reuses.
+5. Restore, fork, changeset, retention, and deletion resolve or protect those
+   explicit component dependencies. The async job is successful only after a
+   restorable manifest exists; a failed worker result is surfaced as a failed
+   job rather than a false completion.
+
+Restore also moves the sandbox's in-memory component-source cursor to the
+restored logical point. This matters when newer manifests remain on disk: a
+clean checkpoint after rolling back to A must reuse A, not the newer stored B.
+The restored process source becomes the scheduler's next incremental parent.
+
+Automatic interval and LLM-window gates do not apply to requested logical
+points: once the inspector reports changed state, skipping physical work would
+make the logical id refer to the wrong state. The interval policy remains in
+effect for `checkpoint_if_due(...)`. Explicit `sandbox.checkpoint()` /
+`checkpoint_once(...)` remains the force-full escape hatch.
+
 ## Scheduler Inspection Modes
 
 `CRScheduler.query_checkpoint(...)` now has two inspection paths:

@@ -840,15 +840,36 @@ class _Routes:
             except Exception:
                 manifest = None
             if manifest is not None:
+                metadata = dict(manifest.metadata or {})
+                try:
+                    resolved_manifest = eng.system._resolve_restore_manifest(
+                        sid, ckpt_id
+                    )
+                except Exception:
+                    resolved_manifest = manifest
                 entry["created_at"] = (
                     manifest.created_at.isoformat() if manifest.created_at else None
                 )
-                entry["label"] = manifest.metadata.get("label") if manifest.metadata else None
+                entry["label"] = metadata.get("label")
                 entry["has_process"] = bool(
-                    getattr(manifest, "process_artifacts", None)
+                    getattr(resolved_manifest, "process_artifacts", None)
                 )
                 entry["has_filesystem"] = bool(
-                    getattr(manifest, "filesystem_artifacts", None)
+                    getattr(resolved_manifest, "filesystem_artifacts", None)
+                )
+                entry["materialized_process"] = bool(manifest.process_artifacts)
+                entry["materialized_filesystem"] = bool(
+                    manifest.filesystem_artifacts
+                )
+                entry["logical"] = bool(metadata.get("logical_checkpoint", False))
+                entry["materialization"] = metadata.get(
+                    "checkpoint_materialization"
+                )
+                entry["process_checkpoint_id"] = metadata.get(
+                    "process_restore_checkpoint_id"
+                )
+                entry["filesystem_checkpoint_id"] = metadata.get(
+                    "filesystem_restore_checkpoint_id"
                 )
             out.append(entry)
         return {"ok": True, "checkpoints": out}
@@ -1488,17 +1509,51 @@ class _Routes:
                     try:
                         # 3a. checkpoint
                         if do_checkpoint:
-                            ckpt_result = eng.system.checkpoint_once(
+                            ckpt_result = eng.system.checkpoint_requested(
                                 sid,
                                 leave_running=True,
-                                checkpoint_id=client_ckpt_id,
+                                checkpoint_id=job_id,
                             )
-                            resolved_id = (
-                                str(ckpt_result.checkpoint_id)
-                                if ckpt_result.checkpoint_id
-                                else job_id
+                            checkpoint_status = getattr(
+                                getattr(ckpt_result, "status", None),
+                                "value",
+                                getattr(ckpt_result, "status", None),
                             )
-                            result["checkpoint_id"] = resolved_id
+                            checkpoint_manifest = getattr(
+                                ckpt_result, "manifest", None
+                            )
+                            if (
+                                checkpoint_status != "succeeded"
+                                or checkpoint_manifest is None
+                            ):
+                                failure_code = getattr(
+                                    getattr(ckpt_result, "failure_code", None),
+                                    "value",
+                                    "unknown",
+                                )
+                                raise RuntimeError(
+                                    "logical checkpoint failed: "
+                                    f"status={checkpoint_status} "
+                                    f"failure_code={failure_code} "
+                                    f"message={getattr(ckpt_result, 'message', None) or ''}"
+                                )
+                            resolved_id = str(ckpt_result.checkpoint_id)
+                            if resolved_id != job_id:
+                                raise RuntimeError(
+                                    "logical checkpoint id changed during materialization: "
+                                    f"expected={job_id} actual={resolved_id}"
+                                )
+                            result["checkpoint_id"] = job_id
+                            result["checkpoint_materialization"] = (
+                                checkpoint_manifest.metadata.get(
+                                    "checkpoint_materialization", "legacy"
+                                )
+                            )
+                            result["physical_checkpoint_created"] = bool(
+                                checkpoint_manifest.metadata.get(
+                                    "physical_checkpoint_created", True
+                                )
+                            )
 
                         # 3b. changeset
                         if do_changeset:

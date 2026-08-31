@@ -978,6 +978,22 @@ def _cmd_checkpoint_ls(args: argparse.Namespace) -> int:
         return 0
     rows = []
     for ckpt in checkpoints:
+        materialization = ckpt.get("materialization")
+        if not materialization:
+            materialized_process = ckpt.get(
+                "materialized_process", ckpt.get("has_process")
+            )
+            materialized_filesystem = ckpt.get(
+                "materialized_filesystem", ckpt.get("has_filesystem")
+            )
+            if materialized_process and materialized_filesystem:
+                materialization = "full"
+            elif materialized_process:
+                materialization = "process_only"
+            elif materialized_filesystem:
+                materialization = "filesystem_only"
+            else:
+                materialization = "reused"
         rows.append(
             {
                 "CHECKPOINT_ID": ckpt.get("checkpoint_id", ""),
@@ -985,9 +1001,20 @@ def _cmd_checkpoint_ls(args: argparse.Namespace) -> int:
                 "LABEL": ckpt.get("label") or "",
                 "PROCESS": "yes" if ckpt.get("has_process") else "no",
                 "FILESYSTEM": "yes" if ckpt.get("has_filesystem") else "no",
+                "MATERIALIZATION": materialization,
             }
         )
-    _print_table(rows, columns=["CHECKPOINT_ID", "CREATED_AT", "PROCESS", "FILESYSTEM", "LABEL"])
+    _print_table(
+        rows,
+        columns=[
+            "CHECKPOINT_ID",
+            "CREATED_AT",
+            "PROCESS",
+            "FILESYSTEM",
+            "MATERIALIZATION",
+            "LABEL",
+        ],
+    )
     return 0
 
 

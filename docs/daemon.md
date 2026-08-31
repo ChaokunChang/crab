@@ -101,13 +101,18 @@ sudo crab restore "$SBX" "$CKPT"
 sudo crab checkpoint rm "$SBX" "$CKPT"
 ```
 
-`checkpoint ls` reports whether each manifest contains process state,
-filesystem state, or both. Automatic checkpoints may be filesystem-only when
-the inspector sees only filesystem changes. Manual `checkpoint create`
-requests a full process-and-filesystem checkpoint.
+`checkpoint ls` reports both logical restore availability (`has_process`,
+`has_filesystem`) and what this manifest physically materialized
+(`materialized_process`, `materialized_filesystem`). SDK action checkpoints
+also expose `materialization` plus their process/filesystem source ids: a clean
+action can therefore have a new logical id and complete restore state while
+materializing neither component. Filesystem-only changes materialize only the
+filesystem component. Manual `checkpoint create` requests a full
+process-and-filesystem checkpoint.
 
-Incremental process checkpoints form dependency chains. Deleting a parent
-with live descendants is rejected unless `--cascade` is supplied.
+Incremental process checkpoints and logical restore-source references form
+dependency chains. Deleting a physical source with live descendants is
+rejected unless `--cascade` is supplied.
 
 ### Stop, remove, and daemon shutdown
 

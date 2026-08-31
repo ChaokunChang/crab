@@ -153,12 +153,35 @@ class _RemoteStorageShim:
         if entry is None:
             raise KeyError(f"checkpoint not found: {checkpoint_id}")
         created_at = entry.get("created_at")
+        metadata = {
+            key: entry.get(source_key)
+            for key, source_key in (
+                ("label", "label"),
+                ("logical_checkpoint", "logical"),
+                ("checkpoint_materialization", "materialization"),
+                ("process_restore_checkpoint_id", "process_checkpoint_id"),
+                ("filesystem_restore_checkpoint_id", "filesystem_checkpoint_id"),
+            )
+            if entry.get(source_key) is not None
+        }
         return SimpleNamespace(
             checkpoint_id=checkpoint_id,
             created_at=(datetime.fromisoformat(str(created_at)) if created_at else None),
-            process_artifacts=([True] if entry.get("has_process") else []),
-            filesystem_artifacts=([True] if entry.get("has_filesystem") else []),
-            metadata={"label": entry.get("label")} if entry.get("label") else {},
+            process_artifacts=(
+                [True]
+                if entry.get("materialized_process", entry.get("has_process"))
+                else []
+            ),
+            filesystem_artifacts=(
+                [True]
+                if entry.get("materialized_filesystem", entry.get("has_filesystem"))
+                else []
+            ),
+            restore_process_artifacts=([True] if entry.get("has_process") else []),
+            restore_filesystem_artifacts=(
+                [True] if entry.get("has_filesystem") else []
+            ),
+            metadata=metadata,
         )
 
     def delete_checkpoint(

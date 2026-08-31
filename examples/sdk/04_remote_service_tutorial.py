@@ -319,6 +319,9 @@ echo reaped
         #   * checkpoint_id 在客户端侧预分配（ckpt-<uuid>），daemon 的
         #     /action 端点做完 exec + observe 后 *立即返回*，checkpoint
         #     在 daemon 后台线程异步执行。
+        #   * 这个 id 是 logical checkpoint id，wait 前后不会改变。daemon
+        #     根据 inspector 选择复用旧物理状态、只做 filesystem checkpoint，
+        #     或做 process + filesystem checkpoint。
         #   * observe=True 会调用 daemon 的只读 inspector peek 路由，
         #     不重置任何游标。
         #
@@ -352,6 +355,21 @@ echo reaped
             step_ok(f"checkpoint 已完成: {ckpt_id} (wait 轮询) ⏱ {wait_latency:.3f}s")
             print(f"  checkpoint 完成?: {result.checkpoint.done}")  # 期望 True
             print(f"  → exec 返回 {exec_latency:.3f}s + checkpoint 等待 {wait_latency:.3f}s")
+            checkpoint_info = next(
+                (
+                    item
+                    for item in sandbox.checkpoints.list()
+                    if item.get("checkpoint_id") == ckpt_id
+                ),
+                None,
+            )
+            if checkpoint_info is not None:
+                print(
+                    "  materialization: "
+                    f"{checkpoint_info.get('materialization')} "
+                    f"(process={checkpoint_info.get('process_checkpoint_id')}, "
+                    f"filesystem={checkpoint_info.get('filesystem_checkpoint_id')})"
+                )
         except Exception as exc:
             step_fail(f"等待 checkpoint 失败: {exc}")
 
@@ -369,9 +387,10 @@ echo reaped
         #   run#C: 等到完全空闲后再发起相同的命令 -> 无背压，作为基线
         #   背压额外延迟 ≈ run#B 延迟 - run#C 延迟
         #
-        # 重要事实：本项目 checkpoint 走 ZFS 快照，是 O(1) 写时复制，
-        # 与文件数量基本无关（实测 10240 个新文件 vs 空沙箱都 ~0.1s）。
-        # 所以真实环境下背压额外延迟通常只有 ~0.1s；背压逻辑本身由
+        # 重要事实：logical checkpoint 会由 inspector 自适应决定物理工作；
+        # 本段 run#A 写了文件，所以至少会生成 filesystem checkpoint。ZFS
+        # 快照是 O(1) 写时复制，与文件数量基本无关。无变化轮次则可完全
+        # 复用之前的物理状态。所以真实环境下背压额外延迟通常较小；逻辑由
         # 单元测试 tests/test_daemon_action_backpressure.py 注入 1s 延迟
         # 做了严格验证。
         banner("5b. 背压 — 上一个后台 checkpoint 阻塞下一个 run")
@@ -446,8 +465,9 @@ echo reaped
         # 7. auto_checkpoint 模式
         # ----------------------------------------------------------
         # Sandbox 级 auto_checkpoint=True：每次 commands.run 后自动
-        # 触发后台 checkpoint，无需每次都传 checkpoint=True。预分配的
-        # checkpoint_id 可以通过 sandbox.last_checkpoint_id 直接读出。
+        # 触发后台 logical checkpoint，无需每次都传 checkpoint=True。
+        # 预分配的 logical id 可以通过 sandbox.last_checkpoint_id 直接读出；
+        # 是否产生新物理 checkpoint、是 partial 还是 full 由 inspector 决定。
         banner("7. auto_checkpoint 模式")
         auto_sb = safe_run(
             "创建 auto_checkpoint 沙箱",

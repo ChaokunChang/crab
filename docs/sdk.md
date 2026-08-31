@@ -155,18 +155,45 @@ and checkpoints the sandbox with the process alive.
 
 ### Capturing a background process in a checkpoint
 
-`auto_checkpoint=True` (or a per-call `checkpoint=True`) takes a **full**
-checkpoint by default: a CRIU dump of every live process in the sandbox plus a
-ZFS snapshot of the filesystem. "Full" is the granularity — the checkpoint
-captures the complete set of processes that are alive *at the moment the
-checkpoint runs*, together with their memory, open files, and the filesystem.
+`auto_checkpoint=True` (or a per-call `checkpoint=True`) allocates a stable
+**logical checkpoint id** before the asynchronous work starts. Crab then uses
+the inspector to choose the physical work needed for that recovery point:
+
+- the first point creates a full process + filesystem baseline;
+- no observed change creates no new CRIU/ZFS data and maps the new logical id
+  to the previous physical restore sources;
+- a filesystem-only change creates only a filesystem checkpoint and reuses the
+  previous process image;
+- a process change captures process + filesystem state; when incremental
+  process checkpoints are enabled, the existing incremental policy still
+  chooses the process representation.
+
+Requested recovery points are not dropped by the automatic scheduler's time
+window. If state changed, Crab materializes it even when the normal minimum
+checkpoint interval has not elapsed. `result.checkpoint.wait()` always returns
+the same logical id that was available immediately after `commands.run()`.
+After completion, `result.checkpoint.materialization` reports `reused`,
+`filesystem_only`, `full`, or `incremental`, and
+`physical_checkpoint_created` tells whether this logical turn wrote new
+physical checkpoint data.
+
+The checkpoint remains asynchronous from the caller's perspective: the SDK
+returns the handle before materialization completes. On the remote service,
+the next command for the same sandbox waits behind that background checkpoint
+so it cannot mutate the state being captured; output inspection and agent-side
+planning can proceed immediately.
+
+The explicit `sandbox.checkpoint()` API remains the force-full primitive for
+callers that require a new physical CRIU + filesystem snapshot regardless of
+inspector state.
 
 The practical consequence for background processes: a process launched with
 `detach=True` (or any of the redirect recipes above) is captured only if it is
 still running when the checkpoint is taken. A short-lived command that has
 already exited leaves nothing for CRIU to dump — only its filesystem side
-effects survive in the ZFS snapshot. Restoring or forking such a checkpoint
-brings the still-live background processes back and they resume running.
+effects survive in the selected filesystem restore source. Restoring or
+forking the logical checkpoint brings back the process/filesystem composition
+recorded for that point.
 
 ### Host work directories are not rolled back
 

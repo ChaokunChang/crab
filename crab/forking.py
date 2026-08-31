@@ -12,6 +12,10 @@ from .models import CheckpointManifest
 
 logger = logging.getLogger(__name__)
 
+_LOGICAL_CHECKPOINT = "logical_checkpoint"
+_PROCESS_RESTORE_CHECKPOINT_ID = "process_restore_checkpoint_id"
+_FILESYSTEM_RESTORE_CHECKPOINT_ID = "filesystem_restore_checkpoint_id"
+
 
 @dataclass(frozen=True)
 class ForkResult:
@@ -33,10 +37,19 @@ def resolve_checkpoint_copy_plan(
     checkpoint_id: CheckpointId,
 ) -> list[tuple[CheckpointId, bool, bool]]:
     """Which (checkpoint, copy_process, copy_filesystem) tuples a fork needs
-    so the leaf checkpoint is restorable on the fork side. Moved verbatim
-    from ``benchmarks.support`` (which re-exports it) as part of the fork
-    wiring (task A3)."""
+    so the leaf checkpoint is restorable on the fork side. Logical manifests
+    use their explicit component mappings; legacy manifests retain the
+    historical nearest-artifact scan. ``benchmarks.support`` re-exports this
+    helper as part of the fork wiring (task A3)."""
     manifest = manifests[checkpoint_id]
+    if bool(manifest.metadata.get(_LOGICAL_CHECKPOINT, False)):
+        return _resolve_logical_checkpoint_copy_plan(
+            checkpoint_order,
+            manifests,
+            checkpoint_id,
+            manifest,
+        )
+
     plan: list[tuple[CheckpointId, bool, bool]] = [
         (checkpoint_id, bool(manifest.process_artifacts), bool(manifest.filesystem_artifacts))
     ]
@@ -67,6 +80,77 @@ def resolve_checkpoint_copy_plan(
 
     if need_process or need_filesystem:
         raise ValueError(f"unable to resolve restore dependencies for checkpoint {checkpoint_id}")
+    return plan
+
+
+def _resolve_logical_checkpoint_copy_plan(
+    checkpoint_order: list[CheckpointId],
+    manifests: dict[CheckpointId, CheckpointManifest],
+    checkpoint_id: CheckpointId,
+    manifest: CheckpointManifest,
+) -> list[tuple[CheckpointId, bool, bool]]:
+    """Resolve a logical leaf from its exact component mappings.
+
+    The legacy planner scans backwards for the nearest artifacts. Logical
+    manifests deliberately carry explicit mappings, so scanning can copy a
+    different recovery point when an older logical id is forked after newer
+    physical checkpoints have been recorded.
+    """
+    process_source_raw = manifest.metadata.get(_PROCESS_RESTORE_CHECKPOINT_ID)
+    filesystem_source_raw = manifest.metadata.get(
+        _FILESYSTEM_RESTORE_CHECKPOINT_ID
+    )
+    if process_source_raw is None or filesystem_source_raw is None:
+        raise ValueError(
+            f"logical checkpoint {checkpoint_id} is missing explicit "
+            "process/filesystem restore sources"
+        )
+
+    required: dict[CheckpointId, list[bool]] = {
+        checkpoint_id: [
+            bool(manifest.process_artifacts),
+            bool(manifest.filesystem_artifacts),
+        ]
+    }
+    for source_raw, component_index, component_name in (
+        (process_source_raw, 0, "process"),
+        (filesystem_source_raw, 1, "filesystem"),
+    ):
+        source_id = CheckpointId(str(source_raw))
+        source = manifests.get(source_id)
+        if source is None:
+            raise ValueError(
+                f"logical checkpoint {checkpoint_id} references missing "
+                f"{component_name} source {source_id}"
+            )
+        artifacts = (
+            source.process_artifacts
+            if component_index == 0
+            else source.filesystem_artifacts
+        )
+        if not artifacts:
+            raise ValueError(
+                f"logical checkpoint {checkpoint_id} references {component_name} "
+                f"source {source_id} without {component_name} artifacts"
+            )
+        flags = required.setdefault(source_id, [False, False])
+        flags[component_index] = True
+
+    plan: list[tuple[CheckpointId, bool, bool]] = []
+    ordered_ids = set(checkpoint_order)
+    missing_from_order = set(required).difference(ordered_ids)
+    if missing_from_order:
+        raise ValueError(
+            f"logical checkpoint {checkpoint_id} restore sources are missing "
+            f"from checkpoint order: {sorted(str(item) for item in missing_from_order)}"
+        )
+    for candidate_id in checkpoint_order:
+        if candidate_id == checkpoint_id or candidate_id not in required:
+            continue
+        copy_process, copy_filesystem = required[candidate_id]
+        plan.append((candidate_id, copy_process, copy_filesystem))
+    copy_process, copy_filesystem = required[checkpoint_id]
+    plan.append((checkpoint_id, copy_process, copy_filesystem))
     return plan
 
 

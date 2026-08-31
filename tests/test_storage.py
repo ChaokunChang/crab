@@ -687,6 +687,98 @@ class StorageTests(unittest.TestCase):
                 "ckpt-2",
             )
 
+    def test_logical_manifest_resolves_explicit_physical_sources(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
+            sid = SandboxId("sbx-logical")
+            mgr = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
+            physical = CheckpointManifest(
+                schema_version="v1",
+                checkpoint_id=CheckpointId("ckpt-physical"),
+                sandbox_id=sid,
+                created_at=utc_now(),
+                runtime_name="runc",
+                runtime_version=None,
+                process_artifacts=[self._reference(ArtifactKind.PROCESS, "p1")],
+                filesystem_artifacts=[
+                    self._reference(ArtifactKind.FILESYSTEM, "f1")
+                ],
+                metadata={},
+                parent_checkpoint_id=CheckpointId("ckpt-parent"),
+                process_kind="incremental",
+            ).with_integrity()
+            logical = CheckpointManifest(
+                schema_version="v1",
+                checkpoint_id=CheckpointId("ckpt-logical"),
+                sandbox_id=sid,
+                created_at=utc_now() + timedelta(seconds=1),
+                runtime_name="runc",
+                runtime_version=None,
+                process_artifacts=[],
+                filesystem_artifacts=[],
+                metadata={
+                    "logical_checkpoint": True,
+                    "checkpoint_materialization": "reused",
+                    "process_restore_checkpoint_id": "ckpt-physical",
+                    "filesystem_restore_checkpoint_id": "ckpt-physical",
+                },
+            ).with_integrity()
+            mgr.put_manifest(physical)
+            mgr.put_manifest(logical)
+
+            resolved = resolve_restore_manifest(mgr, logical)
+
+            self.assertEqual(resolved.checkpoint_id, CheckpointId("ckpt-logical"))
+            self.assertEqual(resolved.process_artifacts, physical.process_artifacts)
+            self.assertEqual(
+                resolved.filesystem_artifacts, physical.filesystem_artifacts
+            )
+            self.assertEqual(resolved.process_kind, "incremental")
+            self.assertEqual(
+                resolved.parent_checkpoint_id, CheckpointId("ckpt-parent")
+            )
+
+    def test_physical_checkpoint_delete_protects_logical_descendant(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
+            sid = SandboxId("sbx-logical")
+            mgr = LocalCheckpointManager(StorageConfig(root_dir=Path(tmp)))
+            physical_id = CheckpointId("ckpt-physical")
+            logical_id = CheckpointId("ckpt-logical")
+            for manifest in (
+                CheckpointManifest(
+                    schema_version="v1",
+                    checkpoint_id=physical_id,
+                    sandbox_id=sid,
+                    created_at=utc_now(),
+                    runtime_name="runc",
+                    runtime_version=None,
+                    process_artifacts=[],
+                    filesystem_artifacts=[],
+                    metadata={},
+                ).with_integrity(),
+                CheckpointManifest(
+                    schema_version="v1",
+                    checkpoint_id=logical_id,
+                    sandbox_id=sid,
+                    created_at=utc_now() + timedelta(seconds=1),
+                    runtime_name="runc",
+                    runtime_version=None,
+                    process_artifacts=[],
+                    filesystem_artifacts=[],
+                    metadata={
+                        "logical_checkpoint": True,
+                        "process_restore_checkpoint_id": str(physical_id),
+                        "filesystem_restore_checkpoint_id": str(physical_id),
+                    },
+                ).with_integrity(),
+            ):
+                mgr.put_manifest(manifest)
+
+            with self.assertRaisesRegex(RuntimeError, "logical restore dependents"):
+                mgr.delete_checkpoint(sid, physical_id)
+
+            mgr.delete_checkpoint(sid, physical_id, cascade=True)
+            self.assertEqual(mgr.list_checkpoints(sid), [])
+
     def test_delete_after_restore_manager_removes_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
             sid = SandboxId("sbx-1")

@@ -76,7 +76,7 @@ class _FakeSystem:
         self.since_calls: list[tuple[SandboxId, CheckpointId, bool]] = []
         self.checkpoint_barrier: threading.Event | None = None
 
-    def checkpoint_once(self, sandbox_id, *, leave_running=True, checkpoint_id=None):
+    def checkpoint_requested(self, sandbox_id, *, leave_running=True, checkpoint_id=None):
         if self.checkpoint_barrier is not None:
             self.checkpoint_barrier.wait(timeout=5.0)
         self.checkpoint_calls.append(
@@ -91,9 +91,22 @@ class _FakeSystem:
         ckpt = CheckpointId(str(resolved))
         return SimpleNamespace(
             checkpoint_id=ckpt,
-            manifest=SimpleNamespace(checkpoint_id=ckpt),
+            manifest=SimpleNamespace(
+                checkpoint_id=ckpt,
+                metadata={
+                    "checkpoint_materialization": "full",
+                    "physical_checkpoint_created": True,
+                },
+            ),
             status=JobStatus.SUCCEEDED,
             message="",
+        )
+
+    def checkpoint_once(self, sandbox_id, *, leave_running=True, checkpoint_id=None):
+        return self.checkpoint_requested(
+            sandbox_id,
+            leave_running=leave_running,
+            checkpoint_id=checkpoint_id,
         )
 
     def fork_changeset(self, sandbox_id, *, force=False):
@@ -266,6 +279,8 @@ class AsyncCheckpointTests(unittest.TestCase):
         returned_id = result.checkpoint.wait(timeout=5.0)
         self.assertEqual(returned_id, result.checkpoint.checkpoint_id)
         self.assertTrue(result.checkpoint.done)
+        self.assertEqual(result.checkpoint.materialization, "full")
+        self.assertTrue(result.checkpoint.physical_checkpoint_created)
         # The daemon received the client-preallocated id verbatim.
         self.assertEqual(len(system.checkpoint_calls), 1)
         self.assertEqual(
@@ -292,7 +307,7 @@ class AsyncCheckpointTests(unittest.TestCase):
         def _fail(*_a, **_k):
             raise RuntimeError("checkpoint blew up")
 
-        system.checkpoint_once = _fail  # type: ignore[assignment]
+        system.checkpoint_requested = _fail  # type: ignore[assignment]
         result = sbx.commands.run("make", checkpoint=True)
         assert result.checkpoint is not None
         with self.assertRaises(RuntimeError):
@@ -446,7 +461,7 @@ class ObserveTests(unittest.TestCase):
         # the peek is guaranteed to see the pre-reset state.
         #
         # We express the invariant deterministically by having the fake
-        # `checkpoint_once` mirror the real reset side-effect (zeroing the
+        # `checkpoint_requested` mirror the real reset side-effect (zeroing the
         # inspector's dirty flags). If peek ran after the checkpoint thread
         # had already run, it would observe the post-reset False; because
         # peek now runs first on the main thread, it captures True.
@@ -462,7 +477,7 @@ class ObserveTests(unittest.TestCase):
 
         inspector.inspect = tracking_inspect  # type: ignore[assignment]
 
-        orig_checkpoint = system.checkpoint_once
+        orig_checkpoint = system.checkpoint_requested
 
         def resetting_checkpoint(sandbox_id, *, leave_running=True, checkpoint_id=None):
             # Mirror host-inspector's `reset()` triggered by
@@ -478,7 +493,7 @@ class ObserveTests(unittest.TestCase):
                 checkpoint_id=checkpoint_id,
             )
 
-        system.checkpoint_once = resetting_checkpoint  # type: ignore[assignment]
+        system.checkpoint_requested = resetting_checkpoint  # type: ignore[assignment]
 
         result = sbx.commands.run("touch x", checkpoint=True, observe=True)
         assert result.checkpoint is not None
@@ -601,6 +616,8 @@ class _FakeRuntimeWithBatchAction(_FakeRuntime):
                 response["checkpoint_status"] = "pending"
                 response["checkpoint_id"] = job_id
                 job_result["checkpoint_id"] = job_id
+                job_result["checkpoint_materialization"] = "full"
+                job_result["physical_checkpoint_created"] = True
             if changeset:
                 response["changeset_status"] = "pending"
                 job_result["changeset"] = {
@@ -660,6 +677,8 @@ class BatchActionTests(unittest.TestCase):
         self.assertTrue(result.checkpoint.done)
         self.assertTrue(ckpt_id.startswith("ckpt-"))
         self.assertEqual(sbx.last_checkpoint_id, ckpt_id)
+        self.assertEqual(result.checkpoint.materialization, "full")
+        self.assertTrue(result.checkpoint.physical_checkpoint_created)
 
     def test_batch_checkpoint_initially_pending_then_completes(self) -> None:
         """Verify the async flow: daemon returns pending, SDK polls until complete."""
@@ -688,6 +707,20 @@ class BatchActionTests(unittest.TestCase):
         ckpt_id = result.checkpoint.wait(timeout=2.0)
         self.assertTrue(result.checkpoint.done)
         self.assertEqual(ckpt_id, job_id)
+
+    def test_batch_checkpoint_failure_remains_failed_after_done_poll(self) -> None:
+        sbx, _system, runtime = _make_batch_sandbox()
+        result = sbx.commands.run("echo hi", checkpoint=True)
+        assert result.checkpoint is not None
+        job_id = runtime.batch_calls[-1]["checkpoint_id"]
+        runtime._job_results[job_id] = {
+            "status": "failed",
+            "error": "logical checkpoint failed: dump failed",
+        }
+
+        self.assertTrue(result.checkpoint.done)
+        with self.assertRaisesRegex(RuntimeError, "dump failed"):
+            result.checkpoint.wait(timeout=2.0)
 
     def test_batch_used_when_changeset_true(self) -> None:
         sbx, _system, runtime = _make_batch_sandbox()
