@@ -442,6 +442,86 @@ class RemoteSandboxBaselineRealTests(unittest.TestCase):
             )
         self.assertEqual(sandbox._last_checkpoint_id, previous)
 
+    def test_action_checkpoint_returns_stable_logical_id_and_reuses_clean_state(self) -> None:
+        sandbox = self._sandbox("ubuntu:22.04", network=False)
+
+        first = sandbox.commands.run(
+            "echo logical-state >/tmp/logical-state",
+            checkpoint=True,
+            observe=True,
+        )
+        assert first.checkpoint is not None
+        first_id = first.checkpoint.checkpoint_id
+        self.assertEqual(first.checkpoint.wait(timeout=120.0), first_id)
+        self.assertEqual(first.checkpoint.materialization, "full")
+        self.assertTrue(first.checkpoint.physical_checkpoint_created)
+
+        clean = sandbox.commands.run("true", checkpoint=True, observe=True)
+        assert clean.checkpoint is not None
+        clean_id = clean.checkpoint.checkpoint_id
+        self.assertNotEqual(clean_id, first_id)
+        self.assertEqual(clean.checkpoint.wait(timeout=120.0), clean_id)
+        self.assertEqual(clean.checkpoint.materialization, "reused")
+        self.assertFalse(clean.checkpoint.physical_checkpoint_created)
+
+        listed = {
+            str(item["checkpoint_id"]): item
+            for item in sandbox.checkpoints.list()
+        }
+        self.assertEqual(listed[clean_id]["materialization"], "reused")
+        self.assertFalse(listed[clean_id]["materialized_process"])
+        self.assertFalse(listed[clean_id]["materialized_filesystem"])
+        self.assertEqual(listed[clean_id]["process_checkpoint_id"], first_id)
+        self.assertEqual(listed[clean_id]["filesystem_checkpoint_id"], first_id)
+
+        fork = sandbox.fork(count=1, checkpoint_id=clean_id)[0]
+        self.addCleanup(fork.kill)
+        forked = fork.commands.run("cat /tmp/logical-state", check=True)
+        self.assertEqual(forked.stdout.strip(), "logical-state")
+        fork.kill()
+
+        sandbox.restore(clean_id)
+        restored = sandbox.commands.run("cat /tmp/logical-state", check=True)
+        self.assertEqual(restored.stdout.strip(), "logical-state")
+
+        filesystem_change = sandbox.commands.run(
+            "echo filesystem-only >/tmp/filesystem-only",
+            checkpoint=True,
+            observe=True,
+        )
+        assert filesystem_change.checkpoint is not None
+        filesystem_id = filesystem_change.checkpoint.checkpoint_id
+        self.assertEqual(
+            filesystem_change.checkpoint.wait(timeout=120.0), filesystem_id
+        )
+        self.assertEqual(
+            filesystem_change.checkpoint.materialization, "filesystem_only"
+        )
+        self.assertTrue(
+            filesystem_change.checkpoint.physical_checkpoint_created
+        )
+        listed = {
+            str(item["checkpoint_id"]): item
+            for item in sandbox.checkpoints.list()
+        }
+        self.assertEqual(
+            listed[filesystem_id]["process_checkpoint_id"], first_id
+        )
+        self.assertEqual(
+            listed[filesystem_id]["filesystem_checkpoint_id"], filesystem_id
+        )
+        self.assertFalse(listed[filesystem_id]["materialized_process"])
+        self.assertTrue(listed[filesystem_id]["materialized_filesystem"])
+
+        sandbox.restore(filesystem_id)
+        restored = sandbox.commands.run(
+            "cat /tmp/logical-state /tmp/filesystem-only", check=True
+        )
+        self.assertEqual(
+            restored.stdout.splitlines(),
+            ["logical-state", "filesystem-only"],
+        )
+
     def test_port_exposure_rejects_host_and_works_in_isolated_mode(self) -> None:
         host = self._sandbox("python:3.12-slim", network=False)
         with self.assertRaises(CloudRequestError) as caught:

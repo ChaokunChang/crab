@@ -43,11 +43,23 @@ class _FakeSystem:
             )
         )
 
-    def checkpoint_once(self, sid, *, leave_running=True, checkpoint_id=None):
+    def checkpoint_requested(self, sid, *, leave_running=True, checkpoint_id=None):
         # Simulate a slow checkpoint (e.g. large ZFS snapshot).
         time.sleep(self._ckpt_delay)
         self._log.append(("ckpt_done", str(checkpoint_id), time.monotonic()))
-        return SimpleNamespace(checkpoint_id=checkpoint_id or "ckpt-auto")
+        resolved = checkpoint_id or "ckpt-auto"
+        return SimpleNamespace(
+            checkpoint_id=resolved,
+            status=JobStatus.SUCCEEDED,
+            failure_code=FailureCode.NONE,
+            message=None,
+            manifest=SimpleNamespace(
+                metadata={
+                    "checkpoint_materialization": "full",
+                    "physical_checkpoint_created": True,
+                }
+            ),
+        )
 
 
 class _FakeDaemon:
@@ -173,6 +185,33 @@ class CheckpointBackpressureTests(unittest.TestCase):
         self.assertLess(time.monotonic() - t1, 0.5)
         self._wait_for_jobs_idle(sbx)
 
+    def test_failed_checkpoint_result_marks_async_job_failed(self) -> None:
+        routes = self._make_routes(ckpt_delay=0.0)
+        sbx = "sbx-checkpoint-failure"
+        engine = routes._daemon.require_engine()
+        engine.system.checkpoint_requested = lambda *args, **kwargs: SimpleNamespace(
+            checkpoint_id=kwargs.get("checkpoint_id"),
+            status=JobStatus.FAILED,
+            failure_code=FailureCode.RUNTIME_ERROR,
+            message="dump failed",
+            manifest=None,
+        )
+
+        response = self._action(
+            routes,
+            sbx,
+            ["echo", "failure"],
+            checkpoint=True,
+            checkpoint_id="ckpt-failed",
+        )
+        self._wait_for_jobs_idle(sbx)
+        job = routes.get_job(
+            {}, sandbox_id=sbx, job_id=response["job_id"]
+        )
+
+        self.assertEqual(job["status"], "failed")
+        self.assertIn("dump failed", job["error"])
+
     def test_nonzero_action_skips_checkpoint(self) -> None:
         checkpoint_calls: list[str] = []
 
@@ -182,7 +221,7 @@ class CheckpointBackpressureTests(unittest.TestCase):
                 return SimpleNamespace(returncode=7, stdout="", stderr="failed")
 
         system = _FakeSystem(self.log, 0.0)
-        system.checkpoint_once = lambda *args, **kwargs: checkpoint_calls.append(
+        system.checkpoint_requested = lambda *args, **kwargs: checkpoint_calls.append(
             "called"
         )
         routes = _Routes(
@@ -216,7 +255,7 @@ class CheckpointBackpressureTests(unittest.TestCase):
                 raise SandboxExecTimeout(["sleep", "30"], 1.0)
 
         system = _FakeSystem(self.log, 0.0)
-        system.checkpoint_once = lambda *args, **kwargs: checkpoint_calls.append(
+        system.checkpoint_requested = lambda *args, **kwargs: checkpoint_calls.append(
             "called"
         )
         routes = _Routes(

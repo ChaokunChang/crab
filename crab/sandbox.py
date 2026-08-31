@@ -81,6 +81,8 @@ class AsyncCheckpoint:
         self._thread = thread
         self._poll_fn = poll_fn
         self._error: BaseException | None = None
+        self.materialization: str | None = None
+        self.physical_checkpoint_created: bool | None = None
         # Do NOT eagerly cache done-ness: an unstarted thread reports
         # is_alive()==False, and _start_async_checkpoint constructs the
         # handle with a placeholder thread before reassigning the real one.
@@ -116,8 +118,19 @@ class AsyncCheckpoint:
                 self._done = True
                 result = resp.get("result") or {}
                 resolved = result.get("checkpoint_id")
-                if resolved:
-                    self.checkpoint_id = str(resolved)
+                if resolved and str(resolved) != self.checkpoint_id:
+                    self._error = RuntimeError(
+                        "logical checkpoint id changed while waiting: "
+                        f"expected={self.checkpoint_id} actual={resolved}"
+                    )
+                    raise self._error
+                materialization = result.get("checkpoint_materialization")
+                if materialization is not None:
+                    self.materialization = str(materialization)
+                if "physical_checkpoint_created" in result:
+                    self.physical_checkpoint_created = bool(
+                        result["physical_checkpoint_created"]
+                    )
                 return self.checkpoint_id
             if status == "failed":
                 err_msg = resp.get("error", "checkpoint failed")
@@ -139,7 +152,27 @@ class AsyncCheckpoint:
         if self._poll_fn is not None:
             try:
                 resp = self._poll_fn()
-                if resp.get("status") in ("completed", "failed"):
+                status = resp.get("status")
+                if status == "completed":
+                    result = resp.get("result") or {}
+                    resolved = result.get("checkpoint_id")
+                    if resolved and str(resolved) != self.checkpoint_id:
+                        self._error = RuntimeError(
+                            "logical checkpoint id changed while waiting: "
+                            f"expected={self.checkpoint_id} actual={resolved}"
+                        )
+                    materialization = result.get("checkpoint_materialization")
+                    if materialization is not None:
+                        self.materialization = str(materialization)
+                    if "physical_checkpoint_created" in result:
+                        self.physical_checkpoint_created = bool(
+                            result["physical_checkpoint_created"]
+                        )
+                    self._done = True
+                elif status == "failed":
+                    self._error = RuntimeError(
+                        resp.get("error", "checkpoint failed")
+                    )
                     self._done = True
             except Exception:
                 pass
@@ -570,9 +603,11 @@ class _CommandsNamespace:
                 done_thread.join()
                 ckpt_handle = AsyncCheckpoint(ckpt_id, done_thread)
                 server_ckpt = response.get("checkpoint_id")
-                if server_ckpt and server_ckpt != ckpt_id:
-                    ckpt_handle.checkpoint_id = str(server_ckpt)
-                    sandbox._last_checkpoint_id = str(server_ckpt)
+                if server_ckpt and str(server_ckpt) != ckpt_id:
+                    raise RuntimeError(
+                        "daemon changed the preallocated logical checkpoint id: "
+                        f"expected={ckpt_id} actual={server_ckpt}"
+                    )
 
         if changeset:
             if cs_status == "pending" and poll_fn is not None:
@@ -789,13 +824,37 @@ class _CheckpointsNamespace:
                 out.append({"checkpoint_id": str(ckpt_id), "metadata": {}})
                 continue
             md = dict(manifest.metadata or {})
+            try:
+                resolved = self._sandbox._engine.system._resolve_restore_manifest(
+                    sandbox_id, ckpt_id
+                )
+            except Exception:
+                resolved = manifest
+            restore_process_artifacts = getattr(
+                manifest,
+                "restore_process_artifacts",
+                getattr(resolved, "process_artifacts", None),
+            )
+            restore_filesystem_artifacts = getattr(
+                manifest,
+                "restore_filesystem_artifacts",
+                getattr(resolved, "filesystem_artifacts", None),
+            )
             out.append(
                 {
                     "checkpoint_id": str(manifest.checkpoint_id),
                     "created_at": manifest.created_at.isoformat() if hasattr(manifest, "created_at") else None,
                     "label": md.get(_LABEL_METADATA_KEY),
-                    "has_process": bool(getattr(manifest, "process_artifacts", None)),
-                    "has_filesystem": bool(getattr(manifest, "filesystem_artifacts", None)),
+                    "has_process": bool(restore_process_artifacts),
+                    "has_filesystem": bool(restore_filesystem_artifacts),
+                    "materialized_process": bool(manifest.process_artifacts),
+                    "materialized_filesystem": bool(manifest.filesystem_artifacts),
+                    "logical": bool(md.get("logical_checkpoint", False)),
+                    "materialization": md.get("checkpoint_materialization"),
+                    "process_checkpoint_id": md.get("process_restore_checkpoint_id"),
+                    "filesystem_checkpoint_id": md.get(
+                        "filesystem_restore_checkpoint_id"
+                    ),
                     "metadata": md,
                 }
             )
@@ -1626,7 +1685,31 @@ class Sandbox:
 
         def _do_checkpoint() -> None:
             try:
-                self.checkpoint(checkpoint_id=ckpt_id)
+                result = self._engine.system.checkpoint_requested(
+                    self.sandbox_id,
+                    leave_running=True,
+                    checkpoint_id=ckpt_id,
+                )
+                if result.status != JobStatus.SUCCEEDED or result.manifest is None:
+                    raise RuntimeError(
+                        "logical checkpoint failed: "
+                        f"status={result.status.value} message={result.message}"
+                    )
+                if str(result.checkpoint_id) != ckpt_id:
+                    raise RuntimeError(
+                        "logical checkpoint id changed during materialization: "
+                        f"expected={ckpt_id} actual={result.checkpoint_id}"
+                    )
+                handle.materialization = str(
+                    result.manifest.metadata.get(
+                        "checkpoint_materialization", "legacy"
+                    )
+                )
+                handle.physical_checkpoint_created = bool(
+                    result.manifest.metadata.get(
+                        "physical_checkpoint_created", True
+                    )
+                )
             except BaseException as exc:
                 handle._error = exc
 

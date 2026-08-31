@@ -1193,6 +1193,81 @@ class BenchmarkHelperTests(unittest.TestCase):
             ],
         )
 
+    def test_resolve_checkpoint_copy_plan_uses_logical_manifest_sources(self) -> None:
+        sid = SandboxId("sbx")
+        checkpoint_order = [
+            CheckpointId("ckpt-process-source"),
+            CheckpointId("ckpt-filesystem-source"),
+            CheckpointId("ckpt-newer-unrelated"),
+            CheckpointId("ckpt-logical"),
+        ]
+        process_ref = ArtifactReference(
+            kind=ArtifactKind.PROCESS,
+            name="process_checkpoint.json",
+            relative_path="artifacts/sbx/process/process_checkpoint.json",
+            size_bytes=1,
+            sha256="0" * 64,
+            metadata={},
+        )
+        filesystem_ref = ArtifactReference(
+            kind=ArtifactKind.FILESYSTEM,
+            name="filesystem_checkpoint.json",
+            relative_path="artifacts/sbx/filesystem/filesystem_checkpoint.json",
+            size_bytes=1,
+            sha256="1" * 64,
+            metadata={},
+        )
+
+        def _manifest(
+            checkpoint_id: str,
+            *,
+            process: bool = False,
+            filesystem: bool = False,
+            metadata: dict[str, object] | None = None,
+        ) -> CheckpointManifest:
+            return CheckpointManifest(
+                schema_version="v1",
+                checkpoint_id=CheckpointId(checkpoint_id),
+                sandbox_id=sid,
+                created_at=utc_now(),
+                runtime_name="runc",
+                runtime_version=None,
+                process_artifacts=[process_ref] if process else [],
+                filesystem_artifacts=[filesystem_ref] if filesystem else [],
+                metadata=metadata or {},
+            ).with_integrity()
+
+        manifests = {
+            CheckpointId("ckpt-process-source"): _manifest(
+                "ckpt-process-source", process=True
+            ),
+            CheckpointId("ckpt-filesystem-source"): _manifest(
+                "ckpt-filesystem-source", filesystem=True
+            ),
+            CheckpointId("ckpt-newer-unrelated"): _manifest(
+                "ckpt-newer-unrelated", process=True, filesystem=True
+            ),
+            CheckpointId("ckpt-logical"): _manifest(
+                "ckpt-logical",
+                metadata={
+                    "logical_checkpoint": True,
+                    "process_restore_checkpoint_id": "ckpt-process-source",
+                    "filesystem_restore_checkpoint_id": "ckpt-filesystem-source",
+                },
+            ),
+        }
+
+        self.assertEqual(
+            resolve_checkpoint_copy_plan(
+                checkpoint_order, manifests, CheckpointId("ckpt-logical")
+            ),
+            [
+                (CheckpointId("ckpt-process-source"), True, False),
+                (CheckpointId("ckpt-filesystem-source"), False, True),
+                (CheckpointId("ckpt-logical"), False, False),
+            ],
+        )
+
     def test_bounded_probability_rejects_invalid_values(self) -> None:
         self.assertEqual(bounded_probability("0.3"), 0.3)
         with self.assertRaises(Exception):

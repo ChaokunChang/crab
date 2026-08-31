@@ -328,7 +328,8 @@ class LocalCheckpointManager(CheckpointManager):
         if descendants:
             if not cascade:
                 raise RuntimeError(
-                    "refusing to delete checkpoint with live incremental descendants: "
+                    "refusing to delete checkpoint with live incremental descendants "
+                    "or logical restore dependents: "
                     f"sandbox={sandbox_id} checkpoint={checkpoint_id} "
                     f"descendants={[str(d) for d in descendants]} "
                     "(pass cascade=True to drop the whole chain)"
@@ -362,15 +363,19 @@ class LocalCheckpointManager(CheckpointManager):
         sandbox_id: SandboxId,
         checkpoint_id: CheckpointId,
     ) -> list[CheckpointId]:
-        """Transitive descendants whose `parent_checkpoint_id` chain
-        bottoms out at ``checkpoint_id``. Returned newest-first so callers
-        deleting them in order never orphan a child.
+        """Transitive incremental or logical-restore descendants.
+
+        Logical checkpoints explicitly reference the physical process and
+        filesystem manifests they reuse. Treat those references like parent
+        edges so direct deletion cannot leave an apparently valid logical id
+        dangling. Returned newest-first so cascade deletion never orphans a
+        child.
         """
         sandbox_dir = self._manifests_root / str(sandbox_id)
         if not sandbox_dir.exists():
             return []
 
-        parent_by_child: dict[CheckpointId, CheckpointId] = {}
+        parents_by_child: dict[CheckpointId, set[CheckpointId]] = {}
         order: dict[CheckpointId, str] = {}
         for path in sandbox_dir.glob("*.json"):
             try:
@@ -384,7 +389,21 @@ class LocalCheckpointManager(CheckpointManager):
             order[cid] = str(raw.get("created_at", ""))
             parent_raw = raw.get("parent_checkpoint_id")
             if parent_raw is not None:
-                parent_by_child[cid] = CheckpointId(str(parent_raw))
+                parents_by_child.setdefault(cid, set()).add(
+                    CheckpointId(str(parent_raw))
+                )
+            metadata = raw.get("metadata")
+            if isinstance(metadata, dict):
+                for metadata_key in (
+                    "process_restore_checkpoint_id",
+                    "filesystem_restore_checkpoint_id",
+                ):
+                    dependency_raw = metadata.get(metadata_key)
+                    if dependency_raw is None:
+                        continue
+                    dependency = CheckpointId(str(dependency_raw))
+                    if dependency != cid:
+                        parents_by_child.setdefault(cid, set()).add(dependency)
 
         target = checkpoint_id
         descendants: set[CheckpointId] = set()
@@ -392,8 +411,8 @@ class LocalCheckpointManager(CheckpointManager):
         frontier = {target}
         while frontier:
             next_frontier: set[CheckpointId] = set()
-            for cid, parent in parent_by_child.items():
-                if parent in frontier and cid not in descendants and cid != target:
+            for cid, parents in parents_by_child.items():
+                if parents.intersection(frontier) and cid not in descendants and cid != target:
                     descendants.add(cid)
                     next_frontier.add(cid)
             frontier = next_frontier

@@ -148,6 +148,12 @@ _CAPTURED_REQUEST_GROUP_KIND = "captured_request_group_kind"
 _CAPTURED_REQUEST_GROUP_ID = "captured_request_group_id"
 _CAPTURED_REQUEST_IDS = "captured_request_ids"
 _CAPTURED_REQUEST_GROUP_STARTED_AT = "captured_request_group_started_at"
+_LOGICAL_CHECKPOINT = "logical_checkpoint"
+_LOGICAL_CHECKPOINT_ID = "logical_checkpoint_id"
+_CHECKPOINT_MATERIALIZATION = "checkpoint_materialization"
+_PHYSICAL_CHECKPOINT_CREATED = "physical_checkpoint_created"
+_PROCESS_RESTORE_CHECKPOINT_ID = "process_restore_checkpoint_id"
+_FILESYSTEM_RESTORE_CHECKPOINT_ID = "filesystem_restore_checkpoint_id"
 _RESTORE_RUNTIME_READY_ATTEMPTS = 10
 _RESTORE_RUNTIME_READY_DELAY_S = 0.1
 
@@ -235,6 +241,11 @@ class CrabSystem:
     _fork_lock: Lock = field(init=False, repr=False)
     _fork_chain_pins: dict[SandboxId, tuple[SandboxId, CheckpointId]] = field(init=False, repr=False)
     _fork_children: dict[SandboxId, set[SandboxId]] = field(init=False, repr=False)
+    _current_restore_lock: Lock = field(init=False, repr=False)
+    _current_restore_sources: dict[
+        SandboxId,
+        tuple[CheckpointId, CheckpointId | None, CheckpointId | None],
+    ] = field(init=False, repr=False)
     _txn_lock: Lock = field(init=False, repr=False)
     _active_txns: dict[SandboxId, TxnDescription | None] = field(init=False, repr=False)
 
@@ -260,6 +271,8 @@ class CrabSystem:
         self._fork_lock = Lock()
         self._fork_chain_pins = {}
         self._fork_children = {}
+        self._current_restore_lock = Lock()
+        self._current_restore_sources = {}
         self._txn_lock = Lock()
         self._active_txns = {}
         self._merge_lock = Lock()
@@ -403,6 +416,12 @@ class CrabSystem:
             )
             result = self.executor.run_checkpoint(job)
             if result.status.value == "succeeded":
+                self._remember_current_restore_sources(
+                    sandbox_id,
+                    result.checkpoint_id,
+                    result.checkpoint_id,
+                    result.checkpoint_id,
+                )
                 self.scheduler.mark_checkpoint_complete(
                     sandbox_id,
                     result.finished_at,
@@ -459,6 +478,40 @@ class CrabSystem:
         assert result is not None
         logger.info("Manual checkpoint for sandbox %s finished with status=%s", sandbox_id, result.status.value)
         return result
+
+    def checkpoint_requested(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        leave_running: bool = True,
+        checkpoint_id: str | CheckpointId | None = None,
+    ) -> CheckpointResult:
+        """Create a user-visible logical checkpoint.
+
+        The id is allocated before work starts and remains stable.  Inspector
+        state determines whether this turn creates a full/partial physical
+        checkpoint or persists a zero-artifact logical node that reuses the
+        prior restore sources. Unlike automatic scheduling, a requested
+        checkpoint is never skipped merely because a time interval has not
+        elapsed: changed state must be materialized to keep the logical point
+        exact.
+        """
+        logical_id = (
+            CheckpointId.new()
+            if checkpoint_id is None
+            else CheckpointId(str(checkpoint_id))
+        )
+        pending_request = self._next_pending_live_request(sandbox_id)
+        try:
+            return self._execute_requested_checkpoint_flow(
+                sandbox_id,
+                logical_id=logical_id,
+                leave_running=leave_running,
+                pending_request=pending_request,
+            )
+        finally:
+            self._release_response_gate(sandbox_id, pending_request)
+            self._refresh_interceptor_pending_state(sandbox_id)
 
     def checkpoint_if_due(self, sandbox_id: SandboxId) -> CheckpointResult | None:
         if self._txn_active(sandbox_id):
@@ -535,15 +588,20 @@ class CrabSystem:
                 },
             )
             return failed_result
-        restore_manifest = None
+        # Resolve once before the runtime is mutated. Besides feeding replay
+        # metadata, the exact component ids become the new *current* baseline
+        # after a successful restore. Looking at the newest stored manifest at
+        # that point would be wrong when the caller restored an older logical
+        # recovery point.
+        restore_manifest = self._resolve_restore_manifest(
+            sandbox_id, restore_checkpoint_id
+        )
         if self.restore_metadata_handler is not None:
-            restore_manifest = self._resolve_restore_manifest(sandbox_id, restore_checkpoint_id)
-            if restore_manifest is not None:
-                # Preload replay/router state before the restored process can
-                # resume making requests. This avoids a narrow race where the
-                # process issues its first post-restore request before the
-                # replay service cursor is rewound to the checkpoint position.
-                self.restore_metadata_handler(sandbox_id, restore_manifest)
+            # Preload replay/router state before the restored process can
+            # resume making requests. This avoids a narrow race where the
+            # process issues its first post-restore request before the replay
+            # service cursor is rewound to the checkpoint position.
+            self.restore_metadata_handler(sandbox_id, restore_manifest)
         self.runtime.prepare_for_restore(sandbox_id)
         job = RestoreJob(
             job_id=JobId.new(),
@@ -574,6 +632,47 @@ class CrabSystem:
             else:
                 self.runtime.mark_restored(sandbox_id)
                 self._mark_sandbox_running(sandbox_id)
+                restored_at = utc_now()
+                process_source_raw = restore_manifest.metadata.get(
+                    _PROCESS_RESTORE_CHECKPOINT_ID
+                )
+                filesystem_source_raw = restore_manifest.metadata.get(
+                    _FILESYSTEM_RESTORE_CHECKPOINT_ID
+                )
+                if process_source_raw is None or filesystem_source_raw is None:
+                    # Legacy/incomplete restores remain supported, but they
+                    # cannot safely seed adaptive reuse. The next requested
+                    # checkpoint therefore creates a full baseline.
+                    self._mark_current_restore_sources_incomplete(
+                        sandbox_id, restore_checkpoint_id
+                    )
+                else:
+                    process_source_id = CheckpointId(str(process_source_raw))
+                    filesystem_source_id = CheckpointId(
+                        str(filesystem_source_raw)
+                    )
+                    self._remember_current_restore_sources(
+                        sandbox_id,
+                        restore_checkpoint_id,
+                        process_source_id,
+                        filesystem_source_id,
+                    )
+                    # A restore changes which historical process image the
+                    # live sandbox descends from. Reset the incremental
+                    # scheduler base to that exact source; retaining a newer
+                    # pre-restore parent can create a divergent CRIU chain.
+                    self.scheduler.mark_checkpoint_complete(
+                        sandbox_id,
+                        restored_at,
+                        process_checkpoint_id=process_source_id,
+                        is_incremental_process=False,
+                    )
+                self.inspector.mark_checkpoint_complete(
+                    sandbox_id,
+                    process=True,
+                    filesystem=True,
+                    at=restored_at,
+                )
                 self.storage.handle_restore_complete(sandbox_id, result.checkpoint_id)
                 self._journal_lifecycle(
                     sandbox_id,
@@ -649,6 +748,11 @@ class CrabSystem:
                 raise ValueError(f"checkpoint {checkpoint_id} not found for sandbox {source_sandbox_id}")
             checkpoint_order = list(manifests.keys())
             copy_plan = forking.resolve_checkpoint_copy_plan(checkpoint_order, manifests, checkpoint_id)
+            process_checkpoint_id = next(
+                copy_id
+                for copy_id, copy_process, _ in reversed(copy_plan)
+                if copy_process
+            )
             filesystem_checkpoint_id = next(
                 copy_id for copy_id, _, copy_filesystem in reversed(copy_plan) if copy_filesystem
             )
@@ -761,6 +865,13 @@ class CrabSystem:
 
             with self._fork_lock:
                 self._fork_children.setdefault(source_sandbox_id, set()).add(target_sandbox_id)
+
+            self._remember_current_restore_sources(
+                target_sandbox_id,
+                checkpoint_id,
+                process_checkpoint_id,
+                filesystem_checkpoint_id,
+            )
 
             inherited_checkpoint_at = manifests[checkpoint_id].created_at
             upsert = getattr(self.inspector, "upsert_snapshot", None)
@@ -956,6 +1067,7 @@ class CrabSystem:
         promote one fork's filesystem clone so the source's dataset loses
         its dependents, and replace chain-shared symlinks with real bytes
         (storage artifacts and runtime pre-dump trees)."""
+        self._forget_current_restore_sources(source_sandbox_id)
         self._journal_lifecycle(source_sandbox_id, "destroy")
         # Recorded egress bodies die with the sandbox (D2): replay must
         # happen while the recording sandbox is still alive.
@@ -2034,6 +2146,29 @@ class CrabSystem:
                 return checkpoint_id
         return None
 
+    def _filesystem_restore_source_id(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> CheckpointId:
+        try:
+            resolved_manifest = self._resolve_restore_manifest(
+                sandbox_id, checkpoint_id
+            )
+        except (FileNotFoundError, KeyError):
+            # Backward compatibility for runtime snapshots created before a
+            # manifest was recorded (and lightweight test/runtime adapters):
+            # historical ids were physical ids.
+            return checkpoint_id
+        filesystem_source_raw = resolved_manifest.metadata.get(
+            _FILESYSTEM_RESTORE_CHECKPOINT_ID
+        )
+        if filesystem_source_raw is None:
+            raise ValueError(
+                f"checkpoint {checkpoint_id} has no filesystem restore source"
+            )
+        return CheckpointId(str(filesystem_source_raw))
+
     def changeset_since(
         self,
         sandbox_id: SandboxId,
@@ -2047,6 +2182,11 @@ class CrabSystem:
         the filesystem since the last filesystem checkpoint AND that
         checkpoint is the requested base; anything less falls through to
         the authoritative diff."""
+        logical_checkpoint_id = CheckpointId(str(checkpoint_id))
+        filesystem_checkpoint_id = self._filesystem_restore_source_id(
+            sandbox_id, logical_checkpoint_id
+        )
+
         skipped_by_gate = False
         if use_inspector_gate:
             filesystem_changed = True
@@ -2055,15 +2195,23 @@ class CrabSystem:
                 filesystem_changed = bool(snapshot.filesystem_changed)
             except Exception:
                 filesystem_changed = True
-            if not filesystem_changed and self._latest_filesystem_checkpoint_id(sandbox_id) == checkpoint_id:
+            if (
+                not filesystem_changed
+                and self._latest_filesystem_checkpoint_id(sandbox_id)
+                == filesystem_checkpoint_id
+            ):
                 skipped_by_gate = True
         if skipped_by_gate:
             entries: tuple[ChangesetEntry, ...] = ()
         else:
-            entries = tuple(self.runtime.changeset_since(sandbox_id, checkpoint_id))
+            entries = tuple(
+                self.runtime.changeset_since(
+                    sandbox_id, filesystem_checkpoint_id
+                )
+            )
         result = ChangesetResult(
             sandbox_id=sandbox_id,
-            base_checkpoint_id=checkpoint_id,
+            base_checkpoint_id=logical_checkpoint_id,
             entries=entries,
             skipped_by_gate=skipped_by_gate,
         )
@@ -2071,7 +2219,8 @@ class CrabSystem:
             sandbox_id,
             "changeset",
             metadata={
-                "base_checkpoint_id": str(checkpoint_id),
+                "base_checkpoint_id": str(logical_checkpoint_id),
+                "filesystem_checkpoint_id": str(filesystem_checkpoint_id),
                 "entry_count": len(entries),
                 "skipped_by_gate": skipped_by_gate,
             },
@@ -2081,17 +2230,18 @@ class CrabSystem:
             self._telemetry_attrs(
                 sandbox_id,
                 component="system",
-                checkpoint_id=checkpoint_id,
+                checkpoint_id=logical_checkpoint_id,
                 extra={
                     "entry_count": len(entries),
                     "skipped_by_gate": skipped_by_gate,
+                    "filesystem_checkpoint_id": str(filesystem_checkpoint_id),
                 },
             ),
         )
         logger.info(
             "Computed changeset sandbox=%s base=%s entries=%d skipped_by_gate=%s",
             sandbox_id,
-            checkpoint_id,
+            logical_checkpoint_id,
             len(entries),
             skipped_by_gate,
         )
@@ -2243,8 +2393,13 @@ class CrabSystem:
                 ) from exc
             source_root = Path(self.runtime.rootfs_path_for(source_sandbox_id))
             fork_root = Path(self.runtime.rootfs_path_for(fork_sandbox_id))
+            fork_base_filesystem_id = self._filesystem_restore_source_id(
+                fork_sandbox_id, base_checkpoint_id
+            )
             base_root = Path(
-                self.runtime.snapshot_content_root(fork_sandbox_id, base_checkpoint_id)
+                self.runtime.snapshot_content_root(
+                    fork_sandbox_id, fork_base_filesystem_id
+                )
             )
             plan = plan_merge(
                 fork_entries=fork_result.entries,
@@ -3309,7 +3464,14 @@ class CrabSystem:
         existing = self.changeset_since(fork_id, base_checkpoint_id)
         source_root = Path(self.runtime.rootfs_path_for(source_id))
         fork_root = Path(self.runtime.rootfs_path_for(fork_id))
-        base_root = Path(self.runtime.snapshot_content_root(source_id, base_checkpoint_id))
+        source_base_filesystem_id = self._filesystem_restore_source_id(
+            source_id, base_checkpoint_id
+        )
+        base_root = Path(
+            self.runtime.snapshot_content_root(
+                source_id, source_base_filesystem_id
+            )
+        )
         # Direction swap: the "fork side" of the engine is whoever's
         # changes are being applied — here the source's, onto the fork.
         plan = plan_merge(
@@ -3996,6 +4158,426 @@ class CrabSystem:
                 sandbox_id,
             )
 
+    def _ensure_current_restore_state(
+        self,
+    ) -> tuple[
+        Lock,
+        dict[
+            SandboxId,
+            tuple[CheckpointId, CheckpointId | None, CheckpointId | None],
+        ],
+    ]:
+        """Return restore-cursor state, tolerating lightweight test adapters.
+
+        Production instances always run ``__post_init__``. A few embedders and
+        unit fixtures intentionally construct ``CrabSystem`` with ``__new__``
+        and attach only the collaborators needed by the method under test, so
+        keep this new bookkeeping lazily initializable for compatibility.
+        """
+        lock = getattr(self, "_current_restore_lock", None)
+        sources = getattr(self, "_current_restore_sources", None)
+        if lock is None or sources is None:
+            lock = Lock()
+            sources = {}
+            self._current_restore_lock = lock
+            self._current_restore_sources = sources
+        return lock, sources
+
+    def _remember_current_restore_sources(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+        process_checkpoint_id: CheckpointId,
+        filesystem_checkpoint_id: CheckpointId,
+    ) -> None:
+        lock, sources = self._ensure_current_restore_state()
+        with lock:
+            sources[sandbox_id] = (
+                CheckpointId(str(checkpoint_id)),
+                CheckpointId(str(process_checkpoint_id)),
+                CheckpointId(str(filesystem_checkpoint_id)),
+            )
+
+    def _mark_current_restore_sources_incomplete(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> None:
+        lock, sources = self._ensure_current_restore_state()
+        with lock:
+            sources[sandbox_id] = (
+                CheckpointId(str(checkpoint_id)),
+                None,
+                None,
+            )
+
+    def _forget_current_restore_sources(self, sandbox_id: SandboxId) -> None:
+        lock, sources = self._ensure_current_restore_state()
+        with lock:
+            sources.pop(sandbox_id, None)
+
+    def _latest_restore_sources(
+        self,
+        sandbox_id: SandboxId,
+    ) -> tuple[CheckpointManifest, CheckpointId, CheckpointId] | None:
+        """Current recovery point and its physical component ids.
+
+        Normally the current point is the newest stored manifest. Restore can
+        move a live sandbox backwards while newer manifests remain on disk,
+        so an in-memory cursor takes precedence until another successful
+        checkpoint advances it. The cursor intentionally is not reconstructed
+        after daemon restart; without a trustworthy inspector/scheduler
+        baseline the requested flow forces a new full checkpoint.
+        """
+        lock, sources = self._ensure_current_restore_state()
+        with lock:
+            current_sources = sources.get(sandbox_id)
+        if current_sources is not None:
+            current_id, process_id, filesystem_id = current_sources
+            if process_id is None or filesystem_id is None:
+                return None
+            try:
+                candidate = self.storage.get_manifest(sandbox_id, current_id)
+                process_manifest = self.storage.get_manifest(
+                    sandbox_id, process_id
+                )
+                filesystem_manifest = self.storage.get_manifest(
+                    sandbox_id, filesystem_id
+                )
+                if not process_manifest.process_artifacts:
+                    raise ValueError(
+                        f"process source {process_id} has no process artifacts"
+                    )
+                if not filesystem_manifest.filesystem_artifacts:
+                    raise ValueError(
+                        f"filesystem source {filesystem_id} has no filesystem artifacts"
+                    )
+            except Exception:
+                logger.warning(
+                    "Current restore-source cursor is not resolvable; forcing a "
+                    "fresh baseline sandbox=%s checkpoint=%s",
+                    sandbox_id,
+                    current_id,
+                    exc_info=True,
+                )
+                self._mark_current_restore_sources_incomplete(
+                    sandbox_id, current_id
+                )
+                return None
+            return candidate, process_id, filesystem_id
+
+        try:
+            checkpoint_ids = self.storage.list_checkpoints(sandbox_id)
+        except Exception:
+            return None
+        for candidate_id in reversed(checkpoint_ids):
+            try:
+                candidate = self.storage.get_manifest(sandbox_id, candidate_id)
+            except (FileNotFoundError, KeyError):
+                continue
+            try:
+                resolved = resolve_restore_manifest(self.storage, candidate)
+            except Exception:
+                logger.warning(
+                    "Latest checkpoint is not resolvable; forcing a fresh baseline "
+                    "sandbox=%s checkpoint=%s",
+                    sandbox_id,
+                    candidate_id,
+                    exc_info=True,
+                )
+                return None
+            if not resolved.process_artifacts or not resolved.filesystem_artifacts:
+                return None
+            process_raw = resolved.metadata.get(_PROCESS_RESTORE_CHECKPOINT_ID)
+            filesystem_raw = resolved.metadata.get(_FILESYSTEM_RESTORE_CHECKPOINT_ID)
+            if process_raw is None or filesystem_raw is None:
+                return None
+            return (
+                candidate,
+                CheckpointId(str(process_raw)),
+                CheckpointId(str(filesystem_raw)),
+            )
+        return None
+
+    def _execute_requested_checkpoint_flow(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        logical_id: CheckpointId,
+        leave_running: bool,
+        pending_request: PendingSandboxResponse | None = None,
+    ) -> CheckpointResult:
+        started = utc_now()
+        operation = start_operation(
+            self.telemetry,
+            "checkpoint.flow",
+            self._telemetry_attrs(
+                sandbox_id,
+                component="system",
+                checkpoint_id=logical_id,
+                request_id=(
+                    None if pending_request is None else pending_request.request_id
+                ),
+                extra={"logical_checkpoint": True, "reason": "requested"},
+            ),
+        )
+        job: CheckpointJob | None = None
+        result: CheckpointResult | None = None
+        flow_exception: BaseException | None = None
+        physical_checkpoint_created = False
+        materialization = "unknown"
+        try:
+            # Never overwrite or silently reuse an existing recovery point:
+            # this method runs after an action, so mapping a colliding id to
+            # older state would violate the requested turn boundary.
+            try:
+                existing = self.storage.get_manifest(sandbox_id, logical_id)
+            except (FileNotFoundError, KeyError):
+                existing = None
+            if existing is not None:
+                materialization = str(
+                    existing.metadata.get(_CHECKPOINT_MATERIALIZATION, "legacy")
+                )
+                result = CheckpointResult(
+                    job_id=JobId.new(),
+                    sandbox_id=sandbox_id,
+                    checkpoint_id=logical_id,
+                    status=JobStatus.FAILED,
+                    started_at=started,
+                    finished_at=utc_now(),
+                    manifest=None,
+                    failure_code=FailureCode.VALIDATION_ERROR,
+                    message="logical checkpoint id already exists",
+                )
+                return result
+
+            restore_sources = self._latest_restore_sources(sandbox_id)
+            decision = self.scheduler.query_requested_checkpoint(
+                sandbox_id,
+                baseline_available=restore_sources is not None,
+                leave_running=leave_running,
+            )
+            checkpoint_metadata = self._build_checkpoint_metadata(
+                sandbox_id, pending_request=pending_request
+            )
+
+            if not decision.should_checkpoint:
+                if decision.reason != "no_change_signal" or restore_sources is None:
+                    result = CheckpointResult(
+                        job_id=JobId.new(),
+                        sandbox_id=sandbox_id,
+                        checkpoint_id=logical_id,
+                        status=JobStatus.FAILED,
+                        started_at=started,
+                        finished_at=utc_now(),
+                        manifest=None,
+                        failure_code=FailureCode.VALIDATION_ERROR,
+                        message=decision.reason,
+                    )
+                    return result
+
+                _, process_checkpoint_id, filesystem_checkpoint_id = restore_sources
+                materialization = "reused"
+                finished = utc_now()
+                manifest = CheckpointManifest(
+                    schema_version="v1",
+                    checkpoint_id=logical_id,
+                    sandbox_id=sandbox_id,
+                    created_at=finished,
+                    runtime_name=self.runtime.name,
+                    runtime_version=self.runtime.version,
+                    process_artifacts=[],
+                    filesystem_artifacts=[],
+                    metadata={
+                        "policy": decision.policy_name,
+                        **decision.metadata,
+                        **checkpoint_metadata,
+                        _LOGICAL_CHECKPOINT: True,
+                        _LOGICAL_CHECKPOINT_ID: str(logical_id),
+                        _CHECKPOINT_MATERIALIZATION: materialization,
+                        _PHYSICAL_CHECKPOINT_CREATED: False,
+                        _PROCESS_RESTORE_CHECKPOINT_ID: str(process_checkpoint_id),
+                        _FILESYSTEM_RESTORE_CHECKPOINT_ID: str(
+                            filesystem_checkpoint_id
+                        ),
+                        "checkpoint_scope": "reused",
+                        "reason": decision.reason,
+                        "leave_running": bool(leave_running),
+                    },
+                ).with_integrity()
+                self.storage.put_manifest(manifest)
+                self.storage.handle_checkpoint_complete(manifest)
+                self._remember_current_restore_sources(
+                    sandbox_id,
+                    logical_id,
+                    process_checkpoint_id,
+                    filesystem_checkpoint_id,
+                )
+                result = CheckpointResult(
+                    job_id=JobId.new(),
+                    sandbox_id=sandbox_id,
+                    checkpoint_id=logical_id,
+                    status=JobStatus.SUCCEEDED,
+                    started_at=started,
+                    finished_at=finished,
+                    manifest=manifest,
+                    message="reused_previous_physical_checkpoint",
+                )
+                self._journal_lifecycle(
+                    sandbox_id,
+                    "checkpoint",
+                    metadata={
+                        "checkpoint_id": str(logical_id),
+                        "logical_checkpoint": True,
+                        "physical_checkpoint_created": False,
+                        "materialization": materialization,
+                        "reason": decision.reason,
+                    },
+                )
+                return result
+
+            prior_process_id = None
+            prior_filesystem_id = None
+            if restore_sources is not None:
+                _, prior_process_id, prior_filesystem_id = restore_sources
+            process_checkpoint_id = (
+                logical_id if decision.checkpoint_process else prior_process_id
+            )
+            filesystem_checkpoint_id = (
+                logical_id if decision.checkpoint_filesystem else prior_filesystem_id
+            )
+            if process_checkpoint_id is None or filesystem_checkpoint_id is None:
+                result = CheckpointResult(
+                    job_id=JobId.new(),
+                    sandbox_id=sandbox_id,
+                    checkpoint_id=logical_id,
+                    status=JobStatus.FAILED,
+                    started_at=started,
+                    finished_at=utc_now(),
+                    manifest=None,
+                    failure_code=FailureCode.VALIDATION_ERROR,
+                    message="requested checkpoint has no complete restore base",
+                )
+                return result
+
+            if decision.is_incremental_process:
+                materialization = "incremental"
+            elif decision.checkpoint_process and decision.checkpoint_filesystem:
+                materialization = "full"
+            elif decision.checkpoint_filesystem:
+                materialization = "filesystem_only"
+            else:
+                materialization = "process_only"
+            job = CheckpointJob(
+                job_id=JobId.new(),
+                sandbox_id=sandbox_id,
+                requested_at=started,
+                reason=decision.reason,
+                checkpoint_process=decision.checkpoint_process,
+                checkpoint_filesystem=decision.checkpoint_filesystem,
+                leave_running=decision.leave_running,
+                is_incremental_process=decision.is_incremental_process,
+                parent_process_checkpoint_id=decision.parent_process_checkpoint_id,
+                produce_pre_dump=decision.produce_pre_dump,
+                metadata={
+                    "policy": decision.policy_name,
+                    **decision.metadata,
+                    **checkpoint_metadata,
+                    "checkpoint_id": str(logical_id),
+                    _LOGICAL_CHECKPOINT: True,
+                    _LOGICAL_CHECKPOINT_ID: str(logical_id),
+                    _CHECKPOINT_MATERIALIZATION: materialization,
+                    _PHYSICAL_CHECKPOINT_CREATED: True,
+                    _PROCESS_RESTORE_CHECKPOINT_ID: str(process_checkpoint_id),
+                    _FILESYSTEM_RESTORE_CHECKPOINT_ID: str(
+                        filesystem_checkpoint_id
+                    ),
+                },
+            )
+            result = self.executor.submit_checkpoint(job).result()
+            if result.status == JobStatus.SUCCEEDED:
+                if result.manifest is None or result.checkpoint_id != logical_id:
+                    result = replace(
+                        result,
+                        status=JobStatus.FAILED,
+                        manifest=None,
+                        failure_code=FailureCode.STORAGE_ERROR,
+                        message=(
+                            "logical checkpoint materialized with an unexpected id "
+                            f"(expected={logical_id}, actual={result.checkpoint_id})"
+                        ),
+                    )
+                    return result
+                physical_checkpoint_created = True
+                self._remember_current_restore_sources(
+                    sandbox_id,
+                    logical_id,
+                    process_checkpoint_id,
+                    filesystem_checkpoint_id,
+                )
+                self.scheduler.mark_checkpoint_complete(
+                    sandbox_id,
+                    result.finished_at,
+                    process_checkpoint_id=(
+                        result.checkpoint_id if job.checkpoint_process else None
+                    ),
+                    is_incremental_process=job.is_incremental_process,
+                )
+                self._journal_lifecycle(
+                    sandbox_id,
+                    "checkpoint",
+                    metadata={
+                        "checkpoint_id": str(logical_id),
+                        "logical_checkpoint": True,
+                        "physical_checkpoint_created": True,
+                        "materialization": materialization,
+                        "reason": decision.reason,
+                        "leave_running": bool(job.leave_running),
+                    },
+                )
+            return result
+        except BaseException as exc:
+            flow_exception = exc
+            raise
+        finally:
+            if job is not None and self._should_resume_after_checkpoint(job, result):
+                self._resume_sandbox(sandbox_id)
+            if (
+                job is not None
+                and result is not None
+                and result.status == JobStatus.SUCCEEDED
+            ):
+                self.inspector.mark_checkpoint_complete(
+                    sandbox_id,
+                    process=job.checkpoint_process,
+                    filesystem=job.checkpoint_filesystem,
+                    at=result.finished_at,
+                )
+            if result is not None:
+                operation.finish(
+                    status=result.status.value,
+                    attributes={
+                        "checkpoint_id": str(logical_id),
+                        "job_id": str(result.job_id),
+                        "materialization": materialization,
+                        "physical_checkpoint_created": physical_checkpoint_created,
+                        "failure_code": result.failure_code.value,
+                    },
+                )
+            else:
+                operation.finish(
+                    status="failed",
+                    attributes={
+                        "checkpoint_id": str(logical_id),
+                        "materialization": materialization,
+                        "error": (
+                            type(flow_exception).__name__
+                            if flow_exception is not None
+                            else "unknown"
+                        ),
+                    },
+                )
+
     def _execute_checkpoint_flow(
         self,
         sandbox_id: SandboxId,
@@ -4025,6 +4607,7 @@ class CrabSystem:
                 ),
             ),
         )
+        prior_restore_sources = self._latest_restore_sources(sandbox_id)
         decision = self.scheduler.query_checkpoint(sandbox_id)
         if not decision.should_checkpoint:
             operation.finish(status="skipped", attributes={"reason": decision.reason})
@@ -4049,11 +4632,53 @@ class CrabSystem:
         try:
             result = self.executor.submit_checkpoint(job).result()
             if result.status.value == "succeeded":
+                prior_process_id = (
+                    None
+                    if prior_restore_sources is None
+                    else prior_restore_sources[1]
+                )
+                prior_filesystem_id = (
+                    None
+                    if prior_restore_sources is None
+                    else prior_restore_sources[2]
+                )
+                materialized_process = bool(
+                    result.manifest is not None
+                    and result.manifest.process_artifacts
+                )
+                materialized_filesystem = bool(
+                    result.manifest is not None
+                    and result.manifest.filesystem_artifacts
+                )
+                current_process_id = (
+                    result.checkpoint_id
+                    if materialized_process
+                    else prior_process_id
+                )
+                current_filesystem_id = (
+                    result.checkpoint_id
+                    if materialized_filesystem
+                    else prior_filesystem_id
+                )
+                if (
+                    current_process_id is not None
+                    and current_filesystem_id is not None
+                ):
+                    self._remember_current_restore_sources(
+                        sandbox_id,
+                        result.checkpoint_id,
+                        current_process_id,
+                        current_filesystem_id,
+                    )
+                else:
+                    self._mark_current_restore_sources_incomplete(
+                        sandbox_id, result.checkpoint_id
+                    )
                 self.scheduler.mark_checkpoint_complete(
                     sandbox_id,
                     result.finished_at,
                     process_checkpoint_id=(
-                        result.checkpoint_id if job.checkpoint_process else None
+                        result.checkpoint_id if materialized_process else None
                     ),
                     is_incremental_process=job.is_incremental_process,
                 )

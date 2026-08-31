@@ -5,6 +5,7 @@ import unittest
 
 from crab import (
     CRScheduler,
+    CheckpointId,
     FaultToleranceCheckpointingPolicy,
     InMemorySandboxInspector,
     InMemorySchedulerStateStore,
@@ -117,6 +118,135 @@ class SchedulerTests(unittest.TestCase):
         self.assertFalse(decision.should_checkpoint)
         self.assertEqual(self.sandbox_manager.calls, [("pause", self.sandbox_id), ("resume", self.sandbox_id)])
         self.assertEqual(self.sandbox_manager.describe(self.sandbox_id).status, "running")
+
+    def test_requested_clean_checkpoint_reuses_existing_baseline(self) -> None:
+        observed_at = utc_now()
+        self.inspector.upsert_snapshot(
+            SandboxSnapshot(
+                sandbox_id=self.sandbox_id,
+                runtime_name="runc",
+                is_running=True,
+                process_changed=False,
+                filesystem_changed=False,
+                observed_at=observed_at,
+                last_checkpoint_at=observed_at,
+            )
+        )
+
+        decision = self.scheduler.query_requested_checkpoint(
+            self.sandbox_id,
+            baseline_available=True,
+            leave_running=True,
+        )
+
+        self.assertFalse(decision.should_checkpoint)
+        self.assertEqual(decision.reason, "no_change_signal")
+        self.assertEqual(
+            self.sandbox_manager.calls,
+            [("pause", self.sandbox_id), ("resume", self.sandbox_id)],
+        )
+
+    def test_requested_change_ignores_automatic_minimum_interval(self) -> None:
+        scheduler = CRScheduler(
+            SchedulerConfig(
+                min_checkpoint_interval_seconds=3600.0,
+                force_checkpoint_after_seconds=7200.0,
+                require_change_signal=True,
+            ),
+            self.inspector,
+            self.sandbox_manager,
+            InMemorySchedulerStateStore(),
+        )
+        observed_at = utc_now()
+        self.inspector.upsert_snapshot(
+            SandboxSnapshot(
+                sandbox_id=self.sandbox_id,
+                runtime_name="runc",
+                is_running=True,
+                process_changed=False,
+                filesystem_changed=True,
+                observed_at=observed_at,
+                last_checkpoint_at=observed_at,
+            )
+        )
+
+        decision = scheduler.query_requested_checkpoint(
+            self.sandbox_id,
+            baseline_available=True,
+            leave_running=True,
+        )
+
+        self.assertTrue(decision.should_checkpoint)
+        self.assertFalse(decision.checkpoint_process)
+        self.assertTrue(decision.checkpoint_filesystem)
+        self.assertEqual(decision.reason, "requested_change_signal")
+        self.assertEqual(
+            self.sandbox_manager.calls,
+            [("pause", self.sandbox_id)],
+        )
+
+    def test_requested_first_checkpoint_forces_full_baseline(self) -> None:
+        observed_at = utc_now()
+        self.inspector.upsert_snapshot(
+            SandboxSnapshot(
+                sandbox_id=self.sandbox_id,
+                runtime_name="runc",
+                is_running=True,
+                process_changed=False,
+                filesystem_changed=False,
+                observed_at=observed_at,
+            )
+        )
+
+        decision = self.scheduler.query_requested_checkpoint(
+            self.sandbox_id,
+            baseline_available=False,
+            leave_running=True,
+        )
+
+        self.assertTrue(decision.should_checkpoint)
+        self.assertTrue(decision.checkpoint_process)
+        self.assertTrue(decision.checkpoint_filesystem)
+        self.assertEqual(decision.reason, "no_previous_checkpoint")
+
+    def test_requested_missing_baseline_never_uses_stale_incremental_parent(self) -> None:
+        store = InMemorySchedulerStateStore()
+        store.record_process_checkpoint(
+            self.sandbox_id,
+            CheckpointId("ckpt-stale-parent"),
+            is_incremental=False,
+        )
+        scheduler = CRScheduler(
+            SchedulerConfig(
+                incremental_process_enabled=True,
+                full_process_checkpoint_interval=10,
+                max_process_chain_length=10,
+            ),
+            self.inspector,
+            self.sandbox_manager,
+            store,
+        )
+        self.inspector.upsert_snapshot(
+            SandboxSnapshot(
+                sandbox_id=self.sandbox_id,
+                runtime_name="runc",
+                is_running=True,
+                process_changed=True,
+                filesystem_changed=True,
+                observed_at=utc_now(),
+                last_checkpoint_at=utc_now(),
+            )
+        )
+
+        decision = scheduler.query_requested_checkpoint(
+            self.sandbox_id,
+            baseline_available=False,
+        )
+
+        self.assertTrue(decision.should_checkpoint)
+        self.assertFalse(decision.is_incremental_process)
+        self.assertIsNone(decision.parent_process_checkpoint_id)
+        self.assertEqual(decision.reason, "no_previous_checkpoint")
 
     def test_query_expands_process_change_to_process_and_filesystem_checkpoint(self) -> None:
         observed_at = utc_now()
